@@ -439,6 +439,8 @@ export type NormalizedQuickBooksLedgerLine = {
 };
 
 export type NormalizedQuickBooksLedgerTransaction = {
+  readonly totalTax?: DecimalString;
+  readonly taxCalculation?: string;
   readonly sourceTransactionId: string;
   readonly sourceTransactionType: string;
   readonly transactionDate: IsoDate;

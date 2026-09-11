@@ -53,8 +53,8 @@ export type PostgresTableManifest = {
 };
 
 export type PostgresSchemaManifest = {
-  readonly manifestVersion: "2026-08-26.customer-deposit-invoice-applications";
-  readonly schemaVersion: 23;
+  readonly manifestVersion: "2026-09-11.commercial-document-detail";
+  readonly schemaVersion: 24;
   readonly dialect: "postgres";
   readonly namespace: "erp_financials";
   readonly requiredTriggers: readonly PostgresTriggerManifest[];
@@ -144,8 +144,8 @@ const table = (
 });
 
 export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
-  manifestVersion: "2026-08-26.customer-deposit-invoice-applications",
-  schemaVersion: 23,
+  manifestVersion: "2026-09-11.commercial-document-detail",
+  schemaVersion: 24,
   dialect: "postgres",
   namespace: "erp_financials",
   requiredTriggers: [
@@ -2496,15 +2496,15 @@ function sdkV1LineTables(): readonly PostgresTableManifest[] {
     { name: `${prefix}_number_check`, sql: "line_number > 0" },
     {
       name: `${prefix}_amount_check`,
-      sql: "quantity > 0 and unit_amount >= 0 and discount_amount >= 0 and tax_amount >= 0 and line_amount > 0"
+      sql: prefix === "subledger_document_lines" ? "discount_amount >= 0 and (quantity <> 0 or (line_amount = 0 and discount_amount = 0 and tax_amount = 0))" : "quantity > 0 and unit_amount >= 0 and discount_amount >= 0 and tax_amount >= 0 and line_amount > 0"
     },
     {
       name: `${prefix}_scale_check`,
-      sql: "scale(quantity) <= 4 and scale(unit_amount) <= 2 and scale(discount_amount) <= 2 and scale(tax_amount) <= 2 and scale(line_amount) <= 2"
+      sql: prefix === "subledger_document_lines" ? "scale(quantity) <= 12 and scale(unit_amount) <= 12 and scale(discount_amount) <= 2 and scale(tax_amount) <= 2 and scale(line_amount) <= 2" : "scale(quantity) <= 4 and scale(unit_amount) <= 2 and scale(discount_amount) <= 2 and scale(tax_amount) <= 2 and scale(line_amount) <= 2"
     },
     {
       name: `${prefix}_arithmetic_check`,
-      sql: "discount_amount <= round(quantity * unit_amount, 2) and line_amount = round(quantity * unit_amount, 2) - discount_amount + tax_amount"
+      sql: prefix === "subledger_document_lines" ? "discount_amount <= abs(round(quantity * unit_amount, 2)) and line_amount = round(quantity * unit_amount, 2) - (case when quantity * unit_amount < 0 then -discount_amount else discount_amount end) + tax_amount" : "discount_amount <= round(quantity * unit_amount, 2) and line_amount = round(quantity * unit_amount, 2) - discount_amount + tax_amount"
     },
     {
       name: `${prefix}_dimension_refs_shape_check`,

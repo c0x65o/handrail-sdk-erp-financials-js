@@ -18,6 +18,16 @@ import type {
 } from "../src/index.js";
 
 describe("QuickBooks SDK envelope adapter", () => {
+  it("carries document tax and provider precision into the normalized commercial contract", () => {
+    const envelope = fullSyncEnvelope();
+    const adapted = adaptHandrailQuickBooksSdkFullSyncEnvelope({ ...envelope, normalizedResources: {
+      ...envelope.normalizedResources,
+      transactions: (envelope.normalizedResources?.transactions ?? []).map(value => ({ ...fixtureResource(value), totalTax: 27, taxCalculation: "TaxExcluded" })),
+      transaction_lines: (envelope.normalizedResources?.transaction_lines ?? []).map(value => ({ ...fixtureResource(value), quantity: 0.3333333, unitAmount: 215999.9568 }))
+    } }, adapterOptions());
+    expect(adapted.resources.operationalDocuments?.[0]?.resource).toMatchObject({ totalTax: "27.00", taxCalculation: "TaxExcluded", lines: [{ sourceQuantity: "0.3333333", sourceUnitAmount: "215999.9568" }] });
+  });
+
   it("adapts a full-sync envelope without losing identity, warnings, completeness, checkpoints, or posting polarity", () => {
     const sdkEnvelope = fullSyncEnvelope();
     const adapted = adaptHandrailQuickBooksSdkFullSyncEnvelope(sdkEnvelope, adapterOptions());
@@ -276,7 +286,7 @@ describe("QuickBooks SDK envelope adapter", () => {
             sourceTransactionType: "Invoice",
             totalAmount: "0.00",
             openAmount: "0.00",
-            unappliedAmount: undefined,
+            unappliedAmount: "0.00",
             lines: []
           }
         }]
@@ -313,7 +323,7 @@ describe("QuickBooks SDK envelope adapter", () => {
         sourceTransactionType,
         totalAmount: "0.00",
         openAmount: "0.00",
-        unappliedAmount: undefined,
+        unappliedAmount: "0.00",
         lines: []
       }
     });
@@ -358,7 +368,7 @@ describe("QuickBooks SDK envelope adapter", () => {
       ]);
     }
 
-    expect(statements).toHaveLength(2);
+    expect(statements).toHaveLength(4);
     expect(statements.every((statement) => /^select\b/i.test(statement.trim()))).toBe(true);
   });
 
@@ -400,7 +410,7 @@ describe("QuickBooks SDK envelope adapter", () => {
         totalAmount: "125.00",
         openAmount: "0.00",
         unappliedAmount: "0.00",
-        lines: []
+        lines: commercialFixtureLines("125.00")
       }
     };
     const vendorCredit = {
@@ -414,7 +424,7 @@ describe("QuickBooks SDK envelope adapter", () => {
         totalAmount: "125.00",
         openAmount: "0.00",
         unappliedAmount: "0.00",
-        lines: []
+        lines: commercialFixtureLines("125.00")
       }
     };
     const applicationOnlyBillPayment = {
@@ -528,7 +538,7 @@ describe("QuickBooks SDK envelope adapter", () => {
         totalAmount,
         openAmount: "0.00",
         unappliedAmount: "0.00",
-        lines: []
+        lines: commercialFixtureLines(totalAmount)
       }
     });
     const deposit = linkedDocument("deposit_2704", "Deposit", "1948.06");
@@ -655,7 +665,7 @@ describe("QuickBooks SDK envelope adapter", () => {
         totalAmount,
         openAmount: "0.00",
         unappliedAmount: "0.00",
-        lines: []
+        lines: commercialFixtureLines(totalAmount)
       }
     });
     const applicationOnlyPayment = {
@@ -811,11 +821,11 @@ describe("QuickBooks SDK envelope adapter", () => {
         ...resourceTemplate.resource,
         sourceTransactionId,
         sourceTransactionType,
-        ...(sourceTransactionType === "Deposit" ? { partyRef: undefined } : {}),
+        ...(sourceTransactionType === "Deposit" ? { partyRef: { sourceObjectId: "unknown", partyType: "other" as const } } : {}),
         totalAmount: "1.00",
         openAmount: "0.00",
         unappliedAmount: "0.00",
-        lines: []
+        lines: commercialFixtureLines("1.00")
       }
     });
     const payment = {
@@ -862,7 +872,7 @@ describe("QuickBooks SDK envelope adapter", () => {
       facts: {
         ...mapped.facts,
         transactions: [
-          { ...transactionTemplate, transactionId: "transaction_deposit_380", sourceTransactionId: "deposit_380", sourceTransactionType: "Deposit", partyId: undefined },
+          { ...omitFixtureField(transactionTemplate, "partyId"), transactionId: "transaction_deposit_380", sourceTransactionId: "deposit_380", sourceTransactionType: "Deposit" },
           { ...transactionTemplate, transactionId: "transaction_invoice_379", sourceTransactionId: "invoice_379", sourceTransactionType: "Invoice" }
         ],
         postings: []
@@ -904,7 +914,7 @@ describe("QuickBooks SDK envelope adapter", () => {
         facts: {
           ...mapped.facts,
           transactions: [
-            { ...transactionTemplate, transactionId: "transaction_deposit_380", sourceTransactionId: "deposit_380", sourceTransactionType: "Deposit", partyId: undefined },
+            { ...omitFixtureField(transactionTemplate, "partyId"), transactionId: "transaction_deposit_380", sourceTransactionId: "deposit_380", sourceTransactionType: "Deposit" },
             { ...transactionTemplate, transactionId: "transaction_invoice_379", sourceTransactionId: "invoice_379", sourceTransactionType: "Invoice", partyId: "canonical_other_customer" }
           ],
           postings: []
@@ -946,7 +956,7 @@ describe("QuickBooks SDK envelope adapter", () => {
         totalAmount: "100.00",
         openAmount: "100.00",
         unappliedAmount: "100.00",
-        lines: []
+        lines: commercialFixtureLines("100.00")
       }
     });
     const creditLine = {
@@ -1020,7 +1030,7 @@ describe("QuickBooks SDK envelope adapter", () => {
           totalAmount: "0.00",
           openAmount: "0.00",
           unappliedAmount: "0.00",
-          memo: undefined,
+          memo: "",
           lines: unsafe.lines
         }
       };
@@ -1575,7 +1585,7 @@ describe("QuickBooks SDK envelope adapter", () => {
     expect(calls.some((sql) => sql.includes('delete from "erp_financials"."subledger_document_lines"'))).toBe(true);
   });
 
-  it("retains a balanced QuickBooks journal and header when a commercial line omits its account", async () => {
+  it("rejects incomplete commercial detail before deleting or persisting any rows", async () => {
     const envelope = fullSyncEnvelope();
     const resources = envelope.normalizedResources;
     const adapted = adaptHandrailQuickBooksSdkFullSyncEnvelope({
@@ -1610,9 +1620,11 @@ describe("QuickBooks SDK envelope adapter", () => {
     });
 
     const lineInserts: readonly unknown[][] = [];
-    const result = await persistQuickBooksSubledgerResources({
+    const calls: string[] = [];
+    await expect(persistQuickBooksSubledgerResources({
       client: {
         query(sql, params = []) {
+          calls.push(sql);
           if (sql.includes('insert into "erp_financials"."subledger_document_lines"')) {
             (lineInserts as unknown[][]).push([...params]);
           }
@@ -1623,12 +1635,10 @@ describe("QuickBooks SDK envelope adapter", () => {
       importedAt: "2026-08-13T12:46:00.000Z",
       facts: mapped.facts,
       resources: adapted.resources
-    });
+    })).rejects.toThrow("unresolved_line_account");
 
     expect(mapped.facts.postings).toHaveLength(2);
-    expect(result.documents).toBe(1);
-    expect(result.documentLines).toBe(0);
-    expect(result.skippedDocumentLines).toBe(1);
+    expect(calls.every(sql => /^select\b/i.test(sql.trim()))).toBe(true);
     expect(lineInserts).toHaveLength(0);
   });
 
@@ -1912,4 +1922,13 @@ function normalizedResources(overrides: {
       }
     ]
   };
+}
+
+function commercialFixtureLines(amount: string) {
+  return [{ lineNumber: 1, sourceLineId: "1", sourceAmount: amount, sourceQuantity: "1", sourceUnitAmount: amount, accountRef: { sourceObjectId: "400" }, postings: [] }];
+}
+
+function omitFixtureField<T extends object, K extends keyof T>(value: T, key: K): Omit<T, K> {
+  const { [key]: _omitted, ...remaining } = value;
+  return remaining;
 }

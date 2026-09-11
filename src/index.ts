@@ -1129,3 +1129,7 @@ export * from "./accounting-basis-projection.js";
 export * from "./quickbooks-dual-basis-backfill.js";
 
 export { VENDOR_BILL_LINE_CUSTOMERS_SUPPORTED } from "./erp-financials-service.js";
+
+export { planQuickBooksCommercialDetail, QUICKBOOKS_COMMERCIAL_DETAIL_VERSION, QuickBooksCommercialDetailError, type QuickBooksCommercialReferences, type QuickBooksCommercialDetailPlan } from "./quickbooks-commercial-detail.js";
+
+export { previewQuickBooksCommercialBackfill, type QuickBooksCommercialBackfillInput, type QuickBooksCommercialBackfillDocument } from "./quickbooks-commercial-backfill.js";

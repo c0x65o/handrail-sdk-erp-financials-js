@@ -445,6 +445,8 @@ function operationalDocumentResources(
       ...(transactionNumber === undefined ? {} : { transactionNumber }),
       ...(dueDate === undefined ? {} : { dueDate }),
       ...(totalAmount === undefined ? {} : { totalAmount: decimalFromNumber(totalAmount) }),
+      ...(optionalNumber(header, "totalTax") === undefined ? {} : { totalTax: decimalFromNumber(optionalNumber(header, "totalTax")!) }),
+      ...(optionalString(header, "taxCalculation") === undefined ? {} : { taxCalculation: optionalString(header, "taxCalculation")! }),
       ...(openAmount === undefined ? {} : { openAmount: decimalFromNumber(openAmount) }),
       ...(unappliedAmount === undefined ? {} : { unappliedAmount: decimalFromNumber(unappliedAmount) }),
       ...(emailStatus === undefined ? {} : { emailStatus }),
@@ -516,9 +518,9 @@ function operationalDocumentLine(
     ...(detailType === undefined ? {} : { detailType }),
     ...(description === undefined ? {} : { description }),
     amount: decimalFromNumber(amount ?? 0),
-    ...(amount === undefined ? {} : { sourceAmount: decimalFromNumber(Math.abs(amount)) }),
-    ...(quantity === undefined ? {} : { sourceQuantity: decimalFromNumber(quantity) }),
-    ...(unitAmount === undefined ? {} : { sourceUnitAmount: decimalFromNumber(unitAmount) }),
+    ...(amount === undefined ? {} : { sourceAmount: decimalFromNumber(amount) }),
+    ...(quantity === undefined ? {} : { sourceQuantity: commercialDecimalFromNumber(quantity) }),
+    ...(unitAmount === undefined ? {} : { sourceUnitAmount: commercialDecimalFromNumber(unitAmount) }),
     ...(taxCode === undefined ? {} : { taxCode }),
     ...(accountRef === undefined ? {} : { accountRef }),
     ...(partyRef === undefined ? {} : { partyRef }),
@@ -904,6 +906,8 @@ function ledgerTransactionResource(
     ...(transactionNumber === undefined ? {} : { transactionNumber }),
     ...(dueDate === undefined ? {} : { dueDate }),
     ...(totalAmount === undefined ? {} : { totalAmount: decimalFromNumber(totalAmount) }),
+      ...(optionalNumber(header, "totalTax") === undefined ? {} : { totalTax: decimalFromNumber(optionalNumber(header, "totalTax")!) }),
+      ...(optionalString(header, "taxCalculation") === undefined ? {} : { taxCalculation: optionalString(header, "taxCalculation")! }),
     ...(openAmount === undefined ? {} : { openAmount: decimalFromNumber(openAmount) }),
     ...(unappliedAmount === undefined ? {} : { unappliedAmount: decimalFromNumber(unappliedAmount) }),
     ...(emailStatus === undefined ? {} : { emailStatus }),
@@ -971,9 +975,9 @@ function ledgerLine(
     lineNumber: lineIndex + 1,
     ...(description === undefined ? {} : { description }),
     amount: decimalFromNumber(amount),
-    ...(sourceAmount === undefined ? {} : { sourceAmount: decimalFromNumber(Math.abs(sourceAmount)) }),
-    ...(sourceQuantity === undefined ? {} : { sourceQuantity: decimalFromNumber(sourceQuantity) }),
-    ...(sourceUnitAmount === undefined ? {} : { sourceUnitAmount: decimalFromNumber(sourceUnitAmount) }),
+    ...(sourceAmount === undefined ? {} : { sourceAmount: decimalFromNumber(sourceAmount) }),
+    ...(sourceQuantity === undefined ? {} : { sourceQuantity: commercialDecimalFromNumber(sourceQuantity) }),
+    ...(sourceUnitAmount === undefined ? {} : { sourceUnitAmount: commercialDecimalFromNumber(sourceUnitAmount) }),
     ...(taxCode === undefined ? {} : { taxCode }),
     ...(firstPosting === undefined ? {} : { accountRef: firstPosting.accountRef }),
     ...(firstPosting?.partyRef === undefined ? {} : { partyRef: firstPosting.partyRef }),
@@ -1460,4 +1464,22 @@ function decimalFromNumber(value: number): string {
     throw new Error("QuickBooks amount must be finite.");
   }
   return value.toFixed(2);
+}
+
+function commercialDecimalFromNumber(value: number): string {
+  if (!Number.isFinite(value)) throw new Error("QuickBooks commercial value must be finite.");
+  // toFixed introduces binary-float noise at high precision (e.g. 215999.9568).
+  // Expand the number's shortest decimal representation without further arithmetic.
+  const [coefficient, exponent = "0"] = String(value).split("e");
+  const negative = coefficient!.startsWith("-");
+  const [whole, fraction = ""] = (negative ? coefficient!.slice(1) : coefficient!).split(".");
+  const digits = whole! + fraction;
+  const point = whole!.length + Number(exponent);
+  const expanded = point <= 0 ? `0.${"0".repeat(-point)}${digits}`
+    : point >= digits.length ? digits + "0".repeat(point - digits.length)
+    : `${digits.slice(0, point)}.${digits.slice(point)}`;
+  const [integer, decimal = ""] = expanded.split(".");
+  const precise = decimal.replace(/0+$/, "");
+  if (precise.length > 12) throw new Error("QuickBooks commercial precision exceeds twelve decimal places.");
+  return `${negative ? "-" : ""}${integer}.${precise.padEnd(2, "0")}`;
 }

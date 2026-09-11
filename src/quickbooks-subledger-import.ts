@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
+import { planQuickBooksCommercialDetail, QuickBooksCommercialDetailError, type QuickBooksCommercialDetailPlan, type QuickBooksCommercialReferences } from "./quickbooks-commercial-detail.js";
 
 import type { JsonValue } from "./canonical-model.js";
-import type { NormalizedQuickBooksLedgerTransaction } from "./normalized-accounting-contracts.js";
+import type { NormalizedQuickBooksLedgerTransaction, NormalizedQuickBooksResourceSet } from "./normalized-accounting-contracts.js";
 import type { PostgresQueryClient } from "./postgres-storage.js";
-import type { CanonicalAccountingFactSet } from "./source-adapters.js";
-import type { HandrailQuickBooksSdkResourceSet } from "./source-adapters.js";
+import type { HandrailQuickBooksSdkResourceSet, CanonicalAccountingFactSet } from "./source-adapters.js";
 
 type ImportedDocumentType =
   | "invoice"
@@ -46,7 +46,7 @@ export type PersistQuickBooksSubledgerResourcesInput = {
   readonly companyId: string;
   readonly importedAt: string;
   readonly facts: CanonicalAccountingFactSet;
-  readonly resources: HandrailQuickBooksSdkResourceSet;
+  readonly resources: HandrailQuickBooksSdkResourceSet | NormalizedQuickBooksResourceSet;
   /** Treat the supplied operational documents as the complete provider snapshot. */
   readonly replaceMissingDocuments?: boolean;
 };
@@ -135,6 +135,20 @@ export async function persistQuickBooksSubledgerResources(
   const itemBySourceId = new Map(input.facts.items.map((item) => [item.sourceItemId, item]));
   const partyIdBySourceId = new Map(input.facts.parties.map((party) => [party.sourcePartyId, party.partyId]));
   const operationalDocuments = input.resources.operationalDocuments ?? input.resources.ledgerTransactions ?? [];
+  // Incremental envelopes need not repeat unchanged (including inactive) references.
+  const retainedAccounts = await input.client.query<{ source_account_id: string; account_id: string }>(
+    `select source_account_id, account_id from erp_financials.accounts where tenant_id=$1 and source_id=$2`,
+    [input.facts.company.tenantId, input.facts.source.sourceId]);
+  const retainedItems = await input.client.query<{ source_item_id: string; item_id: string; income_account_id: string | null; expense_account_id: string | null }>(
+    `select source_item_id, item_id, income_account_id, expense_account_id from erp_financials.items where tenant_id=$1 and source_id=$2`,
+    [input.facts.company.tenantId, input.facts.source.sourceId]);
+  const commercialReferences: QuickBooksCommercialReferences = {
+    accounts: [...retainedAccounts.rows.map(row => ({ sourceAccountId: row.source_account_id, accountId: row.account_id })), ...input.facts.accounts],
+    items: [...retainedItems.rows.map(row => ({ sourceItemId: row.source_item_id, itemId: row.item_id,
+      ...(row.income_account_id ? { incomeAccountId: row.income_account_id } : {}),
+      ...(row.expense_account_id ? { expenseAccountId: row.expense_account_id } : {}) })), ...input.facts.items]
+  };
+  const commercialPlans = new Map<string, QuickBooksCommercialDetailPlan>();
   for (const resource of operationalDocuments) {
     const normalized = resource.resource;
     if (importedDocumentType(normalized.sourceTransactionType) !== undefined) {
@@ -318,6 +332,14 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       normalized,
       originalAmount
     );
+    if (["invoice", "vendor_bill", "credit_memo", "vendor_credit"].includes(documentType)) {
+      try {
+        commercialPlans.set(`${normalized.sourceTransactionType}:${normalized.sourceTransactionId}`, planQuickBooksCommercialDetail(normalized, commercialReferences));
+      } catch (error) {
+        if (!(error instanceof QuickBooksCommercialDetailError)) throw error;
+        rejectionReasons.push(error.reason);
+      }
+    }
     if (rejectionReasons.length > 0) {
       recordProjectionDiagnostic({
         ...quickBooksSubledgerProjectionDiagnostic(normalized, false),
@@ -482,6 +504,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     );
     documents += result.rowCount ?? 0;
 
+    const commercialPlan = commercialPlans.get(`${normalized.sourceTransactionType}:${normalized.sourceTransactionId}`);
     const persistedLineNumbers: number[] = [];
     if (!importsCommercialDocumentLines(documentType)) {
       await input.client.query(
@@ -496,11 +519,12 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger
         skippedDocumentLines += 1;
         continue;
       }
-      const amount = positiveAmount(line.sourceAmount);
+      const plannedLine = commercialPlan?.lines.find(candidate => candidate.source === line);
+      const amount = plannedLine?.amount ?? positiveAmount(line.sourceAmount);
       const item = line.itemRef === undefined ? undefined : itemBySourceId.get(line.itemRef.sourceObjectId);
-      const accountId = line.accountRef === undefined
+      const accountId = plannedLine?.accountId ?? (line.accountRef === undefined
         ? documentLineItemAccount(documentType, item)
-        : accountIdBySourceId.get(line.accountRef.sourceObjectId);
+        : accountIdBySourceId.get(line.accountRef.sourceObjectId));
       if (amount === undefined) {
         continue;
       }
@@ -514,7 +538,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger
         skippedDocumentLines += 1;
         continue;
       }
-      const commercialAmounts = commercialLineAmounts(amount, line.sourceQuantity, line.sourceUnitAmount);
+      const commercialAmounts = plannedLine ?? commercialLineAmounts(amount, line.sourceQuantity, line.sourceUnitAmount);
       const customerPartyId = line.partyRef?.partyType === "customer"
         ? partyIdBySourceId.get(line.partyRef.sourceObjectId)
         : undefined;
@@ -540,7 +564,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger
           documentId,
           line.lineNumber,
           accountId,
-          item?.itemId ?? null,
+          plannedLine?.itemId ?? item?.itemId ?? null,
           customerPartyId ?? null,
           line.description ?? null,
           commercialAmounts.quantity,
@@ -1007,7 +1031,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     ...(input.resources.journalEntries ?? []).map((resource) => ({
       syncAction: resource.syncAction,
       sourceTransactionType: "JournalEntry",
-      sourceTransactionId: resource.resource.Id
+      sourceTransactionId: "Id" in resource.resource ? resource.resource.Id : resource.resource.sourceTransactionId
     })),
     ...(input.resources.operationalDocuments ?? input.resources.ledgerTransactions ?? []).map((resource) => ({
       syncAction: resource.syncAction,
