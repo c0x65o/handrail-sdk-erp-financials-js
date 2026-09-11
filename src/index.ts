@@ -707,6 +707,7 @@ export type {
   SubledgerDocumentType,
   UpsertAccountTreeInput,
   UpsertAccountTreeResult,
+  VendorBillExpenseLine,
   VoidIssuedAdjustmentInput,
   VoidIssuedBillPaymentInput,
   VoidIssuedCreditMemoInput,
@@ -1126,3 +1127,5 @@ export type {
 } from "./quickbooks-sync-service.js";
 export * from "./accounting-basis-projection.js";
 export * from "./quickbooks-dual-basis-backfill.js";
+
+export { VENDOR_BILL_LINE_CUSTOMERS_SUPPORTED } from "./erp-financials-service.js";

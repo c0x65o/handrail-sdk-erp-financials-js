@@ -15,6 +15,7 @@ import {
 
 import type {
   CanonicalAccountingFactSet,
+  CreateVendorBillInput,
   HandrailQuickBooksSdkResourceSet,
   PostgresMigrationTransactionRunner,
   PostgresQueryClient,
@@ -1337,6 +1338,152 @@ where application.subledger_application_id = $1`,
       periodEnd: "2026-08-31",
       status: "voided"
     })).resolves.toMatchObject({ items: [{ paymentId: payment.documentId, version: 2 }] });
+  });
+
+  it("retains native bill-line customers through reads, replay, replacement, and void", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:bill-line-customers" });
+    await seedAccountingScope(pool);
+    const operation = sdkOperation();
+    const sdk = createErpFinancialsSdk({
+      database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "book_primary",
+      writeSourceId: "source_1", currencyCode: "USD", postingPolicy: "legacy_unrestricted",
+      now: () => "2026-08-12T12:00:00.000Z"
+    });
+    await sdk.books.define({ operation, bookId: "book_primary", name: "Primary", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({
+      operation, bookId: "book_primary", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01"
+    });
+    const line = { accountId: "account_cash", amount: "10.00" };
+    const input: CreateVendorBillInput = {
+      operation, idempotencyKey: "bill-line-customers", date: "2026-08-01", dueDate: "2026-08-31",
+      vendorId: "vendor_1", payableAccount: { accountId: "account_ap" },
+      expenseLines: [{ ...line, customerId: "customer_1" }, line, { ...line, customerId: "customer_2" }]
+    };
+    const bill = await sdk.commands.vendorBills.create(input);
+    const detail = await sdk.queries.getVendorBill(bill.documentId, "2026-08-31");
+    expect(detail).toMatchObject({ vendorId: "vendor_1", originalAmount: "30.00", lines: [
+      { lineNumber: 1, customerId: "customer_1", customerName: "Customer One", amount: "10.00" },
+      { lineNumber: 2, amount: "10.00" },
+      { lineNumber: 3, customerId: "customer_2", customerName: "Customer Two", amount: "10.00" }
+    ] });
+    expect(detail.lines[1]).not.toHaveProperty("customerId");
+    await expect(sdk.commands.vendorBills.create(input)).resolves.toMatchObject({
+      documentId: bill.documentId, status: "already_posted"
+    });
+    for (const expenseLines of [
+      [{ ...line, customerId: "customer_2" }, line, { ...line, customerId: "customer_1" }],
+      [line, line, line],
+      [{ ...line, customerId: "customer_1" }, { ...line, customerId: "customer_1" }, { ...line, customerId: "customer_2" }]
+    ]) {
+      await expect(sdk.commands.vendorBills.create({ ...input, expenseLines }))
+        .rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    const legacyInput = { ...input, idempotencyKey: "bill-without-customers", expenseLines: [line] };
+    const legacy = await sdk.commands.vendorBills.create(legacyInput);
+    await expect(sdk.commands.vendorBills.create(legacyInput)).resolves.toMatchObject({ status: "already_posted" });
+    await expect(sdk.commands.vendorBills.create({
+      ...legacyInput, expenseLines: [{ ...line, customerId: "customer_1" }]
+    })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    const stored = await pool.query(`select customer_party_id from erp_financials.subledger_document_lines
+where subledger_document_id = $1`, [legacy.documentId]);
+    expect(stored.rows).toEqual([{ customer_party_id: null }]);
+
+    const replacementInput = {
+      operation, vendorBillId: bill.documentId, expectedVersion: 1,
+      idempotencyKey: "replace-customer-bill", date: "2026-08-12",
+      replacement: { ...input, idempotencyKey: "replacement-customer-bill",
+        expenseLines: [{ ...line, customerId: "customer_2" }] }
+    };
+    const replaced = await sdk.commands.vendorBills.replacePosted(replacementInput);
+    if (replaced.replacement === undefined) throw new Error("Expected a replacement bill");
+    const replacementId = replaced.replacement.documentId;
+    await expect(sdk.commands.vendorBills.replacePosted(replacementInput))
+      .resolves.toMatchObject({ status: "already_replaced" });
+    await expect(sdk.commands.vendorBills.replacePosted({
+      ...replacementInput,
+      replacement: { ...replacementInput.replacement, expenseLines: [{ ...line, customerId: "customer_1" }] }
+    })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(sdk.queries.getVendorBill(replacementId, "2026-08-31"))
+      .resolves.toMatchObject({ lines: [{ customerId: "customer_2" }] });
+    await sdk.commands.vendorBills.voidPosted({
+      operation, vendorBillId: replacementId, expectedVersion: 1,
+      idempotencyKey: "void-customer-bill", date: "2026-08-12"
+    });
+    const historicalLines = await pool.query(`select subledger_document_id, customer_party_id
+from erp_financials.subledger_document_lines where subledger_document_id = any($1::text[])
+order by subledger_document_id, line_number`, [[bill.documentId, replacementId]]);
+    expect(historicalLines.rows).toEqual(expect.arrayContaining([
+      { subledger_document_id: bill.documentId, customer_party_id: "customer_1" },
+      { subledger_document_id: bill.documentId, customer_party_id: "customer_2" },
+      { subledger_document_id: replacementId, customer_party_id: "customer_2" }
+    ]));
+  });
+
+  it("validates native bill-line customer identity and scope and rolls back failed replacements", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:bill-line-customer-validation" });
+    await seedAccountingScope(pool);
+    await pool.query(`insert into erp_financials.accounting_sources
+(source_id, tenant_id, source_system, provider_environment, connection_ref, status)
+values ('source_other', 'tenant_other', 'native_erp', 'test', 'source:other', 'active');
+insert into erp_financials.parties
+(party_id, tenant_id, source_id, source_party_id, party_type, display_name, active) values
+('inactive_customer', 'tenant_1', 'source_1', 'inactive', 'customer', 'Inactive', false),
+('other_source_customer', 'tenant_1', 'source_2', 'other-source', 'customer', 'Other Source', true),
+('other_tenant_customer', 'tenant_other', 'source_other', 'other-tenant', 'customer', 'Other Tenant', true)`);
+    const financials = createErpFinancials({
+      database: runner, tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1",
+      currencyCode: "USD", postingPolicy: "legacy_unrestricted", now: () => "2026-08-12T12:00:00.000Z"
+    });
+    const assignedLine = { accountId: "account_cash", amount: "10.00", customerId: "customer_1" };
+    const input: CreateVendorBillInput = {
+      operation: sdkOperation(), idempotencyKey: "validated-customer-bill", date: "2026-08-01", dueDate: "2026-08-31",
+      vendorId: "vendor_1", payableAccount: { accountId: "account_ap" },
+      expenseLines: [assignedLine]
+    };
+    const counts = async () => (await pool.query<Record<string, string>>(`select
+(select count(*) from erp_financials.transactions) as transactions,
+(select count(*) from erp_financials.ledger_postings) as postings,
+(select count(*) from erp_financials.subledger_documents) as documents,
+(select count(*) from erp_financials.subledger_document_lines) as lines,
+(select count(*) from erp_financials.financial_lifecycle_events) as events,
+(select count(*) from erp_financials.financial_outbox) as outbox`)).rows;
+    const before = await counts();
+    for (const customerId of ["missing", "vendor_1", "inactive_customer", "other_source_customer", "other_tenant_customer"]) {
+      await expect(financials.vendorBills.create({
+        ...input, expenseLines: [assignedLine, { ...assignedLine, customerId }]
+      })).rejects.toMatchObject({ code: "missing_party" });
+      expect(await counts()).toEqual(before);
+    }
+    for (const customerId of ["", "  "]) {
+      await expect(financials.vendorBills.create({
+        ...input, expenseLines: [{ ...assignedLine, customerId }]
+      })).rejects.toThrow("customerId must not be empty");
+    }
+    for (const customerId of [null, 42, {}]) {
+      await expect(financials.vendorBills.create({
+        ...input, expenseLines: [{ ...assignedLine, customerId: customerId as unknown as string }]
+      })).rejects.toThrow("customerId must be a string");
+    }
+    // Fail the second line at the SQL boundary after posting and the first line were written.
+    await pool.query(`alter table erp_financials.subledger_document_lines add constraint test_reject_customer
+check (customer_party_id is distinct from 'customer_2')`);
+    await expect(financials.vendorBills.create({
+      ...input, expenseLines: [assignedLine, { ...assignedLine, customerId: "customer_2" }]
+    })).rejects.toThrow('violates check constraint "test_reject_customer"');
+    expect(await counts()).toEqual(before);
+    await pool.query('alter table erp_financials.subledger_document_lines drop constraint test_reject_customer');
+    const original = await financials.vendorBills.create(input);
+    const beforeReplacement = await counts();
+    await expect(financials.vendorBills.replacePosted({
+      operation: sdkOperation(), vendorBillId: original.documentId, expectedVersion: 1,
+      idempotencyKey: "invalid-customer-replacement", date: "2026-08-12",
+      replacement: { ...input, idempotencyKey: "invalid-customer-replacement-bill",
+        expenseLines: [{ accountId: "account_cash", amount: "10.00", customerId: "vendor_1" }] }
+    })).rejects.toMatchObject({ code: "missing_party" });
+    expect(await counts()).toEqual(beforeReplacement);
+    const state = await pool.query(`select status, version from erp_financials.subledger_documents
+where subledger_document_id = $1`, [original.documentId]);
+    expect(state.rows).toEqual([{ status: "open", version: 1 }]);
   });
 
   it("atomically clears ordered vendor bills, exposes provenance and summary, and compensates applications", async () => {

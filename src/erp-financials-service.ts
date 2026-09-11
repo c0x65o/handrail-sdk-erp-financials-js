@@ -316,11 +316,19 @@ export type IssuedAdjustmentLifecycleResult = {
   readonly lifecycleEventIds: readonly string[];
 };
 
+/** Native writes validate, retain, and replay-check per-line customer attribution. */
+export const VENDOR_BILL_LINE_CUSTOMERS_SUPPORTED = true;
+
+export type VendorBillExpenseLine = SubledgerAmountLine & {
+  /** Canonical active customer party in the bill's tenant/source scope, when assigned. */
+  readonly customerId?: string;
+};
+
 export type CreateVendorBillInput = SubledgerDocumentInputCommon & {
   readonly vendorId: string;
   readonly dueDate: IsoDate;
   readonly payableAccount: ErpFinancialsAccountReference;
-  readonly expenseLines: readonly SubledgerAmountLine[];
+  readonly expenseLines: readonly VendorBillExpenseLine[];
 };
 
 export type VoidPostedVendorBillInput = {
@@ -1024,7 +1032,7 @@ type SubledgerDocumentWrite = {
   readonly documentStartsOpen: boolean;
   readonly metadata: Readonly<Record<string, JsonValue>>;
   readonly journalLines: readonly PostJournalEntryLineInput[];
-  readonly documentLines?: readonly (ErpFinancialsAccountReference & NormalizedCommercialDocumentLine)[];
+  readonly documentLines?: readonly NormalizedSubledgerAmountLine[];
   readonly memo?: string;
   readonly operation: FinancialOperationContext;
 };
@@ -1157,7 +1165,15 @@ async function createVendorBill(
       })),
       { ...input.payableAccount, credit: amount, partyId: input.vendorId }
     ],
-    documentLines: expenseLines
+    // Attach attribution after commercial normalization, including signed bill-line normalization.
+    documentLines: expenseLines.map((line, index) => {
+      const customerId = input.expenseLines[index]?.customerId;
+      if (customerId !== undefined && typeof customerId !== "string") {
+        throw new ErpFinancialsValidationError(`expenseLines[${String(index)}].customerId must be a string`);
+      }
+      optionalNonEmpty(customerId, `expenseLines[${String(index)}].customerId`);
+      return { ...line, ...(customerId === undefined ? {} : { customerId }) };
+    })
   });
 }
 
@@ -2094,6 +2110,11 @@ async function createSubledgerDocument(
     );
     await assertCompanySourceScope(client, context);
     await assertSubledgerParty(client, context, input.partyId, input.documentType);
+    for (const customerId of unique((input.documentLines ?? []).flatMap((line) =>
+      line.customerId === undefined ? [] : [line.customerId]
+    ))) {
+      await assertActiveSubledgerParty(client, context, customerId, "customer", "Bill-line customerId");
+    }
     await assertRelatedInvoiceReference(client, context, input.partyId, input.metadata);
     const posted = await executePostJournalEntryInTransaction(client, context, journalInput, journal, identities);
     if (isDualBasisCashMovement(input.documentType)) {
@@ -2165,6 +2186,9 @@ returning *`,
       stableJson(storedJson(existing.metadata)) !== stableJson(input.metadata)
     ) {
       throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+    }
+    if (input.documentType === "vendor_bill") {
+      await assertSameBillLineCustomers(client, context, documentId, input);
     }
     await persistRefundCashBasisProjection(client, context, input, documentId, "reverse");
     await appendSubledgerDocumentOutboxEvent(client, context, input, documentId, posted.transactionId);
@@ -2241,11 +2265,41 @@ async function appendSubledgerDocumentOutboxEvent(
   });
 }
 
+type NormalizedSubledgerAmountLine = ErpFinancialsAccountReference & NormalizedCommercialDocumentLine &
+  Pick<VendorBillExpenseLine, "customerId">;
+
+async function assertSameBillLineCustomers(
+  client: PostgresQueryClient,
+  context: ServiceContext,
+  documentId: string,
+  input: SubledgerDocumentWrite
+): Promise<void> {
+  // Compare assignments separately so legacy unassigned journal fingerprints remain valid.
+  const stored = await client.query(
+    `select "line_number", "customer_party_id" from "erp_financials"."subledger_document_lines"
+where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_document_id" = $4
+  and "customer_party_id" is not null
+order by "line_number"
+for key share`,
+    [context.tenantId, context.companyId, context.sourceId, documentId]
+  );
+  const expected = (input.documentLines ?? []).flatMap((line, index) => line.customerId === undefined
+    ? []
+    : [{ lineNumber: index + 1, customerId: line.customerId }]);
+  const actual = stored.rows.map((row) => ({
+    lineNumber: storedInteger(row.line_number, "line_number"),
+    customerId: storedString(row.customer_party_id, "customer_party_id")
+  }));
+  if (stableJson(actual) !== stableJson(expected)) {
+    throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+  }
+}
+
 async function writeSubledgerDocumentLines(
   client: PostgresQueryClient,
   context: ServiceContext,
   documentId: string,
-  lines: readonly (ErpFinancialsAccountReference & NormalizedCommercialDocumentLine)[]
+  lines: readonly NormalizedSubledgerAmountLine[]
 ): Promise<void> {
   for (const [index, line] of lines.entries()) {
     const lineNumber = index + 1;
@@ -2253,8 +2307,8 @@ async function writeSubledgerDocumentLines(
       `insert into "erp_financials"."subledger_document_lines" (
   "subledger_document_line_id", "tenant_id", "company_id", "source_id", "subledger_document_id", "line_number",
   "account_id", "item_id", "description", "quantity", "unit_amount", "unit_cost", "discount_amount", "tax_code", "tax_amount",
-  "service_period_start", "service_period_end", "dimension_refs", "line_amount"
-) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+  "service_period_start", "service_period_end", "dimension_refs", "line_amount", "customer_party_id"
+) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
       [
         scopedRecordId(context, "subledger_document_line", `${documentId}:${String(lineNumber)}`),
         context.tenantId,
@@ -2274,7 +2328,8 @@ async function writeSubledgerDocumentLines(
         line.servicePeriodStart,
         line.servicePeriodEnd,
         JSON.stringify(line.dimensionRefs),
-        line.amount
+        line.amount,
+        line.customerId
       ]
     );
   }
@@ -2626,6 +2681,16 @@ async function assertSubledgerParty(
     return;
   }
   const expectedPartyType = ["vendor_bill", "bill_payment"].includes(documentType) ? "vendor" : "customer";
+  await assertActiveSubledgerParty(client, context, partyId, expectedPartyType, documentType);
+}
+
+async function assertActiveSubledgerParty(
+  client: PostgresQueryClient,
+  context: ServiceContext,
+  partyId: string,
+  expectedPartyType: "vendor" | "customer",
+  label: string
+): Promise<void> {
   const result = await client.query(
     `select "party_type", "active" from "erp_financials"."parties"
 where "tenant_id" = $1 and "source_id" = $2 and "party_id" = $3
@@ -2635,7 +2700,7 @@ for key share`,
   const party = result.rows[0];
   if (party === undefined || party.active !== true || party.party_type !== expectedPartyType) {
     throw new ErpFinancialsValidationError(
-      `${documentType} requires an active ${expectedPartyType} in the current tenant/source scope`,
+      `${label} requires an active ${expectedPartyType} in the current tenant/source scope`,
       "missing_party",
       { partyId }
     );
@@ -3276,7 +3341,8 @@ for update`,
     vendorId: storedString(row.party_id, "party_id"),
     currencyCode: storedString(row.currency_code, "currency_code"),
     originalAmount: storedMoney(row.original_amount, "original_amount"),
-    openAmount: storedMoney(row.open_amount, "open_amount"),
+    // PostgreSQL stores the void transition's numeric zero without a decimal scale.
+    openAmount: formatMoney(parsePositiveOrZeroMoney(row.open_amount, "open_amount")),
     status: status as LoadedPostedVendorBill["status"],
     version: storedInteger(row.version, "version"),
     journal: await loadPostedJournalForLifecycle(
