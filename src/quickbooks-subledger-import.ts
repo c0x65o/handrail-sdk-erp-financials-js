@@ -612,11 +612,21 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       subledger_application_id: string;
       version: number;
     }>(
-      `select "subledger_application_id", "version"
-from "erp_financials"."subledger_applications"
-where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
-  and "source_document_id" = $4 and "status" = 'applied'`,
-      [input.facts.company.tenantId, input.companyId, input.facts.source.sourceId, sourceDocumentId]
+      // A credit can also fund Payment/BillPayment projections or native
+      // applications. Only this object's ordinary LinkedTxn applications are
+      // owned by the incoming lines. Legacy ordinary events have no kind.
+      `select application."subledger_application_id", application."version"
+from "erp_financials"."subledger_applications" application
+join "erp_financials"."financial_lifecycle_events" event
+  on event."tenant_id" = application."tenant_id" and event."company_id" = application."company_id"
+  and event."source_id" = application."source_id" and event."event_id" = application."applied_event_id"
+where application."tenant_id" = $1 and application."company_id" = $2 and application."source_id" = $3
+  and application."source_document_id" = $4 and application."status" = 'applied'
+  and event."event_type" = 'quickbooks_application_imported'
+  and event."payload" ->> 'provider' = 'quickbooks'
+  and event."payload" ->> 'sourceTransactionId' = $5
+  and event."payload" ->> 'projectionKind' is null`,
+      [input.facts.company.tenantId, input.companyId, input.facts.source.sourceId, sourceDocumentId, source.sourceTransactionId]
     );
     for (const existing of existingApplications.rows) {
       if (incomingApplicationIds.has(existing.subledger_application_id)) continue;

@@ -280,6 +280,107 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
     expect(replay).toMatchObject({ documents: 0, applications: 0, skippedApplications: 0 });
   });
 
+  it.each([false, true])("preserves wrapper ownership through credit-only deltas (customer=%s)", async (customer) => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:credit-delta-ownership" });
+    const { facts, resources } = await creditOwnershipFixture(pool, customer);
+    const persist = (documents = resources.operationalDocuments, full = false) => runner.transaction((client) =>
+      persistQuickBooksSubledgerResources({ client, companyId: "company_qbo", facts,
+        resources: { ...resources, operationalDocuments: documents ?? [] },
+        importedAt: "2026-09-11T10:00:00.000Z", replaceMissingDocuments: full }));
+    await persist(resources.operationalDocuments, true);
+    const before = await creditOwnershipState(pool);
+    expect(before.documents).toEqual([
+      { source_id: "2572", original_amount: "1922.58", open_amount: "0.00", status: "settled" },
+      { source_id: "2573", original_amount: "1861.52", open_amount: "0.00", status: "settled" }
+    ]);
+    const delta = resources.operationalDocuments?.filter(row => row.resourceId === "2572");
+    for (let replay = 0; replay < 2; replay += 1) {
+      expect(await persist(delta)).toMatchObject({ applications: 0, removedLedgerPostings: 0 });
+      expect(await creditOwnershipState(pool)).toEqual(before);
+    }
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_qbo", companyId: "company_qbo",
+      bookId: "book_credit", writeSourceId: "source_qbo", currencyCode: "USD", postingPolicy: "legacy_unrestricted" });
+    await sdk.books.define({ operation: sdkOperation(), bookId: "book_credit", name: "Credit test", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation: { ...sdkOperation(), requestId: "request:credit-source" },
+      bookId: "book_credit", sourceId: "source_qbo", sourceRole: "active", effectiveFrom: "2025-01-01" });
+    expect(await sdk.queries.getAging({ kind: customer ? "receivables" : "payables", asOfDate: "2026-09-11" }))
+      .toMatchObject({ rows: [], totals: { total: "0.00", daysOver90: "0.00" } });
+  });
+
+  it.each([
+    [false, "changed"], [false, "voided"], [false, "deleted"], [false, "malformed"],
+    [true, "changed"], [true, "voided"], [true, "deleted"], [true, "malformed"]
+  ] as const)("still reconciles the owning wrapper (customer=%s, action=%s)", async (customer, action) => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:credit-wrapper-retirement" });
+    const { facts, resources } = await creditOwnershipFixture(pool, customer);
+    const persist = (documents = resources.operationalDocuments) => runner.transaction((client) =>
+      persistQuickBooksSubledgerResources({ client, companyId: "company_qbo", facts,
+        resources: { ...resources, operationalDocuments: documents ?? [] }, importedAt: "2026-09-11T11:00:00.000Z" }));
+    await persist();
+    const wrapper = resources.operationalDocuments?.find(row => row.resourceId === "2574");
+    if (!wrapper) throw new Error("Missing wrapper fixture");
+    const delta = [{ ...wrapper,
+      ...(action === "voided" || action === "deleted" ? { syncAction: action } : {}),
+      resource: { ...wrapper.resource, sourceUpdatedAt: "2026-09-11T11:00:00.000Z",
+        lines: action === "malformed" ? [] : wrapper.resource.lines.map(line => ({ ...line, sourceAmount: "1800.00" })) }
+    }];
+    if (action === "malformed") {
+      const before = await creditOwnershipState(pool);
+      await expect(persist(delta)).rejects.toThrow("cannot be projected");
+      expect(await creditOwnershipState(pool)).toEqual(before);
+      return;
+    }
+    await persist(delta);
+    const after = await creditOwnershipState(pool);
+    expect(after.applications).toHaveLength(1);
+    expect(after.applications[0]).toMatchObject({ status: action === "changed" ? "applied" : "voided",
+      applied_amount: action === "changed" ? "1800.00" : "1861.52" });
+    expect(after.documents.map(row => row.open_amount)).toEqual(action === "changed" ? ["61.52", "61.52"] : ["1861.52", "1861.52"]);
+    await persist(delta);
+    expect(await creditOwnershipState(pool)).toEqual(after);
+  });
+
+  it.each([false, true])("removes only directly owned LinkedTxn applications (customer=%s)", async (customer) => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:direct-credit-ownership" });
+    const { facts, resources } = await creditOwnershipFixture(pool, customer);
+    const documents = resources.operationalDocuments?.filter(row => row.resourceId !== "2574").map(row => ({
+      ...row, resource: { ...row.resource, openAmount: row.resourceId === "2572" ? "1902.58" : "1841.52",
+        lines: row.resource.lines.flatMap(line => row.resourceId === "2572" ? [{ ...line,
+          sourceAmount: "20.00", linkedTransactions: [{ sourceTransactionId: "2573", sourceTransactionType: customer ? "Invoice" : "Bill" }]
+        }, { ...line, sourceLineId: "2", lineNumber: 2, sourceAmount: "1902.58" }] : [line]) }
+    }));
+    await runner.transaction(client => persistQuickBooksSubledgerResources({ client, companyId: "company_qbo", facts,
+      resources: { ...resources, operationalDocuments: documents ?? [] }, importedAt: "2026-09-11T10:00:00.000Z" }));
+    // Same source document is not ownership: native, another provider object,
+    // and a wrapper projection must all survive the ordinary credit refresh.
+    for (const [id, payload] of [
+      ["native", { provider: "native", sourceTransactionId: "2572" }],
+      ["other", { provider: "quickbooks", sourceTransactionId: "other-object" }],
+      ["projection", { provider: "quickbooks", sourceTransactionId: "2572", projectionKind: customer ? "customer_credit_application" : "vendor_credit_application" }]
+    ] as const) {
+      await pool.query(`insert into erp_financials.financial_lifecycle_events
+        (event_id, tenant_id, company_id, source_id, aggregate_id, aggregate_type, event_type, occurred_at, recorded_at,
+          idempotency_key, payload, payload_checksum, actor_ref, request_id, correlation_id, reason_code)
+        select $1, tenant_id, company_id, source_id, $1, aggregate_type, event_type, occurred_at, recorded_at,
+          $1, $2::jsonb, payload_checksum, actor_ref, $1, $1, reason_code
+        from erp_financials.financial_lifecycle_events where event_type = 'quickbooks_application_imported' limit 1`, [id, JSON.stringify(payload)]);
+      await pool.query(`insert into erp_financials.subledger_applications (
+        subledger_application_id, tenant_id, company_id, source_id, application_type, source_document_id,
+        target_document_id, applied_amount, currency_code, application_date, status, version,
+        idempotency_key, applied_event_id, created_at, updated_at)
+        select $1, tenant_id, company_id, source_id, application_type, source_document_id, target_document_id,
+        1, currency_code, application_date, 'applied', 1, $1, $1, created_at, updated_at
+        from erp_financials.subledger_applications where subledger_application_id not in ('native', 'other', 'projection') limit 1`, [id]);
+    }
+    const delta = resources.operationalDocuments?.filter(row => row.resourceId === "2572");
+    await runner.transaction(client => persistQuickBooksSubledgerResources({ client, companyId: "company_qbo", facts,
+      resources: { ...resources, operationalDocuments: delta ?? [] }, importedAt: "2026-09-11T11:00:00.000Z" }));
+    const state = await creditOwnershipState(pool);
+    expect(state.applications.filter(row => row.status === "applied").map(row => row.subledger_application_id).sort())
+      .toEqual(["native", "other", "projection"]);
+    expect(state.applications.filter(row => row.status === "voided")).toHaveLength(1);
+  });
+
   it("persists and idempotently replays a zero-cash BillPayment as a vendor-credit application", async () => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:quickbooks-credit-only-bill-payment" });
     await seedQuickBooksAllDocumentScope(pool);
@@ -2680,4 +2781,52 @@ async function documentBalances(pool: Pool): Promise<readonly Record<string, unk
     "select subledger_document_id, open_amount::text, status, version from erp_financials.subledger_documents where subledger_document_id in ('invoice_1', 'payment_1') order by subledger_document_id"
   );
   return result.rows;
+}
+
+async function creditOwnershipFixture(pool: Pool, customer: boolean) {
+  await seedQuickBooksAllDocumentScope(pool);
+  const base = quickBooksAllDocumentFacts();
+  const types = customer ? ["credit_all", "invoice_all", "payment_all"] : ["vendor_credit_all", "bill_all", "bill_payment_all"];
+  const ids = ["2572", "2573", "2574"];
+  const resources: HandrailQuickBooksSdkResourceSet = {
+    ...quickBooksAllDocumentResources(),
+    operationalDocuments: types.map((type, index) => {
+      const template = quickBooksAllDocumentResources().operationalDocuments?.find(row => row.resourceId === type);
+      if (!template) throw new Error(`Missing fixture ${type}`);
+      const id = ids[index];
+      if (id === undefined) throw new Error("Missing fixture ID");
+      const amount = index === 0 ? "1922.58" : index === 1 ? "1861.52" : "0.00";
+      return { ...template, resourceId: id, resource: { ...template.resource,
+        sourceTransactionId: id, transactionDate: index === 0 ? "2025-07-25" : "2025-08-19",
+        dueDate: "2025-09-18", totalAmount: amount, openAmount: "0.00",
+        ...(index === 2 ? { unappliedAmount: "0.00" } : {}),
+        lines: index === 2 ? [0, 1].map(link => ({ sourceLineId: String(link + 1), lineNumber: link + 1,
+          sourceAmount: "1861.52", linkedTransactions: [{ sourceTransactionId: link === 0 ? "2572" : "2573",
+            sourceTransactionType: link === 0 ? (customer ? "CreditMemo" : "VendorCredit") : (customer ? "Invoice" : "Bill") }], postings: [] })) :
+          [{ sourceLineId: "1", lineNumber: 1, sourceAmount: amount,
+            accountRef: { sourceObjectId: customer ? "revenue" : "expense" }, postings: [] }]
+      } };
+    })
+  };
+  const facts: CanonicalAccountingFactSet = { ...base,
+    transactions: types.slice(0, 2).map((type, index) => {
+      const transaction = base.transactions.find(row => row.sourceTransactionId === type);
+      if (!transaction) throw new Error(`Missing transaction ${type}`);
+      return { ...transaction, sourceTransactionId: index === 0 ? "2572" : "2573" };
+    }) };
+  for (const transaction of facts.transactions) {
+    await pool.query(`update erp_financials.transactions set source_transaction_id = $1 where transaction_id = $2`,
+      [transaction.sourceTransactionId, transaction.transactionId]);
+  }
+  return { facts, resources };
+}
+
+async function creditOwnershipState(pool: Pool) {
+  return {
+    documents: await quickBooksDocumentState(pool),
+    applications: (await pool.query<Record<string, unknown>>(`select subledger_application_id, applied_amount::text, status, version, applied_event_id, ended_event_id
+      from erp_financials.subledger_applications order by subledger_application_id`)).rows,
+    events: (await pool.query(`select * from erp_financials.financial_lifecycle_events order by event_id`)).rows,
+    postings: (await pool.query(`select * from erp_financials.ledger_postings order by posting_id`)).rows
+  };
 }
