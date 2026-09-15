@@ -35,12 +35,13 @@ export type NormalizedCommercialDocumentLine = {
 
 /**
  * Normalizes and proves line arithmetic with integer math. Quantity supports up
- * to four fractional digits; money supports two. Extended price is rounded
+ * to four fractional digits, as do unit rates; money supports two. Extended price is rounded
  * half-up to cents before discounts and tax are applied.
  */
 export function normalizeCommercialDocumentLine(
   input: CommercialDocumentLineInput,
-  field = "line"
+  field = "line",
+  unitRatePrecision: 2 | 4 = 4
 ): NormalizedCommercialDocumentLine {
   const amountMinor = parseMoney(input.amount, `${field}.amount`, false);
   if ((input.quantity === undefined) !== (input.unitAmount === undefined)) {
@@ -51,13 +52,13 @@ export function normalizeCommercialDocumentLine(
   const discountAmount = input.discountAmount ?? "0.00";
   const taxAmount = input.taxAmount ?? "0.00";
   const quantityScaled = parseQuantity(quantity, `${field}.quantity`);
-  const unitMinor = parseMoney(unitAmount, `${field}.unitAmount`, true);
+  const unitScaled = parseUnitRate(unitAmount, `${field}.unitAmount`, unitRatePrecision);
   const unitCost = input.unitCost === undefined
     ? undefined
     : parseExactUnitCost(input.unitCost, `${field}.unitCost`);
   const discountMinor = parseMoney(discountAmount, `${field}.discountAmount`, true);
   const taxMinor = parseMoney(taxAmount, `${field}.taxAmount`, true);
-  const extendedMinor = divideRoundedHalfUp(quantityScaled * unitMinor, 10_000n);
+  const extendedMinor = divideRoundedHalfUp(quantityScaled * unitScaled, 1_000_000n);
   const calculatedMinor = extendedMinor - discountMinor + taxMinor;
   if (discountMinor > extendedMinor) {
     throw new ErpFinancialsError("invalid_input", `${field}.discountAmount exceeds the extended price`);
@@ -92,7 +93,7 @@ export function normalizeCommercialDocumentLine(
     ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
     ...(input.description === undefined ? {} : { description: input.description }),
     quantity: quantityString(quantityScaled),
-    unitAmount: money(unitMinor),
+    unitAmount: unitRateString(unitScaled),
     ...(unitCost === undefined ? {} : { unitCost }),
     discountAmount: money(discountMinor),
     ...(input.taxCode === undefined ? {} : { taxCode: input.taxCode }),
@@ -101,6 +102,19 @@ export function normalizeCommercialDocumentLine(
     ...(input.servicePeriodEnd === undefined ? {} : { servicePeriodEnd: input.servicePeriodEnd }),
     dimensionRefs: input.dimensionRefs ?? []
   };
+}
+
+function parseUnitRate(value: string, field: string, precision: 2 | 4): bigint {
+  const match = new RegExp(`^(\\d+)(?:\\.(\\d{1,${String(precision)}}))?$`, "u").exec(value);
+  if (match?.[1] === undefined) {
+    throw new ErpFinancialsError("invalid_input", `${field} must be a nonnegative decimal with at most ${precision === 4 ? "four" : "two"} fractional digits`);
+  }
+  return BigInt(match[1]) * 10_000n + BigInt((match[2] ?? "").padEnd(4, "0"));
+}
+
+function unitRateString(value: bigint): DecimalString {
+  const fraction = (value % 10_000n).toString().padStart(4, "0").replace(/0+$/u, "").padEnd(2, "0");
+  return `${(value / 10_000n).toString()}.${fraction}`;
 }
 
 function parseExactUnitCost(value: string, field: string): DecimalString {

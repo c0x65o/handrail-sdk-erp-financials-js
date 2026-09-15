@@ -1441,6 +1441,38 @@ where application.subledger_application_id = $1`,
     })).resolves.toMatchObject({ items: [{ paymentId: payment.documentId, version: 2 }] });
   });
 
+  it("round-trips four-place bill rates with cent-rounded extensions and exact replay", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:bill-unit-rates" });
+    await seedAccountingScope(pool);
+    const operation = sdkOperation();
+    const sdk = createErpFinancialsSdk({
+      database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "book_primary",
+      writeSourceId: "source_1", currencyCode: "USD", postingPolicy: "legacy_unrestricted",
+      now: () => "2026-08-12T12:00:00.000Z"
+    });
+    await sdk.books.define({ operation, bookId: "book_primary", name: "Primary", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: "book_primary", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    const lines = [
+      { accountId: "account_cash", quantity: "723", unitAmount: "1.7472", amount: "1263.23" },
+      { accountId: "account_cash", quantity: "600", unitAmount: "10.4832", amount: "6289.92" }
+    ];
+    const input: CreateVendorBillInput = {
+      operation, idempotencyKey: "four-place-bill", date: "2026-08-01", dueDate: "2026-08-31",
+      vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: lines
+    };
+    const bill = await sdk.commands.vendorBills.create(input);
+    const detail = await sdk.queries.getVendorBill(bill.documentId, "2026-08-31");
+    expect(detail.originalAmount).toBe("7553.15");
+    expect(detail.lines).toMatchObject(lines);
+    const stored = await pool.query(`select quantity::text, unit_amount::text, line_amount::text
+from erp_financials.subledger_document_lines where subledger_document_id = $1 order by line_number`, [bill.documentId]);
+    expect(stored.rows).toEqual([
+      { quantity: "723", unit_amount: "1.7472", line_amount: "1263.23" },
+      { quantity: "600", unit_amount: "10.4832", line_amount: "6289.92" }
+    ]);
+    await expect(sdk.commands.vendorBills.create(input)).resolves.toMatchObject({ documentId: bill.documentId, status: "already_posted" });
+  });
+
   it("retains native bill-line customers through reads, replay, replacement, and void", async () => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:bill-line-customers" });
     await seedAccountingScope(pool);

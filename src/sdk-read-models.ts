@@ -6025,7 +6025,7 @@ function commercialLineFromRow(row: Readonly<Record<string, unknown>>): Commerci
     ...(itemId === undefined ? {} : { itemId }),
     ...(description === undefined ? {} : { description }),
     quantity: decimal(row.quantity, "quantity"),
-    unitAmount: money(row.unit_amount, "unit_amount"),
+    unitAmount: unitRate(row.unit_amount),
     ...(unitCost === undefined ? {} : { unitCost }),
     discountAmount: money(row.discount_amount, "discount_amount"),
     ...(taxCode === undefined ? {} : { taxCode }),
@@ -6304,6 +6304,11 @@ function decimal(value: unknown, field: string): DecimalString {
   const result = typeof value === "number" ? String(value) : string(value, field);
   if (!/^-?\d+(?:\.\d+)?$/u.test(result)) throw new Error(`Stored ${field} must be decimal`);
   return result;
+}
+
+function unitRate(value: unknown): DecimalString {
+  const [whole = "0", fraction = ""] = decimal(value, "unit_amount").split(".");
+  return `${whole}.${fraction.padEnd(2, "0")}`;
 }
 
 function money(value: unknown, field: string): DecimalString {

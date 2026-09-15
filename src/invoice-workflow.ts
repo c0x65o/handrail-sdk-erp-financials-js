@@ -485,7 +485,8 @@ type NormalizedLine = ReturnType<typeof normalizeCommercialDocumentLine> & { rea
 function normalizedLines(scope: Scope, lines: readonly SubledgerAmountLine[]): readonly NormalizedLine[] {
   if (lines.length === 0) throw new ErpFinancialsError("invalid_input", "revenueLines must contain at least one line");
   return lines.map((line, index) => ({
-    ...normalizeCommercialDocumentLine(line, `revenueLines[${String(index)}]`),
+    // Invoice drafts retain their existing two-place storage contract.
+    ...normalizeCommercialDocumentLine(line, `revenueLines[${String(index)}]`, 2),
     accountId: resolveAccountId(scope, line)
   }));
 }

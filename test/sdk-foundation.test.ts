@@ -106,6 +106,21 @@ describe("pre-v1 SDK foundation", () => {
     }
   });
 
+  it.each([
+    ["723", "1.7472", "1263.23"], ["600", "10.4832", "6289.92"],
+    ["3", "12.50", "37.50"], ["2.5", "10.25", "25.63"],
+    ["1.0001", "1.0049", "1.01"],
+  ])("extends the full unit rate %s × %s to %s", (quantity, unitAmount, amount) => {
+    expect(normalizeCommercialDocumentLine({ quantity, unitAmount, amount })).toMatchObject({ quantity, unitAmount, amount });
+  });
+
+  it("rejects overprecision and incorrect extensions without rounding the rate", () => {
+    expect(() => normalizeCommercialDocumentLine({ quantity: "723", unitAmount: "1.7472", amount: "1263.23" }, "draft", 2)).toThrow("at most two fractional digits");
+    expect(() => normalizeCommercialDocumentLine({ quantity: "723", unitAmount: "1.74721", amount: "1263.23" })).toThrow("at most four fractional digits");
+    expect(() => normalizeCommercialDocumentLine({ quantity: "723", unitAmount: "1.7472", amount: "1263.22" })).toThrow("amount must equal");
+    expect(() => normalizeCommercialDocumentLine({ quantity: "723", unitAmount: "1.7472", amount: "1263.2256" })).toThrow("at most two fractional digits");
+  });
+
   it("fails closed on cross-currency subledger commands before opening a transaction", async () => {
     let transactions = 0;
     const service = createErpFinancials({
@@ -301,7 +316,7 @@ describe("pre-v1 SDK foundation", () => {
         customerName: "Houchens Industries, Inc.",
         categoryMappingProvenance: "item_expense_account",
         quantity: "1",
-        unitAmount: "125.00",
+        unitAmount: "1.7472",
         amount: "125.00"
       })],
       applications: [expect.objectContaining({
@@ -716,7 +731,7 @@ class VendorBillClient implements PostgresQueryClient {
         customer_name: "Houchens Industries, Inc.",
         description: "Annual security subscription",
         quantity: "1",
-        unit_amount: "125",
+        unit_amount: "1.7472",
         discount_amount: "0",
         tax_code: null,
         tax_amount: "0",
