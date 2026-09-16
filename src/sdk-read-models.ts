@@ -4527,18 +4527,18 @@ left join "erp_financials"."ledger_postings" posting
  and posting."accounting_basis" = $5 and posting."currency_code" = $6 and posting."posting_date" <= $4::date
  and (source."effective_from" is null or source."effective_from" <= posting."posting_date")
  and (source."effective_through" is null or source."effective_through" >= posting."posting_date")
-where account."tenant_id" = $1 and ($7::boolean or mapping."book_account_key" is null or book_account."active")
+where account."tenant_id" = $1
 group by coalesce(mapping."book_account_key", account."source_id" || ':' || account."account_id")
 order by min(account."account_number") nulls last, min(account."name"), "book_account_key"`,
-      [scope.tenantId, scope.companyId, scope.bookId, asOfDate, book.accountingBasis, book.currencyCode, input.includeInactive === true]
+      [scope.tenantId, scope.companyId, scope.bookId, asOfDate, book.accountingBasis, book.currencyCode]
     );
     const defined = await client.query(
       `select "book_account_key", "account_number", "name" as "account_name", "classification",
   "account_type", "account_subtype", "account_role", "version", "parent_book_account_key", "active"
 from "erp_financials"."reporting_book_accounts"
-where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and ($4::boolean or "active")
+where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3
 order by "account_number" nulls last, "name", "book_account_key"`,
-      [scope.tenantId, scope.companyId, scope.bookId, input.includeInactive === true]
+      [scope.tenantId, scope.companyId, scope.bookId]
     );
     return visibleChartAccounts(rollupChartAccounts(mergeBookChartAccounts(
       result.rows.map((row) => chartAccountFromRow(row, book.currencyCode)),
@@ -4665,7 +4665,7 @@ left join "erp_financials"."ledger_postings" posting
    or ($8 <> 'profit_and_loss' and posting."posting_date" <= $9::date))
  and (source."effective_from" is null or source."effective_from" <= posting."posting_date")
  and (source."effective_through" is null or source."effective_through" >= posting."posting_date")
-where account."tenant_id" = $1 and (mapping."book_account_key" is null or book_account."active")
+where account."tenant_id" = $1
   and (($8 = 'profit_and_loss' and coalesce(book_account."classification", account."classification") in ('income', 'cost_of_goods_sold', 'expense', 'other_income', 'other_expense'))
     or ($8 = 'balance_sheet' and coalesce(book_account."classification", account."classification") in ('asset', 'liability', 'equity'))
     or $8 = 'trial_balance')
@@ -4678,7 +4678,7 @@ order by coalesce(min(book_account."account_number"), min(account."account_numbe
     const defined = await client.query(
       `select "book_account_key", "parent_book_account_key", "account_number", "name" as "account_name", "classification"
 from "erp_financials"."reporting_book_accounts"
-where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "active"
+where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3
   and (($4 = 'profit_and_loss' and "classification" in ('income', 'cost_of_goods_sold', 'expense', 'other_income', 'other_expense'))
     or ($4 = 'balance_sheet' and "classification" in ('asset', 'liability', 'equity'))
     or $4 = 'trial_balance')
@@ -4706,7 +4706,7 @@ join "erp_financials"."ledger_postings" posting
  and posting."posting_date" <= $7::date
  and (source."effective_from" is null or source."effective_from" <= posting."posting_date")
  and (source."effective_through" is null or source."effective_through" >= posting."posting_date")
-where account."tenant_id" = $1 and (mapping."book_account_key" is null or book_account."active")
+where account."tenant_id" = $1
   and coalesce(book_account."classification", account."classification") in
     ('income', 'cost_of_goods_sold', 'expense', 'other_income', 'other_expense')`,
         [scope.tenantId, scope.companyId, scope.bookId, accountingBasis, book.currencyCode,

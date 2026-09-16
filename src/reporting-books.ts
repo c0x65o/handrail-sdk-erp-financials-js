@@ -79,6 +79,7 @@ export type DefineReportingBookAccountInput = {
   readonly accountRole: ReportingBookAccountRole;
   readonly parentBookAccountKey?: string;
   readonly currencyCode?: IsoCurrencyCode;
+  /** False retains identity and mappings for history but disallows new native postings. Defaults to true. */
   readonly active?: boolean;
   /** Use 0 to create; pass the returned version for every subsequent mutation. */
   readonly expectedVersion: number;
@@ -119,6 +120,7 @@ export type ReportingBookService = {
   define(input: DefineReportingBookInput): Promise<ReportingBook>;
   bindSource(input: BindReportingBookSourceInput): Promise<ReportingBookSource>;
   defineAccount(input: DefineReportingBookAccountInput): Promise<ReportingBookAccount>;
+  /** Retains a reporting identity even for inactive posting accounts; does not grant posting eligibility. */
   mapAccount(input: MapReportingBookAccountInput): Promise<ReportingBookAccountMapping>;
   resolve(bookId: string, asOfDate?: IsoDate): Promise<ReportingBookResolvedScope>;
 };
@@ -391,7 +393,7 @@ async function mapAccount(
   return database.transaction(async (client) => {
     const compatibility = await client.query(
       `select source_account."classification" as "source_classification", book_account."classification" as "book_classification",
-  book_account."account_role" as "book_account_role", book_account."active" as "book_account_active"
+  book_account."account_role" as "book_account_role"
 from "erp_financials"."reporting_book_sources" source
 join "erp_financials"."accounts" source_account
   on source_account."tenant_id" = source."tenant_id" and source_account."source_id" = source."source_id" and source_account."account_id" = $5
@@ -408,8 +410,8 @@ where source."tenant_id" = $1 and source."company_id" = $2 and source."book_id" 
     if (compatibilityRow.source_classification !== compatibilityRow.book_classification) {
       throw new ErpFinancialsError("invalid_account_hierarchy", "A source account can only map to a book account with the same classification");
     }
-    if (compatibilityRow.book_account_role !== "posting" || compatibilityRow.book_account_active !== true) {
-      throw new ErpFinancialsError("invalid_account_hierarchy", "A source account can only map to an active posting account");
+    if (compatibilityRow.book_account_role !== "posting") {
+      throw new ErpFinancialsError("invalid_account_hierarchy", "A source account can only map to a posting account");
     }
     const result = await client.query(
       `insert into "erp_financials"."reporting_book_account_mappings" (

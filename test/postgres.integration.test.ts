@@ -50,7 +50,7 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     expect(result.targetVersion).toBe(POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion);
     expect(result.applied.at(-1)?.toVersion).toBe(POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion);
     expect(schema).toMatchObject({ compatible: true, fixtureSupport: true, issues: [] });
-    expect(history).toMatchObject({ compatible: true, currentVersion: 22, issues: [] });
+    expect(history).toMatchObject({ compatible: true, currentVersion: POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion, issues: [] });
     await expect(
       pool.query("update erp_financials.schema_migrations set name = 'tampered' where to_version = 20")
     ).rejects.toThrow("schema migration history is append-only");
@@ -1716,6 +1716,221 @@ where subledger_document_id = $1`, [original.documentId]);
     });
   });
 
+  it.each([0, 16, 24])("retains inactive mapped account history and posting eligibility (from version=%s)", async (upgrade) => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:inactive", ...(upgrade ? { targetVersion: upgrade } : {}) });
+    await seedAccountingScope(pool);
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1",
+      bookId: "book_primary", writeSourceId: "source_1", currencyCode: "USD", postingPolicy: "legacy_unrestricted" });
+    const operation = (requestId: string) => ({ ...sdkOperation(), requestId });
+    await sdk.books.define({ operation: operation("book"), bookId: "book_primary", name: "Primary", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation: operation("source"), bookId: "book_primary", sourceId: "source_1", sourceRole: "active" });
+    const definition = { bookId: "book_primary", bookAccountKey: "revenue", name: "Service Revenue",
+      classification: "income" as const, accountRole: "posting" as const };
+    const created = await sdk.books.defineAccount({ ...definition, operation: operation("create"), expectedVersion: 0 });
+    const mappingInput = { operation: operation("map"), bookId: "book_primary", sourceId: "source_1",
+      accountId: "account_income", bookAccountKey: "revenue" };
+    const mapping = await sdk.books.mapAccount(mappingInput);
+    const journal = { operation: operation("post"), idempotencyKey: "inactive-history", date: "2026-08-15",
+      lines: [{ accountId: "account_cash", debit: "25.00" }, { accountId: "account_income", credit: "25.00" }] };
+    const posted = await sdk.commands.journalEntries.post(journal);
+    const filters = { periodStart: "2026-08-01", periodEnd: "2026-08-31" };
+    const history = async () => ({
+      profitAndLoss: await sdk.queries.getFinancialStatement({ ...filters, reportName: "profit_and_loss" }),
+      balanceSheet: await sdk.queries.getFinancialStatement({ ...filters, reportName: "balance_sheet" }),
+      trialBalance: await sdk.queries.getFinancialStatement({ ...filters, reportName: "trial_balance" }),
+      ledger: await sdk.queries.listGeneralLedger(filters),
+      summary: await sdk.queries.getGeneralLedgerSummary(filters),
+      postings: (await pool.query('select * from erp_financials.ledger_postings order by posting_id')).rows,
+      transactions: (await pool.query('select * from erp_financials.transactions order by transaction_id')).rows
+    });
+    const before = await history();
+    if (upgrade) {
+      await expect(sdk.books.defineAccount({ ...definition, operation: operation("old-deactivate"), active: false,
+        expectedVersion: 1 })).rejects.toThrow("must remain an active posting account");
+      const migrationHistory = await validatePostgresMigrationHistory(new PgQueryClient(pool));
+      await expect(migratePostgresSchema({ transaction: work => runner.transaction(client =>
+        work(new FailingMigrationClient(client, "insert into \"erp_financials\".\"schema_migrations\""))) },
+      { appliedByRef: "integration:failed-inactive-upgrade" })).rejects.toThrow("injected real migration failure");
+      expect(await validatePostgresMigrationHistory(new PgQueryClient(pool))).toEqual(migrationHistory);
+      await expect(sdk.books.defineAccount({ ...definition, operation: operation("still-old"), active: false,
+        expectedVersion: 1 })).rejects.toThrow("must remain an active posting account");
+      const upgraded = await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade" });
+      expect(upgraded.currentVersion).toBe(upgrade);
+      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 24, toVersion: 25 });
+      expect(await history()).toEqual(before);
+      expect((await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade-replay" })).applied).toEqual([]);
+    }
+    const deactivate = { ...definition, operation: operation("deactivate"), active: false, expectedVersion: created.version };
+    const inactive = await runner.transaction(async client => {
+      const transactionalSdk = createErpFinancialsSdk({ database: { transaction: work => work(client) },
+        tenantId: "tenant_1", companyId: "company_1", bookId: "book_primary", writeSourceId: "source_1", currencyCode: "USD" });
+      const changed = await transactionalSdk.books.defineAccount(deactivate);
+      const competingSdk = createErpFinancialsSdk({ database: { transaction: work => runner.transaction(async competitor => {
+        await competitor.query("set local lock_timeout = '100ms'");
+        return work(competitor);
+      }) }, tenantId: "tenant_1", companyId: "company_1", bookId: "book_primary", writeSourceId: "source_1",
+      currencyCode: "USD", postingPolicy: "legacy_unrestricted" });
+      // A concurrent posting must wait for the lifecycle commit instead of using the old active state.
+      await expect(competingSdk.commands.journalEntries.post({ ...journal, idempotencyKey: "concurrent" }))
+        .rejects.toThrow("lock timeout");
+      return changed;
+    });
+    expect(inactive).toMatchObject({ bookAccountId: created.bookAccountId, active: false, version: 2 });
+    expect(await sdk.books.defineAccount(deactivate)).toEqual(inactive);
+    for (const [assignment, message] of [
+      ["account_role = 'header'", "must remain a posting account"],
+      ["account_type = 'different'", "type cannot change"],
+      ["classification = 'expense'", "classification must match"],
+      ["book_account_key = 'redirected'", "identity is immutable"]
+    ] as const) {
+      await expect(pool.query(`update erp_financials.reporting_book_accounts set ${assignment}, version = version + 1
+        where book_account_id = $1`, [created.bookAccountId])).rejects.toThrow(message);
+    }
+    await expect(sdk.books.defineAccount({ ...deactivate, active: true })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(sdk.books.defineAccount({ ...deactivate, operation: operation("stale") })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    expect(await sdk.books.mapAccount(mappingInput)).toMatchObject({ bookAccountMappingId: mapping.bookAccountMappingId,
+      accountId: mapping.accountId, bookAccountKey: mapping.bookAccountKey, createdAt: mapping.createdAt });
+    expect(await history()).toEqual(before);
+    expect(await sdk.queries.listChartOfAccounts({ asOfDate: "2026-08-31" })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ bookAccountKey: "revenue", active: false, directBalance: "-25.00" })
+    ]));
+    const writeState = async () => Promise.all(["financial_lifecycle_events", "financial_outbox", "import_batches", "transaction_lines"]
+      .map(async table => (await pool.query<Record<string, unknown>>(`select * from erp_financials.${table} order by 1`)).rows));
+    const beforeDenied = await writeState();
+    await expect(sdk.commands.journalEntries.post({ ...journal, operation: operation("denied"), idempotencyKey: "denied" }))
+      .rejects.toThrow(/inactive/);
+    expect(await history()).toEqual(before);
+    expect(await writeState()).toEqual(beforeDenied);
+    expect(await sdk.commands.journalEntries.post(journal)).toMatchObject({ transactionId: posted.transactionId, status: "already_posted" });
+    const reactivate = { ...definition, operation: operation("reactivate"), active: true, expectedVersion: inactive.version };
+    const active = await sdk.books.defineAccount(reactivate);
+    expect(active).toMatchObject({ bookAccountId: created.bookAccountId, active: true, version: 3 });
+    expect(await sdk.books.defineAccount(reactivate)).toEqual(active);
+    // An old retry after a later transition cannot undo the later state.
+    await expect(sdk.books.defineAccount(deactivate)).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    // Source-account inactivity independently prevents posting even when the book account is active.
+    const sourceDefinition = { accountId: "account_income", sourceAccountId: "income", name: "Service Revenue", classification: "income" as const };
+    await sdk.commands.accounts.upsertTree({ operation: operation("source-off"), parent: { ...sourceDefinition, active: false } });
+    await expect(sdk.commands.journalEntries.post({ ...journal, operation: operation("source-denied"), idempotencyKey: "source-denied" }))
+      .rejects.toThrow(/inactive/);
+    expect(await history()).toEqual(before);
+    await sdk.commands.accounts.upsertTree({ operation: operation("source-on"), parent: { ...sourceDefinition, active: true } });
+    await expect(sdk.commands.journalEntries.post({ ...journal, operation: operation("restored"), idempotencyKey: "restored" }))
+      .resolves.toMatchObject({ status: "posted" });
+    expect((await pool.query("select account_id, source_account_id from erp_financials.accounts where account_id = 'account_income'")).rows)
+      .toEqual([{ account_id: "account_income", source_account_id: "income" }]);
+  });
+
+  it("creates inactive source and book accounts with retained mappings and rolls back the whole host transaction", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-create" });
+    await seedAccountingScope(pool);
+    const sdkFor = (database: PostgresMigrationTransactionRunner, tenantId = "tenant_1", companyId = "company_1") =>
+      createErpFinancialsSdk({ database, tenantId, companyId, bookId: "book_primary", writeSourceId: "source_1",
+        currencyCode: "USD", postingPolicy: "legacy_unrestricted" });
+    const sdk = sdkFor(runner);
+    const operation = sdkOperation();
+    await sdk.books.define({ operation, bookId: "book_primary", name: "Primary", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: "book_primary", sourceId: "source_1", sourceRole: "active" });
+    const mirror = async (database: PostgresMigrationTransactionRunner, classification: "income" | "expense" = "income") => {
+      const scoped = sdkFor(database);
+      const source = await scoped.commands.accounts.upsertTree({ operation,
+        parent: { accountKey: "retired", name: "Retired", classification: "income", active: false } });
+      const account = await scoped.books.defineAccount({ operation, bookId: "book_primary", bookAccountKey: "retired",
+        name: "Retired", classification, accountRole: "posting", active: false, expectedVersion: 0 });
+      const sourceAccount = source.accounts[0];
+      if (sourceAccount === undefined) throw new Error("Missing created source account");
+      const mapping = await scoped.books.mapAccount({ operation, bookId: "book_primary", sourceId: "source_1",
+        accountId: sourceAccount.accountId, bookAccountKey: "retired" });
+      return { source, account, mapping };
+    };
+    const state = async () => {
+      const tables = ["accounts", "reporting_book_accounts", "reporting_book_account_mappings", "financial_lifecycle_events", "financial_outbox"];
+      return Promise.all(tables.map(async table => (await pool.query<Record<string, unknown>>(`select * from erp_financials.${table} order by 1`)).rows));
+    };
+    const before = await state();
+    await expect(runner.transaction(client => mirror({ transaction: work => work(client) }, "expense")))
+      .rejects.toMatchObject({ code: "invalid_account_hierarchy" });
+    expect(await state()).toEqual(before);
+    await expect(runner.transaction(async client => {
+      await mirror({ transaction: work => work(client) });
+      throw new Error("injected host failure");
+    })).rejects.toThrow("injected host failure");
+    expect(await state()).toEqual(before);
+    const created = await runner.transaction(client => mirror({ transaction: work => work(client) }));
+    const canonicalAccount = created.source.accounts[0];
+    if (canonicalAccount === undefined) throw new Error("Missing created source account");
+    expect(canonicalAccount).toMatchObject({ active: false });
+    expect(created.account).toMatchObject({ active: false, version: 1 });
+    const repeated = await runner.transaction(client => mirror({ transaction: work => work(client) }));
+    expect(repeated.account).toEqual(created.account);
+    expect(repeated.source.accounts).toEqual(created.source.accounts);
+    expect(repeated.mapping.bookAccountMappingId).toBe(created.mapping.bookAccountMappingId);
+    const header = { operation: { ...operation, requestId: "header" }, bookId: "book_primary", bookAccountKey: "header",
+      name: "Income", classification: "income" as const, accountRole: "header" as const, expectedVersion: 0 };
+    await sdk.books.defineAccount(header);
+    await sdk.books.defineAccount({ ...header, operation: { ...operation, requestId: "child" }, bookAccountKey: "child",
+      name: "Child", accountRole: "posting", parentBookAccountKey: "header", active: false });
+    await expect(sdk.books.defineAccount({ ...header, operation: { ...operation, requestId: "header-off" },
+      active: false, expectedVersion: 1 })).rejects.toThrow("with children must remain an active header");
+    await expect(sdk.books.mapAccount({ operation, bookId: "book_primary", sourceId: "source_1",
+      accountId: canonicalAccount.accountId, bookAccountKey: "header" }))
+      .rejects.toMatchObject({ code: "invalid_account_hierarchy" });
+    const mappingInput = { operation, bookId: "book_primary", sourceId: "source_1",
+      accountId: canonicalAccount.accountId, bookAccountKey: "retired" };
+    expect(await sdk.books.mapAccount(mappingInput)).toMatchObject({ bookAccountMappingId: created.mapping.bookAccountMappingId });
+    for (const other of [sdkFor(runner, "other_tenant"), sdkFor(runner, "tenant_1", "other_company")]) {
+      await expect(other.books.mapAccount(mappingInput)).rejects.toMatchObject({ code: "scope_mismatch" });
+    }
+    await expect(sdk.books.mapAccount({ ...mappingInput, bookId: "other_book" })).rejects.toMatchObject({ code: "scope_mismatch" });
+    await expect(sdk.books.mapAccount({ ...mappingInput, sourceId: "source_2" })).rejects.toMatchObject({ code: "scope_mismatch" });
+    await expect(sdk.commands.journalEntries.post({ operation, idempotencyKey: "inactive-create-denied", date: "2026-08-15",
+      lines: [{ accountId: "account_cash", debit: "1.00" }, { accountId: mappingInput.accountId, credit: "1.00" }] }))
+      .rejects.toThrow(/inactive/);
+  });
+
+  it("blocks new cash-basis applications and refunds while inactive without breaking replay", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-cash" });
+    await seedAccountingScope(pool);
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1",
+      bookId: "book_primary", writeSourceId: "source_1", currencyCode: "USD", postingPolicy: "legacy_unrestricted" });
+    const operation = sdkOperation();
+    await sdk.books.define({ operation, bookId: "book_primary", name: "Primary", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: "book_primary", sourceId: "source_1", sourceRole: "active" });
+    const definition = { bookId: "book_primary", bookAccountKey: "revenue", name: "Service Revenue",
+      classification: "income" as const, accountRole: "posting" as const };
+    await sdk.books.defineAccount({ ...definition, operation, expectedVersion: 0 });
+    await sdk.books.mapAccount({ operation, bookId: "book_primary", sourceId: "source_1",
+      accountId: "account_income", bookAccountKey: "revenue" });
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "cash-invoice", date: "2026-08-01",
+      dueDate: "2026-08-31", customerId: "customer_1", receivableAccount: { accountId: "account_ar" },
+      revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const payment = await sdk.commands.customerPayments.record({ operation, idempotencyKey: "cash-payment", date: "2026-08-15",
+      customerId: "customer_1", amount: "100.00", receivableAccount: { accountId: "account_ar" }, cashAccount: { accountId: "account_cash" } });
+    const refund = { operation, idempotencyKey: "cash-refund", date: "2026-08-15", customerId: "customer_1", amount: "10.00",
+      receivableAccount: { accountId: "account_ar" }, cashAccount: { accountId: "account_cash" }, relatedInvoiceId: invoice.documentId };
+    await sdk.commands.refunds.issue(refund);
+    const apply = { operation, idempotencyKey: "cash-application", applicationType: "customer_payment_to_invoice" as const,
+      sourceDocumentId: payment.documentId, targetDocumentId: invoice.documentId, expectedSourceVersion: 1, expectedTargetVersion: 1,
+      amount: "100.00", applicationDate: "2026-08-15" };
+    await sdk.books.defineAccount({ ...definition, operation: { ...operation, requestId: "cash-off" }, active: false, expectedVersion: 1 });
+    const state = async () => Promise.all(["transactions", "transaction_lines", "ledger_postings", "import_batches",
+      "subledger_documents", "subledger_applications", "financial_lifecycle_events", "financial_outbox"]
+      .map(async table => (await pool.query<Record<string, unknown>>(`select * from erp_financials.${table} order by 1`)).rows));
+    const before = await state();
+    await expect(sdk.commands.paymentApplications.apply(apply)).rejects.toThrow(/inactive/);
+    expect(await state()).toEqual(before);
+    await expect(sdk.commands.refunds.issue({ ...refund, idempotencyKey: "cash-refund-denied" })).rejects.toThrow(/inactive/);
+    expect(await state()).toEqual(before);
+    await expect(sdk.commands.refunds.issue(refund)).resolves.toMatchObject({ status: "already_posted" });
+    expect(await state()).toEqual(before);
+    await sdk.books.defineAccount({ ...definition, operation: { ...operation, requestId: "cash-on" }, active: true, expectedVersion: 2 });
+    await expect(sdk.commands.paymentApplications.apply(apply)).resolves.toMatchObject({ status: "applied" });
+    await sdk.books.defineAccount({ ...definition, operation: { ...operation, requestId: "cash-off-again" }, active: false, expectedVersion: 3 });
+    const applied = await state();
+    await expect(sdk.commands.paymentApplications.apply(apply)).resolves.toMatchObject({ status: "already_applied" });
+    expect(await state()).toEqual(applied);
+  });
+
   it("uses the scoped transaction identity index for an important journal lookup", async () => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:query-plan" });
     await seedAccountingScope(pool);
@@ -1804,7 +2019,7 @@ where tenant_id = 'tenant_1' and source_id = 'source_1' and transaction_id = 'jo
       accountRole: "header",
       parentBookAccountKey: "income",
       expectedVersion: 1
-    })).rejects.toThrow("a mapped reporting-book account must remain an active posting account");
+    })).rejects.toThrow("a mapped reporting-book account must remain a posting account");
     await expect(sdk.books.defineAccount({
       operation: { ...operation, requestId: "account-number-duplicate", correlationId: "account-number-duplicate" },
       bookId: "book_primary",

@@ -60,7 +60,7 @@ describe("SDK account hierarchy read models", () => {
     ]);
     expect(statement.totals).toMatchObject({ income: "160.00", netIncome: "160.00" });
     expect(client.statementSql).toContain('account."parent_account_id"');
-    expect(client.statementSql).toContain('(mapping."book_account_key" is null or book_account."active")');
+    expect(client.statementSql).not.toContain('(mapping."book_account_key" is null or book_account."active")');
   });
 
   it("keeps explicit reporting-book parent overrides authoritative", async () => {

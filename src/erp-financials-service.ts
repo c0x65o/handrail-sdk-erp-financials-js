@@ -966,6 +966,7 @@ async function executePostJournalEntryInTransaction(
 
     const storage = createPostgresStorageAdapter(client);
     const accountIds = unique(journal.lines.map((line) => line.accountId));
+    await assertPostingAccountEligibility(client, context, accountIds);
     const accounts = await storage.loadAccounts({
       tenantId: context.tenantId,
       sourceId: context.sourceId,
@@ -1712,6 +1713,7 @@ async function assertBillPaymentInstructionScope(
   await assertSubledgerParty(client, context, instruction.vendorId, "bill_payment");
   const storage = createPostgresStorageAdapter(client);
   const accountIds = [instruction.fundingAccountId, instruction.payableAccountId];
+  await assertPostingAccountEligibility(client, context, accountIds);
   const accounts = await storage.loadAccounts({ tenantId: context.tenantId, sourceId: context.sourceId, accountIds });
   assertJournalAccounts(accounts, accountIds);
   await assertBillPaymentBillsForInstruction(client, context, instruction);
@@ -2190,7 +2192,7 @@ returning *`,
     if (input.documentType === "vendor_bill") {
       await assertSameBillLineCustomers(client, context, documentId, input);
     }
-    await persistRefundCashBasisProjection(client, context, input, documentId, "reverse");
+    // The original atomic write already persisted refund cash projections; replay adds no postings.
     await appendSubledgerDocumentOutboxEvent(client, context, input, documentId, posted.transactionId);
     return documentResult(existing, { ...posted, status: "already_posted" });
   });
@@ -2602,6 +2604,10 @@ for key share`,
   });
   const now = context.now();
   const storage = createPostgresStorageAdapter(client);
+  const accountIds = unique(postings.map(posting => posting.accountId));
+  await assertPostingAccountEligibility(client, context, accountIds);
+  const accounts = await storage.loadAccounts({ tenantId: context.tenantId, sourceId: context.sourceId, accountIds });
+  assertJournalAccounts(accounts, accountIds);
   await storage.upsertImportBatch({
     tenantId: context.tenantId,
     sourceId: context.sourceId,
@@ -5127,6 +5133,31 @@ async function appendJournalPostedLifecycleEvent(
       transactionId: identities.transactionId
     }
   });
+}
+
+/** Hold lifecycle locks until commit so deactivation cannot race a new posting. */
+async function assertPostingAccountEligibility(
+  client: PostgresQueryClient,
+  context: ServiceContext,
+  accountIds: readonly AccountId[]
+): Promise<void> {
+  await acquireTransactionLock(client, `account-hierarchy:${context.tenantId}:${context.sourceId}`);
+  if (context.bookId === undefined) return;
+  await acquireTransactionLock(client, `reporting-book-accounts:${context.tenantId}:${context.companyId}:${context.bookId}`);
+  const result = await client.query(
+    `select mapping."account_id"
+from "erp_financials"."reporting_book_account_mappings" mapping
+join "erp_financials"."reporting_book_accounts" account
+  on account."tenant_id" = mapping."tenant_id" and account."company_id" = mapping."company_id"
+ and account."book_id" = mapping."book_id" and account."book_account_key" = mapping."book_account_key"
+where mapping."tenant_id" = $1 and mapping."company_id" = $2 and mapping."book_id" = $3
+  and mapping."source_id" = $4 and mapping."account_id" = any($5::text[])
+  and (account."active" is not true or account."account_role" <> 'posting')`,
+    [context.tenantId, context.companyId, context.bookId, context.sourceId, accountIds]
+  );
+  if (result.rows.length > 0) {
+    throw new ErpFinancialsValidationError("Journal entry references inactive or non-posting reporting-book accounts");
+  }
 }
 
 function assertJournalAccounts(accounts: readonly Account[], requestedAccountIds: readonly AccountId[]): void {
