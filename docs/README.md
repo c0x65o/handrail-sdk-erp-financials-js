@@ -17,6 +17,10 @@ same canonical model.
 
 ## Documents
 
+- [transfer-reversal-contract.md](transfer-reversal-contract.md): Native transfer
+  reversal with command-bound independent approval, immutable postings, PostgreSQL
+  concurrency guarantees and the pending consumer adoption contract.
+
 - [deposit-reversal-contract.md](deposit-reversal-contract.md): Independently
   approved native deposit reversal, immutable identity, dual-basis postings,
   canonical linkage, retry behavior and ERP dependency adoption handoff.

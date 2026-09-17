@@ -487,7 +487,7 @@ export type ReverseDepositResult = {
   readonly originalDepositId: string;
   readonly originalTransactionId: string;
   readonly reversal: PostJournalEntryResult;
-  /** Present when the original deposit has a persisted cash-basis journal. */
+  /** Present when the original document has a persisted cash-basis journal. */
   readonly cashReversal?: PostJournalEntryResult;
   readonly journalEntryLinkIds: readonly string[];
   readonly lifecycleEventIds: readonly string[];
@@ -498,6 +498,40 @@ export type RecordTransferInput = SubledgerDocumentInputCommon & {
   readonly fromAccount: ErpFinancialsAccountReference;
   readonly toAccount: ErpFinancialsAccountReference;
 };
+
+/** Host-authenticated approval of the exact command checksum; never accept this from an untrusted caller. */
+export type TransferReversalApproval = {
+  readonly approvalRef: string;
+  readonly operationChecksum: string;
+};
+
+export type TransferReversalApprovalScope = Pick<CreateErpFinancialsInput,
+  "tenantId" | "companyId" | "sourceId" | "bookId" | "currencyCode">;
+
+export type ReverseTransferInput = Omit<ReverseJournalEntryInput, "originalTransactionId"> & {
+  /** The documentId returned by transfers.record, not its journal transactionId. */
+  readonly transferId: string;
+  readonly approval: TransferReversalApproval;
+};
+
+export type ReverseTransferResult = Omit<ReverseDepositResult, "originalDepositId"> & {
+  readonly originalTransferId: string;
+};
+
+/** Compute at approval time in the trusted host; a checksum is a binding, not authentication. */
+export function createTransferReversalApprovalChecksum(
+  scope: TransferReversalApprovalScope,
+  input: Omit<ReverseTransferInput, "approval">
+): string {
+  const operation = input.operation;
+  return createHash("sha256").update(JSON.stringify([
+    "transfers.reverse:v1", scope.tenantId, scope.companyId, scope.sourceId,
+    scope.bookId ?? null, scope.currencyCode, input.transferId, input.idempotencyKey,
+    input.date, input.memo ?? null, operation.actorRef, operation.approverRef ?? null,
+    operation.requestId, operation.correlationId, operation.reasonCode,
+    operation.reasonDetail ?? null, operation.occurredAt
+  ])).digest("hex");
+}
 
 export type SubledgerDocumentResult = {
   readonly status: "posted" | "already_posted";
@@ -637,7 +671,10 @@ export type ErpFinancials = {
     record(input: RecordDepositInput): Promise<SubledgerDocumentResult>;
     reverse(input: ReverseDepositInput): Promise<ReverseDepositResult>;
   };
-  readonly transfers: { record(input: RecordTransferInput): Promise<SubledgerDocumentResult> };
+  readonly transfers: {
+    record(input: RecordTransferInput): Promise<SubledgerDocumentResult>;
+    reverse(input: ReverseTransferInput): Promise<ReverseTransferResult>;
+  };
   readonly paymentApplications: {
     apply(input: ApplySubledgerPaymentInput): Promise<SubledgerApplicationResult>;
     unapply(input: EndSubledgerApplicationInput): Promise<SubledgerApplicationResult>;
@@ -829,7 +866,10 @@ export function createErpFinancials(input: CreateErpFinancialsInput): ErpFinanci
       record: (documentInput) => recordDeposit(context, documentInput),
       reverse: (documentInput) => reverseDeposit(context, documentInput)
     },
-    transfers: { record: (documentInput) => recordTransfer(context, documentInput) },
+    transfers: {
+      record: (documentInput) => recordTransfer(context, documentInput),
+      reverse: (documentInput) => reverseTransfer(context, documentInput)
+    },
     paymentApplications: {
       apply: (applicationInput) => applySubledgerPayment(context, applicationInput),
       unapply: (applicationInput) => endSubledgerApplication(context, applicationInput, "unapplied"),
@@ -2070,36 +2110,84 @@ async function recordTransfer(context: ServiceContext, input: RecordTransferInpu
 }
 
 async function reverseDeposit(context: ServiceContext, input: ReverseDepositInput): Promise<ReverseDepositResult> {
+  const { originalDocumentId, ...result } = await reverseRecordedCashMovement(context, "deposit", {
+    ...input, documentId: input.depositId
+  });
+  return { ...result, originalDepositId: originalDocumentId };
+}
+
+async function reverseTransfer(context: ServiceContext, input: ReverseTransferInput): Promise<ReverseTransferResult> {
   assertIndependentApproval(input.operation);
-  assertNonEmpty(input.depositId, "depositId");
+  // JavaScript callers can omit fields that TypeScript requires.
+  const approval = input.approval as TransferReversalApproval | null | undefined;
+  if (approval == null || typeof approval.approvalRef !== "string" ||
+      approval.approvalRef.trim().length === 0 ||
+      approval.operationChecksum !== createTransferReversalApprovalChecksum(context, input)) {
+    throw new ErpFinancialsError("authorization_context_invalid", "Transfer reversal requires approval bound to this exact command and scope");
+  }
+  // Snapshot the approved command before any asynchronous work.
+  const { originalDocumentId, ...result } = await reverseRecordedCashMovement(context, "transfer", {
+    ...input, documentId: input.transferId, operation: { ...input.operation }, approval: { ...input.approval }
+  });
+  return { ...result, originalTransferId: originalDocumentId };
+}
+
+/** Narrow routing for native cash movements; generic journal commands remain restricted. */
+async function reverseRecordedCashMovement(
+  context: ServiceContext,
+  documentType: "deposit" | "transfer",
+  input: Omit<ReverseJournalEntryInput, "originalTransactionId"> & {
+    readonly documentId: string;
+    readonly approval?: TransferReversalApproval;
+  }
+): Promise<Omit<ReverseDepositResult, "originalDepositId"> & { readonly originalDocumentId: string }> {
+  assertIndependentApproval(input.operation);
+  assertNonEmpty(input.documentId, "documentId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertIsoDate(input.date, "date");
 
   return context.database.transaction(async (client) => {
-    await acquireTransactionLock(client, `deposit-reversal:${context.tenantId}:${context.sourceId}:${input.depositId}`);
+    await acquireTransactionLock(client, `${documentType}-reversal:${context.tenantId}:${context.sourceId}:${input.documentId}`);
     await assertCompanySourceScope(client, context);
     // Serialize with fiscal close/reopen and posting-lock changes through commit.
     await acquireTransactionLock(client, `fiscal-period:${context.tenantId}:${context.companyId}:${context.sourceId}`);
+    if (documentType === "transfer") {
+      const replay = await client.query(
+        `select "aggregate_id", "payload" from "erp_financials"."financial_lifecycle_events"
+where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "idempotency_key" = $4
+for key share`,
+        [context.tenantId, context.companyId, context.sourceId, `transfer-reversal:${input.idempotencyKey}`]
+      );
+      const existing = replay.rows[0];
+      if (existing !== undefined) {
+        const payload = storedJson(existing.payload) as { approval?: TransferReversalApproval };
+        if (existing.aggregate_id !== input.documentId ||
+            payload.approval?.approvalRef !== input.approval?.approvalRef ||
+            payload.approval?.operationChecksum !== input.approval?.operationChecksum) {
+          throw new ErpFinancialsError("idempotency_conflict", "Transfer reversal key is already bound to a different approved command");
+        }
+      }
+    }
     const result = await client.query(
       `select "transaction_id", "idempotency_key", "lifecycle_event_id", "status"
 from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
-  and "subledger_document_id" = $4 and "document_type" = 'deposit'
+  and "subledger_document_id" = $4 and "document_type" = $5
 for key share`,
-      [context.tenantId, context.companyId, context.sourceId, input.depositId]
+      [context.tenantId, context.companyId, context.sourceId, input.documentId, documentType]
     );
     const document = result.rows[0];
     if (document === undefined) {
-      throw new ErpFinancialsValidationError("Deposit does not exist in this scope", "missing_document");
+      throw new ErpFinancialsValidationError(`Recorded ${documentType} does not exist in this scope`, "missing_document");
     }
     if (document.status !== "settled") {
-      throw new ErpFinancialsError("terminal_state_conflict", "Only a settled recorded deposit can be reversed");
+      throw new ErpFinancialsError("terminal_state_conflict", `Only a settled recorded ${documentType} can be reversed`);
     }
     const transactionId = storedString(document.transaction_id, "transaction_id");
     const originalKey = storedString(document.idempotency_key, "idempotency_key");
     await acquireTransactionLock(client, `subledger-document:${context.tenantId}:${context.companyId}:${context.sourceId}:${originalKey}`);
     // Reuse the lifecycle implementation inside this one outer transaction. New
-    // deposit reversals always enforce fiscal periods, including legacy callers.
+    // cash movement reversals always enforce fiscal periods, including legacy callers.
     const nestedContext: ServiceContext = {
       ...context,
       postingPolicy: "enforce_fiscal_periods",
@@ -2118,20 +2206,20 @@ for key share`,
         [context.tenantId, context.companyId, context.sourceId, originalTransactionId]
       );
       if (provenance.rows.length !== 1 || storedOptionalString(provenance.rows[0]?.book_id) !== context.bookId) {
-        throw new ErpFinancialsValidationError("Deposit posting book provenance is missing or outside this scope", "scope_mismatch");
+        throw new ErpFinancialsValidationError(`Recorded ${documentType} posting book provenance is missing or outside this scope`, "scope_mismatch");
       }
-      const original = await loadPostedJournalForLifecycle(client, context, originalTransactionId, ["Subledger:deposit"]);
+      const original = await loadPostedJournalForLifecycle(client, context, originalTransactionId, [`Subledger:${documentType}`]);
       if (original.accountingBasis !== basis || original.accountingPolicy !== "configured_basis_only") {
-        throw new ErpFinancialsValidationError("Deposit journal has an unsupported accounting context");
+        throw new ErpFinancialsValidationError(`Recorded ${documentType} journal has an unsupported accounting context`);
       }
       return runJournalLifecycleWorkflow(nestedContext, "reversed", {
         originalTransactionId,
-        idempotencyKey: `deposit-reversal:${input.idempotencyKey}:${basis}`,
+        idempotencyKey: `${documentType}-reversal:${input.idempotencyKey}:${basis}`,
         date: input.date,
         ...(input.memo === undefined ? {} : { memo: input.memo }),
         operation: input.operation
       }, {
-        allowedSourceTypes: ["Subledger:deposit"],
+        allowedSourceTypes: [`Subledger:${documentType}`],
         priorEventId: storedString(document.lifecycle_event_id, "lifecycle_event_id")
       });
     };
@@ -2141,7 +2229,7 @@ for key share`,
     const cash = await client.query(
       `select "transaction_id" from "erp_financials"."transactions"
 where "tenant_id" = $1 and "source_id" = $2
-  and "source_transaction_type" = 'Subledger:deposit' and "source_transaction_id" = $3`,
+  and "source_transaction_type" = 'Subledger:${documentType}' and "source_transaction_id" = $3`,
       [context.tenantId, context.sourceId, `${originalKey}:accounting-basis:cash`]
     );
     const cashRow = cash.rows[0];
@@ -2152,28 +2240,31 @@ where "tenant_id" = $1 and "source_id" = $2
       companyId: context.companyId,
       sourceId: context.sourceId,
       aggregateType: "subledger_document",
-      aggregateId: input.depositId,
-      eventType: "subledger.deposit.reversed",
-      idempotencyKey: `deposit-reversal:${input.idempotencyKey}`,
+      aggregateId: input.documentId,
+      eventType: `subledger.${documentType}.reversed`,
+      idempotencyKey: `${documentType}-reversal:${input.idempotencyKey}`,
       operation: input.operation,
       recordedAt: context.now(),
       priorEventId: storedString(document.lifecycle_event_id, "lifecycle_event_id"),
       payload: {
-        depositId: input.depositId,
+        [`${documentType}Id`]: input.documentId,
         originalTransactionId: transactionId,
-        reversalTransactionIds: workflows.map((workflow) => workflow.reversal.transactionId)
+        reversalTransactionIds: workflows.map((workflow) => workflow.reversal.transactionId),
+        ...(input.approval === undefined ? {} : { approval: {
+          approvalRef: input.approval.approvalRef, operationChecksum: input.approval.operationChecksum
+        } })
       }
     });
     await appendServiceOutboxEvent(client, context, {
       aggregateType: "subledger_document",
-      aggregateId: input.depositId,
-      eventType: "subledger.deposit.reversed",
-      idempotencyKey: `deposit-reversal:${input.idempotencyKey}:outbox`,
-      payload: { depositId: input.depositId, originalTransactionId: transactionId, lifecycleEventId: event.eventId }
+      aggregateId: input.documentId,
+      eventType: `subledger.${documentType}.reversed`,
+      idempotencyKey: `${documentType}-reversal:${input.idempotencyKey}:outbox`,
+      payload: { [`${documentType}Id`]: input.documentId, originalTransactionId: transactionId, lifecycleEventId: event.eventId }
     });
     return {
       status: primary.reversal.status === "already_posted" ? "already_reversed" : "reversed",
-      originalDepositId: input.depositId,
+      originalDocumentId: input.documentId,
       originalTransactionId: transactionId,
       reversal: primary.reversal,
       ...(cashResult === undefined ? {} : { cashReversal: cashResult.reversal }),

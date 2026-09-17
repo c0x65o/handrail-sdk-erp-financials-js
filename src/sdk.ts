@@ -21,7 +21,15 @@ export type {
   StandardAccountingMethod
 } from "./accounting-basis-projection.js";
 export type { PostgresTransactionRunner } from "./postgres-storage.js";
-export type { ReverseDepositInput, ReverseDepositResult } from "./erp-financials-service.js";
+export { createTransferReversalApprovalChecksum } from "./erp-financials-service.js";
+export type {
+  ReverseDepositInput,
+  ReverseDepositResult,
+  ReverseTransferInput,
+  ReverseTransferResult,
+  TransferReversalApproval,
+  TransferReversalApprovalScope
+} from "./erp-financials-service.js";
 import { createErpFinancials } from "./erp-financials-service.js";
 import { createFinancialOutboxService } from "./financial-outbox.js";
 import { createFinancialRuntime } from "./financial-runtime.js";

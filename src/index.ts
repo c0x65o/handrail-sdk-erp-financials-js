@@ -70,6 +70,7 @@ export {
   ErpFinancialsIdempotencyConflictError,
   ErpFinancialsValidationError,
   createErpFinancials,
+  createTransferReversalApprovalChecksum,
   createPostgresTransactionRunner
 } from "./erp-financials-service.js";
 export { createErpFinancialsSdk } from "./sdk.js";
@@ -695,6 +696,10 @@ export type {
   RecordDepositInput,
   ReverseDepositInput,
   ReverseDepositResult,
+  ReverseTransferInput,
+  ReverseTransferResult,
+  TransferReversalApproval,
+  TransferReversalApprovalScope,
   RecordTransferInput,
   RecordWriteOffInput,
   ReverseJournalEntryInput,
