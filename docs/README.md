@@ -17,6 +17,9 @@ same canonical model.
 
 ## Documents
 
+- [deposit-reversal-contract.md](deposit-reversal-contract.md): Independently
+  approved native deposit reversal, immutable identity, dual-basis postings,
+  canonical linkage, retry behavior and ERP dependency adoption handoff.
 - [blu-adapter-contract.md](blu-adapter-contract.md): Supported BLU-to-SDK
   scope, identity, cents/decimal, command, read, ownership, QuickBooks, and
   pre-v1 adoption boundary, traced to the public BLU consumer harness.

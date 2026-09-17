@@ -693,6 +693,8 @@ export type {
   RecordAndApplyBillPaymentInput,
   RecordCustomerPaymentInput,
   RecordDepositInput,
+  ReverseDepositInput,
+  ReverseDepositResult,
   RecordTransferInput,
   RecordWriteOffInput,
   ReverseJournalEntryInput,

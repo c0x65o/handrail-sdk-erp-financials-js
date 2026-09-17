@@ -16,6 +16,8 @@ import {
 import type {
   CanonicalAccountingFactSet,
   CreateVendorBillInput,
+  CreateErpFinancialsInput,
+  ReverseDepositInput,
   HandrailQuickBooksSdkResourceSet,
   PostgresMigrationTransactionRunner,
   PostgresQueryClient,
@@ -39,6 +41,251 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
   afterAll(async () => {
     await pool.query('drop schema if exists "erp_financials" cascade');
     await pool.end();
+  });
+
+  async function depositFixture(bookId?: string) {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:deposit-reversal" });
+    await seedAccountingScope(pool);
+    const scope = bookId === undefined ? {} : { bookId };
+    if (bookId !== undefined) {
+      const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1",
+        bookId, writeSourceId: "source_1", currencyCode: "USD", now: () => "2026-08-12T12:00:00.000Z" });
+      await sdk.books.define({ operation: sdkOperation(), bookId, name: "Deposit book", baseCurrencyCode: "USD" });
+      await sdk.books.bindSource({ operation: sdkOperation(), bookId, sourceId: "source_1",
+        sourceRole: "active", effectiveFrom: "2026-01-01" });
+    }
+    const financials = depositService(runner, scope);
+    await financials.fiscalPeriods.define({
+      operation: sdkOperation(), fiscalYear: 2026, periodNumber: 8,
+      periodStart: "2026-08-01", periodEnd: "2026-08-31"
+    });
+    const deposit = await financials.deposits.record({
+      operation: { ...sdkOperation(), actorRef: "user:original-recorder", requestId: "request:deposit" },
+      idempotencyKey: "deposit:one", date: "2026-08-10", documentNumber: "DEP-1", memo: "Original deposit",
+      amount: "123.45", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" }
+    });
+    const input: ReverseDepositInput = {
+      depositId: deposit.documentId, idempotencyKey: "reverse:one", date: "2026-08-12",
+      memo: "Approved deposit reversal", operation: sdkOperation()
+    };
+    return { financials, deposit, input };
+  }
+
+  it("deposit reversal preserves original identity and attribution, reverses both bases, and links canonical evidence", async () => {
+    const { financials, deposit, input } = await depositFixture();
+    const before = await depositDatabaseState(pool);
+    const result = await financials.deposits.reverse(input);
+    expect(result).toMatchObject({ status: "reversed", originalDepositId: deposit.documentId,
+      originalTransactionId: deposit.journal.transactionId, reversal: { status: "posted" }, cashReversal: { status: "posted" } });
+    expect(result.journalEntryLinkIds).toHaveLength(2);
+    const after = await depositDatabaseState(pool);
+    // Every original row, including document, transactions, lines, postings,
+    // lifecycle actor/request/correlation and outbox book attribution is intact.
+    for (const [table, rows] of Object.entries(before)) {
+      expect(after[table], table).toEqual(expect.arrayContaining(rows));
+    }
+    const balances = await pool.query(`select account_id, accounting_basis, currency_code,
+      sum(debit_amount) as debit, sum(credit_amount) as credit, sum(net_amount) as net
+      from erp_financials.ledger_postings group by account_id, accounting_basis, currency_code`);
+    expect(balances.rows).toHaveLength(4);
+    for (const row of balances.rows) {
+      expect(row).toMatchObject({ currency_code: "USD", debit: "123.45", credit: "123.45", net: "0.00" });
+    }
+    const links = await pool.query<{ related_transaction_id: string }>(`select link.*, event.actor_ref, event.approver_ref, event.prior_event_id
+      from erp_financials.journal_entry_links link join erp_financials.financial_lifecycle_events event
+      on event.event_id = link.lifecycle_event_id order by link.original_transaction_id`);
+    expect(links.rows).toHaveLength(2);
+    for (const row of links.rows) expect(row).toMatchObject({ link_type: "reversal",
+      actor_ref: input.operation.actorRef, approver_ref: input.operation.approverRef,
+      prior_event_id: deposit.journal.lifecycleEventId });
+    expect(links.rows.map((row) => row.related_transaction_id).sort()).toEqual(
+      [result.reversal.transactionId, result.cashReversal?.transactionId].sort());
+    const documentEvent = await pool.query(`select * from erp_financials.financial_lifecycle_events
+      where aggregate_id = $1 and event_type = 'subledger.deposit.reversed'`, [deposit.documentId]);
+    expect(documentEvent.rows).toHaveLength(1);
+    expect(documentEvent.rows[0]).toMatchObject({ prior_event_id: deposit.journal.lifecycleEventId,
+      request_id: input.operation.requestId, correlation_id: input.operation.correlationId });
+  });
+
+  it.each(["missing", "self"])("deposit reversal denies %s approval without writes", async (approval) => {
+    const { financials, input } = await depositFixture();
+    const before = await depositDatabaseState(pool);
+    const operation = { ...input.operation };
+    delete operation.approverRef;
+    await expect(financials.deposits.reverse({ ...input, operation: approval === "self"
+      ? { ...operation, approverRef: operation.actorRef } : operation
+    })).rejects.toMatchObject({ code: "authorization_context_invalid" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("deposit reversal retains a configured book and stored bases despite the caller's default basis", async () => {
+    const { input } = await depositFixture("book_deposit");
+    const before = await depositDatabaseState(pool);
+    await expect(depositService(runner).deposits.reverse(input)).rejects.toMatchObject({ code: "scope_mismatch" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const reversed = await depositService(runner, { bookId: "book_deposit", accountingBasis: "cash" }).deposits.reverse(input);
+    expect(reversed.cashReversal).toBeDefined();
+    const outbox = await pool.query<{ book_id: string }>("select book_id from erp_financials.financial_outbox where event_type in ('ledger.posted', 'subledger.deposit.reversed')");
+    expect(outbox.rows).toHaveLength(5);
+    expect(outbox.rows.every((row) => row.book_id === "book_deposit")).toBe(true);
+  });
+
+  it.each([
+    { tenantId: "other_tenant" }, { companyId: "other_company" },
+    { sourceId: "source_2" }, { bookId: "other_book" }, { currencyCode: "EUR" }
+  ])("deposit reversal denies changed scope %j without writes", async (scope) => {
+    const { input } = await depositFixture();
+    // Bind another company to the same source, and another source to the same
+    // company, so denial must include document ownership, not just a missing FK.
+    await pool.query(`insert into erp_financials.accounting_companies values
+      ('other_company', 'tenant_1', 'Other', 'Other', 'USD', 1, 'test', 'native_erp', 'other');
+      insert into erp_financials.company_sources values
+      ('other_binding', 'tenant_1', 'other_company', 'source_1', now()),
+      ('source_2_binding', 'tenant_1', 'company_1', 'source_2', now())`);
+    const before = await depositDatabaseState(pool);
+    await expect(depositService(runner, scope).deposits.reverse(input)).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("deposit reversal rejects generic journal routing and non-deposit documents", async () => {
+    const { financials, deposit, input } = await depositFixture();
+    await expect(financials.journalEntries.reverse({ ...input,
+      originalTransactionId: deposit.journal.transactionId })).rejects.toThrow("not an allowed lifecycle journal");
+    const transfer = await financials.transfers.record({ operation: sdkOperation(), idempotencyKey: "transfer:one",
+      date: "2026-08-10", amount: "10.00", fromAccount: { accountId: "account_cash" }, toAccount: { accountId: "account_ar" } });
+    const before = await depositDatabaseState(pool);
+    await expect(financials.deposits.reverse({ ...input, depositId: transfer.documentId })).rejects.toMatchObject({ code: "missing_document" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["closed", "missing", "lock"])("deposit reversal enforces %s fiscal periods even for legacy callers", async (scenario) => {
+    const { financials, input } = await depositFixture();
+    if (scenario === "closed") await closeDepositPeriod(pool, financials);
+    if (scenario === "lock") await financials.fiscalPeriods.setPostingLockDate({
+      operation: sdkOperation(), postingLockDate: "2026-08-31", expectedVersion: 0
+    });
+    const before = await depositDatabaseState(pool);
+    await expect(depositService(runner, { postingPolicy: "legacy_unrestricted" }).deposits.reverse({
+      ...input, date: scenario === "missing" ? "2026-09-01" : input.date
+    })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("deposit reversal replays after pool/service recreation and period closure with identical persistent IDs", async () => {
+    const { financials, input } = await depositFixture();
+    const first = await financials.deposits.reverse(input);
+    await closeDepositPeriod(pool, financials);
+    const before = await depositDatabaseState(pool);
+    const recreatedPool = new Pool({ connectionString: safeDatabaseUrl, max: 2 });
+    try {
+      const replay = await depositService(new PgTransactionRunner(recreatedPool)).deposits.reverse(input);
+      expect(replay).toMatchObject({ ...first, status: "already_reversed",
+        reversal: { ...first.reversal, status: "already_posted", snapshotsMarkedStale: 0,
+          writeCounts: { importBatches: 0, transactions: 0, transactionLines: 0, postings: 0 } },
+        cashReversal: { ...first.cashReversal, status: "already_posted", snapshotsMarkedStale: 0,
+          writeCounts: { importBatches: 0, transactions: 0, transactionLines: 0, postings: 0 } } });
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    } finally { await recreatedPool.end(); }
+  });
+
+  it.each(["date", "memo", "actor", "approver", "request", "reason", "deposit"])(
+    "deposit reversal rejects conflicting %s replay atomically", async (field) => {
+      const { financials, input } = await depositFixture();
+      const other = await financials.deposits.record({ operation: sdkOperation(), idempotencyKey: "deposit:other",
+        date: "2026-08-10", amount: "123.45", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+      await financials.deposits.reverse(input);
+      const before = await depositDatabaseState(pool);
+      const changed = { ...input,
+        ...(field === "date" ? { date: "2026-08-13" } : {}),
+        ...(field === "memo" ? { memo: "Different" } : {}),
+        ...(field === "deposit" ? { depositId: other.documentId } : {}),
+        operation: { ...input.operation,
+          ...(field === "actor" ? { actorRef: "user:other" } : {}),
+          ...(field === "approver" ? { approverRef: "user:other-controller" } : {}),
+          ...(field === "request" ? { requestId: "request:other" } : {}),
+          ...(field === "reason" ? { reasonCode: "different_reason" } : {}) }
+      };
+      await expect(financials.deposits.reverse(changed)).rejects.toMatchObject({ code: "idempotency_conflict" });
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+  );
+
+  it("deposit reversal rolls back postings, links, events, outbox and snapshot invalidation on late SQL failure", async () => {
+    const { financials, input } = await depositFixture();
+    await pool.query(`insert into erp_financials.report_snapshots (
+      report_snapshot_id, tenant_id, company_id, source_id, report_name, snapshot_source,
+      accounting_basis, period_start, period_end, as_of_date, currency_code, generated_at,
+      freshness, reconciliation_status, reconciliation_difference
+    ) values ('deposit_snapshot', 'tenant_1', 'company_1', 'source_1', 'profit_and_loss', 'rollup',
+      'accrual', '2026-08-01', '2026-08-31', '2026-08-31', 'USD', now(),
+      '{"status":"fresh","sourceId":"source_1"}'::jsonb, 'reconciled', 0);
+    create function erp_financials.fail_deposit_outbox() returns trigger language plpgsql as $$
+    begin if new.event_type = 'subledger.deposit.reversed' then raise exception 'injected late deposit failure'; end if;
+    return new; end $$;
+    create trigger fail_deposit_outbox before insert on erp_financials.financial_outbox
+      for each row execute function erp_financials.fail_deposit_outbox()`);
+    const before = await depositDatabaseState(pool);
+    await expect(financials.deposits.reverse(input)).rejects.toThrow("injected late deposit failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await pool.query("drop trigger fail_deposit_outbox on erp_financials.financial_outbox");
+    await expect(financials.deposits.reverse(input)).resolves.toMatchObject({ status: "reversed" });
+  });
+
+  it.each([true, false])("deposit reversal serializes real concurrent transactions (same key: %s)", async (sameKey) => {
+    const { input } = await depositFixture();
+    let releaseFirst!: () => void;
+    let firstHasLock!: () => void;
+    const holdFirst = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const locked = new Promise<void>((resolve) => { firstHasLock = resolve; });
+    const backendIds: number[] = [];
+    let connectionCount = 0;
+    const concurrentRunner: PostgresMigrationTransactionRunner = {
+      transaction: (work) => runner.transaction(async (client) => {
+        const id = await client.query("select pg_backend_pid() as pid");
+        backendIds.push(Number(id.rows[0]?.pid));
+        const first = connectionCount++ === 0;
+        const observed: PostgresQueryClient = {
+          async query<Row extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: readonly unknown[]) {
+            const result = await client.query<Row>(sql, params);
+            if (first && sql.includes("pg_advisory_xact_lock") && String(params?.[0]).startsWith("deposit-reversal:")) {
+              firstHasLock();
+              await holdFirst;
+            }
+            return result;
+          }
+        };
+        return work(observed);
+      })
+    };
+    const first = depositService(concurrentRunner).deposits.reverse(input);
+    await locked;
+    const second = depositService(concurrentRunner).deposits.reverse({ ...input,
+      idempotencyKey: sameKey ? input.idempotencyKey : "competing-reversal" });
+    // Attach rejection handlers immediately, then prove the second backend is
+    // actually blocked on the transaction advisory lock before releasing it.
+    const outcomesPromise = Promise.allSettled([first, second]);
+    try {
+      await expect.poll(async () => {
+        if (backendIds.length !== 2) return false;
+        const waiting = await pool.query<{ wait_event: string }>("select wait_event from pg_stat_activity where pid = $1", [backendIds[1]]);
+        return waiting.rows[0]?.wait_event;
+      }).toBe("advisory");
+      expect(new Set(backendIds).size).toBe(2);
+    } finally { releaseFirst(); }
+    const outcomes = await outcomesPromise;
+    expect(outcomes[0].status).toBe("fulfilled");
+    if (sameKey) {
+      expect(outcomes[1]).toMatchObject({ status: "fulfilled", value: { status: "already_reversed" } });
+    } else {
+      expect(outcomes[1].status).toBe("rejected");
+      if (outcomes[1].status === "rejected") {
+        const failure: unknown = outcomes[1].reason;
+        expect(failure).toBeInstanceOf(Error);
+        if (failure instanceof Error) expect(failure.message).toContain("terminal reversal");
+      }
+    }
+    expect((await pool.query("select * from erp_financials.journal_entry_links")).rows).toHaveLength(2);
+    expect((await pool.query("select * from erp_financials.ledger_postings")).rows).toHaveLength(8);
   });
 
   it("migrates a blank database transactionally and validates schema plus immutable migration history", async () => {
@@ -2877,6 +3124,35 @@ function sdkOperation() {
     reasonCode: "sdk_integration_test",
     occurredAt: "2026-08-12T11:59:00.000Z"
   } as const;
+}
+
+function depositService(database: PostgresMigrationTransactionRunner, overrides: Partial<CreateErpFinancialsInput> = {}) {
+  return createErpFinancials({
+    database, tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1", currencyCode: "USD",
+    now: () => "2026-08-12T12:00:00.000Z", ...overrides
+  });
+}
+
+async function closeDepositPeriod(pool: Pool, financials: ReturnType<typeof depositService>) {
+  const periods = await pool.query<{ fiscal_period_id: string }>("select fiscal_period_id from erp_financials.fiscal_periods");
+  const fiscalPeriodId = String(periods.rows[0]?.fiscal_period_id);
+  const closing = await financials.fiscalPeriods.beginClose({ operation: sdkOperation(), fiscalPeriodId, expectedVersion: 1 });
+  const evidence = { trialBalanceSnapshotId: "deposit-trial-balance", reconciliationRefs: ["deposit-reconciliation"],
+    checklistRef: "deposit-close-checklist", postingMaxUpdatedAt: "2026-08-12T12:00:00.000Z" };
+  await financials.fiscalPeriods.close({ operation: sdkOperation(), fiscalPeriodId, expectedVersion: closing.version,
+    evidence: { ...evidence, evidenceChecksum: createFiscalCloseEvidenceChecksum(evidence) } });
+}
+
+/** Compare all persisted rows, including audit/outbox/freshness, on failed commands. */
+async function depositDatabaseState(pool: Pool): Promise<Record<string, unknown[]>> {
+  const tables = await pool.query<{ table_name: string }>(`select table_name from information_schema.tables
+    where table_schema = 'erp_financials' and table_type = 'BASE TABLE' order by table_name`);
+  const state: Record<string, unknown[]> = {};
+  for (const { table_name: table } of tables.rows) {
+    if (!/^[a-z_]+$/u.test(table)) throw new Error("Unexpected table name");
+    state[table] = (await pool.query(`select to_jsonb(row) as row from erp_financials."${table}" row order by to_jsonb(row)::text`)).rows;
+  }
+  return state;
 }
 
 async function reconciliationEvidenceCounts(
