@@ -984,7 +984,8 @@ async function writeReportSnapshot(
     manifest,
     "report_snapshot_totals",
     report.totals.map((total) => reportSnapshotTotalRow(total, report.snapshot)),
-    ["tenant_id", "company_id", "source_id", "report_total_id"]
+    // Named totals are unique within a scoped snapshot in both the manifest and migrations.
+    ["tenant_id", "company_id", "source_id", "report_snapshot_id", "total_key"]
   );
 
   return snapshotCount + lineCount + totalCount;

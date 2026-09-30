@@ -2,8 +2,13 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { Pool } from "pg";
 
 import {
+  ERP_FINANCIALS_STATEMENT_FIXTURE,
   POSTGRES_CANONICAL_SCHEMA_MANIFEST,
+  buildProfitAndLossReport,
+  buildTrialBalanceReport,
+  createCompanySourceBinding,
   createErpFinancials,
+  createPostgresStorageAdapter,
   createTransferReversalApprovalChecksum,
   createErpFinancialsSdk,
   createFiscalCloseEvidenceChecksum,
@@ -15,6 +20,7 @@ import {
 } from "../src/index.js";
 
 import type {
+  BuiltReport,
   CanonicalAccountingFactSet,
   CreateVendorBillInput,
   CreateErpFinancialsInput,
@@ -43,6 +49,143 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
   afterAll(async () => {
     await pool.query('drop schema if exists "erp_financials" cascade');
     await pool.end();
+  });
+
+  const statementFixture = ERP_FINANCIALS_STATEMENT_FIXTURE;
+  const reportInput = {
+    ...statementFixture.reportRequest,
+    accounts: statementFixture.accounts,
+    postings: statementFixture.postings
+  };
+
+  async function snapshotFixture() {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:snapshot-totals" });
+    await runner.transaction((client) => createPostgresStorageAdapter(client).loadStatementFixture(statementFixture));
+    return createPostgresStorageAdapter(new PgQueryClient(pool));
+  }
+
+  async function persistSnapshot(report: BuiltReport) {
+    return runner.transaction((client) => createPostgresStorageAdapter(client).writeReportSnapshot(report));
+  }
+
+  function snapshotRequest(report: BuiltReport) {
+    return { ...report.snapshot, reportName: report.metadata.reportName };
+  }
+
+  function storedReport(report: BuiltReport) {
+    return {
+      snapshot: report.snapshot,
+      lines: [...report.lines].sort((a, b) => a.sortOrder - b.sortOrder || a.reportLineId.localeCompare(b.reportLineId)),
+      totals: [...report.totals].sort((a, b) => a.reportTotalId.localeCompare(b.reportTotalId))
+    };
+  }
+
+  it.each([
+    { name: "profit and loss", build: buildProfitAndLossReport, expected: statementFixture.expectedTotals.profitAndLoss },
+    { name: "trial balance", build: buildTrialBalanceReport, expected: statementFixture.expectedTotals.trialBalance }
+  ])("persists snapshot totals for $name and replays without duplicate rows", async ({ build, expected }) => {
+    const storage = await snapshotFixture();
+    const report = build(reportInput);
+    const count = 1 + report.lines.length + report.totals.length;
+
+    await expect(persistSnapshot(report)).resolves.toBe(count);
+    const first = await storage.loadLatestReportSnapshot(snapshotRequest(report));
+    expect(first).toEqual(storedReport(report));
+    expect(Object.fromEntries(first?.totals.map((total) => [total.totalKey, total.amount]) ?? [])).toMatchObject(expected);
+    const beforeReplay = await depositDatabaseState(pool);
+    await expect(persistSnapshot(report)).resolves.toBe(count);
+    expect(await storage.loadLatestReportSnapshot(snapshotRequest(report))).toEqual(first);
+    expect(await depositDatabaseState(pool)).toEqual(beforeReplay);
+  });
+
+  it("refreshes snapshot totals in place, prunes obsolete children, and retains a different report period", async () => {
+    const storage = await snapshotFixture();
+    const original = buildProfitAndLossReport(reportInput);
+    await persistSnapshot(original);
+    // Migrated totals may carry legacy IDs rather than current builder IDs.
+    await pool.query(`update erp_financials.report_snapshot_totals
+      set report_total_id = report_snapshot_id || ':legacy-total:' || total_key`);
+    const revised = buildProfitAndLossReport({
+      ...reportInput,
+      accounts: reportInput.accounts.filter((account) => account.classification !== "expense"),
+      postings: reportInput.postings.filter((posting) =>
+        !reportInput.accounts.some((account) => account.accountId === posting.accountId && account.classification === "expense")),
+      generatedAt: "2026-02-02T00:00:00.000Z"
+    });
+    expect(revised.snapshot.reportSnapshotId).toBe(original.snapshot.reportSnapshotId);
+    expect(revised.lines.length).toBeLessThan(original.lines.length);
+    expect(revised.totals.find((total) => total.totalKey === "net_income")?.amount).toBe("17000.00");
+    await persistSnapshot(revised);
+    expect(await storage.loadLatestReportSnapshot(snapshotRequest(revised))).toEqual(storedReport(revised));
+
+    // The adapter accepts named total sets, including a reduced set on refresh.
+    const reduced = { ...revised, totals: revised.totals.filter((total) => total.totalKey === "net_income") };
+    await persistSnapshot(reduced);
+    await persistSnapshot(reduced);
+    expect(await storage.loadLatestReportSnapshot(snapshotRequest(reduced))).toEqual(storedReport(reduced));
+    const nextPeriod = buildProfitAndLossReport({ ...reportInput,
+      periodStart: "2026-02-01", periodEnd: "2026-02-28", asOfDate: "2026-02-28" });
+    expect(nextPeriod.snapshot.reportSnapshotId).not.toBe(original.snapshot.reportSnapshotId);
+    await persistSnapshot(nextPeriod);
+    expect(await storage.loadLatestReportSnapshot(snapshotRequest(nextPeriod))).toEqual(storedReport(nextPeriod));
+    expect(await storage.loadLatestReportSnapshot(snapshotRequest(reduced))).toEqual(storedReport(reduced));
+    expect((await pool.query("select count(*)::integer as count from erp_financials.report_snapshots")).rows).toEqual([{ count: 2 }]);
+  });
+
+  it("isolates snapshot totals by tenant, company, and source during writes and reads", async () => {
+    const storage = await snapshotFixture();
+    const original = buildProfitAndLossReport(reportInput);
+    await persistSnapshot(original);
+    for (const missingScope of [{ tenantId: "tenant_missing" }, { companyId: "company_missing" }, { sourceId: "source_missing" }]) {
+      await expect(storage.loadLatestReportSnapshot({ ...snapshotRequest(original), ...missingScope })).resolves.toBeUndefined();
+    }
+    const scopes = [
+      { tenantId: reportInput.tenantId, companyId: "company_other", sourceId: reportInput.sourceId },
+      { tenantId: reportInput.tenantId, companyId: reportInput.companyId, sourceId: "source_other" },
+      { tenantId: "tenant_other", companyId: "company_other_tenant", sourceId: "source_other_tenant" }
+    ];
+    for (const scope of scopes) {
+      if (scope.companyId !== reportInput.companyId) {
+        await storage.upsertAccountingCompany({ ...statementFixture.company, tenantId: scope.tenantId,
+          companyId: scope.companyId, sourceCompanyRef: scope.companyId });
+      }
+      if (scope.sourceId !== reportInput.sourceId) {
+        await storage.upsertAccountingSource({ ...statementFixture.source, tenantId: scope.tenantId,
+          sourceId: scope.sourceId, connectionRef: scope.sourceId });
+      }
+      await storage.upsertCompanySourceBinding(createCompanySourceBinding({ ...scope, createdAt: reportInput.generatedAt }));
+      // Empty canonical facts still yield supported named zero totals.
+      const isolated = buildProfitAndLossReport({ ...reportInput, ...scope, accounts: [], postings: [] });
+      await expect(storage.loadLatestReportSnapshot(snapshotRequest(isolated))).resolves.toBeUndefined();
+      await persistSnapshot(isolated);
+      await persistSnapshot(isolated);
+      expect(await storage.loadLatestReportSnapshot(snapshotRequest(isolated))).toEqual(storedReport(isolated));
+      expect(isolated.totals.every((total) => total.amount === "0.00")).toBe(true);
+      expect(await storage.loadLatestReportSnapshot(snapshotRequest(original))).toEqual(storedReport(original));
+    }
+    // A colliding global snapshot identity must fail, never overwrite another scope.
+    const otherScope = scopes[0];
+    if (otherScope === undefined) throw new Error("Expected another scope");
+    const beforeCollision = await depositDatabaseState(pool);
+    await expect(persistSnapshot({ ...original, snapshot: { ...original.snapshot, ...otherScope } }))
+      .rejects.toMatchObject({ code: "23505" });
+    expect(await depositDatabaseState(pool)).toEqual(beforeCollision);
+  });
+
+  it.each([false, true])("rolls back snapshot totals and earlier writes after a later SQL failure (existing=%s)", async (existing) => {
+    const storage = await snapshotFixture();
+    const original = buildProfitAndLossReport(reportInput);
+    if (existing) await persistSnapshot(original);
+    const before = await depositDatabaseState(pool);
+    const revised = buildProfitAndLossReport({ ...reportInput, postings: [], generatedAt: "2026-02-03T00:00:00.000Z" });
+    await expect(runner.transaction(async (client) => {
+      const transactionStorage = createPostgresStorageAdapter(client);
+      await transactionStorage.writeReportSnapshot(revised);
+      expect(await transactionStorage.loadLatestReportSnapshot(snapshotRequest(revised))).toEqual(storedReport(revised));
+      await client.query("select 1 / 0");
+    })).rejects.toMatchObject({ code: "22012" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    expect(await storage.loadLatestReportSnapshot(snapshotRequest(original))).toEqual(existing ? storedReport(original) : undefined);
   });
 
   async function depositFixture(bookId?: string) {
