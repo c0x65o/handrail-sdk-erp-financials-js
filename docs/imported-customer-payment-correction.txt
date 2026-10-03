@@ -1,0 +1,157 @@
+Imported customer-payment correction integration contract
+
+SDK base: @handrail/erp-financials 0.3.55, commit
+93b4b2cfb2d655c7d2757164a0da54e2ee5ef324. This patch is uncommitted;
+Handrail owns the next version/commit/push. Do not pin consumers to the base
+commit expecting these APIs. Pin the resulting full 40-character HTTPS Git
+commit and refresh the consumer lockfile in the parent's integration request.
+
+Public API (root and /sdk type exports)
+
+createErpFinancials({...scope, database, customerPaymentCorrectionGuard})
+  .customerPayments.previewVoidAndUnapply(request)
+    -> Promise<CustomerPaymentCorrectionPreview>
+  .customerPayments.voidAndUnapply({...request, confirmation, approvalRef})
+    -> Promise<VoidAndUnapplyCustomerPaymentResult>
+Existing customerPayments.record is unchanged. createErpFinancialsSdk accepts
+the same guard and exposes these commands under sdk.commands.customerPayments.
+
+CustomerPaymentCorrectionRequest:
+  paymentId, date (effective YYYY-MM-DD), idempotencyKey, operation.
+operation requires actorRef, independent approverRef, requestId, correlationId,
+reasonCode, nonempty reasonDetail, occurredAt. Keep the entire command unchanged
+on retry. Changing any field requires a new preview and approval. Confirmation
+is a SHA-256 snapshot binding, NOT authentication, a secret, or approval itself.
+
+Preview is read-only (transaction/row/advisory locks only). It returns payment
+and source versions, ALL payment applications (including ended history), linked
+invoice versions, exact posting IDs and reversed account amounts for both bases.
+Preview and result explicitly return replayPolicy="block_source_imports".
+Results include reopenedInvoiceIds and complete basisReversals mappings; the
+existing journal-link uniqueness retains one terminal link per original transaction.
+The confirmation also binds complete rows for ALL applications on those invoices,
+source/company/book, original transactions/postings, actor/reason/effective date,
+idempotency key, and the app guard evidence version. Never send bank/provider
+credentials or raw payloads to these APIs.
+
+Confirmation wiring owned by Spartan
+
+1. Authenticate server-side; resolve tenant/company/source/book from authorized
+   context, not browser assertions. Authorize both preview and confirmation.
+2. Reconstruct the operation from the actor and the persisted approval workflow.
+   Store the exact request + preview.confirmation in the app's approval record.
+   Show payment, invoice(s), amounts, both accounting bases, reason and effective
+   date AND the source-wide import block to the independent approver. The
+   approver must not equal the actor.
+3. Supply customerPaymentCorrectionGuard. It receives the SAME transaction client,
+   phase, full scope, request, and (on confirmation) confirmation and approvalRef.
+   In that transaction, lock app permission/approval/deposit/reconciliation/refund
+   evidence. Verify approvalRef belongs to this exact scope, actor, approver,
+   request and confirmation. Return authorized, complete, version, deposited,
+   reconciled, refunded. All are mandatory; complete and authorized must be true,
+   and the three blocking associations must be false. version must be stable
+   between preview and confirmation and must change with any relevant evidence.
+   Missing guard or evidence is a denial, never permission inferred from silence.
+4. Every app-owned deposit/refund/reconciliation/permission writer must acquire
+   lockCustomerPaymentCorrectionSource(client, tenantId, sourceId) BEFORE its
+   own row locks, and check customer_payment_corrections for the payment before
+   writing. Keep locks until commit. Native reconciliation writes also have a
+   database guard. External writers outside this database need an app-held
+   durable fence or must make complete=false; an unlocked API lookup is not proof.
+5. Confirm with the identical request, confirmation and approvalRef. On stale
+   evidence, obtain a new preview and new approval; never auto-confirm a retry.
+   Exact duplicate commands return already_voided with the same correctionId.
+   Changed commands/keys cannot reverse twice. Re-check authorization on replay.
+6. Consume the transactional ledger and subledger outbox to rebuild reports and
+   invoice/payment screens. Never patch a balance or issue a journal from UI code.
+
+Both Spartan QuickBooks import paths
+
+A. Normalized full/incremental sync worker path (createQuickBooksFullSyncWorker,
+   createQuickBooksIncrementalSyncWorker and their Future ERP wrappers): fetch
+   normalized resources through the QuickBooks SDK outside the DB transaction.
+   The app must supply transaction-bound persistence so canonical facts,
+   operational documents, applications and correction evidence share ONE physical
+   transaction. Call assertCustomerPaymentCorrectionImportAllowed(client, tenantId,
+   sourceId) before any canonical persistence or full-snapshot deletion. Do not
+   use a pool as if it were a transaction-bound query client.
+B. Direct/legacy operational-document path: likewise guard the source before
+   canonical storage writes and invoke persistQuickBooksSubledgerResources on
+   that same transaction client. Supply its optional paymentCorrectionEvidence
+   array, or invoke persistImportedCustomerPaymentEvidence(client, scope, evidence)
+   after both ledger and operational projections finish in that transaction.
+   Do not retain a legacy SQL path that bypasses canonical evidence/guards.
+
+ImportedCustomerPaymentEvidence is normalized evidence, never browser input:
+  paymentId: canonical document ID
+  sourceVersion: exact normalized Payment sourceUpdatedAt timestamp
+  sourceTransactionId: provider Payment ID
+  bookId: exact reporting book, or null only for an unbound source
+  transactionIds: document header AND every accrual/cash basis transaction
+  provenanceRef: bounded safe reference to complete normalized import evidence
+
+The SDK durably checksums the stored accounting rows when evidence is registered.
+Separate basis transactions must carry a SafeSourcePayloadRef whose
+sourceObjectType='Payment' and sourceObjectId is the original provider Payment ID.
+A same-ID Payment transaction also qualifies. Do not guess identities by date,
+amount, memo or invoice number. Both bases must contain complete balanced,
+single-currency postings totaling the payment amount, with supported exact minor
+units. Every discoverable transaction for the Payment identity must be listed.
+Missing cash evidence, missing source version, unknown provenance, mixed native
+cash-application projections, mismatched invoice/application totals or an
+ambiguous/shared company source blocks correction. Registration rejects older
+source timestamps. The source-version timestamp is not an inferred SyncToken.
+If the provider cannot supply complete versioned evidence, leave the action blocked.
+
+Existing imports need verified normalized provenance registration, not a blind
+business-data migration. No fixture or backfill should run against Spartan:
+staging and production share a database. Parent app integration must identify
+and update BOTH actual app entry points; this SDK checkout contains no Spartan
+source files and does not claim app-path validation.
+
+Replay contract and deliberate limit
+
+customer_payment_corrections is a permanent durable identity/tombstone. The local
+operation reverses both bases with append-only compensating postings, ends every
+active application, reopens invoices, and zeros/voids the original spendable
+payment in one transaction. It uses the existing posting engine, lifecycle,
+application-balance triggers, fiscal controls and outbox. It never deletes
+original postings and does not issue a journal-only correction. Compensation
+uses the dedicated Subledger:customer_payment_correction transaction type, which
+the generic journal reversal API rejects.
+
+This release FAILS CLOSED FOR THE ENTIRE CORRECTED SOURCE on later provider
+imports, upserts, deletions, full-snapshot replacement and source reset. It does
+not silently merge provider state over a local correction, even if the incoming
+source version is newer. Import entry points throw terminal_state_conflict;
+database write guards also reject bypasses with customer_payment_corrected_source.
+Consumers must stop and surface that reconciliation requirement, not retry forever
+or advance a successful checkpoint. There is no tombstone-clear/resume-sync API.
+Continued automated sync of that source requires a separately reviewed explicit
+reconciliation contract. Native applications of OTHER existing payment credit
+remain supported. Database source locks also serialize canonical writers before
+correction, making incomplete refreshes stale against the registered checksum.
+
+Schema-only manifest
+
+Manifest: 2026-10-03.customer-payment-corrections, schema version 26.
+Migration: migrations/future-erp/20261003010000_add_customer_payment_corrections.sql
+Upgrade 25 -> 26 creates imported_customer_payment_evidence and
+customer_payment_corrections plus bounded JSON, scoped FKs, unique identities,
+immutable tombstone and canonical source write guards. No UPDATE/DELETE of
+business rows, provider calls, credential changes, business-data backfill or
+migration execution against app databases belongs to this request.
+Use planPostgresMigrations / migratePostgresSchema through the app-owned migration
+runner. Guards serialize writes by tenant/source; account for that lock ordering
+in app writers and retry PostgreSQL deadlock/serialization failures by rolling
+back the entire transaction. Never reuse a partially failed transaction.
+
+Synthetic verification
+
+npm run test:postgres:isolated -- test/postgres.integration.test.ts
+requires ERP_FINANCIALS_EPHEMERAL_ROOT pointing to an approved disposable writable
+directory; optional ERP_FINANCIALS_POSTGRES_BIN selects installed Postgres binaries.
+The harness creates its own cluster, disables TCP listeners at startup, proves
+its data directory and Unix socket connection, ignores app DB URLs, runs real
+multi-connection tests with one Vitest worker, then destroys the cluster.
+See imported-customer-payment-correction-test-receipt.txt for actual results.

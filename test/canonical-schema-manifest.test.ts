@@ -45,8 +45,8 @@ const CUSTOMER_DEPOSIT_INVOICE_APPLICATIONS_UPGRADE_SQL = readFileSync(
 
 describe("canonical schema manifest", () => {
   it("is versioned and covers the documented canonical entities", () => {
-    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.manifestVersion).toBe("2026-09-15.inactive-mapped-accounts");
-    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion).toBe(25);
+    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.manifestVersion).toBe("2026-10-03.customer-payment-corrections");
+    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion).toBe(26);
 
     const tableNames = POSTGRES_CANONICAL_SCHEMA_MANIFEST.tables.map((table) => table.name);
 
@@ -91,7 +91,9 @@ describe("canonical schema manifest", () => {
       "subledger_document_delivery_events",
       "invoice_voids",
       "bank_statement_lines",
-      "bank_reconciliation_matches"
+      "bank_reconciliation_matches",
+      "imported_customer_payment_evidence",
+      "customer_payment_corrections"
     ]);
   });
 
@@ -267,7 +269,8 @@ describe("canonical schema manifest", () => {
       [21, 22],
       [22, 23],
       [23, 24],
-      [24, 25]
+      [24, 25],
+      [25, 26]
     ]);
     expect(renderPostgresSchemaSql()).toContain('create table if not exists "erp_financials"."schema_migrations"');
     expect(FUTURE_ERP_CANONICAL_SCHEMA_MIGRATION_SQL).not.toMatch(

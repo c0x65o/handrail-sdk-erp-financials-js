@@ -55,7 +55,8 @@ describe("Postgres schema migrations", () => {
       [21, 22],
       [22, 23],
       [23, 24],
-      [24, 25]
+      [24, 25],
+      [25, 26]
     ]);
     expect(POSTGRES_MIGRATIONS.every((entry) => /^[a-f0-9]{64}$/.test(entry.checksum))).toBe(true);
     expect(new Set(POSTGRES_MIGRATIONS.map((entry) => entry.migrationId)).size).toBe(
@@ -69,7 +70,7 @@ describe("Postgres schema migrations", () => {
     const plan = await planPostgresMigrations(client);
 
     expect(plan.currentVersion).toBe(0);
-    expect(plan.targetVersion).toBe(25);
+    expect(plan.targetVersion).toBe(26);
     expect(plan.requiresBaselineAdoption).toBe(false);
     expect(plan.pendingMigrations).toEqual(POSTGRES_MIGRATIONS);
     expect(client.calls.some((call) => call.includes("pg_advisory_xact_lock"))).toBe(false);
@@ -83,7 +84,7 @@ describe("Postgres schema migrations", () => {
     const result = await migratePostgresSchema(runner, { appliedByRef: "deploy:future-erp:42" });
 
     expect(result.currentVersion).toBe(0);
-    expect(result.targetVersion).toBe(25);
+    expect(result.targetVersion).toBe(26);
     expect(result.adoptedBaselineVersion).toBeUndefined();
     expect(result.applied.map((entry) => [entry.fromVersion, entry.toVersion])).toEqual([
       [0, 6],
@@ -105,9 +106,10 @@ describe("Postgres schema migrations", () => {
       [21, 22],
       [22, 23],
       [23, 24],
-      [24, 25]
+      [24, 25],
+      [25, 26]
     ]);
-    expect(client.state.version).toBe(25);
+    expect(client.state.version).toBe(26);
     expect(client.state.ledger.map((entry) => entry.migrationId)).toEqual(
       POSTGRES_MIGRATIONS.map((entry) => entry.migrationId)
     );
@@ -139,7 +141,7 @@ describe("Postgres schema migrations", () => {
 
     expect(plan.currentVersion).toBe(7);
     expect(plan.requiresBaselineAdoption).toBe(true);
-    expect(plan.pendingMigrations.map((entry) => entry.toVersion)).toEqual([8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
+    expect(plan.pendingMigrations.map((entry) => entry.toVersion)).toEqual([8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
   });
 
   it("reports an existing unversioned schema as requiring baseline adoption", async () => {

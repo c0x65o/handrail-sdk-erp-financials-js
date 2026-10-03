@@ -1,3 +1,4 @@
+import type { CustomerPaymentCorrectionGuard } from "./customer-payment-correction.js";
 import { createBankReconciliationService } from "./bank-reconciliation.js";
 export { projectCashBasisApplication } from "./accounting-basis-projection.js";
 export { createHandrailQuickBooksBackfillProvider, createQuickBooksDualBasisBackfillWorker, materializeQuickBooksBasisBackfill } from "./quickbooks-dual-basis-backfill.js";
@@ -71,6 +72,7 @@ export type ErpFinancialsSdk = {
 };
 
 export type CreateErpFinancialsSdkInput = {
+  readonly customerPaymentCorrectionGuard?: CustomerPaymentCorrectionGuard;
   readonly database: ErpFinancialsDatabase;
   readonly tenantId: string;
   readonly companyId: string;
@@ -105,6 +107,7 @@ export function createErpFinancialsSdk(input: CreateErpFinancialsSdkInput): ErpF
   });
   return {
     commands: createErpFinancials({
+      ...(input.customerPaymentCorrectionGuard === undefined ? {} : { customerPaymentCorrectionGuard: input.customerPaymentCorrectionGuard }),
       database,
       tenantId: input.tenantId,
       companyId: input.companyId,
@@ -357,3 +360,6 @@ export type {
 } from "./reporting-books.js";
 export type { FinancialOutboxEvent, FinancialOutboxService, FinancialOutboxStatus } from "./financial-outbox.js";
 export type { FinancialRuntime, FinancialRuntimeHandlers, FinancialRuntimeRunResult } from "./financial-runtime.js";
+
+export type { ImportedCustomerPaymentEvidence, CustomerPaymentCorrectionRequest, CustomerPaymentCorrectionGuard, CustomerPaymentCorrectionPreview, VoidAndUnapplyCustomerPaymentInput, VoidAndUnapplyCustomerPaymentResult } from "./customer-payment-correction.js";
+export { persistImportedCustomerPaymentEvidence, assertCustomerPaymentCorrectionImportAllowed, lockCustomerPaymentCorrectionSource } from "./customer-payment-correction.js";

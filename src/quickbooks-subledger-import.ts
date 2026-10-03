@@ -1,3 +1,4 @@
+import { assertCustomerPaymentCorrectionImportAllowed, persistImportedCustomerPaymentEvidence, type ImportedCustomerPaymentEvidence } from "./customer-payment-correction.js";
 import { createHash } from "node:crypto";
 import { planQuickBooksCommercialDetail, QuickBooksCommercialDetailError, type QuickBooksCommercialDetailPlan, type QuickBooksCommercialReferences } from "./quickbooks-commercial-detail.js";
 
@@ -43,6 +44,7 @@ export type QuickBooksSubledgerImportResult = {
 };
 
 export type PersistQuickBooksSubledgerResourcesInput = {
+  readonly paymentCorrectionEvidence?: readonly ImportedCustomerPaymentEvidence[];
   readonly companyId: string;
   readonly importedAt: string;
   readonly facts: CanonicalAccountingFactSet;
@@ -124,6 +126,7 @@ export class QuickBooksSubledgerProjectionError extends Error {
 export async function persistQuickBooksSubledgerResources(
   input: PersistQuickBooksSubledgerResourcesInput & { readonly client: PostgresQueryClient }
 ): Promise<QuickBooksSubledgerImportResult> {
+  await assertCustomerPaymentCorrectionImportAllowed(input.client, input.facts.company.tenantId, input.facts.source.sourceId);
   await input.client.query(
     `select set_config('erp_financials.quickbooks_projection_refresh', 'on', true)`
   );
@@ -1037,7 +1040,6 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   const retiredNonDocumentTransactions = [
     // Older normalized-sync envelopes can omit this family even though the
     // current resource-set contract materializes it as an empty array.
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
     ...(input.resources.journalEntries ?? []).map((resource) => ({
       syncAction: resource.syncAction,
       sourceTransactionType: "JournalEntry",
@@ -1073,6 +1075,10 @@ where transaction."tenant_id" = $1 and transaction."source_id" = $2
   await input.client.query(
     `select set_config('erp_financials.quickbooks_projection_refresh', 'off', true)`
   );
+  for (const evidence of input.paymentCorrectionEvidence ?? []) {
+    await persistImportedCustomerPaymentEvidence(input.client, {tenantId: input.facts.company.tenantId, companyId: input.companyId, sourceId: input.facts.source.sourceId}, evidence);
+  }
+
   return {
     documents,
     documentLines,

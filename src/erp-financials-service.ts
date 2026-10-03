@@ -1,3 +1,4 @@
+import { createCustomerPaymentCorrectionService, type CustomerPaymentCorrectionGuard } from "./customer-payment-correction.js";
 import { createHash } from "node:crypto";
 
 import { assertValidAccountHierarchy } from "./account-hierarchy.js";
@@ -65,6 +66,7 @@ export type ErpFinancialsPostgresPool = {
 export type ErpFinancialsDatabase = ErpFinancialsTransactionRunner | ErpFinancialsPostgresPool;
 
 export type CreateErpFinancialsInput = {
+  readonly customerPaymentCorrectionGuard?: CustomerPaymentCorrectionGuard;
   readonly database: ErpFinancialsDatabase;
   readonly tenantId: string;
   readonly companyId: string;
@@ -628,7 +630,7 @@ export type ErpFinancials = {
   };
   readonly fiscalPeriods: FiscalPeriodService;
   readonly invoices: { create(input: CreateInvoiceInput): Promise<SubledgerDocumentResult> };
-  readonly customerPayments: { record(input: RecordCustomerPaymentInput): Promise<SubledgerDocumentResult> };
+  readonly customerPayments: { record(input: RecordCustomerPaymentInput): Promise<SubledgerDocumentResult> } & ReturnType<typeof createCustomerPaymentCorrectionService>;
   readonly adjustments: {
     voidIssued(input: VoidIssuedAdjustmentInput): Promise<IssuedAdjustmentLifecycleResult>;
     replaceIssued(input: ReplaceIssuedAdjustmentInput): Promise<IssuedAdjustmentLifecycleResult>;
@@ -710,6 +712,7 @@ export class ErpFinancialsIdempotencyConflictError extends ErpFinancialsError {
 }
 
 type ServiceContext = {
+  readonly customerPaymentCorrectionGuard?: CustomerPaymentCorrectionGuard;
   readonly database: ErpFinancialsTransactionRunner;
   readonly tenantId: string;
   readonly companyId: string;
@@ -799,7 +802,14 @@ export function createErpFinancials(input: CreateErpFinancialsInput): ErpFinanci
     },
     fiscalPeriods: createFiscalPeriodService(context),
     invoices: { create: (documentInput) => createInvoice(context, documentInput) },
-    customerPayments: { record: (documentInput) => recordCustomerPayment(context, documentInput) },
+    customerPayments: { record: (documentInput) => recordCustomerPayment(context, documentInput),
+      ...createCustomerPaymentCorrectionService(context, (client, journal) => {
+        // Keep correction compensation out of the generic journal lifecycle API.
+        const correctionJournal: InternalPostJournalEntryInput = {
+          ...journal, nativeTransactionType: "Subledger:customer_payment_correction"
+        };
+        return postJournalEntry({ ...nestedServiceContext(context, client), postingPolicy: "enforce_fiscal_periods" }, correctionJournal);
+      }) },
     adjustments: {
       voidIssued: (adjustmentInput) => runIssuedAdjustmentLifecycle(context, "voided", adjustmentInput),
       replaceIssued: (adjustmentInput) => runIssuedAdjustmentLifecycle(context, "replaced", adjustmentInput)
@@ -4828,7 +4838,8 @@ function serviceContext(input: CreateErpFinancialsInput): ServiceContext {
     currencyPolicy: input.currencyPolicy ?? "single_currency",
     accountingBasis,
     now: input.now ?? (() => new Date().toISOString()),
-    postingPolicy: input.postingPolicy ?? "enforce_fiscal_periods"
+    postingPolicy: input.postingPolicy ?? "enforce_fiscal_periods",
+    ...(input.customerPaymentCorrectionGuard === undefined ? {} : { customerPaymentCorrectionGuard: input.customerPaymentCorrectionGuard })
   };
 }
 

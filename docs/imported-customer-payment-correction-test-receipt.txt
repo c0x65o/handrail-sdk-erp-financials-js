@@ -1,0 +1,142 @@
+Synthetic verification receipt — imported customer payment correction
+
+Work request: 0dbd3f2a-6090-4d51-88e9-9127faa2b606
+Base package: @handrail/erp-financials 0.3.55
+Base full Git SHA: 93b4b2cfb2d655c7d2757164a0da54e2ee5ef324
+Patch remains uncommitted. Handrail owns the next version, commit and push.
+No consumer update, registry publication, deploy or application migration ran.
+
+Isolation: PostgreSQL 15.19, freshly initialized in this worker's approved
+run-specific tmp directory. The harness asserted its exact data_directory,
+listen_addresses='', and inet_server_addr() IS NULL before creating the
+synthetic erp_financials_test_correction database. Unix socket only; no TCP.
+Each harness run stopped the server and removed its entire cluster afterward.
+The Spartan staging/production host/database was never used or probed.
+No real payment, provider sync, credit application, journal, balance repair,
+business-data migration, email, credentials or Handrail queue state was changed.
+All posting/application operations described below occurred only in that cluster.
+
+Public APIs compiled and import-smoked through dist/index.js and dist/sdk.js:
+  customerPayments.record (retained)
+  customerPayments.previewVoidAndUnapply
+  customerPayments.voidAndUnapply
+  persistImportedCustomerPaymentEvidence
+  assertCustomerPaymentCorrectionImportAllowed
+  lockCustomerPaymentCorrectionSource
+
+Schema-only migration validated on real Postgres:
+  25 -> 26; 20261003010000_add_customer_payment_corrections
+  manifest 2026-10-03.customer-payment-corrections
+  SQL SHA-256 d95d802c6b7a0de6930638f5dd5ebdf951fa2b189d6d5a06fc5d66af091bae81
+
+Actual results
+
+- npm run build: PASS (typed production source compile).
+- Public root and /sdk import smoke: PASS, no database calls.
+- Scoped ESLint for modified source/scripts/tests: PASS. Final whole-repository
+  lint: FAIL with 29 errors, all in unmodified files; zero warnings and no findings
+  in the changed correction/service/import/runtime/schema/test/harness code.
+- Final real PostgreSQL focused correction run: PASS, 41 passed, zero failed,
+  103 unrelated existing tests not selected by the name filter; 29.60 seconds.
+  All required correction concurrency cases actually ran. Includes the final
+  generic-compensation-reversal denial assertion.
+- Real PostgreSQL full run BEFORE the final dedicated compensation transaction
+  discriminator/extra reversal-denial assertion: 133 passed, 11 failed, ZERO
+  skipped (144 tests, 105.87 seconds). All 41 correction cases passed.
+- Four focused real migration/install/upgrades also passed in the preceding
+  43-test run (39 correction cases then, plus four migration cases).
+- Full Vitest non-DB run: 462 passed, 18 failed, 144 DB tests skipped because no
+  external database URL was supplied. Those DB tests were separately executed
+  above; the skipped run is NOT concurrency evidence.
+- npm run typecheck: FAIL, 23 diagnostics in existing test code; no src diagnostics.
+  These cover optional-property mismatches, missing report company/source fields,
+  obsolete Account.status fixtures, catalog-row types, and unsafe generic casts.
+- git diff --check: PASS.
+
+Financial regression actually executed
+
+Synthetic invoice 1396 dated 2025-07-01, phantom Payment 27.56 dated 2025-07-03,
+USD. Document header has NO ledger postings: accrual and cash postings live on
+separate basis transactions with exact Payment provenance. Another PAYMENT has
+84.81 available credit, with no credit memo. Correction preserved original rows,
+posted balanced compensation on both bases, reopened invoice by 27.56, zeroed
+and voided the phantom, and reduced Undeposited Funds once. Accrual A/R became
+-57.25. Applying 27.56 of the existing payment credit closed the invoice and left
+57.25 available without changing accrual A/R again. Final per-basis balances:
+  Undeposited Funds 84.81; A/R -57.25; revenue -27.56 on BOTH bases.
+The original phantom postings plus their compensation net to zero on each basis.
+
+Concurrency and rejection evidence
+
+Real multi-connection PostgreSQL tests ran concurrent same-command confirmations,
+competing keys, sync winning before correction, correction winning before sync,
+application mutation, deposit association and period-close races. Tests observe
+pg_stat_activity advisory-lock waiters before releasing the competing transaction;
+these are not timing-only mocks. Tests assert duplicate returns exactly once,
+stale/incomplete evidence rejection, omitted payment/basis/application evidence,
+all invoice versions, permission denial, incomplete app evidence, deposit/refund/
+reconciliation denial, native bank matches before/after correction, confirmation
+and approval tampering, scope mismatches, late failure rollback of every table,
+provider upserts/deletions/full replacement, direct ledger writes and source reset.
+Additional tests cover read-only preview, explicit transaction enforcement,
+delayed evidence versions, one transaction carrying both bases, and the importer
+registration path. Final hardening also rejects generic reversal of compensation.
+
+Limits and follow-up
+
+Overall repository validation is FAILING, not release-ready by test-suite evidence.
+The existing-test failures below were investigated but not rewritten in this task.
+No clean pre-change full-suite baseline was run, so this receipt does not assert
+that every remaining broader failure has been independently baseline-proven.
+
+The replay contract is deliberately source-wide fail-closed. Preview/result say
+replayPolicy=block_source_imports. ALL later provider import mutations for that
+source are rejected, including newer versions; there is no resume-sync/tombstone
+clear API. Preserving continued sync requires a separately reviewed reconciliation
+contract. Parent must make this effect visible in confirmation, implement the
+transactional app guard and both import-path fences, validate app-specific
+permissions/refunds/deposits, review the broad failures, and pin the eventual
+Handrail-generated version/full SHA. No app/provider integration was executed here.
+See imported-customer-payment-correction.txt for exact wiring and prerequisites.
+
+Remaining full PostgreSQL failures
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > imports and safely replays QuickBooks documents, lines, and applications
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > preserves every QuickBooks operational document family and application relationship
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > persists and idempotently replays a zero-cash BillPayment as a vendor-credit application
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > persists, replays, revises, and voids a zero-cash Payment credit application without cash activity
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > retires deleted delta documents and documents missing from an authoritative full snapshot
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > serializes advisory locks and preserves repeatable-read snapshot isolation
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > reads bounded historical customer statements with scoped lifecycle evidence
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > atomically settles invoice write-offs and rejects locked application transitions
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > voids and reloads a canonical bill payment through real PostgreSQL
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > atomically clears ordered vendor bills, exposes provenance and summary, and compensates applications
+ test/postgres.integration.test.ts > ERP Financials real PostgreSQL > runs the host-facing SDK from book setup through invoice, atomic match, reconciliation, reads, and outbox delivery
+
+Remaining non-DB Vitest failures
+ test/future-erp-app-owned-boundary-audit.test.ts > Future ERP app-owned storage and reporting boundary audit > installs only canonical ERP Financials tables with bounded safe refs, not provider credential or raw payload custody
+ test/future-erp-app-owned-boundary-audit.test.ts > Future ERP app-owned storage and reporting boundary audit > keeps Future ERP sandbox replay, preflight, and captured app-owned writes credential-free
+ test/future-erp-canonical-import-smoke.test.ts > Future ERP deterministic canonical import smoke > imports normalized QuickBooks fixtures through canonical storage and emits stable reports
+ test/future-erp-install-health-preflight.test.ts > Future ERP install health preflight > returns healthy structured install and fixture smoke results for dev/test callers
+ test/future-erp-install-health-preflight.test.ts > Future ERP install health preflight > blocks outside dev/test even when install and fixture smoke checks are otherwise healthy
+ test/future-erp-install-health-preflight.test.ts > Future ERP install health preflight > returns degraded when deterministic fixture smoke storage hooks are incomplete
+ test/future-erp-persistence.test.ts > Future ERP canonical fact persistence > uses canonical identity conflict targets for canonical fact upserts
+ test/future-erp-preflight.test.ts > Future ERP canonical schema preflight > returns compatible validation details before import jobs persist facts
+ test/future-erp-preflight.test.ts > Future ERP canonical schema preflight > can install the canonical schema on a blank database before validating
+ test/future-erp-sandbox-replay.test.ts > Future ERP QuickBooks sandbox replay orchestration > returns a bounded deterministic replay result without credentials or raw provider payloads
+ test/future-erp-sandbox-replay.test.ts > Future ERP QuickBooks sandbox replay orchestration > writes canonical facts, report snapshots, and freshness in order with repeatable replay ids
+ test/future-erp-sandbox-sync-worker.test.ts > Future ERP QuickBooks sandbox sync worker > emits bounded owner evidence for a mounted Future ERP replay through ERP storage and SDK parity links
+ test/future-erp-sandbox-sync-worker.test.ts > Future ERP QuickBooks sandbox sync worker > passes worker preflight against a blank schema when canonical install is explicitly enabled
+ test/health-contract.test.ts > ERP Financials health contract smoke > runs the deterministic host-app health contract without provider credentials or network calls
+ test/install-health.test.ts > ERP Financials install health > returns healthy package, manifest, schema, fixture, and credential-column status for compatible installs
+ test/normalized-quickbooks-contract-compatibility.test.ts > normalized QuickBooks contract compatibility > transforms normalized QuickBooks resources into the ERP Financials adapter input shape
+ test/quickbooks-sdk-envelope-adapter.test.ts > QuickBooks SDK envelope adapter > reports every invalid document projection in one fail-closed preflight
+ test/serialized-evidence-boundary.test.ts > serialized evidence credential and raw payload boundary > keeps fixtures, replay summaries, and output-store writes credential-free
+
+Detailed local logs (gitignored): .test-artifacts/{postgres-final-full.log,
+correction-verified.log,unit-final-full.log,typecheck-final.log,build-final.log}.
+
+Final focused command:
+ERP_FINANCIALS_EPHEMERAL_ROOT=/opt/handrail/.handrail/codex-runs/39bfc263-46e6-4f63-ac4b-7ae3ebae79e9/tmp node scripts/test-ephemeral-postgres.mjs test/postgres.integration.test.ts -t "payment correction"
+
+ISOLATION VERIFIED {"data_directory":"/opt/handrail/.handrail/codex-runs/39bfc263-46e6-4f63-ac4b-7ae3ebae79e9/tmp/epg-zp8dCC/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+EPHEMERAL POSTGRES REMOVED

@@ -1140,3 +1140,6 @@ export { VENDOR_BILL_LINE_CUSTOMERS_SUPPORTED } from "./erp-financials-service.j
 export { planQuickBooksCommercialDetail, QUICKBOOKS_COMMERCIAL_DETAIL_VERSION, QuickBooksCommercialDetailError, type QuickBooksCommercialReferences, type QuickBooksCommercialDetailPlan } from "./quickbooks-commercial-detail.js";
 
 export { previewQuickBooksCommercialBackfill, type QuickBooksCommercialBackfillInput, type QuickBooksCommercialBackfillDocument } from "./quickbooks-commercial-backfill.js";
+
+export type { ImportedCustomerPaymentEvidence, CustomerPaymentCorrectionRequest, CustomerPaymentCorrectionGuard, CustomerPaymentCorrectionPreview, VoidAndUnapplyCustomerPaymentInput, VoidAndUnapplyCustomerPaymentResult } from "./customer-payment-correction.js";
+export { persistImportedCustomerPaymentEvidence, assertCustomerPaymentCorrectionImportAllowed, lockCustomerPaymentCorrectionSource } from "./customer-payment-correction.js";

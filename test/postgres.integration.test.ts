@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { Pool } from "pg";
 
 import {
+  persistImportedCustomerPaymentEvidence,
   POSTGRES_CANONICAL_SCHEMA_MANIFEST,
   createErpFinancials,
   createTransferReversalApprovalChecksum,
@@ -15,6 +16,7 @@ import {
 } from "../src/index.js";
 
 import type {
+  CustomerPaymentCorrectionGuard,
   CanonicalAccountingFactSet,
   CreateVendorBillInput,
   CreateErpFinancialsInput,
@@ -43,6 +45,240 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
   afterAll(async () => {
     await pool.query('drop schema if exists "erp_financials" cascade');
     await pool.end();
+  });
+
+  async function correctionFixture(guardOverride?: CustomerPaymentCorrectionGuard) {
+    await migratePostgresSchema(runner, {appliedByRef:"synthetic:payment-correction"});
+    await seedQuickBooksImportScope(pool);
+    await pool.query<Record<string, unknown>>(`insert into erp_financials.accounts(account_id,tenant_id,source_id,source_account_id,name,type,classification,active)
+      values('account_ar_qbo','tenant_qbo','source_qbo','ar','A/R','AccountsReceivable','asset',true);
+      update erp_financials.transactions set transaction_date=case when source_transaction_type='Invoice' then '2025-07-01'::date else '2025-07-03'::date end;
+      insert into erp_financials.transactions(transaction_id,tenant_id,source_id,source_transaction_id,source_transaction_type,transaction_date,party_id,currency_code,status,source_payload_ref)
+      values('payment_accrual','tenant_qbo','source_qbo','basis:payment:accrual','PaymentBasis','2025-07-03','customer_qbo','USD','posted','{"sourceObjectType":"Payment","sourceObjectId":"payment_700"}'),
+            ('payment_cash','tenant_qbo','source_qbo','basis:payment:cash','PaymentBasis','2025-07-03','customer_qbo','USD','posted','{"sourceObjectType":"Payment","sourceObjectId":"payment_700"}');`);
+    for(const [tx,basis,debit,credit] of [
+      ['transaction_invoice_qbo','accrual','account_ar_qbo','account_revenue_qbo'],
+      ['payment_accrual','accrual','account_cash_qbo','account_ar_qbo'],
+      ['payment_cash','cash','account_cash_qbo','account_revenue_qbo']
+    ] as const) for(const [side,account] of [['debit',debit],['credit',credit]] as const) {
+      await pool.query<Record<string, unknown>>(`insert into erp_financials.ledger_postings(posting_id,tenant_id,source_id,source_posting_id,transaction_id,account_id,party_id,posting_date,accounting_basis,debit_amount,credit_amount,net_amount,currency_code,dimension_hash,dimension_refs,import_batch_id)
+        values($1,'tenant_qbo','source_qbo',$1,$2,$3,'customer_qbo',$4,$5,$6,$7,$8,'USD',repeat('a',64),'[]','batch_qbo')`,
+        [`${tx}:${side}`,tx,account,tx==='transaction_invoice_qbo'?'2025-07-01':'2025-07-03',basis,side==='debit'?'27.56':'0.00',side==='credit'?'27.56':'0.00',side==='debit'?'27.56':'-27.56']);
+    }
+    const sourceVersion='2025-07-03T12:00:00.000Z';
+    const resources=quickBooksSubledgerResources('27.56',true,sourceVersion);
+    const documents=(resources.operationalDocuments ?? []).map(r=>({...r,resource:{...r.resource,
+      transactionDate:r.resource.sourceTransactionType==='Invoice'?'2025-07-01':'2025-07-03',
+      ...(r.resource.sourceTransactionType==='Invoice'?{transactionNumber:'1396',totalAmount:'27.56',openAmount:'0.00',lines:r.resource.lines.map(l=>({...l,sourceAmount:'27.56',sourceQuantity:'1.00',sourceUnitAmount:'27.56'}))}:{})}}));
+    await runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:quickBooksSubledgerFacts(),resources:{...resources,operationalDocuments:documents}}));
+    const docs=(await pool.query<Record<string, unknown>>(`select * from erp_financials.subledger_documents order by document_type`)).rows;
+    const payment=docs.find(d=>d.document_type==='customer_payment');const invoice=docs.find(d=>d.document_type==='invoice');
+    if(!payment||!invoice) throw Error('Fixture missing documents');
+    const evidence={paymentId:String(payment.subledger_document_id),sourceVersion,sourceTransactionId:'payment_700',bookId:null,transactionIds:['transaction_payment_qbo','payment_accrual','payment_cash'],provenanceRef:'synthetic:normalized-complete'};
+    await runner.transaction(client=>persistImportedCustomerPaymentEvidence(client,{tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo'},evidence));
+    const guard:CustomerPaymentCorrectionGuard=guardOverride ?? (input=>{
+      if(input.phase==='confirm' && (!input.confirmation || input.approvalRef!=='approval:synthetic')) throw Error('Approval not bound');
+      return Promise.resolve({authorized:true,complete:true,version:'app-guards:1',deposited:false,reconciled:false,refunded:false});
+    });
+    const service=createErpFinancials({database:runner,tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo',currencyCode:'USD',customerPaymentCorrectionGuard:guard,now:()=> '2026-08-12T12:00:00.000Z'});
+    const period=await service.fiscalPeriods.define({operation:sdkOperation(),fiscalYear:2025,periodNumber:7,periodStart:'2025-07-01',periodEnd:'2025-07-31'});
+    const request={paymentId:evidence.paymentId,date:'2025-07-04',idempotencyKey:'synthetic:correct',operation:{...sdkOperation(),reasonDetail:'Remove synthetic phantom imported payment'}};
+    const input={...request,confirmation:(await service.customerPayments.previewVoidAndUnapply(request)).confirmation,approvalRef:'approval:synthetic'};
+    return {service,input,invoiceId:String(invoice.subledger_document_id),evidence,period,resources:{...resources,operationalDocuments:documents}};
+  }
+
+  it('payment correction synthetic 27.56 preserves both bases, retires phantom and applies existing PAYMENT credit',async()=>{
+    const f=await correctionFixture();
+    const credit=await f.service.customerPayments.record({operation:sdkOperation(),idempotencyKey:'real-payment',date:'2025-07-02',customerId:'customer_qbo',amount:'84.81',cashAccount:{accountId:'account_cash_qbo'},receivableAccount:{accountId:'account_ar_qbo'}});
+    const before=await pool.query<Record<string, unknown>>(`select * from erp_financials.ledger_postings order by posting_id`);
+    const result=await f.service.customerPayments.voidAndUnapply(f.input);
+    expect(result.status).toBe('voided');expect(result.reversalTransactionIds).toHaveLength(2);
+    for (const originalTransactionId of result.reversalTransactionIds) {
+      await expect(f.service.journalEntries.reverse({...f.input, originalTransactionId, idempotencyKey:`forbidden:${originalTransactionId}`})).rejects.toThrow("not an allowed lifecycle journal");
+    }
+    expect((await pool.query<Record<string, unknown>>(`select * from erp_financials.ledger_postings order by posting_id`)).rows).toEqual(expect.arrayContaining(before.rows));
+    const state=(await pool.query<Record<string, unknown>>(`select subledger_document_id,open_amount,status from erp_financials.subledger_documents`)).rows;
+    expect(state.find(r=>r.subledger_document_id===f.input.paymentId)).toMatchObject({open_amount:'0',status:'voided'});
+    expect(state.find(r=>r.subledger_document_id===f.invoiceId)).toMatchObject({open_amount:'27.56',status:'open'});
+    expect((await pool.query<Record<string, unknown>>(`select sum(net_amount)::text net from erp_financials.ledger_postings where account_id='account_ar_qbo' and accounting_basis='accrual'`)).rows[0]?.net).toBe('-57.25');
+    await f.service.paymentApplications.apply({operation:sdkOperation(),idempotencyKey:'apply-real-payment',applicationType:'customer_payment_to_invoice',sourceDocumentId:credit.documentId,targetDocumentId:f.invoiceId,amount:'27.56',applicationDate:'2025-07-04',expectedSourceVersion:credit.version,expectedTargetVersion:Number((await pool.query<Record<string, unknown>>('select version from erp_financials.subledger_documents where subledger_document_id=$1',[f.invoiceId])).rows[0]?.version)});
+    const after=(await pool.query<Record<string, unknown>>(`select subledger_document_id,open_amount,status from erp_financials.subledger_documents`)).rows;
+    expect(after.find(r=>r.subledger_document_id===credit.documentId)).toMatchObject({open_amount:'57.25',status:'partially_applied'});
+    expect(after.find(r=>r.subledger_document_id===f.invoiceId)).toMatchObject({open_amount:'0.00',status:'settled'});
+    const balances=(await pool.query<Record<string, unknown>>(`select accounting_basis,account_id,sum(net_amount)::text net from erp_financials.ledger_postings group by accounting_basis,account_id order by accounting_basis,account_id`)).rows;
+    for(const basis of ['accrual','cash']) expect(balances.filter(r=>r.accounting_basis===basis).map(r=>[r.account_id,r.net])).toEqual([['account_ar_qbo','-57.25'],['account_cash_qbo','84.81'],['account_revenue_qbo','-27.56']]);
+    expect((await f.service.customerPayments.voidAndUnapply(f.input)).status).toBe('already_voided');
+    expect((await pool.query<Record<string, unknown>>('select * from erp_financials.customer_payment_corrections')).rows).toHaveLength(1);
+  });
+
+  it('payment correction concurrent confirmations commit exactly once and different keys fail',async()=>{
+    const f=await correctionFixture();
+    const results=await Promise.all([f.service.customerPayments.voidAndUnapply(f.input),f.service.customerPayments.voidAndUnapply(f.input)]);
+    expect(results.map(r=>r.status).sort()).toEqual(['already_voided','voided']);
+    await expect(f.service.customerPayments.voidAndUnapply({...f.input,idempotencyKey:'other'})).rejects.toMatchObject({code:'idempotency_conflict'});
+    await expect(f.service.customerPayments.voidAndUnapply({...f.input,operation:{...f.input.operation,actorRef:'other'}})).rejects.toMatchObject({code:'idempotency_conflict'});
+  });
+
+  it.each(['payment','invoice','application','posting','source','book','omitted-basis','omitted-application','cash-missing'])('payment correction rejects stale/incomplete %s evidence without writes',async(change)=>{
+    const f=await correctionFixture();
+    if(change==='payment'||change==='invoice') await runner.transaction(async c=>{await c.query("select set_config('erp_financials.application_balance_update','on',true)");await c.query('update erp_financials.subledger_documents set version=version+1 where subledger_document_id=$1',[change==='payment'?f.input.paymentId:f.invoiceId]);});
+    if(change==='application') await runner.transaction(c=>c.query("update erp_financials.subledger_applications set status='voided',version=version+1,ended_event_id=applied_event_id"));
+    if(change==='posting') await pool.query<Record<string, unknown>>("update erp_financials.ledger_postings set dimension_hash=repeat('b',64) where transaction_id='payment_cash'");
+    if(change==='source') await pool.query<Record<string, unknown>>("update erp_financials.imported_customer_payment_evidence set source_version='stale'");
+    if(change==='book') await pool.query<Record<string, unknown>>("update erp_financials.imported_customer_payment_evidence set evidence=jsonb_set(evidence,'{bookId}','\"other\"')");
+    if(change==='omitted-basis') await pool.query<Record<string, unknown>>("update erp_financials.imported_customer_payment_evidence set evidence=jsonb_set(evidence,'{transactionIds}','[\"transaction_payment_qbo\",\"payment_accrual\"]')");
+    if(change==='cash-missing') await pool.query<Record<string, unknown>>("delete from erp_financials.ledger_postings where transaction_id='payment_cash'");
+    if(change==='omitted-application') await runner.transaction(async c=>{await c.query("update erp_financials.subledger_applications set status='voided',version=version+1,ended_event_id=applied_event_id");await c.query("select set_config('erp_financials.application_balance_update','on',true)");await c.query("update erp_financials.subledger_documents set open_amount=0,status='settled' where subledger_document_id=$1",[f.input.paymentId]);});
+    const before=await depositDatabaseState(pool);
+    await expect(f.service.customerPayments.voidAndUnapply(f.input)).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(['authorized','complete','deposited','reconciled','refunded'])('payment correction denies app guard %s and rollback is exact',async(field)=>{
+    let denied=false;
+    const f=await correctionFixture(()=>Promise.resolve({authorized:!(denied&&field==='authorized'),complete:!(denied&&field==='complete'),version:'v1',deposited:denied&&field==='deposited',reconciled:denied&&field==='reconciled',refunded:denied&&field==='refunded'}));
+    denied=true;const before=await depositDatabaseState(pool);
+    await expect(f.service.customerPayments.voidAndUnapply(f.input)).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it('payment correction rolls back compensation, applications, audit and outbox after a late failure',async()=>{
+    const f=await correctionFixture();
+    await pool.query<Record<string, unknown>>(`create function erp_financials.fail_correction_test() returns trigger language plpgsql as $$ begin raise exception 'injected late failure'; end $$;
+      create trigger fail_correction_test before insert on erp_financials.customer_payment_corrections for each row execute function erp_financials.fail_correction_test()`);
+    const before=await depositDatabaseState(pool);
+    await expect(f.service.customerPayments.voidAndUnapply(f.input)).rejects.toThrow('injected late failure');
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(['upsert','deleted','full-replace','direct-postings','direct-transaction','reset'])('payment correction tombstone rejects delayed provider %s',async(action)=>{
+    const f=await correctionFixture();await f.service.customerPayments.voidAndUnapply(f.input);
+    const before=await depositDatabaseState(pool);
+    const replay=()=>runner.transaction(async client=>{
+      if(action==='direct-postings') return client.query("delete from erp_financials.ledger_postings where transaction_id='payment_accrual'");
+      if(action==='direct-transaction') return client.query("update erp_financials.transactions set memo='provider replay' where transaction_id='payment_cash'");
+      if(action==='reset') return resetSourceImportState(client,{tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo'});
+      return persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:quickBooksSubledgerFacts(),replaceMissingDocuments:action==='full-replace',resources:{...f.resources,operationalDocuments:action==='full-replace'?[]:f.resources.operationalDocuments.map(r=>({...r,...(action==='deleted'?{syncAction:'deleted' as const}:{})}))}});
+    });
+    await expect(replay()).rejects.toThrow();expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(['sync','period-close','application','deposit'])('payment correction locks/revalidates concurrent %s winner from another connection',async(kind)=>{
+    const f=await correctionFixture();
+    const blocker=await pool.connect();
+    try {
+      await blocker.query('begin');
+      if(kind==='period-close') {
+        await blocker.query("select pg_advisory_xact_lock(hashtextextended('fiscal-period:tenant_qbo:company_qbo:source_qbo',0))");
+        await blocker.query("update erp_financials.fiscal_periods set status='closing',version=version+1");
+      } else {
+        await blocker.query("select pg_advisory_xact_lock(hashtextextended('payment-correction:tenant_qbo:source_qbo',0))");
+        if(kind==='sync') await blocker.query("update erp_financials.transactions set memo='new provider version' where transaction_id='payment_cash'");
+        if(kind==='application') await blocker.query("update erp_financials.subledger_applications set status='voided',version=version+1,ended_event_id=applied_event_id");
+        if(kind==='deposit') {await blocker.query("select set_config('erp_financials.application_balance_update','on',true)");await blocker.query("update erp_financials.subledger_documents set metadata=metadata||'{\"customerPaymentProvenance\":{\"deposit\":{\"depositId\":\"synthetic-deposit\"}}}'::jsonb where subledger_document_id=$1",[f.input.paymentId]);}
+      }
+      const pending=f.service.customerPayments.voidAndUnapply(f.input).then(()=> 'committed',()=> 'rejected');
+      // Observe a real PostgreSQL lock waiter, not a timing-only assertion.
+      let waiting=false;
+      for(let i=0;i<100;i++) {const r=await pool.query<Record<string, unknown>>("select 1 from pg_stat_activity where datname=current_database() and wait_event='advisory'");if(r.rows.length){waiting=true;break;} await new Promise(r=>setTimeout(r,10));}
+      expect(waiting).toBe(true);await blocker.query('commit');expect(await pending).toBe('rejected');
+      expect((await pool.query<Record<string, unknown>>('select * from erp_financials.customer_payment_corrections')).rows).toHaveLength(0);
+    } finally {await blocker.query('rollback');blocker.release();}
+  });
+
+  it('payment correction preview is read-only and rejects an unbound confirmation',async()=>{
+    const f=await correctionFixture();const before=await depositDatabaseState(pool);
+    await f.service.customerPayments.previewVoidAndUnapply(f.input);
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(f.service.customerPayments.voidAndUnapply({...f.input,confirmation:'tampered'})).rejects.toMatchObject({code:'optimistic_concurrency_conflict'});
+    await expect(f.service.customerPayments.voidAndUnapply({...f.input,approvalRef:'wrong-approval'})).rejects.toThrow('Approval not bound');
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it('payment correction handles both bases on one separate transaction and records complete basis links',async()=>{
+    const f=await correctionFixture();
+    await pool.query("update erp_financials.ledger_postings set transaction_id='payment_accrual' where transaction_id='payment_cash'");
+    await pool.query("delete from erp_financials.transactions where transaction_id='payment_cash'");
+    await runner.transaction(client=>persistImportedCustomerPaymentEvidence(client,{tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo'},{...f.evidence,transactionIds:['transaction_payment_qbo','payment_accrual']}));
+    const preview=await f.service.customerPayments.previewVoidAndUnapply(f.input);
+    const result=await f.service.customerPayments.voidAndUnapply({...f.input,confirmation:preview.confirmation});
+    expect(result.basisReversals).toHaveLength(2);
+    expect(result.basisReversals.map(r=>r.originalTransactionIds)).toEqual([['payment_accrual'],['payment_accrual']]);
+    expect((await pool.query('select * from erp_financials.journal_entry_links')).rows).toHaveLength(1);
+  });
+
+  it('payment correction registers evidence through the operational importer and rejects delayed evidence',async()=>{
+    const f=await correctionFixture();
+    await runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:quickBooksSubledgerFacts(),resources:f.resources,paymentCorrectionEvidence:[f.evidence]}));
+    await expect(f.service.customerPayments.previewVoidAndUnapply(f.input)).resolves.toMatchObject({sourceVersion:f.evidence.sourceVersion});
+    await expect(runner.transaction(client=>persistImportedCustomerPaymentEvidence(client,{tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo'},{...f.evidence,sourceVersion:'2025-07-02T12:00:00.000Z'}))).rejects.toThrow('Delayed payment evidence');
+  });
+
+  it.each(['tenant','company','source','book','currency','missing-guard'])('payment correction rejects %s scope or authorization wiring',async(field)=>{
+    const f=await correctionFixture();
+    const overrides:Partial<CreateErpFinancialsInput>=field==='tenant'?{tenantId:'other'}:field==='company'?{companyId:'other'}:field==='source'?{sourceId:'other'}:field==='book'?{bookId:'other'}:field==='currency'?{currencyCode:'EUR'}:{};
+    const service=createErpFinancials({database:runner,tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo',currencyCode:'USD',...(field==='missing-guard'?{}:{customerPaymentCorrectionGuard:()=>Promise.resolve({authorized:true,complete:true,version:'v1',deposited:false,reconciled:false,refunded:false})}),...overrides});
+    const before=await depositDatabaseState(pool);
+    await expect(service.customerPayments.voidAndUnapply(f.input)).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it('payment correction protects a retired payment from later deposit and reapplication writes',async()=>{
+    const f=await correctionFixture();await f.service.customerPayments.voidAndUnapply(f.input);
+    const before=await depositDatabaseState(pool);
+    await expect(runner.transaction(async client=>{
+      await client.query("select set_config('erp_financials.application_balance_update','on',true)");
+      await client.query("update erp_financials.subledger_documents set metadata=metadata||'{\"depositId\":\"late\"}' where subledger_document_id=$1",[f.input.paymentId]);
+    })).rejects.toThrow('customer_payment_corrected_source');
+    await expect(runner.transaction(client=>client.query("update erp_financials.subledger_applications set status='applied',version=version+1,ended_event_id=null where source_document_id=$1",[f.input.paymentId]))).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it('payment correction rejects application-pool clients without an explicit transaction',async()=>{
+    const f=await correctionFixture();
+    await expect(persistImportedCustomerPaymentEvidence(new PgQueryClient(pool),{tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo'},f.evidence)).rejects.toThrow('explicit transaction');
+  });
+
+  it('payment correction wins the source lock against concurrent provider sync without resurrection',async()=>{
+    let entered!:()=>void;let release!:()=>void;
+    const barrier=new Promise<void>(resolve=>{entered=resolve;});
+    const resume=new Promise<void>(resolve=>{release=resolve;});
+    const f=await correctionFixture(async({phase})=>{
+      if(phase==='confirm'){entered();await resume;}
+      return {authorized:true,complete:true,version:'v1',deposited:false,reconciled:false,refunded:false};
+    });
+    const correction=f.service.customerPayments.voidAndUnapply(f.input);
+    await barrier;
+    const sync=runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:quickBooksSubledgerFacts(),resources:f.resources})).then(()=> 'committed',()=> 'rejected');
+    try {
+      let waiting=false;
+      for(let i=0;i<100;i++){if((await pool.query("select 1 from pg_stat_activity where datname=current_database() and wait_event='advisory'")).rows.length){waiting=true;break;}await new Promise(resolve=>setTimeout(resolve,10));}
+      expect(waiting).toBe(true);
+    } finally {release();}
+    expect((await correction).status).toBe('voided');expect(await sync).toBe('rejected');
+    expect((await pool.query<Record<string,unknown>>('select status,open_amount from erp_financials.subledger_documents where subledger_document_id=$1',[f.input.paymentId])).rows[0]).toEqual({status:'voided',open_amount:'0'});
+  });
+
+  it.each(["before", "after"])("payment correction enforces native bank reconciliation %s correction", async timing => {
+    const f = await correctionFixture();
+    if (timing === "after") await f.service.customerPayments.voidAndUnapply(f.input);
+    const sdk = createErpFinancialsSdk({database: runner, tenantId: "tenant_qbo", companyId: "company_qbo", writeSourceId: "source_qbo",
+      bookId: "correction_book", currencyCode: "USD", now: () => "2026-08-12T12:00:00.000Z",
+      customerPaymentCorrectionGuard: () => Promise.resolve({authorized: true, complete: true, version: "v1", deposited: false, reconciled: false, refunded: false})});
+    await sdk.books.define({operation: sdkOperation(), bookId: "correction_book", name: "Synthetic correction", baseCurrencyCode: "USD"});
+    await sdk.books.bindSource({operation: sdkOperation(), bookId: "correction_book", sourceId: "source_qbo", sourceRole: "active", effectiveFrom: "2025-01-01"});
+    const line = await sdk.bankReconciliation.ingest({operation: sdkOperation(), externalLineId: "synthetic-bank-line", bankAccountId: "account_cash_qbo", postedDate: "2025-07-03", amount: "27.56"});
+    const match = () => sdk.bankReconciliation.match({operation: sdkOperation(), bankStatementLineId: line.bankStatementLineId, transactionId: "payment_accrual", expectedVersion: line.version, idempotencyKey: "synthetic-bank-match", method: "manual"});
+    if (timing === "after") {
+      await expect(match()).rejects.toThrow("customer_payment_corrected_source");
+    } else {
+      await runner.transaction(client => persistImportedCustomerPaymentEvidence(client, {tenantId: "tenant_qbo", companyId: "company_qbo", sourceId: "source_qbo"}, {...f.evidence, bookId: "correction_book"}));
+      const preview = await sdk.commands.customerPayments.previewVoidAndUnapply(f.input);
+      await match();
+      const before = await depositDatabaseState(pool);
+      await expect(sdk.commands.customerPayments.voidAndUnapply({...f.input, confirmation: preview.confirmation})).rejects.toThrow("Reconciled payment");
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
   });
 
   async function depositFixture(bookId?: string) {
@@ -2305,7 +2541,7 @@ where subledger_document_id = $1`, [original.documentId]);
         expectedVersion: 1 })).rejects.toThrow("must remain an active posting account");
       const upgraded = await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade" });
       expect(upgraded.currentVersion).toBe(upgrade);
-      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 24, toVersion: 25 });
+      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 25, toVersion: 26 });
       expect(await history()).toEqual(before);
       expect((await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade-replay" })).applied).toEqual([]);
     }

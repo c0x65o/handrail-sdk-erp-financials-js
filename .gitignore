@@ -10,3 +10,5 @@ dist/
 coverage/
 .vitest/
 npm-debug.log*
+
+.test-artifacts/

@@ -100,6 +100,7 @@ function handlerFor(
   if (event.eventType.startsWith("payment_match.") || event.eventType.startsWith("subledger_application.") ||
     [
       "subledger_document.customer_payment.posted",
+      "subledger_document.customer_payment.voided",
       "subledger_document.bill_payment.posted",
       "subledger_document.deposit.posted",
       "subledger_document.transfer.posted"
