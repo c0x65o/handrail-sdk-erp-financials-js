@@ -1,0 +1,103 @@
+Payment-correction release conflict repair handoff
+
+Work request: 5f8df7af-5fec-4d05-8947-336511e44f7f
+Validated reconciliation: f460a01e-a3e0-4b90-9c57-fd52612a1512
+Reported auto-commit operation: 4e3d12f4-eb18-4a6f-b504-1d3ae53e02eb
+
+Observed remote state (2026-10-04 UTC)
+
+Public repository: https://github.com/c0x65o/handrail-sdk-erp-financials-js.git
+Local main and remote refs/heads/main:
+  8186b6626522e04abd497312784e25b47508686a
+Local and remote refs/tags/v0.3.57:
+  9ee2675fa17fa3ef577241eae573a819ef901385
+Remote refs/heads/feature/report-snapshot-totals-repair:
+  9ee2675fa17fa3ef577241eae573a819ef901385
+
+The correction commit reached remote main despite the reported push failure.
+The v0.3.57 tag belongs to a different history. Do not retry that tag push or
+force, delete, move, or overwrite either history. No merge or history rewrite
+is needed for this bounded release repair; continue from correction main.
+
+Next release selection
+
+The checkout's package.json, package-lock.json version, and lockfile root package
+version all agree at 0.3.57. Inspection of local and remote tags found v0.3.58
+unused: 0.3.58 is the next valid patch under the existing three-component version
+convention. The historical v0.3.55.1 tag is not a valid three-component patch.
+
+The queued worker instruction reserves version bump, commit, and push for
+Handrail's post-agent auto-commit step. Therefore this worker leaves this handoff
+uncommitted and does not change package versions or create tags. This document
+does not reserve v0.3.58 or assert that the release pipeline has already run.
+
+At execution time the native pipeline must re-read remote branch/tag state and
+local tags, choose the next unused valid patch (currently 0.3.58), and reconcile
+package.json and both package-lock.json root version fields in its new commit.
+If that version has become occupied, select the next unused patch before
+committing; never reuse or overwrite an occupied tag. A successful push exit code
+alone is insufficient: verify the remote branch and matching peeled tag SHA.
+
+Correction behavior and prior receipts
+
+The correction commit message's "source-wide import guards" wording is stale.
+The approved schema 27 behavior is RECORD-SCOPED replay. Corrected Payment and
+dependent facts retain immutable evidence while unrelated records on the same
+source continue importing. There is no permanent source shutdown or resume API.
+Preserve all source, migrations, tests and the historical validation receipt:
+  docs/imported-customer-payment-correction-test-receipt.txt
+That receipt records 631 passing tests, including 151 PostgreSQL tests and all
+48 correction cases, with zero skips. It remains evidence for reconciliation;
+it does not establish publication of the repaired version.
+
+This worker's installation evidence
+
+The already remote-reachable correction commit was installed in a disposable
+consumer at the exact public HTTPS SHA above, with Git credential helpers and
+global/system Git configuration disabled. Ordinary prepare compiled the package.
+The initial npm install succeeded, but the lockfile-policy assertion failed:
+npm 10.9.8 normalized the resolved GitHub URL to git+ssh despite the HTTPS manifest.
+Only that consumer lockfile's resolved URL was corrected to the identical HTTPS
+repository and SHA. A fresh-cache npm ci then passed, preserving the HTTPS pin.
+Manifest dependency, lockfile root dependency, lockfile resolved SHA, installed
+0.3.57 version, and absence of overrides were checked. The existing public API
+smoke passed from the installed dependency: root and /sdk exports, correction
+commands, schema 27, original v26 checksum, and prepare contract. No DB was called.
+
+Workspace logs (gitignored):
+  .test-artifacts/correction-release/public-git-install.log
+  .test-artifacts/correction-release/public-git-https-ci.log
+The first log is the successful install preceding the failed lockfile assertion;
+the second records the correction and successful clean installation verification.
+Temporary consumer, including the verified manifest and lockfile:
+  /opt/handrail/.handrail/codex-runs/c94754ed-f688-4dff-98f1-8251019e0a66/tmp/correction-git-consumer-6smvmocs
+
+This worker's source verification
+
+PASS npm run lint (zero warnings), npm run typecheck, and npm run build.
+PASS npm run test:postgres:isolated -- test, with ERP_FINANCIALS_EPHEMERAL_ROOT
+set to this run's writable temporary directory: 56 files, 631 passing tests,
+zero failures/skips, including 151 PostgreSQL tests and the 48 correction cases.
+Duration: 150.47 seconds. The existing runner enforced maxWorkers=1 and disabled
+file parallelism. PostgreSQL 15.19 was verified Unix-socket-only in a fresh
+disposable data directory; the cluster was stopped and removed afterward.
+Logs: .test-artifacts/correction-release/{lint,typecheck,build,all-tests}.log.
+PASS git diff --check. Source, migrations, tests, original correction receipt,
+package manifest and lockfile remain identical to the correction commit.
+Only this release handoff is left uncommitted for the native pipeline.
+
+Release completion remains owned by the post-agent workflow
+
+After native version/commit/push, return the new full 40-character remote-reachable
+SHA, package version and matching tag, and verify the final checkout is clean.
+Install the final release into a disposable consumer using
+  git+https://github.com/c0x65o/handrail-sdk-erp-financials-js.git#<full-40-character-SHA>
+through ordinary npm install/prepare. Verify the installed version, both public
+exports, correction APIs, schema 27, and exact repository/SHA in consumer manifest
+and lockfile. Never substitute a branch/tag, registry, tarball, file, or workspace
+dependency. The old correction SHA still reports 0.3.57 and has no matching tag;
+an install of that SHA is baseline evidence, not proof of the new release.
+
+No registry publication, app pin, deployment, real-data changes, credential
+changes, or Handrail database/queue mutations belong to this repair. Spartan's
+pin/integration/deployment remains separate parent work after release verification.
