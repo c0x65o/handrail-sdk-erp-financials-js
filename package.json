@@ -1,6 +1,6 @@
 {
   "name": "@handrail/erp-financials",
-  "version": "0.3.58",
+  "version": "0.3.59",
   "description": "Provider-neutral ERP accounting and reporting kernel for canonical facts, journal posting, rollups, snapshots, and report APIs.",
   "type": "module",
   "license": "UNLICENSED",
@@ -31,8 +31,8 @@
     "build": "tsc -p tsconfig.build.json",
     "lint": "eslint . --max-warnings=0",
     "test": "vitest run",
-    "test:postgres:isolated": "node scripts/test-ephemeral-postgres.mjs",
-    "test:postgres": "vitest run test/postgres.integration.test.ts",
+    "test:postgres:isolated": "npm run build && node scripts/test-ephemeral-postgres.mjs",
+    "test:postgres": "npm run build && vitest run test/postgres.integration.test.ts test/imported-credit.postgres.test.ts",
     "contract:smoke": "vitest run test/normalized-quickbooks-contract-smoke.test.ts",
     "health:smoke": "vitest run test/health-contract.test.ts test/install-health.test.ts test/fixture-smoke-health.test.ts test/freshness-drilldown-health.test.ts test/future-erp-install-health-preflight.test.ts",
     "prepare": "npm run build",

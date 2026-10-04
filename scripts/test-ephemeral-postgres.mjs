@@ -28,7 +28,7 @@ try {
   await pool.query('create database erp_financials_test_correction');
   const url = new URL('postgresql:///erp_financials_test_correction'); url.searchParams.set('host', directory); url.searchParams.set('port','55439');
   const args = process.argv.slice(2);
-  const child = spawn(resolve('node_modules/.bin/vitest'), ['run', ...(args.length ? args : ['test/postgres.integration.test.ts']), '--maxWorkers=1', '--no-file-parallelism'], { stdio:'inherit', env:{...process.env, ERP_FINANCIALS_TEST_DATABASE_URL:url.href} });
+  const child = spawn(resolve('node_modules/.bin/vitest'), ['run', ...(args.length ? args : ['test/postgres.integration.test.ts', 'test/imported-credit.postgres.test.ts']), '--maxWorkers=1', '--no-file-parallelism'], { stdio:'inherit', env:{...process.env, ERP_FINANCIALS_TEST_DATABASE_URL:url.href} });
   process.exitCode = await new Promise(r=>child.once('exit', code=>r(code ?? 1)));
 } finally {
   await pool.end();

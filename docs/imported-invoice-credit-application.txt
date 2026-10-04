@@ -1,0 +1,180 @@
+Imported invoice / existing PAYMENT credit integration guidance
+
+Work request cd826e53-d767-46ac-8c48-da8e7b2de493
+Workspace candidate based on 0.3.58 / b09dfc49bc73166b6bc9a47be1381b0e92b3fefc.
+No release/version change, commit, push, app edit, migration, provider call or
+financial record repair is authorized or performed. Parent reviews this candidate,
+commits it, then pins the resulting full HTTPS Git SHA with a matching lockfile.
+No local package/tarball/workspace dependency is an app integration substitute.
+
+Public command contract
+
+Use createErpFinancialsSdk from @handrail/erp-financials/sdk, with server-resolved
+{database,tenantId,companyId,bookId,writeSourceId,currencyCode,
+ customerPaymentCorrectionGuard}. writeSourceId must be the imported documents'
+canonical source. An unrelated native write source cannot act on these documents.
+Root createErpFinancials has the same commands directly, using sourceId instead.
+
+1. sdk.commands.customerPayments.previewVoidAndUnapply(request)
+2. sdk.commands.customerPayments.voidAndUnapply({...request,confirmation,approvalRef})
+3. sdk.commands.paymentApplications.apply({
+     operation, idempotencyKey, applicationType:'customer_payment_to_invoice',
+     sourceDocumentId: existingPaymentDocumentId,
+     targetDocumentId: reopenedInvoiceDocumentId,
+     amount:'27.56', applicationDate:'2025-07-04',
+     expectedSourceVersion: currentCreditVersion,
+     expectedTargetVersion: currentInvoiceVersion
+   })
+
+Use the existing PAYMENT document, original amount 330.72 / available credit
+84.81; do not record a replacement payment or create a CreditMemo. Read the
+invoice's NEW version after correction in the same transaction. Applying credit
+changes canonical applications and their balances, creates the cash recognition
+with provenance, and creates no second accrual A/R change or bank receipt.
+Exact retries use identical commands/keys. A changed version, reason, actor,
+approver, effective date or command needs a new preview and approval.
+
+Approval and authority (app-owned; no self-approval)
+
+FinancialOperationContext is evidence, not authentication or a permissions token.
+The SDK requires actorRef, requestId, correlationId, reasonCode, occurredAt; this
+correction additionally requires nonempty reasonDetail and an approverRef that
+DIFFERS from actorRef. This also applies to preview. The app chooses the intended
+independent approver from trusted workflow context BEFORE generating the preview.
+A preview is not an approval. The eventual approver must review that exact frozen
+request/preview. If the selected approver changes, generate a new preview.
+
+Keep the preparer's actorRef on confirmation. Authenticate the confirming session
+as the designated approver (or a trusted executor of their recorded decision);
+verify that in the guard. Do not replace actorRef with the approver's identity,
+and never set approverRef=actorRef just to pass gateway defaults. Separate
+preview capability, confirm capability, and the immutable human approval record.
+The app's public gateway must forward/reconstruct this stored operation unchanged;
+browser-provided approverRef or confirmation alone grants no authority.
+
+Store the exact request, returned preview and confirmation hash, full scope,
+preparer, designated independent approver, approval decision and approvalRef in
+an immutable approved record. Show both bases, affected invoices, date, reason,
+amounts and preserve_corrected_payment provider dependency to the approver.
+Do not silently regenerate the request at confirm time with a new timestamp.
+The confirmation binds request, scope/book, source version, transactions/postings,
+all payment/invoice application rows and versions, and guard evidence version.
+Stale confirmation must lead to a new reviewed preview; never auto-approve it.
+
+customerPaymentCorrectionGuard receives the SAME explicit transaction client,
+phase ('preview' or 'confirm'), scope, request, confirmation and approvalRef.
+Use that client to lock app authority, approval, deposit, reconciliation and
+refund evidence. On confirm, match the approved record to the entire exact
+request, scope, hash, actor and approver; verify independent human authority.
+Return authorized,complete,version,deposited,reconciled,refunded. All fields are
+mandatory. Only authorized=true, complete=true, and all associations=false pass.
+The version represents stable permission/association evidence, not the mere
+insertion of the approval record after preview. Change it when relevant authority
+or financial associations change. Check approval state separately. Authorization
+is rechecked even on exact correction replay. The hash is not a secret or an
+approval. Missing guard or evidence fails closed.
+
+Transaction composition and lock order
+
+The app owns begin/commit/rollback. Supply a runner whose transaction(callback)
+uses one pg client for all statements. Never wrap pool.query as if it were a
+transaction-bound client. To compose already-authorized prerequisites and SDK
+commands atomically, use this pattern inside the app's outer transaction:
+
+  await lockCustomerPaymentCorrectionSource(client, tenantId, sourceId);
+  const boundDatabase = { transaction: work => work(client) };
+  const txSdk = createErpFinancialsSdk({...trustedScope,
+    database:boundDatabase, customerPaymentCorrectionGuard});
+  // Lock/read app permission and immutable independent approval evidence here.
+  // Persist a legitimate externally approved decision if necessary, using client.
+  // Define required fiscal periods only with the app's accounting authority,
+  // through txSdk.commands.fiscalPeriods.define; never reopen a closed period
+  // or invent an open period as an authorization bypass.
+  const correction = await txSdk.commands.customerPayments.voidAndUnapply(input);
+  // Read current document IDs/versions using this SAME client or bound SDK queries.
+  const applied = await txSdk.commands.paymentApplications.apply(application);
+  // The outer transaction commits both, or rolls back EVERYTHING on error.
+
+The guard itself can perform legitimate app prerequisites on its supplied client;
+it cannot mint its own independent approval. Preview remains a read-only SDK
+operation, and its guard should only read/lock. The integration tests prove
+approval insertion visible in the confirming transaction, full correction plus
+application commit, and exact rollback including approval/audit/outbox/postings.
+Use the same bound runner for transactional preview prerequisites if needed.
+
+Acquire source advisory lock BEFORE any app/SDK row locks; SDK correction then
+acquires the fiscal lock, then evidence/document/application/posting locks. The
+native apply/unapply commands now also acquire the source lock before their own
+locks. Every app deposit/refund/reconciliation/authority writer must cooperate
+with this lock and check the corrected payment identity before mutation. All
+locks last through the OUTER commit, not the nested SDK method return. A competing
+application or correction waits, then revalidates state/versions. Retry deadlocks
+or serialization errors only by rolling back the entire transaction. External
+systems outside this lock need a durable app fence or complete=false.
+
+Canonical import prerequisites and supported accounting shape
+
+Use public mapHandrailQuickBooksSdkResourcesToCanonicalFacts,
+persistCanonicalFacts(createPostgresStorageAdapter(client), facts), and
+persistQuickBooksSubledgerResources on the same explicit client for normalized
+headers/documents/applications. The public materializeQuickBooksBasisBackfill and
+createPostgresQuickBooksDualBasisBackfillPersistence handle separate basis facts.
+Safe refs identify the exact sourceObjectType ('Invoice'/'Payment') and original
+sourceObjectId. Basis transaction IDs need not equal document header IDs. A date,
+amount, memo, invoice number or report reference is not object identity.
+
+Register complete imported phantom-payment correction evidence via
+persistImportedCustomerPaymentEvidence (or paymentCorrectionEvidence in the
+operational importer) only AFTER ledger and subledger persistence. Include the
+header and ALL basis transaction IDs, exact normalized sourceUpdatedAt version,
+bookId and safe provenanceRef. Older basis headers with no party_id qualify only
+when exact object identity and ALL their posting parties prove the same customer.
+The basis importer now preserves a header party when every row agrees on its
+mapped party. No backfill or direct row patch is needed to accept existing rows.
+
+For the newly supported separate-invoice-basis path, require one complete balanced
+accrual invoice journal, with invoice amount, currency, exact identity and customer
+matching its canonical document. Multiple accrual journals, missing postings,
+wrong parties/currencies, or reversed journals fail closed. Source PAYMENT
+journals must be complete for both bases and its remaining credit must be
+represented as cash-basis A/R credit (after earlier native applications). If
+unallocated cash was already classified as income, the SDK refuses to recognize
+it again: reconcile normalized provider allocation evidence first. Do not fabricate
+A/R postings or hardcode the remaining balance to satisfy this check. The SDK
+cannot infer an unapplied-income reclassification from totals alone.
+
+The new native cash postings live on the invoice header, retain the original
+basis source posting identity/SafeSourcePayloadRef, and are linked by application
+identity and transactional lifecycle/outbox. Imported accrual postings remain
+unchanged on their actual basis transaction. No fake accrual header posting,
+journal-only bypass, or copied SDK accounting implementation is required in app.
+
+Replay lifetime
+
+The corrected Payment remains permanently record-scoped, preserving all originals,
+compensation, ended applications and source version. Provider replay still returns
+provider_dependency for that Payment, including newer deletions; no source-wide
+freeze, resume API or automatic convergence claim is introduced. Both supported
+persistence paths retain the corrected invoice's separate basis transactions on
+omission, as well as its native cash application postings. Incoming provider
+Balance cannot reclose a corrected invoice; incoming UnappliedAmt is reduced by
+active native applications, so the 57.25 credit cannot reset to 84.81. Contradictory
+snapshots that overconsume balances fail transactionally. This is not provider
+writeback or a license to treat a successful unrelated sync as reconciliation.
+
+Evidence/access boundary
+
+All new accounting fixtures are synthetic and created by public normalized
+mappers/importers. Tests consume built package root and /sdk exports. The five
+requested Spartan files under
+/opt/handrail/repos/spartan-cyber-services/spartan-cyber-erp-v3/spartan-cyber-services-spartan-cyber-erp-v3
+were each unavailable with 'No such file or directory':
+  tests/imported-payment-sdk-postgres.test.ts
+  tests/support/imported-payment-replay-fixture.ts
+  artifacts/imported-payment-correction-qualification.json
+  artifacts/imported-payment-correction-test-results.json
+  docs/imported-payment-correction-runbook.txt
+No other app paths were inspected; no app files were changed. Real PostgreSQL
+SDK public-consumer validation substitutes for missing app evidence, not for an
+actual Spartan gateway run. Parent must rerun that app gateway after pinning the
+reviewed resulting Git SHA. See imported-invoice-credit-test-receipt.txt for checks.

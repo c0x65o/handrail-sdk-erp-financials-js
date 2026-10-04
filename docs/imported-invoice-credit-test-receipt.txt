@@ -1,0 +1,125 @@
+Imported invoice credit application: execution receipt
+
+WR cd826e53-d767-46ac-8c48-da8e7b2de493
+Base: @handrail/erp-financials 0.3.58,
+b09dfc49bc73166b6bc9a47be1381b0e92b3fefc (clean starting workspace).
+Validation date: 2026-10-03 America/Chicago / 2026-10-04 UTC.
+Workspace only. No commit, push, release, deploy, app edits, real records,
+provider requests, shared DB access, credentials changes or Handrail state writes.
+Handrail current context successfully verified the active work request.
+
+Reproduction and repair
+
+The public-importer synthetic fixture reproduced on real PostgreSQL:
+1. Original basis producer omitted transaction party_id although all detailed
+   posting parties identified the customer. Correction failed with
+   'Basis transaction lacks exact Payment provenance'.
+2. After fixing producer party attribution, the complete correction succeeded;
+   applying the imported existing PAYMENT failed with
+   'Cash-basis projection requires accrual postings'. This is the reported
+   separate-invoice-basis contract gap, not a missing invoice accrual journal.
+3. Regression expansion caught omitted range snapshots deleting the separately
+   imported invoice journal. Both range and full omission retention now include
+   that exact invoice identity; unrelated records remain outside the fence.
+4. Regression expansion caught normal provider UnappliedAmt replay resetting the
+   existing payment's credit from 57.25 to 84.81 after native application. Native
+   application overlays now survive that snapshot without duplicate ledger facts.
+
+No original tests were removed or weakened. No migration/schema change. The SDK
+resolves exact imported invoice journal identity; preserves legacy basis party
+provenance when postings unanimously prove it; creates only native cash
+application recognition; acquires the source lock before native application
+row locks; and preserves record-scoped replay accounting. Missing source credit
+cash evidence or already-recognized cash income fails closed to prevent double
+recognition. Details and host prerequisites: imported-invoice-credit-application.txt.
+
+Accounting proved (synthetic, public package / real PostgreSQL)
+
+Invoice number 1396, July 1 2025, 27.56; phantom Payment July 3, 27.56.
+Separate header, accrual and cash transactions generated from normalized inputs.
+Another imported PAYMENT has original amount 330.72, prior canonical application
+245.91, and available credit 84.81. This is not a CreditMemo or a new 84.81 payment.
+
+Supported voidAndUnapply reopens invoice 27.56, voids/zeros phantom payment,
+ends its original application and removes Undeposited Funds 27.56 on both bases.
+Accrual net A/R moves from -84.81 to -57.25 exactly once.
+Supported paymentApplications.apply consumes 27.56 of existing payment credit:
+  invoice open = 0.00 / settled
+  existing PAYMENT remaining credit = 57.25 / partially_applied
+  net A/R = -57.25 (accrual AND cash)
+  bank = 330.72 (accrual AND cash; no second receipt)
+  revenue = -273.47 (245.91 prior invoice + 27.56 current invoice, both bases)
+  Undeposited Funds = 0.00 (both bases)
+Original postings remain intact; new native cash facts retain provider object
+and original basis posting provenance. Exact correction/application retries write
+nothing. Both public import paths preserve final balances. Unapply reverses only
+native recognition and restores 84.81 credit. Independent approval, stale versions,
+closed fiscal periods, authorization/approval binding, deposit/reconciliation/
+refund gates, conflicting applications, both application/correction winners,
+source-lock lifetime, and whole-transaction rollback are tested.
+
+Executed commands and results
+
+ERP_FINANCIALS_EPHEMERAL_ROOT=<run tmp>
+  npm run test:postgres:isolated -- test --reporter=default --reporter=json
+    --outputFile=.test-artifacts/imported-credit-full.json
+  PASS: 57 files, 665 tests, 0 failures, 0 skipped, 174.43 seconds.
+  All original 631 remain passing, including all 48 original correction tests.
+  151 original real-PostgreSQL tests + 34 new public-consumer PostgreSQL tests
+  + 480 other existing tests. One worker, no file parallelism.
+
+After clean install and extending the omission test to exercise full replacement
+as well as range omission (no production source changes after the full run):
+  npm run test:postgres:isolated -- test/imported-credit.postgres.test.ts
+    --reporter=default --reporter=json
+    --outputFile=.test-artifacts/imported-credit-public-final.json
+  PASS: all 34 regression tests, 0 failures/skips, 26.28 seconds.
+
+npm run lint: PASS, zero warnings.
+npm run typecheck: PASS.
+npm run typecheck:blu-erp-imports: PASS.
+npm run typecheck:core-erp-imports: PASS.
+npm run typecheck:future-erp-imports: PASS.
+npm run build: PASS; also passed through ordinary install prepare and isolated
+  test prebuild. Both declared exports resolve to the built dist entry points.
+Node public API smoke: PASS for root and /sdk imports, correction preview/confirm,
+  apply/unapply command construction, evidence/lock exports, and public importer
+  exports. No DB/provider calls in this construction-only smoke. The PG tests
+  independently execute the built public package commands and importers.
+npm ci --no-audit --no-fund: FAILED exit 127, 'tsc: not found'. The worker has
+  NODE_ENV=production / npm omit=dev, so the source build compiler was omitted.
+npm ci --include=dev --no-audit --no-fund: PASS, 170 packages; normal prepare/build
+  passed. This is source-checkout installation, not a fabricated app dependency.
+Manifest/lock agreement: PASS, version 0.3.58; package-lock unchanged; no Handrail
+  dependency or override added. Parent owns future version/commit and app pin.
+git diff --check: PASS.
+
+Isolation proof
+
+Existing scripts/test-ephemeral-postgres.mjs, PostgreSQL 15.19 (Debian 15.19-0+deb12u1),
+created fresh initdb clusters in the permitted run tmp; no TCP listen address;
+Unix socket only; inet_server_addr() NULL; verified exact private data directory.
+Database name erp_financials_test_correction. ERP_FINANCIALS_TEST_DATABASE_URL was
+constructed by the harness, not obtained from an app/shared environment.
+Full run directory: <run tmp>/epg-yyekct/data.
+Final public run directory: <run tmp>/epg-PESqIY/data.
+Both clusters stopped and removed in harness finally; schema/rows synthetic only.
+
+Artifacts and gates
+
+Machine receipt (all 48 original correction and 34 new test names/statuses,
+final implementation hashes): imported-invoice-credit-test-results.json.
+Full raw Vitest receipts remain in the workspace .test-artifacts paths above.
+
+Each of the five specifically permitted Spartan evidence files returned
+'No such file or directory' (ENOENT). Their exact paths are listed in the
+integration guidance. No access to other app source was attempted. Consequently,
+Spartan's actual public gateway and immutable approval UI/workflow are UNVERIFIED
+here; SDK transaction/approval composition is supported and passed in real PG.
+A fresh consumer install of this uncommitted candidate's Git SHA is not possible
+until the parent reviews and commits it. No forbidden local dependency substitute
+was used. Parent must pin the vetted full public HTTPS Git commit and matching
+lockfile, wire trusted actor/independent approval context, and rerun the app gateway.
+Cash credit already recognized as income or ambiguous/missing source provenance
+remains an explicit failure gate pending legitimate normalized allocation evidence.
+Execution completed for review; this receipt is not acceptance or app shipment.

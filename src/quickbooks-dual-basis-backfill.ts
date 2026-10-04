@@ -227,6 +227,11 @@ export function materializeQuickBooksBasisBackfill(
       sourceObjectId: first.transactionId,
       preview: { providerReportRef: report.providerReportRef }
     };
+    // Preserve a transaction party only when every detailed row identifies the
+    // same mapped party. Never infer it from amounts, dates or document numbers.
+    const rowPartyIds = rows.map(row => row.partySourceId === undefined ? undefined : input.partyIdsBySourceId?.[row.partySourceId]);
+    const partyId = rowPartyIds[0];
+    const transactionPartyId = partyId !== undefined && rowPartyIds.every(id => id === partyId) ? partyId : undefined;
     transactions.push({
       tenantId: input.tenantId,
       sourceId: input.sourceId,
@@ -235,6 +240,7 @@ export function materializeQuickBooksBasisBackfill(
       sourceTransactionType: `QuickBooksGeneralLedger:${first.transactionType}`,
       ...(first.documentNumber === undefined ? {} : { transactionNumber: first.documentNumber }),
       transactionDate: first.transactionDate,
+      ...(transactionPartyId === undefined ? {} : { partyId: transactionPartyId }),
       postedAt: report.generatedAt,
       updatedAt: report.generatedAt,
       currencyCode: report.currencyCode,

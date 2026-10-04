@@ -1,4 +1,4 @@
-import { createCustomerPaymentCorrectionService, type CustomerPaymentCorrectionGuard } from "./customer-payment-correction.js";
+import { createCustomerPaymentCorrectionService, lockCustomerPaymentCorrectionSource, type CustomerPaymentCorrectionGuard } from "./customer-payment-correction.js";
 import { createHash } from "node:crypto";
 
 import { assertValidAccountHierarchy } from "./account-hierarchy.js";
@@ -2587,6 +2587,7 @@ async function applySubledgerPayment(
   assertSubledgerMatchInput(input.match);
   const applicationId = scopedRecordId(context, "subledger_application", input.idempotencyKey);
   return context.database.transaction(async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(
       client,
       `subledger-application:${context.tenantId}:${context.companyId}:${context.sourceId}:${input.sourceDocumentId}:${input.targetDocumentId}`
@@ -2675,6 +2676,7 @@ returning *`,
     }
     const cashBasisPostingIds = await persistCashBasisApplicationProjection(client, context, {
       action: "recognize",
+      sourceDocument: source,
       applicationId,
       applicationType: input.applicationType,
       appliedAmount: amount,
@@ -2708,6 +2710,7 @@ async function endSubledgerApplication(
   assertIsoDate(input.effectiveDate, "effectiveDate");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
   return context.database.transaction(async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(
       client,
       `subledger-application:${context.tenantId}:${context.companyId}:${context.sourceId}:${input.applicationId}`
@@ -2814,6 +2817,7 @@ async function persistCashBasisApplicationProjection(
     readonly appliedAmount: DecimalString;
     readonly effectiveDate: IsoDate;
     readonly targetTransactionId: string;
+    readonly sourceDocument?: Record<string, unknown>;
   }
 ): Promise<readonly string[]> {
   if (!["customer_payment_to_invoice", "bill_payment_to_bill", "customer_refund_against_invoice"].includes(input.applicationType)) return [];
@@ -2829,7 +2833,11 @@ for key share`,
     "import_batch",
     `cash-basis-application:${input.applicationId}:${input.action}`
   );
-  const accrualPostings = result.rows.map(storedLedgerPosting);
+  const accrualPostings = (result.rows.length ? result.rows :
+    await loadImportedDocumentAccrualPostings(client, context, input.targetTransactionId)).map(storedLedgerPosting);
+  if (!result.rows.length && input.sourceDocument !== undefined && input.applicationType === 'customer_payment_to_invoice') {
+    await assertImportedPaymentCashCredit(client, context, input.sourceDocument);
+  }
   const postings = projectCashBasisApplication({
     applicationId: input.applicationId,
     applicationType: input.applicationType as CashBasisApplicationType,
@@ -2855,7 +2863,10 @@ for key share`,
     completedAt: now,
     sourceObjectCounts: { applications: 1, postings: postings.length }
   });
-  await storage.upsertLedgerPostings(postings);
+  // These are new native application facts on the document header. The source
+  // posting identity and payload ref still identify the original basis journal;
+  // no accrual posting or provider transaction is fabricated or moved.
+  await storage.upsertLedgerPostings(postings.map(posting => ({ ...posting, transactionId: input.targetTransactionId })));
   const firstPosting = postings[0];
   if (firstPosting === undefined) throw new Error("Cash-basis projection returned no postings");
   await storage.markReportSnapshotsStaleForPostingChanges({
@@ -2869,6 +2880,91 @@ for key share`,
     currencyCode: firstPosting.currencyCode
   });
   return postings.map((posting) => posting.postingId);
+}
+
+/** A provider cash journal must actually contain the unallocated A/R credit.
+ * Otherwise projecting the invoice could recognize cash income a second time.
+ */
+async function assertImportedPaymentCashCredit(
+  client: PostgresQueryClient, context: ServiceContext, payment: Record<string, unknown>
+): Promise<void> {
+  const metadata = payment.metadata as Record<string, unknown> | undefined;
+  if (metadata?.provider !== 'quickbooks') return;
+  if (metadata.sourceTransactionType !== 'Payment' || typeof metadata.sourceTransactionId !== 'string')
+    throw new ErpFinancialsValidationError('Missing imported Payment identity');
+  const transactions = (await client.query(`select * from erp_financials.transactions
+    where tenant_id=$1 and source_id=$2 and
+      ((source_transaction_type='Payment' and source_transaction_id=$3) or
+       (source_payload_ref->>'sourceObjectType'='Payment' and source_payload_ref->>'sourceObjectId'=$3))
+    order by transaction_id for share`, [context.tenantId,context.sourceId,metadata.sourceTransactionId])).rows;
+  const postings = (await client.query(`select p.*,a.type as account_type from erp_financials.ledger_postings p
+    join erp_financials.accounts a using(tenant_id,source_id,account_id)
+    where p.tenant_id=$1 and p.source_id=$2 and p.transaction_id=any($3::text[]) order by posting_id for share of p,a`,
+    [context.tenantId,context.sourceId,transactions.map(t=>t.transaction_id)])).rows;
+  const original = parsePositiveMoney(payment.original_amount,'original_amount');
+  if (!transactions.some(t=>t.transaction_id===payment.transaction_id) ||
+      transactions.some(t=>t.status!=='posted' || t.currency_code!==payment.currency_code || (t.party_id!==null && t.party_id!==payment.party_id)) ||
+      postings.some(p=>p.currency_code!==payment.currency_code || p.party_id!==payment.party_id || !['accrual','cash'].includes(String(p.accounting_basis))))
+    throw new ErpFinancialsValidationError('Incomplete imported Payment accounting provenance');
+  for (const basis of ['accrual','cash']) {
+    const entries=postings.filter(p=>p.accounting_basis===basis);
+    if(entries.reduce((sum,p)=>sum+parsePositiveOrZeroMoney(p.debit_amount,'debit_amount'),0n)!==original ||
+       entries.reduce((sum,p)=>sum+parsePositiveOrZeroMoney(p.credit_amount,'credit_amount'),0n)!==original)
+      throw new ErpFinancialsValidationError('Incomplete or duplicate imported Payment basis journal');
+  }
+  const arCredit=(basis:string)=>postings.filter(p=>p.accounting_basis===basis && p.account_type==='AccountsReceivable')
+    .reduce((sum,p)=>sum+parsePositiveOrZeroMoney(p.credit_amount,'credit_amount')-parsePositiveOrZeroMoney(p.debit_amount,'debit_amount'),0n);
+  const nativeApplied=(await client.query(`select a.applied_amount from erp_financials.subledger_applications a
+    where a.tenant_id=$1 and a.source_id=$2 and a.source_document_id=$3 and a.status='applied'
+      and exists(select 1 from erp_financials.ledger_postings p where p.tenant_id=a.tenant_id and p.source_id=a.source_id
+        and starts_with(p.source_posting_id,'cash-application:'||a.subledger_application_id||':recognize:'))`,
+    [context.tenantId,context.sourceId,payment.subledger_document_id])).rows
+    .reduce((sum,a)=>sum+parsePositiveMoney(a.applied_amount,'applied_amount'),0n);
+  if(arCredit('accrual')!==original || arCredit('cash')!==parsePositiveOrZeroMoney(payment.open_amount,'open_amount')+nativeApplied)
+    throw new ErpFinancialsValidationError('Imported Payment lacks canonical unallocated cash-basis A/R credit; reconcile provider allocation evidence');
+}
+
+/** Resolve only exact imported object identities, never amount/date/number matches. */
+async function loadImportedDocumentAccrualPostings(
+  client: PostgresQueryClient, context: ServiceContext, headerTransactionId: string
+): Promise<readonly Record<string, unknown>[]> {
+  const header = (await client.query(`select t.*, d.original_amount, d.document_type, d.metadata
+    from erp_financials.transactions t
+    join erp_financials.subledger_documents d using(tenant_id,source_id,transaction_id)
+    join erp_financials.accounting_sources s using(tenant_id,source_id)
+    where t.tenant_id=$1 and t.source_id=$2 and t.transaction_id=$3 and d.company_id=$4
+      and s.source_system='quickbooks'
+    for share of t,d,s`, [context.tenantId, context.sourceId, headerTransactionId, context.companyId])).rows[0];
+  const metadata = header?.metadata as Record<string, unknown> | undefined;
+  if (!header || metadata?.provider !== 'quickbooks' ||
+      !['Invoice','Bill'].includes(String(header.source_transaction_type)) ||
+      metadata.sourceTransactionId !== header.source_transaction_id || metadata.sourceTransactionType !== header.source_transaction_type ||
+      header.status !== 'posted' || header.currency_code !== context.currencyCode || !header.party_id) {
+    throw new ErpFinancialsValidationError('Missing exact imported document accrual provenance');
+  }
+  const transactions = (await client.query(`select * from erp_financials.transactions
+    where tenant_id=$1 and source_id=$2 and transaction_id<>$3
+      and source_payload_ref->>'sourceObjectType'=$4 and source_payload_ref->>'sourceObjectId'=$5
+    order by transaction_id for share`, [context.tenantId,context.sourceId,headerTransactionId,header.source_transaction_type,header.source_transaction_id])).rows;
+  const rows = (await client.query(`select * from erp_financials.ledger_postings
+    where tenant_id=$1 and source_id=$2 and transaction_id=any($3::text[]) and accounting_basis='accrual'
+    order by posting_id for share`, [context.tenantId,context.sourceId,transactions.map(t=>t.transaction_id)])).rows;
+  const ids = unique(rows.map(r=>String(r.transaction_id)));
+  const transaction = transactions.find(t=>t.transaction_id===ids[0]);
+  // One complete journal is supported. Duplicate/split/ambiguous basis journals
+  // must be reconciled by the importer rather than summed or guessed here.
+  if (ids.length !== 1 || !transaction || transaction.status !== 'posted' || transaction.currency_code !== header.currency_code ||
+      (transaction.party_id !== null && transaction.party_id !== header.party_id) ||
+      rows.some(r=>r.currency_code !== header.currency_code || r.party_id !== header.party_id) ||
+      rows.reduce((sum,r)=>sum+parsePositiveOrZeroMoney(r.debit_amount,'debit_amount'),0n) !== parsePositiveMoney(header.original_amount,'original_amount') ||
+      rows.reduce((sum,r)=>sum+parsePositiveOrZeroMoney(r.credit_amount,'credit_amount'),0n) !== parsePositiveMoney(header.original_amount,'original_amount')) {
+    throw new ErpFinancialsValidationError('Incomplete or ambiguous imported document accrual provenance');
+  }
+  const reversed = await client.query(`select 1 from erp_financials.journal_entry_links
+    where tenant_id=$1 and source_id=$2 and original_transaction_id=any($3::text[]) and link_type in ('reversal','void')`,
+    [context.tenantId,context.sourceId,[headerTransactionId,...ids]]);
+  if (reversed.rows.length) throw new ErpFinancialsValidationError('Imported document accrual journal has been reversed');
+  return rows;
 }
 
 async function loadSubledgerDocumentTransactionId(
@@ -2910,6 +3006,7 @@ function storedLedgerPosting(row: Record<string, unknown>): LedgerPosting {
     dimensionHash: storedString(row.dimension_hash, "dimension_hash"),
     dimensionRefs: storedDimensionRefs(row.dimension_refs),
     importBatchId: storedString(row.import_batch_id, "import_batch_id"),
+    ...(row.source_payload_ref == null ? {} : { sourcePayloadRef: storedJson(row.source_payload_ref) as SafeSourcePayloadRef }),
     ...(checkpointId === undefined ? {} : { checkpointId })
   };
 }

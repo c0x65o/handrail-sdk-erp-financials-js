@@ -1,0 +1,382 @@
+{
+  "workRequest": "cd826e53-d767-46ac-8c48-da8e7b2de493",
+  "baseCommit": "b09dfc49bc73166b6bc9a47be1381b0e92b3fefc",
+  "version": "0.3.58",
+  "workspaceOnly": true,
+  "fullSuite": {
+    "passed": 665,
+    "failed": 0,
+    "skipped": 0,
+    "files": 57
+  },
+  "finalPublicPostgresSuite": {
+    "passed": 34,
+    "failed": 0,
+    "skipped": 0,
+    "files": 1
+  },
+  "originalCorrectionTests": [
+    {
+      "test": "payment correction synthetic 27.56 preserves both bases, retires phantom and applies existing PAYMENT credit",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction concurrent confirmations commit exactly once and different keys fail",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects stale/incomplete payment evidence without writes",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects stale/incomplete invoice evidence without writes",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects stale/incomplete application evidence without writes",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects stale/incomplete posting evidence without writes",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects stale/incomplete source evidence without writes",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects stale/incomplete book evidence without writes",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects stale/incomplete omitted-basis evidence without writes",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects stale/incomplete omitted-application evidence without writes",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects stale/incomplete cash-missing evidence without writes",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction denies app guard authorized and rollback is exact",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction denies app guard complete and rollback is exact",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction denies app guard deposited and rollback is exact",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction denies app guard reconciled and rollback is exact",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction denies app guard refunded and rollback is exact",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rolls back compensation, applications, audit and outbox after a late failure",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects direct mutation direct-postings",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects direct mutation direct-transaction",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects direct mutation direct-new-basis",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects direct mutation direct-evidence",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects direct mutation direct-rekey",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects direct mutation reset",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction preserves accounting on provider upsert with a record dependency",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction preserves accounting on provider deleted with a record dependency",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction preserves accounting on provider full-replace with a record dependency",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction upgrades v26 guards without changing existing correction evidence",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction retains original facts through concurrent dual-basis snapshots (legacy refs=false)",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction retains original facts through concurrent dual-basis snapshots (legacy refs=true)",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction concurrent mixed imports preserve both bases while other customers and bounded deltas continue",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction locks/revalidates concurrent sync winner from another connection",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction locks/revalidates concurrent period-close winner from another connection",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction locks/revalidates concurrent application winner from another connection",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction locks/revalidates concurrent deposit winner from another connection",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction preview is read-only and rejects an unbound confirmation",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction handles both bases on one separate transaction and records complete basis links",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction registers evidence through the operational importer and rejects delayed evidence",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects tenant scope or authorization wiring",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects company scope or authorization wiring",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects source scope or authorization wiring",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects book scope or authorization wiring",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects currency scope or authorization wiring",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects missing-guard scope or authorization wiring",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction protects a retired payment from later deposit and reapplication writes",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction rejects application-pool clients without an explicit transaction",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction wins the source lock against concurrent provider sync without resurrection",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction enforces native bank reconciliation before correction",
+      "status": "passed"
+    },
+    {
+      "test": "payment correction enforces native bank reconciliation after correction",
+      "status": "passed"
+    }
+  ],
+  "newRegressionTests": [
+    {
+      "test": "corrects phantom then applies 27.56 from imported PAYMENT 330.72 / remaining 84.81",
+      "status": "passed"
+    },
+    {
+      "test": "accepts older importer basis headers with exact identity and unanimous posting parties",
+      "status": "passed"
+    },
+    {
+      "test": "requires independent approval even for preview: self",
+      "status": "passed"
+    },
+    {
+      "test": "requires independent approval even for preview: missing",
+      "status": "passed"
+    },
+    {
+      "test": "locks and enforces real app-owned authorization evidence",
+      "status": "passed"
+    },
+    {
+      "test": "locks and enforces real app-owned approval evidence",
+      "status": "passed"
+    },
+    {
+      "test": "locks and enforces real app-owned approver evidence",
+      "status": "passed"
+    },
+    {
+      "test": "locks and enforces real app-owned scope evidence",
+      "status": "passed"
+    },
+    {
+      "test": "locks and enforces real app-owned version evidence",
+      "status": "passed"
+    },
+    {
+      "test": "locks and enforces real app-owned deposited evidence",
+      "status": "passed"
+    },
+    {
+      "test": "locks and enforces real app-owned reconciled evidence",
+      "status": "passed"
+    },
+    {
+      "test": "locks and enforces real app-owned refunded evidence",
+      "status": "passed"
+    },
+    {
+      "test": "rejects stale application source version with complete rollback",
+      "status": "passed"
+    },
+    {
+      "test": "rejects stale application target version with complete rollback",
+      "status": "passed"
+    },
+    {
+      "test": "fails closed on missing invoice basis provenance",
+      "status": "passed"
+    },
+    {
+      "test": "fails closed on foreign invoice basis provenance",
+      "status": "passed"
+    },
+    {
+      "test": "fails closed on incomplete invoice basis provenance",
+      "status": "passed"
+    },
+    {
+      "test": "fails closed on duplicate invoice basis provenance",
+      "status": "passed"
+    },
+    {
+      "test": "fails closed on party invoice basis provenance",
+      "status": "passed"
+    },
+    {
+      "test": "fails closed on currency invoice basis provenance",
+      "status": "passed"
+    },
+    {
+      "test": "fails closed on reversed invoice basis provenance",
+      "status": "passed"
+    },
+    {
+      "test": "rejects a closed period for correction",
+      "status": "passed"
+    },
+    {
+      "test": "rejects a closed period for application",
+      "status": "passed"
+    },
+    {
+      "test": "serializes two conflicting existing-credit applications and preserves exact balances",
+      "status": "passed"
+    },
+    {
+      "test": "holds the correction lock through commit and revalidates a waiting application",
+      "status": "passed"
+    },
+    {
+      "test": "supports same-transaction approval prerequisites (caller rollback=false)",
+      "status": "passed"
+    },
+    {
+      "test": "supports same-transaction approval prerequisites (caller rollback=true)",
+      "status": "passed"
+    },
+    {
+      "test": "preserves canonical provenance and reverses only the native cash recognition on unapply",
+      "status": "passed"
+    },
+    {
+      "test": "retains both invoice basis facts and native applications through omitted full/range replays",
+      "status": "passed"
+    },
+    {
+      "test": "refuses imported credit with missing-cash accounting evidence",
+      "status": "passed"
+    },
+    {
+      "test": "refuses imported credit with already-recognized accounting evidence",
+      "status": "passed"
+    },
+    {
+      "test": "serializes competing application/correction of existing credit: application wins",
+      "status": "passed"
+    },
+    {
+      "test": "serializes competing application/correction of existing credit: correction wins",
+      "status": "passed"
+    },
+    {
+      "test": "replays both public import paths after application without resetting balances or cash recognition",
+      "status": "passed"
+    }
+  ],
+  "finalFilesSha256": {
+    "package.json": "f0a80303f21bd372b81dfc1b0a825a936daede276e5367e6c98a4626a480ff14",
+    "scripts/test-ephemeral-postgres.mjs": "2f8a61939cf831fddcaa158cc6b78eeb5db0fa14d220db1d80e4b1230dc72f61",
+    "src/customer-payment-correction.ts": "90d5bbe34f8ccdf241017c93eadfbca4aabe389e03b2a7f11a57385dabc6868a",
+    "src/erp-financials-service.ts": "a495a94c6f0fbac91ab0618d3836fbb2f2520f56f7eefbf718498929d2ee8dd9",
+    "src/postgres-storage.ts": "cb5181aa40b95d5065532e39f87e028c40649e5dcdb1c3e299572ecd95c2a6fd",
+    "src/quickbooks-dual-basis-backfill.ts": "e9b0f29c22e4c542c305b55435548ec279dcd17ea4bf2d55d422fa2a071e99b7",
+    "src/quickbooks-subledger-import.ts": "4978c961ddf18834369e60d1f7746b33eee4a43b1d43cb4ad8c31b4654cb1996",
+    "test/imported-credit.postgres.test.ts": "386e498e914b8837b718b0f4de615e59c627a622b331d65ff12a2bc8b59937d5",
+    "test/support/imported-credit-fixture.ts": "da217e5b8b0e4ba66ee782d5ee32e7929ca3914240b344a1abad5875a76ce745"
+  },
+  "rawReports": [
+    ".test-artifacts/imported-credit-full.json",
+    ".test-artifacts/imported-credit-public-final.json"
+  ],
+  "checks": {
+    "lint": "passed",
+    "typecheck": "passed",
+    "bluConsumerTypecheck": "passed",
+    "coreConsumerTypecheck": "passed",
+    "futureConsumerTypecheck": "passed",
+    "build": "passed",
+    "publicRootAndSdkNodeImport": "passed",
+    "npmCi": "failed: NODE_ENV=production omitted devDependencies; prepare could not find tsc (exit 127)",
+    "npmCiIncludeDev": "passed: 170 packages; prepare/build passed",
+    "manifestLockVersionAgreement": "passed; no dependency or lockfile change"
+  },
+  "limitations": [
+    "Five permitted Spartan evidence files returned ENOENT; no actual Spartan gateway validation",
+    "Candidate consumer Git pin/install awaits parent-reviewed commit; no tarball/file/workspace dependency used",
+    "Cash allocation already recognized as income or incomplete/ambiguous provenance is rejected; requires normalized allocation evidence, never a guessed journal"
+  ]
+}

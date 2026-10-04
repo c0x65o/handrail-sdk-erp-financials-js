@@ -217,7 +217,7 @@ export function createCustomerPaymentCorrectionService(context: Context, post: (
       fail("Missing basis transaction");
     for (const t of transactions) {
       const ref = t.source_payload_ref as Row | undefined;
-      if (t.status !== "posted" || t.currency_code !== context.currencyCode || t.party_id !== payment.party_id ||
+      if (t.status !== "posted" || t.currency_code !== context.currencyCode || (t.party_id !== null && t.party_id !== payment.party_id) ||
         !(t.source_transaction_type === "Payment" && t.source_transaction_id === evidence.sourceTransactionId || ref?.sourceObjectType === "Payment" && ref.sourceObjectId === evidence.sourceTransactionId))
         fail("Basis transaction lacks exact Payment provenance");
     }
@@ -227,6 +227,14 @@ export function createCustomerPaymentCorrectionService(context: Context, post: (
     if (stable(discovered) !== stable([...evidence.transactionIds].sort()))
       fail("Omitted payment basis transaction");
     const postings = (await client.query(`select * from erp_financials.ledger_postings where tenant_id=$1 and source_id=$2 and transaction_id=any($3::text[]) order by posting_id for update`, [context.tenantId, context.sourceId, evidence.transactionIds])).rows;
+    // Older basis imports did not populate transaction.party_id. Exact object
+    // identity plus unanimous posting parties is sufficient; missing/conflicting
+    // posting identity is not permission to infer a party.
+    for (const transaction of transactions.filter(t => t.party_id === null)) {
+      const entries = postings.filter(p => p.transaction_id === transaction.transaction_id);
+      if (!entries.length || entries.some(p => p.party_id !== payment.party_id))
+        fail("Basis transaction lacks complete Payment party provenance");
+    }
     if (evidence.accountingChecksum !== hash({ transactions, postings }))
       fail("Imported payment accounting changed without complete refreshed evidence");
     for (const basis of ["accrual", "cash"]) {

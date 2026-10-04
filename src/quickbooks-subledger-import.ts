@@ -978,7 +978,8 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
   // normalize LinkedTxn evidence differently; never let that make the current
   // operational balance disagree with QuickBooks. Locally corrected invoices
   // instead retain the canonical application balance; a late Balance snapshot
-  // cannot reinstate the voided application.
+  // cannot reinstate the voided application. Native applications are a local
+  // overlay on the provider snapshot; replay must not make that credit spendable again.
   for (const resource of operationalDocuments) {
     if (resource.syncAction === "voided" || resource.syncAction === "deleted" || resource.syncAction === "skipped") continue;
     const normalized = resource.resource;
@@ -990,12 +991,19 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
     if (openAmount === undefined || documentId === undefined || preservedInvoiceIds.includes(documentId)) continue;
     await input.client.query(
       `update "erp_financials"."subledger_documents"
-set "open_amount" = $5,
-  "status" = case when $5::numeric = 0 then 'settled'
-    when $5::numeric = "original_amount" then 'open' else 'partially_applied' end,
+set "open_amount" = $5::numeric - native_overlay.applied_amount,
+  "status" = case when $5::numeric - native_overlay.applied_amount = 0 then 'settled'
+    when $5::numeric - native_overlay.applied_amount = "original_amount" then 'open' else 'partially_applied' end,
   "version" = "version" + 1, "updated_at" = $6
+from (select coalesce(sum(a.applied_amount),0) as applied_amount
+  from erp_financials.subledger_applications a
+  join erp_financials.financial_lifecycle_events e on e.tenant_id=a.tenant_id and e.company_id=a.company_id
+    and e.source_id=a.source_id and e.event_id=a.applied_event_id
+  where a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3
+    and (a.source_document_id=$4 or a.target_document_id=$4) and a.status='applied'
+    and e.event_type='subledger_application.applied') native_overlay
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
-  and "subledger_document_id" = $4 and "open_amount" is distinct from $5::numeric`,
+  and "subledger_document_id" = $4 and "open_amount" is distinct from ($5::numeric - native_overlay.applied_amount)`,
       [
         input.facts.company.tenantId,
         input.companyId,

@@ -1163,8 +1163,14 @@ async function deleteLedgerFactsOutsideImportBatch(
   }
 
   const corrections = await loadCustomerPaymentCorrectionReplayState(client, input.tenantId, input.sourceId);
-  const preserved = await client.query<{transaction_id: string}>(`select transaction_id from ${qualifiedTable(manifest, "subledger_documents")}
-    where tenant_id=$1 and source_id=$2 and subledger_document_id=any($3::text[])`,
+  const preserved = await client.query<{transaction_id: string}>(`select t.transaction_id from ${qualifiedTable(manifest, "transactions")} t
+    join ${qualifiedTable(manifest, "subledger_documents")} d on d.tenant_id=t.tenant_id and d.source_id=t.source_id
+      and (t.transaction_id=d.transaction_id or
+        (t.source_payload_ref->>'sourceObjectType'='Invoice' and t.source_payload_ref->>'sourceObjectId'=d.metadata->>'sourceTransactionId') or
+        (t.source_transaction_type='QuickBooksGeneralLedger:Invoice' and t.source_transaction_id in
+          ('accrual:Invoice:'||(d.metadata->>'sourceTransactionId')||':'||t.transaction_date::text,
+           'cash:Invoice:'||(d.metadata->>'sourceTransactionId')||':'||t.transaction_date::text)))
+    where d.tenant_id=$1 and d.source_id=$2 and d.subledger_document_id=any($3::text[])`,
     [input.tenantId, input.sourceId, corrections.flatMap(row => row.reopenedInvoiceIds)]);
   const retainedIds = [...corrections.flatMap(row => row.transactionIds), ...preserved.rows.map(row => row.transaction_id)];
   await client.query(`select set_config('erp_financials.quickbooks_projection_refresh', 'on', true)`);
@@ -1242,8 +1248,14 @@ async function replaceQuickBooksDualBasisBackfillRange(
   }
   const corrections = await loadCustomerPaymentCorrectionReplayState(client, input.tenantId, input.sourceId);
   const blocked = correctedTransactionIds(corrections, input.projections.flatMap(p => p.transactions));
-  const invoiceTransactions = await client.query<{transaction_id: string}>(`select transaction_id from ${qualifiedTable(manifest, "subledger_documents")}
-    where tenant_id=$1 and source_id=$2 and subledger_document_id=any($3::text[])`,
+  const invoiceTransactions = await client.query<{transaction_id: string}>(`select t.transaction_id from ${qualifiedTable(manifest, "transactions")} t
+    join ${qualifiedTable(manifest, "subledger_documents")} d on d.tenant_id=t.tenant_id and d.source_id=t.source_id
+      and (t.transaction_id=d.transaction_id or
+        (t.source_payload_ref->>'sourceObjectType'='Invoice' and t.source_payload_ref->>'sourceObjectId'=d.metadata->>'sourceTransactionId') or
+        (t.source_transaction_type='QuickBooksGeneralLedger:Invoice' and t.source_transaction_id in
+          ('accrual:Invoice:'||(d.metadata->>'sourceTransactionId')||':'||t.transaction_date::text,
+           'cash:Invoice:'||(d.metadata->>'sourceTransactionId')||':'||t.transaction_date::text)))
+    where d.tenant_id=$1 and d.source_id=$2 and d.subledger_document_id=any($3::text[])`,
     [input.tenantId,input.sourceId,corrections.flatMap(row => row.reopenedInvoiceIds)]);
   const retained = [...blocked,...invoiceTransactions.rows.map(row => row.transaction_id)];
   await client.query(
