@@ -567,3 +567,13 @@ npm run health:smoke
   lint, typecheck, test, and build path.
 - `docs/` remains the implementation contract for the next schema, fixture,
   adapter, rollup, snapshot, and freshness tasks.
+
+### Explicit administrator confirmation
+
+Independent approval remains the default. Trusted server consumers can opt selected
+financial actions into `financialApprovalPolicy: { mode: "administrator_direct",
+actions, guard }`. The guard must authenticate the active company administrator
+and lock an immutable, explicitly confirmed preview in the command transaction.
+This supports same-admin imported payment correction and bank-feed ignore while
+preserving accounting and replay checks. See the [API, guard/storage contract and
+Spartan handoff](docs/administrator-confirmation-sdk-handoff.txt).

@@ -1,9 +1,9 @@
+import { assertFinancialApproval, runFinancialAction, type FinancialApprovalPolicy } from "./financial-approval-policy.js";
 import { createHash } from "node:crypto";
 
 import {
   appendFinancialLifecycleEvent,
   assertFinancialOperationContext,
-  assertIndependentApproval
 } from "./financial-lifecycle.js";
 import { ErpFinancialsError } from "./sdk-errors.js";
 
@@ -24,6 +24,7 @@ export type FiscalPeriodTransactionRunner = {
 };
 
 export type FiscalPeriodServiceContext = FiscalPeriodScope & {
+  readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly database: FiscalPeriodTransactionRunner;
   readonly now: () => IsoDateTime;
 };
@@ -154,13 +155,13 @@ export function createFiscalPeriodService(context: FiscalPeriodServiceContext): 
       return beginFiscalPeriodClose(context, input);
     },
     close(input) {
-      return closeFiscalPeriod(context, input);
+      return runFinancialAction(context, "fiscalPeriods.close", input, closeFiscalPeriod);
     },
     reopen(input) {
-      return reopenFiscalPeriod(context, input);
+      return runFinancialAction(context, "fiscalPeriods.reopen", input, reopenFiscalPeriod);
     },
     setPostingLockDate(input) {
-      return setPostingLockDate(context, input);
+      return runFinancialAction(context, "fiscalPeriods.setPostingLockDate", input, setPostingLockDate);
     }
   };
 }
@@ -342,7 +343,7 @@ async function closeFiscalPeriod(
   context: FiscalPeriodServiceContext,
   input: CloseFiscalPeriodInput
 ): Promise<FiscalPeriodResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   assertExpectedVersion(input.expectedVersion);
   assertCloseEvidence(input.evidence);
 
@@ -413,7 +414,7 @@ async function reopenFiscalPeriod(
   context: FiscalPeriodServiceContext,
   input: ReopenFiscalPeriodInput
 ): Promise<FiscalPeriodResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   assertExpectedVersion(input.expectedVersion);
   return context.database.transaction(async (client) => {
     await lockFiscalScope(client, context);
@@ -467,7 +468,7 @@ async function setPostingLockDate(
   context: FiscalPeriodServiceContext,
   input: SetPostingLockDateInput
 ): Promise<PostingLockDateResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   if (input.postingLockDate !== undefined) {
     assertIsoDate(input.postingLockDate, "postingLockDate");
   }

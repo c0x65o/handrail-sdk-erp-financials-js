@@ -8,6 +8,7 @@ import * as sdk from '@handrail/erp-financials/sdk';
 const database = { transaction() { throw new Error('Import smoke must not access a database'); } };
 const scope = { database, tenantId: 'synthetic', companyId: 'synthetic', sourceId: 'synthetic', currencyCode: 'USD' };
 for (const entry of [root, sdk]) {
+  assert.equal(typeof entry.createFinancialActionCommandChecksum, 'function');
   for (const name of ['persistImportedCustomerPaymentEvidence', 'prepareCustomerPaymentCorrectionImport',
     'assertCustomerPaymentCorrectionImportAllowed', 'lockCustomerPaymentCorrectionSource']) {
     assert.equal(typeof entry[name], 'function', name);

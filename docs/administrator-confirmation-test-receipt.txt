@@ -1,0 +1,139 @@
+Administrator confirmation verification receipt — 2026-10-04
+============================================================
+
+Candidate: uncommitted workspace changes based on
+ce1f3bad667d725983943c5868a0f449714bc4fb, package version 0.3.59.
+The worker did not bump versions, commit, push, change tags, deploy, edit Spartan,
+or modify Handrail database/queue state. Release version/SHA belong to the harness.
+Exact API and app storage/old-pending contract:
+  docs/administrator-confirmation-sdk-handoff.txt
+
+Persistence harness
+-------------------
+Existing scripts/test-ephemeral-postgres.mjs; PostgreSQL 15.19, initdb-created
+private data directory under this run's disposable tmp root. Unix socket only:
+listen_addresses="", inet_server_addr()=NULL, verified data_directory. Synthetic
+erp_financials and credit_test_app schemas only. Real migrations, query clients,
+constraints, triggers, transactions and locks. One Vitest worker, no parallel
+files. Every completed database run reported EPHEMERAL POSTGRES REMOVED.
+No Spartan staging/production database, real business data or provider writes.
+
+Checks and results
+------------------
+PASS npm run lint (zero warnings), npm run typecheck, npm run build.
+PASS node scripts/smoke-public-api.mjs: built root and /sdk exports, new checksum
+helper, existing correction API, unchanged schema 27/v26 migration checksum,
+ordinary prepare -> npm run build contract.
+PASS compiled public declaration consumer probe using tsc CLI/NodeNext with no
+source path aliases; both package export paths and new policy/guard types.
+PASS typecheck:blu-erp-imports, typecheck:core-erp-imports,
+typecheck:future-erp-imports.
+
+PASS full real-PG regression:
+  ERP_FINANCIALS_EPHEMERAL_ROOT=<run tmp> node scripts/test-ephemeral-postgres.mjs
+  2 files, 205 tests, 193.03 seconds.
+PASS non-DB regression:
+  env -u ERP_FINANCIALS_TEST_DATABASE_URL npm test -- --maxWorkers=1 --no-file-parallelism
+  55 files, 480 tests, 25.09 seconds. The 205 DB tests were deliberately skipped
+  here and passed separately above (685 distinct tests across the two runs).
+PASS focused imported-credit PG suite: 54 tests, 49.81 seconds.
+
+Final review changed the new authorization event's recorded_at to the service
+clock, consistent with existing lifecycle events. After that change:
+PASS lint, typecheck, build and public API smoke again.
+PASS final scoped real-PG run:
+  <same isolated harness> test/imported-credit.postgres.test.ts -t administrator
+  20 passed, 34 intentionally deselected, 18.72 seconds. Includes explicit proof
+  that recorded_at uses the service clock when operation.occurredAt is earlier.
+Default execution code was unchanged by this final timestamp correction.
+
+Direct/default evidence
+-----------------------
+- Opted-in authenticated same-admin imported correction: voided + already_voided
+  under concurrent replay, identical reversal transaction IDs, one durable
+  correction receipt. Both cash/accrual reversals and application history survive.
+- Correcting phantom payment then applying 27.56 leaves imported payment credit
+  57.25. For BOTH bases: AR -57.25, bank 330.72, revenue -273.47, undeposited 0.00.
+- Audit records administrator_direct, exact action/digest/ref and the real actor.
+  Same-actor correction columns are truthful; native direct actions without
+  approverRef persist NULL approver_ref, not a fabricated second identity.
+- Default correction preview/execution still reject same/missing approver.
+  Default bank ignore rejects same actor even with a direct confirmation envelope;
+  an empty action allowlist also retains independent approval.
+- Missing guard, boolean-only/untrusted attestation, non-admin, inactive admin,
+  wrong company/actor/action, missing confirmation, changed command, and old
+  independent/pending records are denied with no persisted mutation.
+- Stale application/permission evidence, deposit/refund/fiscal blockers and stale
+  bank versions remain denied. Full regression also covers reconciliation,
+  provenance, source versions, all-applications completeness, import replay,
+  posting/basis, native corrections and fiscal constraints.
+- Concurrent identical direct bank ignores return the same ignored/version-2
+  result with one ignore lifecycle event. Reopen moves to version 3 and rejects
+  the old ignore confirmation. Replays leave the entire database unchanged.
+- Native direct adjustment/reversal, transfer's existing exact approval contract,
+  fiscal locking and caller-transaction rollback pass. Caller rollback removes
+  authorization events, receipts, history and accounting changes together.
+
+Install compatibility
+---------------------
+PASS clean baseline npm ci with public HTTPS full-SHA manifest + matching lock:
+  git+https://github.com/c0x65o/handrail-sdk-erp-financials-js.git#ce1f3bad667d725983943c5868a0f449714bc4fb
+Installed version 0.3.59; ordinary Git dependency prepare/build; both ESM public
+exports import successfully. No tarball/file/workspace/registry SDK dependency
+or separate packaging/publishing step was used.
+
+The initial npm install normalized this URL to a GitHub shorthand/SSH lock
+resolution; that attempt FAILED the required HTTPS lock assertion. The scratch
+consumer manifest kept the full HTTPS URL. Only the generated lock's transport
+was normalized back to that identical HTTPS URL/full SHA, preserving integrity
+and dependency graph, followed by successful clean-cache npm ci. A final clean
+install additionally enforced HTTPS for npm's hosted-git normalization using
+process-local GIT_CONFIG_COUNT=1, GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf,
+GIT_CONFIG_VALUE_0=ssh://git@github.com/. No global Git config was changed.
+The final manifest/lock remained unchanged by npm ci.
+
+UNVERIFIED: installation of this NEW candidate from its release full SHA. There
+is no new commit yet, by explicit worker instructions. The published baseline
+install is not claimed as candidate installation evidence. Harness must create
+and push the patch; parent must repeat the HTTPS/full-SHA/lock install check on
+that exact release and integrate/test the Spartan guard, additive confirmation
+storage, old pending reads, UI and audit presentation before Ship.
+The linked Spartan checkout/handoff file was absent, so app-route/schema-specific
+mapping remains for the parent; the SDK-wide owning-command inventory is supplied.
+
+Earlier failures and retained logs
+---------------------------------
+Initial focused PG run: 50 passed, 2 failed. One assertion did not capture an
+existing synchronous default rejection; one stale fixture update violated the
+existing application transition trigger. Corrected tests then passed 54/54.
+Initial lint errors were corrected while retaining strict runtime guard checks.
+A final lint rerun caught a temporary public-consumer .ts probe outside tsconfig;
+it was retained as .ts.txt outside lint input, then final lint passed.
+No unresolved source/test failures remain in the checks reported above.
+
+Worker-local logs retained under .test-artifacts/:
+  administrator-postgres.log (initial fixture failures)
+  administrator-postgres-second.log (54 passed)
+  administrator-postgres-full.log (205 passed, isolation + teardown)
+  administrator-regression.log (480 passed)
+  administrator-lint.log / administrator-lint-second.log
+  administrator-final-checks-temp-artifact-failure.log
+  administrator-final-checks.log (final lint/typecheck/build/smoke)
+  administrator-final-postgres.log (final 20 direct tests, isolation + teardown)
+  administrator-consumer-checks.log / administrator-public-consumer.ts.txt
+  administrator-exact-baseline-install.log (initial normalization)
+  administrator-exact-https-install.log (HTTPS assertion failure)
+  administrator-https-lock-ci.log / administrator-https-transport-ci.log (passed)
+
+Final tested source SHA-256 fingerprints
+---------------------------------------
+bfc845722ec572b010f779e2af8ea02433dccf0eaef1d05c98a73b9a930483d6  src/financial-approval-policy.ts
+89c105fa1bad8ad2ddc76f70a40ea06e98593fcc1936e48ada86cf58152f7e77  src/financial-lifecycle.ts
+845d63145a6541861e09760b5f652a03d6fb28cf2d5260d90070afc3e89db9e3  src/erp-financials-service.ts
+68f6f79d6ecd2005ff8fad6ac7d48d12f72d67558223d3301c3e7b58aa0ccb32  src/customer-payment-correction.ts
+679071df6d1da2d6c44453e923a73833fcaf012ab4d4c26373c51a297c19bf57  src/bank-reconciliation.ts
+7bbeb747209b4b38a4864f5a13f759ae708252de0c4968253d601e27baac8d83  src/invoice-workflow.ts
+ee827d8ea1a0ae24142facac96804318f3aca304cff152b52d9ee7298cf09d44  src/fiscal-periods.ts
+29698a2efe988e1a8652e6b7a9b060c95e698232b2f32b13ca543d91743538fd  src/sdk.ts
+17f9062271435c9a38017f7a5dec1d3072721ee67bbdaaac8c81021ba8e074f6  src/index.ts
+ed6818247251cd45f8e8fab106f9ac7f3689d69f26f210713759863cfa53f5a4  test/imported-credit.postgres.test.ts

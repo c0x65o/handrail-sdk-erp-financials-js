@@ -1146,3 +1146,6 @@ export { persistImportedCustomerPaymentEvidence, assertCustomerPaymentCorrection
 
 export { prepareCustomerPaymentCorrectionImport } from "./customer-payment-correction-replay.js";
 export type { CustomerPaymentCorrectionDependency, CustomerPaymentCorrectionImportPlan } from "./customer-payment-correction-replay.js";
+
+export { createFinancialActionCommandChecksum } from "./financial-approval-policy.js";
+export type { FinancialAction, FinancialApprovalScope, FinancialApprovalPolicy, AdministratorConfirmation, AdministratorFinancialGuard, AdministratorFinancialGuardInput } from "./financial-approval-policy.js";

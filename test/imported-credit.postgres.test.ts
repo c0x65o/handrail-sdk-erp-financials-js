@@ -4,9 +4,9 @@ import { Pool } from 'pg';
 // Intentionally consume the built public package, including its /sdk facade.
 import { createPostgresStorageAdapter, persistCanonicalFacts, persistQuickBooksSubledgerResources,
   createPostgresQuickBooksDualBasisBackfillPersistence, migratePostgresSchema, persistImportedCustomerPaymentEvidence,
-  lockCustomerPaymentCorrectionSource, createFiscalCloseEvidenceChecksum } from '@handrail/erp-financials';
+  lockCustomerPaymentCorrectionSource, createFiscalCloseEvidenceChecksum, createFinancialActionCommandChecksum, createTransferReversalApprovalChecksum } from '@handrail/erp-financials';
 import { createErpFinancialsSdk } from '@handrail/erp-financials/sdk';
-import type { ErpFinancialsTransactionRunner, CustomerPaymentCorrectionGuard, CustomerPaymentCorrectionRequest } from '@handrail/erp-financials';
+import type { ErpFinancialsTransactionRunner, CustomerPaymentCorrectionGuard, CustomerPaymentCorrectionRequest, FinancialApprovalPolicy, FinancialAction, FinancialOperationContext, AdministratorFinancialGuard } from '@handrail/erp-financials';
 import { importedCreditFixture, scope, now, operation, required } from './support/imported-credit-fixture.js';
 
 const url = process.env.ERP_FINANCIALS_TEST_DATABASE_URL;
@@ -59,7 +59,7 @@ suite('importer-generated imported credit public package PostgreSQL',()=>{
       }
       return {authorized,complete:true,version:String(a.version),deposited:a.deposited===true,reconciled:a.reconciled===true,refunded:a.refunded===true};
     };
-    const makeSdk=(database=runner)=>createErpFinancialsSdk({database,...scope,writeSourceId:scope.sourceId,bookId:'synthetic-book',currencyCode:'USD',now:()=>now,customerPaymentCorrectionGuard:guard});
+    const makeSdk=(database=runner,financialApprovalPolicy?:FinancialApprovalPolicy)=>createErpFinancialsSdk({database,...scope,writeSourceId:scope.sourceId,bookId:'synthetic-book',currencyCode:'USD',now:()=>now,customerPaymentCorrectionGuard:guard,...(financialApprovalPolicy ? {financialApprovalPolicy} : {})});
     const sdk=makeSdk();
     await sdk.books.define({operation,bookId:'synthetic-book',name:'Synthetic',baseCurrencyCode:'USD'});
     await sdk.books.bindSource({operation,bookId:'synthetic-book',sourceId:scope.sourceId,sourceRole:'active',effectiveFrom:'2025-01-01'});
@@ -83,6 +83,148 @@ suite('importer-generated imported credit public package PostgreSQL',()=>{
     const balances=async()=> (await pool.query<Record<string, unknown>>(`select p.accounting_basis,a.source_account_id,sum(p.net_amount)::text as net from erp_financials.ledger_postings p join erp_financials.accounts a using(tenant_id,source_id,account_id) group by 1,2 order by 1,2`)).rows;
     return {...f,sdk,makeSdk,document,approve,applyInput,balances,request,evidence,period};
   }
+  async function administratorFixture() {
+    const f = await fixture();
+    // Synthetic server session and app-owned persistence, never request claims.
+    const sessionActor = operation.actorRef;
+    await pool.query<Record<string, unknown>>(`create table credit_test_app.membership(actor text primary key, tenant text, company text, active boolean, administrator boolean);
+      create table credit_test_app.admin_confirmation(ref text primary key, policy text, actor text, tenant text, company text, source text, book text, action text, request text, checksum text, confirmed boolean);
+      `);
+    await pool.query<Record<string, unknown>>('insert into credit_test_app.membership values($1,$2,$3,true,true)', [sessionActor,scope.tenantId,scope.companyId]);
+    const guard: AdministratorFinancialGuard = async input => {
+      const member = required((await input.client.query('select * from credit_test_app.membership where actor=$1 for share', [sessionActor])).rows[0]);
+      const receipt = (await input.client.query(`select * from credit_test_app.admin_confirmation where ref=$1 and policy='administrator_direct'
+        and actor=$2 and tenant=$3 and company=$4 and source=$5 and book=$6 and action=$7 and request=$8 and checksum=$9 and confirmed for share`,
+        [input.command.operation.administratorConfirmation?.confirmationRef,sessionActor,input.tenantId,input.companyId,input.sourceId,input.bookId,input.action,input.command.operation.requestId,input.commandChecksum])).rows[0];
+      return {tenantId:String(member.tenant),companyId:String(member.company),sourceId:scope.sourceId,bookId:'synthetic-book',
+        actorRef:sessionActor,requestId:input.command.operation.requestId,action:input.action,commandChecksum:input.commandChecksum,
+        active:member.active===true,administrator:member.administrator===true,confirmed:receipt!==undefined};
+    };
+    const policy: FinancialApprovalPolicy = {mode:'administrator_direct', actions:[
+      'customerPayments.voidAndUnapply','bankReconciliation.ignore','bankReconciliation.unignore','bankReconciliation.unmatch',
+      'journalEntries.postAdjustment','journalEntries.reverse','paymentApplications.unapply','fiscalPeriods.setPostingLockDate','transfers.reverse','invoices.voidDraft'
+    ],guard};
+    const admin = f.makeSdk(runner,policy);
+    const adminOperation = {...operation,approverRef:sessionActor};
+    async function confirm<I extends {readonly operation:FinancialOperationContext}>(action:FinancialAction, command:I):Promise<I> {
+      const commandChecksum = createFinancialActionCommandChecksum({...scope,bookId:'synthetic-book',currencyCode:'USD'},action,command);
+      const confirmationRef = `confirmation:${action}:${command.operation.requestId}`;
+      await pool.query<Record<string, unknown>>(`insert into credit_test_app.admin_confirmation values($1,'administrator_direct',$2,$3,$4,$5,$6,$7,$8,$9,true)`,
+        [confirmationRef,sessionActor,scope.tenantId,scope.companyId,scope.sourceId,'synthetic-book',action,command.operation.requestId,commandChecksum]);
+      return {...command,operation:{...command.operation,administratorConfirmation:{confirmationRef,commandChecksum}}};
+    }
+    async function correction() {
+      const request = {...f.request,operation:adminOperation};
+      const preview = await admin.commands.customerPayments.previewVoidAndUnapply(request);
+      // Existing correction evidence guard still binds the exact immutable preview.
+      await pool.query<Record<string, unknown>>(`insert into credit_test_app.approval values('confirmation:correction',$1,$2,$3,'synthetic-book',$4::jsonb,$5,true)`,
+        [scope.tenantId,scope.companyId,scope.sourceId,JSON.stringify(request),preview.confirmation]);
+      return confirm('customerPayments.voidAndUnapply',{...request,confirmation:preview.confirmation,approvalRef:'confirmation:correction'});
+    }
+    async function bankLine() {
+      const account=required((await pool.query<Record<string, unknown>>("select account_id from erp_financials.accounts where source_account_id='bank'")).rows[0]);
+      return admin.bankReconciliation.ingest({operation,externalLineId:'synthetic:admin-line',bankAccountId:String(account.account_id),postedDate:'2025-07-04',amount:'12.00'});
+    }
+    return {...f,admin,policy,guard,adminOperation,confirm,correction,bankLine};
+  }
+
+  it('administrator direct correction confirms the real actor, replays concurrently once and retains accounting parity',async()=>{
+    const f=await administratorFixture();const command=await f.correction();
+    const results=await Promise.all([f.admin.commands.customerPayments.voidAndUnapply(command),f.admin.commands.customerPayments.voidAndUnapply(command)]);
+    expect(results.map(r=>r.status).sort()).toEqual(['already_voided','voided']);
+    expect(results[0].reversalTransactionIds).toEqual(results[1].reversalTransactionIds);
+    expect((await pool.query<Record<string, unknown>>('select * from erp_financials.customer_payment_corrections')).rows).toHaveLength(1);
+    const events=(await pool.query<Record<string, unknown>>(`select actor_ref,approver_ref,payload->'financialApproval' as audit from erp_financials.financial_lifecycle_events where payload ? 'financialApproval'`)).rows;
+    expect(events.length).toBeGreaterThan(4);
+    for(const event of events) {
+      expect(event.actor_ref).toBe(operation.actorRef);expect(event.approver_ref).toBe(operation.actorRef);
+      expect(event.audit).toMatchObject({policy:'administrator_direct',actorRef:operation.actorRef,action:'customerPayments.voidAndUnapply'});
+    }
+    await f.sdk.commands.paymentApplications.apply(await f.applyInput());
+    for(const basis of ['cash','accrual']) expect((await f.balances()).filter(r=>r.accounting_basis===basis)).toEqual([
+      {accounting_basis:basis,source_account_id:'ar',net:'-57.25'},{accounting_basis:basis,source_account_id:'bank',net:'330.72'},
+      {accounting_basis:basis,source_account_id:'revenue',net:'-273.47'},{accounting_basis:basis,source_account_id:'undeposited',net:'0.00'}]);
+    const state=await dbState();await f.admin.commands.customerPayments.voidAndUnapply(command);expect(await dbState()).toEqual(state);
+    await expect(async()=>f.sdk.commands.customerPayments.voidAndUnapply(command)).rejects.toMatchObject({code:'authorization_context_invalid'});
+  });
+  it('administrator ignore/reopen is versioned, audit truthful, concurrent ignore exactly once; default and unlisted actions stay independent',async()=>{
+    const f=await administratorFixture(); const line=await f.bankLine();
+    const command=await f.confirm('bankReconciliation.ignore',{operation:{...f.adminOperation,occurredAt:'2025-07-03T00:00:00.000Z'},bankStatementLineId:line.bankStatementLineId,expectedVersion:1});
+    const initial=await dbState();
+    await expect(f.sdk.bankReconciliation.ignore(command)).rejects.toMatchObject({code:'authorization_context_invalid'});
+    await expect(f.makeSdk(runner,{...f.policy,actions:[]}).bankReconciliation.ignore(command)).rejects.toMatchObject({code:'authorization_context_invalid'});
+    expect(await dbState()).toEqual(initial);
+    const results=await Promise.all([f.admin.bankReconciliation.ignore(command),f.admin.bankReconciliation.ignore(command)]);
+    expect(results[0]).toEqual(results[1]);expect(results[0]).toMatchObject({status:'ignored',version:2});
+    expect((await pool.query<Record<string, unknown>>("select * from erp_financials.financial_lifecycle_events where event_type='bank_statement_line.ignored'")).rows).toHaveLength(1);
+    const recorded=required((await pool.query<{recorded_at:Date}>("select recorded_at from erp_financials.financial_lifecycle_events where event_type='financial_action.administrator_confirmed'")).rows[0]);
+    expect(recorded.recorded_at.toISOString()).toBe(now);
+    const state=await dbState();await f.admin.bankReconciliation.ignore(command);expect(await dbState()).toEqual(state);
+    const reopen=await f.confirm('bankReconciliation.unignore',{...command,expectedVersion:2,operation:{...f.adminOperation,requestId:'admin:reopen'}});
+    expect(await f.admin.bankReconciliation.unignore(reopen)).toMatchObject({status:'unmatched',version:3});
+    await expect(f.admin.bankReconciliation.ignore(command)).rejects.toMatchObject({code:'idempotency_conflict'});
+  });
+  it('administrator policy supports nested native adjustment/reversal, transfer approval and fiscal controls',async()=>{
+    const f=await administratorFixture();
+    const accounts=(await pool.query<{account_id:string;source_account_id:string}>('select account_id,source_account_id from erp_financials.accounts')).rows;
+    const bank=required(accounts.find(a=>a.source_account_id==='bank')).account_id;
+    const clearing=required(accounts.find(a=>a.source_account_id==='undeposited')).account_id;
+    const operationWithoutApprover={actorRef:operation.actorRef,requestId:'admin:adjustment',correlationId:operation.correlationId,reasonCode:operation.reasonCode,reasonDetail:operation.reasonDetail,occurredAt:now};
+    const adjustment=await f.confirm('journalEntries.postAdjustment',{operation:operationWithoutApprover,idempotencyKey:'admin:adjustment',date:'2025-07-04',lines:[{accountId:bank,debit:'5.00'},{accountId:clearing,credit:'5.00'}]});
+    const posted=await f.admin.commands.journalEntries.postAdjustment(adjustment);
+    const reversal=await f.confirm('journalEntries.reverse',{operation:{...operationWithoutApprover,requestId:'admin:reverse'},idempotencyKey:'admin:reverse',originalTransactionId:posted.transactionId,date:'2025-07-04'});
+    await f.admin.commands.journalEntries.reverse(reversal);
+    const transfer=await f.sdk.commands.transfers.record({operation,idempotencyKey:'admin:transfer',date:'2025-07-04',amount:'7.00',fromAccount:{accountId:bank},toAccount:{accountId:clearing}});
+    const reverse={operation:{...operationWithoutApprover,requestId:'admin:transfer-reverse'},idempotencyKey:'admin:transfer-reverse',transferId:transfer.documentId,date:'2025-07-04'};
+    const approval={approvalRef:'admin:transfer-confirmation',operationChecksum:createTransferReversalApprovalChecksum({...scope,bookId:'synthetic-book',currencyCode:'USD'},reverse)};
+    const approved=await f.confirm('transfers.reverse',{...reverse,approval});
+    expect(await f.admin.commands.transfers.reverse(approved)).toMatchObject({status:'reversed'});
+    expect(await f.admin.commands.transfers.reverse(approved)).toMatchObject({status:'already_reversed'});
+    const fiscal=await f.confirm('fiscalPeriods.setPostingLockDate',{operation:{...operationWithoutApprover,requestId:'admin:fiscal'},expectedVersion:0,postingLockDate:'2025-07-31'});
+    await f.admin.commands.fiscalPeriods.setPostingLockDate(fiscal);
+    const audit=(await pool.query<Record<string, unknown>>("select approver_ref,payload from erp_financials.financial_lifecycle_events where event_type='financial_action.administrator_confirmed'")).rows;
+    expect(audit).toHaveLength(4);expect(audit.every(r=>r.approver_ref===null)).toBe(true);
+  });
+  it('administrator execution rolls back authorization, history and accounting with its caller transaction',async()=>{
+    const f=await administratorFixture();const command=await f.correction();const state=await dbState();
+    await expect(runner.transaction(async client=>{
+      await f.makeSdk({transaction:work=>work(client)},f.policy).commands.customerPayments.voidAndUnapply(command);
+      throw Error('synthetic caller rollback');
+    })).rejects.toThrow('synthetic caller rollback');
+    expect(await dbState()).toEqual(state);
+  });
+
+  it.each(['nonadmin','inactive','othercompany','otheractor','missing-confirmation','changed-command','untrusted-guard','missing-guard','wrong-action','old-pending'])('denies administrator correction without writes: %s',async kind=>{
+    const f=await administratorFixture();let command=await f.correction();let admin=f.admin;
+    if(kind==='nonadmin') await pool.query<Record<string, unknown>>('update credit_test_app.membership set administrator=false');
+    if(kind==='inactive') await pool.query<Record<string, unknown>>('update credit_test_app.membership set active=false');
+    if(kind==='othercompany') await pool.query<Record<string, unknown>>("update credit_test_app.membership set company='other-company'");
+    if(kind==='otheractor') command={...command,operation:{...command.operation,actorRef:'untrusted:actor',approverRef:'untrusted:actor'}};
+    if(kind==='missing-confirmation') command={...command,operation:f.adminOperation};
+    if(kind==='changed-command') command={...command,date:'2025-07-05'};
+    if(kind==='untrusted-guard') admin=f.makeSdk(runner,{...f.policy,guard:(()=>Promise.resolve({authorized:true})) as unknown as AdministratorFinancialGuard});
+    if(kind==='missing-guard') admin=f.makeSdk(runner,{mode:'administrator_direct',actions:['customerPayments.voidAndUnapply']} as unknown as FinancialApprovalPolicy);
+    if(kind==='wrong-action') await pool.query<Record<string, unknown>>("update credit_test_app.admin_confirmation set action='bankReconciliation.ignore'");
+    if(kind==='old-pending') await pool.query<Record<string, unknown>>("update credit_test_app.admin_confirmation set policy='independent',confirmed=false");
+    const state=await dbState();await expect(admin.commands.customerPayments.voidAndUnapply(command)).rejects.toMatchObject({code:'authorization_context_invalid'});expect(await dbState()).toEqual(state);
+  });
+  it.each(['application','authority','deposit','refund','fiscal'])('administrator correction retains stale and safety checks: %s',async kind=>{
+    const f=await administratorFixture();const command=await f.correction();
+    if(kind==='application') await pool.query<Record<string, unknown>>("update erp_financials.subledger_applications set status='voided',version=version+1,ended_event_id=applied_event_id");
+    if(kind==='authority') await pool.query<Record<string, unknown>>("update credit_test_app.authority set version='changed'");
+    if(kind==='deposit') await pool.query<Record<string, unknown>>('update credit_test_app.authority set deposited=true');
+    if(kind==='refund') await pool.query<Record<string, unknown>>('update credit_test_app.authority set refunded=true');
+    if(kind==='fiscal') await f.sdk.commands.fiscalPeriods.setPostingLockDate({operation,expectedVersion:0,postingLockDate:'2025-07-31'});
+    const state=await dbState();await expect(f.admin.commands.customerPayments.voidAndUnapply(command)).rejects.toThrow();expect(await dbState()).toEqual(state);
+  });
+  it('administrator bank ignore rejects stale versions and cross-company lines without writes',async()=>{
+    const f=await administratorFixture();const line=await f.bankLine();
+    const command=await f.confirm('bankReconciliation.ignore',{operation:f.adminOperation,bankStatementLineId:line.bankStatementLineId,expectedVersion:2});
+    const state=await dbState();await expect(f.admin.bankReconciliation.ignore(command)).rejects.toMatchObject({code:'reconciliation_conflict'});expect(await dbState()).toEqual(state);
+    const outsider=createErpFinancialsSdk({database:runner,...scope,companyId:'other-company',writeSourceId:scope.sourceId,bookId:'synthetic-book',currencyCode:'USD',financialApprovalPolicy:f.policy});
+    await expect(outsider.bankReconciliation.ignore(command)).rejects.toMatchObject({code:'authorization_context_invalid'});expect(await dbState()).toEqual(state);
+  });
+
   it('corrects phantom then applies 27.56 from imported PAYMENT 330.72 / remaining 84.81',async()=>{
     const f=await fixture(); const input=await f.approve();
     const result=await f.sdk.commands.customerPayments.voidAndUnapply(input);

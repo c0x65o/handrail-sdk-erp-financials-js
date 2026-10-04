@@ -1,0 +1,222 @@
+Administrator confirmation SDK handoff
+======================================
+
+Scope and release ownership
+---------------------------
+This is an opt-in server contract. Existing consumers remain independent-approval
+consumers. No database migration, historical rewrite, autoapproval, or automatic
+execution is introduced. No provider calls are made by this feature.
+
+The requested Spartan checkout and docs/single-admin-approval-sdk-handoff.txt
+were absent in this worker. The inventory below covers every SDK command family
+that invokes independent approval; the parent must map it to Spartan routes.
+The application was not edited. Handrail owns versioning, commit and push. The
+candidate remains uncommitted, so its release version/full SHA and exact Git
+install verification must be recorded after the harness publishes that commit.
+
+Public API
+----------
+The new policy/guard/confirmation types and checksum helper are exported from
+both the package root and /sdk. createErpFinancialsSdk is available from both;
+the lower-level factories below are root exports.
+FinancialApprovalPolicy =
+  { mode: 'independent' } |
+  { mode: 'administrator_direct', actions: readonly FinancialAction[],
+    guard: AdministratorFinancialGuard }
+
+createErpFinancialsSdk({ ..., financialApprovalPolicy })
+createErpFinancials({ ..., financialApprovalPolicy })
+createBankReconciliationService({ ..., financialApprovalPolicy })
+createInvoiceWorkflow({ ..., financialApprovalPolicy })
+createFiscalPeriodService({ ..., financialApprovalPolicy })
+
+FinancialOperationContext.administratorConfirmation?: {
+  confirmationRef: string;
+  commandChecksum: string;
+}
+
+createFinancialActionCommandChecksum(scope, action, command): string
+
+The helper accepts FinancialApprovalScope: tenantId, companyId, sourceId, bookId
+when present, and the factory's currencyCode/accountingBasis/postingPolicy.
+accountingBasis defaults to accrual and postingPolicy to enforce_fiscal_periods.
+Include the same effective settings used to construct the service. Standalone
+fiscal services without currencyCode omit it. The checksum covers the entire
+command, policy, action, actor, request, scope and these settings; it excludes
+only operation.administratorConfirmation to avoid a circular hash. It is a
+binding digest, not an authorization token and not a financial-state preview.
+
+Example server configuration for the two Spartan blockers:
+
+  const executionScope = {
+    tenantId, companyId, sourceId: writeSourceId, bookId,
+    currencyCode: 'USD', accountingBasis: 'accrual',
+    postingPolicy: 'enforce_fiscal_periods'
+  } as const;
+  const financialApprovalPolicy = {
+    mode: 'administrator_direct',
+    actions: ['customerPayments.voidAndUnapply', 'bankReconciliation.ignore'],
+    guard: authenticateAndLockAdministratorConfirmation
+  } satisfies FinancialApprovalPolicy;
+  const sdk = createErpFinancialsSdk({
+    database, ...executionScope, writeSourceId,
+    customerPaymentCorrectionGuard, financialApprovalPolicy
+  });
+
+Do not construct this policy, select its mode/actions, or supply the guard from
+HTTP input. Configure the policy in trusted server code. Unlisted actions retain
+independent approval. A confirmation object on a default instance does not opt
+it in. Keep a default instance for the existing independent workflow if needed.
+The exported assertIndependentApproval function remains strictly independent.
+
+Required administrator guard
+----------------------------
+AdministratorFinancialGuard receives one PostgreSQL transaction client, action,
+phase ('preview' or 'confirm'), execution scope/settings, a defensively copied
+and frozen command, and its commandChecksum. It must:
+
+1. Resolve the actual authenticated principal from trusted server/session
+   context; never treat command.operation.actorRef as authentication.
+2. Lock/read active company administrator membership through commit on client.
+   Reject suspended/deleted membership, non-admins, other companies, mismatched
+   source/book, and any principal other than the command's real actor.
+3. For confirm, lock/read an immutable app-owned preview and explicit human
+   confirmation, bound to administrator_direct, that actor, exact action, all
+   scope fields/settings, requestId and commandChecksum. Validate all app-owned
+   state/version evidence under the same transaction. For bank ignore, show the
+   selected line and expectedVersion before confirmation. For commands without
+   a built-in preview, the app owns a complete preview and stale-state guard;
+   the checksum helper alone is insufficient.
+4. Return attested tenantId/companyId/sourceId/bookId, actorRef, requestId, action,
+   commandChecksum, active:true, administrator:true, and confirmed:true only
+   after those checks. Preview may return confirmed:false. Missing, malformed,
+   boolean-only, mismatched or false evidence is rejected.
+
+Keep locks until the SDK transaction commits. Use a consistent lock order with
+other app guards/writers. An always-true guard or an echo of browser-supplied
+claims does not satisfy this contract. The SDK cannot authenticate an app's
+sessions itself. The PostgreSQL test guard demonstrates locked membership and
+stored confirmations; it is synthetic test code, not production authentication.
+
+The same actual admin can be requester and confirmer. Prefer omitting
+operation.approverRef for direct actions; it may also equal actorRef. A different
+approverRef is rejected on a selected direct action. Do not fabricate an actor,
+use a system identity as approver, disable checks, or patch SDK methods.
+
+Imported customer payment flow
+------------------------------
+1. Construct a stable CustomerPaymentCorrectionRequest with the real actor,
+   request/correlation IDs, reason and effective date. No second actor is needed.
+2. Call sdk.commands.customerPayments.previewVoidAndUnapply(request). Direct
+   policy verifies the active administrator in the transaction. The existing
+   customerPaymentCorrectionGuard remains mandatory and must still attest
+   complete permission/deposit/reconciliation/refund evidence with a version.
+3. Persist/display the returned immutable preview (confirmation hash,
+   source/payment/application/invoice versions, all postings and reversals).
+   The same admin explicitly confirms it. Store the preview and confirmation
+   under the direct policy, with a fresh request/idempotency key for new work.
+4. Construct command = { ...request, confirmation: preview.confirmation,
+   approvalRef: confirmationRecordId }. approvalRef is the existing field name;
+   under this policy it identifies the real admin's confirmation record, NOT a
+   second person's approval. customerPaymentCorrectionGuard still receives it
+   and must bind it to the exact request and preview. Its request excludes the
+   new administratorConfirmation envelope, preserving preview equality.
+5. Compute commandChecksum with createFinancialActionCommandChecksum using the
+   exact complete command. Persist that digest with the explicit confirmation.
+   Add operation.administratorConfirmation = { confirmationRef, commandChecksum }
+   and call sdk.commands.customerPayments.voidAndUnapply(command).
+
+Preview performs no writes. Execution revalidates actual financial evidence,
+including all applications and invoices, complete imported accrual/cash posting
+provenance, fiscal dates, source version, deposit/reconciliation/refund guards,
+and preview equality. The outer administrator guard is also re-run on replay.
+The existing correction result, reversal IDs, lifecycle IDs, outbox, receipt and
+import replay protections are retained. Concurrent identical correction calls
+return voided/already_voided and the same reversal IDs.
+
+Bank-feed ignore
+----------------
+Use action 'bankReconciliation.ignore' and command
+{ operation, bankStatementLineId, expectedVersion }. Display and store the exact
+line/version preview on the server, obtain explicit confirmation, compute/store
+the digest and supply operation.administratorConfirmation as above. The guard
+must authenticate the admin and validate the stored confirmation in transaction.
+The SDK still requires an unmatched line at that version. Direct identical
+concurrent ignores return the same ignored/version result and emit one ignore
+lifecycle/outbox event. After unignore or another state/version change, an old
+ignore confirmation is rejected. Default ignore behavior is unchanged.
+
+Owning command inventory and canonical action names
+--------------------------------------------------
+createErpFinancials / sdk.commands:
+  journalEntries.postAdjustment (also post with adjustment:true);
+  journalEntries.reverse / void / correct / replace;
+  customerPayments.voidAndUnapply (includes previewVoidAndUnapply);
+  adjustments.voidIssued / replaceIssued;
+  credits.voidIssued / replaceIssued;
+  refunds.voidIssued / replaceIssued;
+  vendorBills.voidIssued / replaceIssued (voidPosted/replacePosted aliases);
+  billPayments.cancel / voidAndUnapply / void (voidIssued/voidPosted aliases);
+  writeOffs.voidIssued / replaceIssued;
+  deposits.reverse; transfers.reverse;
+  paymentApplications.unapply / void.
+createInvoiceWorkflow / sdk.invoices:
+  invoices.voidDraft / voidIssued.
+createBankReconciliationService / sdk.bankReconciliation:
+  bankReconciliation.ignore / unignore / unmatch.
+createFiscalPeriodService / sdk.commands.fiscalPeriods:
+  fiscalPeriods.close / reopen / setPostingLockDate.
+
+Aliases use the canonical action name listed above when computing checksums.
+Other SDK commands did not require an independent approver and are unchanged.
+Existing transfer reversal approval checksum/ref, fiscal close evidence, native
+posting rules, optimistic versions, idempotency, terminal-state and provenance
+checks remain required. Direct policy changes authorization only. Derived
+accounting steps carry the exact transaction's authorization; the public
+independent validator has no bypass or global setting.
+
+Storage compatibility and audit
+-------------------------------
+No SDK schema change: actor_ref is required, approver_ref is already nullable,
+and existing lifecycle payloads are JSON. Direct events add payload.financialApproval:
+  { policy: 'administrator_direct', action, actorRef, commandChecksum,
+    confirmationRef }
+Original payload fields remain at their original paths. A separate immutable
+financial_action.administrator_confirmed lifecycle event records each direct
+request/action. The request plus its full checksum/ref is bound by lifecycle
+idempotency. Actual operation actor/approver columns are preserved truthfully.
+No authorization event survives failed execution or caller rollback.
+
+App approval tables may enforce requester != approver or NOT NULL approver.
+Do not remove those constraints globally or insert a fake approver. Use an
+additive direct-confirmation table, or a policy-discriminated schema whose
+independent branch retains its constraints and whose direct branch records the
+real confirmer. The policy and immutable payload must be stored, not inferred
+from current configuration. The exact app schema is unavailable in this worker;
+the parent owns its additive migration and authorization integration.
+
+Existing rows without a policy remain independent. Old pending approvals stay
+readable and pending; never convert them to confirmed/executed on upgrade or on
+read. A new direct request requires a fresh preview and explicit confirmation.
+Do not reuse old approval/request/idempotency keys as a migration technique.
+Continue to render old audit rows under their original independent semantics.
+Display direct audit rows as administrator confirmation, not independent approval.
+
+Verification and parent handoff
+-------------------------------
+See administrator-confirmation-test-receipt.txt for commands and outcomes.
+Tests use an initdb-created Unix-socket-only disposable PostgreSQL cluster with
+synthetic rows, all migrations, actual constraints/transactions, and teardown.
+Spartan stage/prod and business/provider data must never be used for these tests.
+
+The worker found npm normalizes this GitHub dependency to an SSH lock resolution.
+Verify BOTH the manifest and lock use the full git+https URL and exact SHA; the
+baseline clean npm ci check used an explicitly HTTPS-normalized lock resolution
+without changing its commit, integrity or dependency graph.
+
+After Handrail creates/pushes the patch commit, the parent must install the SDK
+from public HTTPS Git pinned to its full 40-character SHA, update the matching
+lockfile, and exercise the ordinary prepare/build install pipeline. Do not use
+file/tarball/registry/workspace/branch/tag substitutes. Integrate app guards,
+additive storage, UI confirmation and policy-aware audit reads before enabling
+selected actions; the parent owns release integration, Test/UI/Ship and deployment.

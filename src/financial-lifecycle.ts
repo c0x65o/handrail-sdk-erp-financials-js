@@ -1,3 +1,4 @@
+import { financialApprovalAudit, type AdministratorConfirmation } from "./financial-approval-policy.js";
 import { createHash } from "node:crypto";
 
 import { assertNoCredentialKeys } from "./canonical-model.js";
@@ -7,6 +8,7 @@ import type { IsoDateTime, JsonValue } from "./canonical-model.js";
 import type { PostgresQueryClient } from "./postgres-storage.js";
 
 export type FinancialOperationContext = {
+  readonly administratorConfirmation?: AdministratorConfirmation;
   readonly actorRef: string;
   readonly approverRef?: string;
   readonly requestId: string;
@@ -108,7 +110,9 @@ export async function appendFinancialLifecycleEvent(
   if (input.priorEventId !== undefined) {
     assertNonEmpty(input.priorEventId, "priorEventId");
   }
-  const payload = input.payload ?? {};
+  const audit = financialApprovalAudit(client, input, input.operation);
+  const originalPayload = input.payload ?? {};
+  const payload = audit === undefined ? originalPayload : withApprovalAudit(originalPayload, audit);
   assertNoCredentialKeys(payload);
   const payloadChecksum = checksum(payload);
   const eventId = lifecycleEventId(input, payloadChecksum);
@@ -246,4 +250,10 @@ function assertIsoDateTime(
   if (Number.isNaN(Date.parse(value))) {
     throw new ErpFinancialsError(code, `${field} must be a valid ISO date-time`);
   }
+}
+
+function withApprovalAudit(payload: JsonValue, audit: JsonValue): JsonValue {
+  return typeof payload === "object" && payload !== null && !Array.isArray(payload)
+    ? Object.assign({}, payload, { financialApproval: audit })
+    : { data: payload, financialApproval: audit };
 }

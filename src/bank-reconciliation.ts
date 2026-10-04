@@ -1,3 +1,4 @@
+import { assertFinancialApproval, financialApprovalAudit, runFinancialAction, type FinancialApprovalPolicy } from "./financial-approval-policy.js";
 import { createHash } from "node:crypto";
 
 import { assertSafeSourcePayloadRef } from "./canonical-model.js";
@@ -5,7 +6,6 @@ import { appendFinancialOutboxEvent } from "./financial-outbox.js";
 import {
   appendFinancialLifecycleEvent,
   assertFinancialOperationContext,
-  assertIndependentApproval
 } from "./financial-lifecycle.js";
 import { ErpFinancialsError } from "./sdk-errors.js";
 
@@ -71,6 +71,7 @@ export type BankReconciliationService = {
 };
 
 type Scope = {
+  readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly database: ErpFinancialsTransactionRunner;
   readonly tenantId: string;
   readonly companyId: string;
@@ -81,6 +82,7 @@ type Scope = {
 };
 
 export function createBankReconciliationService(input: {
+  readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly database: ErpFinancialsTransactionRunner;
   readonly tenantId: string;
   readonly companyId: string;
@@ -104,9 +106,9 @@ export function createBankReconciliationService(input: {
   return {
     ingest: (command) => ingest(scope, command),
     match: (command) => match(scope, command),
-    unmatch: (command) => unmatch(scope, command),
-    ignore: (command) => ignore(scope, command),
-    unignore: (command) => unignore(scope, command)
+    unmatch: (command) => runFinancialAction(scope, "bankReconciliation.unmatch", command, unmatch),
+    ignore: (command) => runFinancialAction(scope, "bankReconciliation.ignore", command, ignore),
+    unignore: (command) => runFinancialAction(scope, "bankReconciliation.unignore", command, unignore)
   };
 }
 
@@ -245,7 +247,7 @@ async function unmatch(
   scope: Scope,
   input: { readonly operation: FinancialOperationContext; readonly bankReconciliationMatchId: string; readonly expectedVersion: number }
 ): Promise<BankReconciliationMatchResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(scope, input.operation);
   assertVersion(input.expectedVersion);
   return scope.database.transaction(async (client) => {
     const result = await client.query(
@@ -288,9 +290,29 @@ async function ignore(
   scope: Scope,
   input: { readonly operation: FinancialOperationContext; readonly bankStatementLineId: string; readonly expectedVersion: number }
 ): Promise<BankStatementLineResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(scope, input.operation);
   assertVersion(input.expectedVersion);
   return scope.database.transaction(async (client) => {
+    if (financialApprovalAudit(client, scope, input.operation) !== undefined) {
+      const locked = await client.query(
+        `select * from "erp_financials"."bank_statement_lines"
+where "tenant_id"=$1 and "company_id"=$2 and "book_id"=$3 and "bank_statement_line_id"=$4 and "source_id"=$5 for update`,
+        [scope.tenantId, scope.companyId, scope.bookId, input.bankStatementLineId, scope.sourceId]
+      );
+      const line = requiredRow(locked.rows[0], "bank statement line");
+      const event = await appendFinancialLifecycleEvent(client, lifecycle(scope, input.operation, {
+        aggregateType: "bank_statement_line", aggregateId: input.bankStatementLineId,
+        eventType: "bank_statement_line.ignored",
+        idempotencyKey: `bank-line:${input.bankStatementLineId}:ignored:v${String(input.expectedVersion)}`,
+        payload: { priorVersion: input.expectedVersion }
+      }));
+      if (event.status === "already_recorded") {
+        if (line.status !== "ignored" || integer(line.version, "version") !== input.expectedVersion + 1) {
+          throw new ErpFinancialsError("idempotency_conflict", "Confirmed ignore no longer has its stable resulting state");
+        }
+        return bankLineResult(line);
+      }
+    }
     const result = await client.query(
       `update "erp_financials"."bank_statement_lines" set "status" = 'ignored', "version" = "version" + 1, "updated_at" = $5
 where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "bank_statement_line_id" = $4
@@ -314,7 +336,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "bank_statem
 }
 
 async function unignore(scope: Scope, input: UnignoreBankStatementLineInput): Promise<BankStatementLineResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(scope, input.operation);
   if (input.operation.reasonDetail === undefined) {
     throw new ErpFinancialsError(
       "authorization_context_invalid",

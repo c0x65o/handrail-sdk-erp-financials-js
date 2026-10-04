@@ -1,3 +1,4 @@
+import { assertFinancialApproval, runFinancialAction, type FinancialApprovalPolicy, copyFinancialOperation } from "./financial-approval-policy.js";
 import { createCustomerPaymentCorrectionService, lockCustomerPaymentCorrectionSource, type CustomerPaymentCorrectionGuard } from "./customer-payment-correction.js";
 import { createHash } from "node:crypto";
 
@@ -6,7 +7,6 @@ import { assertNoCredentialKeys, createDimensionHash } from "./canonical-model.j
 import { ACCOUNT_HIERARCHY_CHANGED_STALE_REASON } from "./rollup-jobs.js";
 import { createPostgresStorageAdapter } from "./postgres-storage.js";
 import { appendFinancialLifecycleEvent, assertFinancialOperationContext } from "./financial-lifecycle.js";
-import { assertIndependentApproval } from "./financial-lifecycle.js";
 import { assertPostingDateAllowed, createFiscalPeriodService } from "./fiscal-periods.js";
 import { ErpFinancialsError } from "./sdk-errors.js";
 import { appendFinancialOutboxEvent } from "./financial-outbox.js";
@@ -66,6 +66,7 @@ export type ErpFinancialsPostgresPool = {
 export type ErpFinancialsDatabase = ErpFinancialsTransactionRunner | ErpFinancialsPostgresPool;
 
 export type CreateErpFinancialsInput = {
+  readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly customerPaymentCorrectionGuard?: CustomerPaymentCorrectionGuard;
   readonly database: ErpFinancialsDatabase;
   readonly tenantId: string;
@@ -712,6 +713,7 @@ export class ErpFinancialsIdempotencyConflictError extends ErpFinancialsError {
 }
 
 type ServiceContext = {
+  readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly customerPaymentCorrectionGuard?: CustomerPaymentCorrectionGuard;
   readonly database: ErpFinancialsTransactionRunner;
   readonly tenantId: string;
@@ -782,22 +784,22 @@ export function createErpFinancials(input: CreateErpFinancialsInput): ErpFinanci
     },
     journalEntries: {
       post(journalInput) {
-        return postJournalEntry(context, journalInput);
+        return journalInput.adjustment ? runFinancialAction(context, "journalEntries.postAdjustment", journalInput, postJournalEntry) : postJournalEntry(context, journalInput);
       },
       postAdjustment(journalInput) {
-        return postJournalEntry(context, { ...journalInput, adjustment: true });
+        return runFinancialAction(context, "journalEntries.postAdjustment", journalInput, (context, command) => postJournalEntry(context, { ...command, adjustment: true }));
       },
       reverse(workflowInput) {
-        return runJournalLifecycleWorkflow(context, "reversed", workflowInput);
+        return runFinancialAction(context, "journalEntries.reverse", workflowInput, (context, workflowInput) => runJournalLifecycleWorkflow(context, "reversed", workflowInput));
       },
       void(workflowInput) {
-        return runJournalLifecycleWorkflow(context, "voided", workflowInput);
+        return runFinancialAction(context, "journalEntries.void", workflowInput, (context, workflowInput) => runJournalLifecycleWorkflow(context, "voided", workflowInput));
       },
       correct(workflowInput) {
-        return runJournalLifecycleWorkflow(context, "corrected", workflowInput);
+        return runFinancialAction(context, "journalEntries.correct", workflowInput, (context, workflowInput) => runJournalLifecycleWorkflow(context, "corrected", workflowInput));
       },
       replace(workflowInput) {
-        return runJournalLifecycleWorkflow(context, "replaced", workflowInput);
+        return runFinancialAction(context, "journalEntries.replace", workflowInput, (context, workflowInput) => runJournalLifecycleWorkflow(context, "replaced", workflowInput));
       }
     },
     fiscalPeriods: createFiscalPeriodService(context),
@@ -811,79 +813,67 @@ export function createErpFinancials(input: CreateErpFinancialsInput): ErpFinanci
         return postJournalEntry({ ...nestedServiceContext(context, client), postingPolicy: "enforce_fiscal_periods" }, correctionJournal);
       }) },
     adjustments: {
-      voidIssued: (adjustmentInput) => runIssuedAdjustmentLifecycle(context, "voided", adjustmentInput),
-      replaceIssued: (adjustmentInput) => runIssuedAdjustmentLifecycle(context, "replaced", adjustmentInput)
+      voidIssued: (adjustmentInput) => runFinancialAction(context, "adjustments.voidIssued", adjustmentInput, (context, adjustmentInput) => runIssuedAdjustmentLifecycle(context, "voided", adjustmentInput)),
+      replaceIssued: (adjustmentInput) => runFinancialAction(context, "adjustments.replaceIssued", adjustmentInput, (context, adjustmentInput) => runIssuedAdjustmentLifecycle(context, "replaced", adjustmentInput))
     },
     credits: {
       issue: (documentInput) => issueCreditMemo(context, documentInput),
-      voidIssued: (adjustmentInput) => runIssuedAdjustmentLifecycle(
-        context,
-        "voided",
-        { ...adjustmentInput, adjustmentType: "credit" }
-      ),
-      replaceIssued: (adjustmentInput) => runIssuedAdjustmentLifecycle(
-        context,
-        "replaced",
-        { ...adjustmentInput, adjustmentType: "credit" }
-      )
+      voidIssued: (adjustmentInput) => runFinancialAction(context, "credits.voidIssued", adjustmentInput, (context, command) => runIssuedAdjustmentLifecycle(
+        context, "voided", { ...command, adjustmentType: "credit" }
+      )),
+      replaceIssued: (adjustmentInput) => runFinancialAction(context, "credits.replaceIssued", adjustmentInput, (context, command) => runIssuedAdjustmentLifecycle(
+        context, "replaced", { ...command, adjustmentType: "credit" }
+      ))
     },
     refunds: {
       issue: (documentInput) => issueRefund(context, documentInput),
-      voidIssued: (adjustmentInput) => runIssuedAdjustmentLifecycle(
-        context,
-        "voided",
-        { ...adjustmentInput, adjustmentType: "refund" }
-      ),
-      replaceIssued: (adjustmentInput) => runIssuedAdjustmentLifecycle(
-        context,
-        "replaced",
-        { ...adjustmentInput, adjustmentType: "refund" }
-      )
+      voidIssued: (adjustmentInput) => runFinancialAction(context, "refunds.voidIssued", adjustmentInput, (context, command) => runIssuedAdjustmentLifecycle(
+        context, "voided", { ...command, adjustmentType: "refund" }
+      )),
+      replaceIssued: (adjustmentInput) => runFinancialAction(context, "refunds.replaceIssued", adjustmentInput, (context, command) => runIssuedAdjustmentLifecycle(
+        context, "replaced", { ...command, adjustmentType: "refund" }
+      ))
     },
     vendorBills: {
       create: (documentInput) => createVendorBill(context, documentInput),
-      voidIssued: (workflowInput) => runPostedVendorBillLifecycle(context, "voided", workflowInput),
-      replaceIssued: (workflowInput) => runPostedVendorBillLifecycle(context, "replaced", workflowInput),
-      voidPosted: (workflowInput) => runPostedVendorBillLifecycle(context, "voided", workflowInput),
-      replacePosted: (workflowInput) => runPostedVendorBillLifecycle(context, "replaced", workflowInput)
+      voidIssued: (workflowInput) => runFinancialAction(context, "vendorBills.voidIssued", workflowInput, (context, workflowInput) => runPostedVendorBillLifecycle(context, "voided", workflowInput)),
+      replaceIssued: (workflowInput) => runFinancialAction(context, "vendorBills.replaceIssued", workflowInput, (context, workflowInput) => runPostedVendorBillLifecycle(context, "replaced", workflowInput)),
+      voidPosted: (workflowInput) => runFinancialAction(context, "vendorBills.voidIssued", workflowInput, (context, workflowInput) => runPostedVendorBillLifecycle(context, "voided", workflowInput)),
+      replacePosted: (workflowInput) => runFinancialAction(context, "vendorBills.replaceIssued", workflowInput, (context, workflowInput) => runPostedVendorBillLifecycle(context, "replaced", workflowInput))
     },
     billPayments: {
       record: (documentInput) => recordBillPayment(context, documentInput),
       recordAndApply: (documentInput) => recordAndApplyBillPayment(context, documentInput),
       schedule: (documentInput) => scheduleBillPayment(context, documentInput),
       clear: (workflowInput) => clearScheduledBillPayment(context, workflowInput),
-      cancel: (workflowInput) => cancelScheduledBillPayment(context, workflowInput),
-      voidAndUnapply: (workflowInput) => voidAndUnapplyBillPayment(context, workflowInput),
-      void: (workflowInput) => runPostedBillPaymentVoid(context, workflowInput),
-      voidIssued: (workflowInput) => runPostedBillPaymentVoid(context, workflowInput),
-      voidPosted: (workflowInput) => runPostedBillPaymentVoid(context, workflowInput)
+      cancel: (workflowInput) => runFinancialAction(context, "billPayments.cancel", workflowInput, (context, workflowInput) => cancelScheduledBillPayment(context, workflowInput)),
+      voidAndUnapply: (workflowInput) => runFinancialAction(context, "billPayments.voidAndUnapply", workflowInput, (context, workflowInput) => voidAndUnapplyBillPayment(context, workflowInput)),
+      void: (workflowInput) => runFinancialAction(context, "billPayments.void", workflowInput, (context, workflowInput) => runPostedBillPaymentVoid(context, workflowInput)),
+      voidIssued: (workflowInput) => runFinancialAction(context, "billPayments.void", workflowInput, (context, workflowInput) => runPostedBillPaymentVoid(context, workflowInput)),
+      voidPosted: (workflowInput) => runFinancialAction(context, "billPayments.void", workflowInput, (context, workflowInput) => runPostedBillPaymentVoid(context, workflowInput))
     },
     writeOffs: {
       record: (documentInput) => recordWriteOff(context, documentInput),
       settleInvoice: (settlementInput) => settleInvoiceWriteOff(context, settlementInput),
-      voidIssued: (workflowInput) => runIssuedAdjustmentLifecycle(context, "voided", {
-        ...workflowInput,
-        adjustmentDocumentId: workflowInput.writeOffDocumentId,
-        adjustmentType: "write_off"
-      }),
-      replaceIssued: (workflowInput) => runIssuedAdjustmentLifecycle(context, "replaced", {
-        ...workflowInput,
-        adjustmentDocumentId: workflowInput.writeOffDocumentId,
-        adjustmentType: "write_off"
-      })
+      voidIssued: (workflowInput) => runFinancialAction(context, "writeOffs.voidIssued", workflowInput, (context, command) => runIssuedAdjustmentLifecycle(context, "voided", {
+        ...command, adjustmentDocumentId: command.writeOffDocumentId, adjustmentType: "write_off"
+      })),
+      replaceIssued: (workflowInput) => runFinancialAction(context, "writeOffs.replaceIssued", workflowInput, (context, command) => runIssuedAdjustmentLifecycle(context, "replaced", {
+        ...command, adjustmentDocumentId: command.writeOffDocumentId, adjustmentType: "write_off"
+      }))
     },
     deposits: {
       record: (documentInput) => recordDeposit(context, documentInput),
-      reverse: (documentInput) => reverseDeposit(context, documentInput)
+      reverse: (documentInput) => runFinancialAction(context, "deposits.reverse", documentInput, (context, documentInput) => reverseDeposit(context, documentInput))
     },
     transfers: {
       record: (documentInput) => recordTransfer(context, documentInput),
-      reverse: (documentInput) => reverseTransfer(context, documentInput)
+      reverse: (documentInput) => runFinancialAction(context, "transfers.reverse", documentInput, (context, documentInput) => reverseTransfer(context, documentInput))
     },
     paymentApplications: {
       apply: (applicationInput) => applySubledgerPayment(context, applicationInput),
-      unapply: (applicationInput) => endSubledgerApplication(context, applicationInput, "unapplied"),
-      void: (applicationInput) => endSubledgerApplication(context, applicationInput, "voided")
+      unapply: (applicationInput) => runFinancialAction(context, "paymentApplications.unapply", applicationInput, (context, applicationInput) => endSubledgerApplication(context, applicationInput, "unapplied")),
+      void: (applicationInput) => runFinancialAction(context, "paymentApplications.void", applicationInput, (context, applicationInput) => endSubledgerApplication(context, applicationInput, "voided"))
     }
   };
 }
@@ -988,7 +978,7 @@ async function postJournalEntry(
   const journal = normalizeJournalEntry(context, input);
   assertFinancialOperationContext(input.operation);
   if (journal.adjustment) {
-    assertIndependentApproval(input.operation);
+    assertFinancialApproval(context, input.operation);
   }
   const identities = journalIdentities(context, journal);
 
@@ -1413,7 +1403,7 @@ async function cancelScheduledBillPayment(
   context: ServiceContext,
   input: CancelScheduledBillPaymentInput
 ): Promise<CancelledScheduledBillPaymentResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.billPaymentId, "billPaymentId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
@@ -2127,7 +2117,7 @@ async function reverseDeposit(context: ServiceContext, input: ReverseDepositInpu
 }
 
 async function reverseTransfer(context: ServiceContext, input: ReverseTransferInput): Promise<ReverseTransferResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   // JavaScript callers can omit fields that TypeScript requires.
   const approval = input.approval as TransferReversalApproval | null | undefined;
   if (approval == null || typeof approval.approvalRef !== "string" ||
@@ -2137,7 +2127,7 @@ async function reverseTransfer(context: ServiceContext, input: ReverseTransferIn
   }
   // Snapshot the approved command before any asynchronous work.
   const { originalDocumentId, ...result } = await reverseRecordedCashMovement(context, "transfer", {
-    ...input, documentId: input.transferId, operation: { ...input.operation }, approval: { ...input.approval }
+    ...input, documentId: input.transferId, operation: copyFinancialOperation(input.operation), approval: { ...input.approval }
   });
   return { ...result, originalTransferId: originalDocumentId };
 }
@@ -2151,7 +2141,7 @@ async function reverseRecordedCashMovement(
     readonly approval?: TransferReversalApproval;
   }
 ): Promise<Omit<ReverseDepositResult, "originalDepositId"> & { readonly originalDocumentId: string }> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.documentId, "documentId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertIsoDate(input.date, "date");
@@ -2706,7 +2696,7 @@ async function endSubledgerApplication(
   input: EndSubledgerApplicationInput,
   status: "unapplied" | "voided"
 ): Promise<SubledgerApplicationResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   assertIsoDate(input.effectiveDate, "effectiveDate");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
   return context.database.transaction(async (client) => {
@@ -3506,7 +3496,7 @@ async function runPostedVendorBillLifecycle(
   outcome: "voided" | "replaced",
   input: VoidPostedVendorBillInput | ReplacePostedVendorBillInput
 ): Promise<PostedVendorBillLifecycleResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.vendorBillId, "vendorBillId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
@@ -3791,7 +3781,7 @@ async function voidAndUnapplyBillPayment(
   context: ServiceContext,
   input: VoidAndUnapplyBillPaymentInput
 ): Promise<VoidAndUnapplyBillPaymentResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.billPaymentId, "billPaymentId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
@@ -3975,7 +3965,7 @@ async function runPostedBillPaymentVoid(
   context: ServiceContext,
   input: VoidPostedBillPaymentInput
 ): Promise<PostedBillPaymentLifecycleResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.billPaymentId, "billPaymentId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
@@ -4204,7 +4194,7 @@ async function runIssuedAdjustmentLifecycle(
   outcome: "voided" | "replaced",
   input: VoidIssuedAdjustmentInput | ReplaceIssuedAdjustmentInput
 ): Promise<IssuedAdjustmentLifecycleResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.adjustmentDocumentId, "adjustmentDocumentId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
@@ -4529,7 +4519,7 @@ async function runJournalLifecycleWorkflow(
   input: ReverseJournalEntryInput | ReplaceJournalEntryInput,
   routing?: { readonly allowedSourceTypes: readonly string[]; readonly priorEventId: string }
 ): Promise<JournalEntryLifecycleResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.originalTransactionId, "originalTransactionId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertIsoDate(input.date, "date");
@@ -4937,6 +4927,7 @@ function serviceContext(input: CreateErpFinancialsInput): ServiceContext {
     accountingBasis,
     now: input.now ?? (() => new Date().toISOString()),
     postingPolicy: input.postingPolicy ?? "enforce_fiscal_periods",
+    ...(input.financialApprovalPolicy === undefined ? {} : { financialApprovalPolicy: input.financialApprovalPolicy }),
     ...(input.customerPaymentCorrectionGuard === undefined ? {} : { customerPaymentCorrectionGuard: input.customerPaymentCorrectionGuard })
   };
 }

@@ -1,6 +1,7 @@
+import { assertFinancialApproval, runFinancialAction, type FinancialApprovalPolicy, copyFinancialOperation } from "./financial-approval-policy.js";
 import { createHash } from "node:crypto";
 import { assertNoCredentialKeys } from "./canonical-model.js";
-import { appendFinancialLifecycleEvent, assertIndependentApproval } from "./financial-lifecycle.js";
+import { appendFinancialLifecycleEvent } from "./financial-lifecycle.js";
 import { assertPostingDateAllowed } from "./fiscal-periods.js";
 import { appendFinancialOutboxEvent } from "./financial-outbox.js";
 import { ErpFinancialsError } from "./sdk-errors.js";
@@ -67,7 +68,8 @@ export type CustomerPaymentCorrectionPreview = {
 };
 export type VoidAndUnapplyCustomerPaymentInput = CustomerPaymentCorrectionRequest & {
   readonly confirmation: string;
-  /** Server-issued approval record, bound by the app guard to request + confirmation. */
+  /** Server-issued record bound by the app guard to request + confirmation.
+   * Under administrator_direct this is the real admin confirmation, not a second approval. */
   readonly approvalRef: string;
 };
 export type VoidAndUnapplyCustomerPaymentResult = {
@@ -94,6 +96,7 @@ type Scope = {
   readonly currencyCode: string;
 };
 type Context = Scope & {
+  readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly database: ErpFinancialsTransactionRunner;
   readonly now: () => string;
   readonly customerPaymentCorrectionGuard?: CustomerPaymentCorrectionGuard;
@@ -166,6 +169,14 @@ export async function persistImportedCustomerPaymentEvidence(client: PostgresQue
   on conflict(tenant_id,company_id,source_id,payment_id) do update set source_version=excluded.source_version,evidence=excluded.evidence`, [`payment_evidence_${hash([scope, evidence.paymentId]).slice(0, 24)}`, scope.tenantId, scope.companyId, scope.sourceId, evidence.paymentId, evidence.sourceVersion, JSON.stringify(storedEvidence)]);
 }
 export function createCustomerPaymentCorrectionService(context: Context, post: (client: PostgresQueryClient, input: PostJournalEntryInput) => Promise<PostJournalEntryResult>) {
+  return {
+    previewVoidAndUnapply: (input: CustomerPaymentCorrectionRequest) => runFinancialAction(context, "customerPayments.voidAndUnapply", input,
+      (context, command) => correctionService(context, post).previewVoidAndUnapply(command), "preview"),
+    voidAndUnapply: (input: VoidAndUnapplyCustomerPaymentInput) => runFinancialAction(context, "customerPayments.voidAndUnapply", input,
+      (context, command) => correctionService(context, post).voidAndUnapply(command))
+  };
+}
+function correctionService(context: Context, post: (client: PostgresQueryClient, input: PostJournalEntryInput) => Promise<PostJournalEntryResult>) {
   const scope = [context.tenantId, context.companyId, context.sourceId];
   async function guard(client: PostgresQueryClient, request: CustomerPaymentCorrectionRequest, phase: "preview" | "confirm", approval?: {
     confirmation: string;
@@ -290,7 +301,8 @@ export function createCustomerPaymentCorrectionService(context: Context, post: (
   }
   function requestCopy(input: CustomerPaymentCorrectionRequest): CustomerPaymentCorrectionRequest {
     const request = structuredClone({ paymentId: input.paymentId, date: input.date, idempotencyKey: input.idempotencyKey, operation: input.operation });
-    assertIndependentApproval(request.operation);
+    request.operation = copyFinancialOperation(input.operation);
+    assertFinancialApproval(context, request.operation);
     [request.paymentId, request.idempotencyKey, request.operation.reasonDetail].forEach(nonempty);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(request.date) || !Number.isFinite(Date.parse(request.date)) || new Date(request.date).toISOString().slice(0, 10) !== request.date)
       fail("Invalid correction effective date");

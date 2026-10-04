@@ -1,3 +1,4 @@
+import { assertFinancialApproval, runFinancialAction, type FinancialApprovalPolicy } from "./financial-approval-policy.js";
 import { createHash } from "node:crypto";
 
 import { assertNoCredentialKeys } from "./canonical-model.js";
@@ -10,7 +11,6 @@ import { appendFinancialOutboxEvent } from "./financial-outbox.js";
 import {
   appendFinancialLifecycleEvent,
   assertFinancialOperationContext,
-  assertIndependentApproval
 } from "./financial-lifecycle.js";
 import { ErpFinancialsError } from "./sdk-errors.js";
 
@@ -113,6 +113,7 @@ export type InvoiceWorkflow = {
 };
 
 type Scope = {
+  readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly database: ErpFinancialsTransactionRunner;
   readonly tenantId: string;
   readonly companyId: string;
@@ -125,6 +126,7 @@ type Scope = {
 };
 
 export function createInvoiceWorkflow(input: {
+  readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly database: ErpFinancialsTransactionRunner;
   readonly tenantId: string;
   readonly companyId: string;
@@ -148,9 +150,9 @@ export function createInvoiceWorkflow(input: {
   return {
     createDraft: (command) => createDraft(scope, command),
     updateDraft: (command) => updateDraft(scope, command),
-    voidDraft: (command) => voidDraft(scope, command),
+    voidDraft: (command) => runFinancialAction(scope, "invoices.voidDraft", command, voidDraft),
     issue: (command) => issueDraft(scope, command),
-    voidIssued: (command) => voidIssuedInvoice(scope, command),
+    voidIssued: (command) => runFinancialAction(scope, "invoices.voidIssued", command, voidIssuedInvoice),
     recordDelivery: (command) => recordDelivery(scope, command)
   };
 }
@@ -251,7 +253,7 @@ async function voidDraft(
   scope: Scope,
   input: { readonly operation: FinancialOperationContext; readonly invoiceDraftId: string; readonly expectedVersion: number }
 ): Promise<InvoiceDraft> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(scope, input.operation);
   assertVersion(input.expectedVersion);
   return scope.database.transaction(async (client) => {
     const current = await lockDraft(client, scope, input.invoiceDraftId);
@@ -351,7 +353,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "invoice_dra
 }
 
 async function voidIssuedInvoice(scope: Scope, input: VoidIssuedInvoiceInput): Promise<VoidIssuedInvoiceResult> {
-  assertIndependentApproval(input.operation);
+  assertFinancialApproval(scope, input.operation);
   assertVersion(input.expectedVersion);
   assertDate(input.date, "date");
   return scope.database.transaction(async (client) => {

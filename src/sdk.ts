@@ -1,3 +1,4 @@
+import type { FinancialApprovalPolicy } from "./financial-approval-policy.js";
 import type { CustomerPaymentCorrectionGuard } from "./customer-payment-correction.js";
 import { createBankReconciliationService } from "./bank-reconciliation.js";
 export { projectCashBasisApplication } from "./accounting-basis-projection.js";
@@ -72,6 +73,7 @@ export type ErpFinancialsSdk = {
 };
 
 export type CreateErpFinancialsSdkInput = {
+  readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly customerPaymentCorrectionGuard?: CustomerPaymentCorrectionGuard;
   readonly database: ErpFinancialsDatabase;
   readonly tenantId: string;
@@ -88,6 +90,7 @@ export type CreateErpFinancialsSdkInput = {
 export function createErpFinancialsSdk(input: CreateErpFinancialsSdkInput): ErpFinancialsSdk {
   const database = asTransactionRunner(input.database);
   const shared = {
+    ...(input.financialApprovalPolicy === undefined ? {} : { financialApprovalPolicy: input.financialApprovalPolicy }),
     database,
     tenantId: input.tenantId,
     companyId: input.companyId,
@@ -107,6 +110,7 @@ export function createErpFinancialsSdk(input: CreateErpFinancialsSdkInput): ErpF
   });
   return {
     commands: createErpFinancials({
+      ...(input.financialApprovalPolicy === undefined ? {} : { financialApprovalPolicy: input.financialApprovalPolicy }),
       ...(input.customerPaymentCorrectionGuard === undefined ? {} : { customerPaymentCorrectionGuard: input.customerPaymentCorrectionGuard }),
       database,
       tenantId: input.tenantId,
@@ -366,3 +370,6 @@ export { persistImportedCustomerPaymentEvidence, assertCustomerPaymentCorrection
 
 export { prepareCustomerPaymentCorrectionImport } from "./customer-payment-correction-replay.js";
 export type { CustomerPaymentCorrectionDependency, CustomerPaymentCorrectionImportPlan } from "./customer-payment-correction-replay.js";
+
+export { createFinancialActionCommandChecksum } from "./financial-approval-policy.js";
+export type { FinancialAction, FinancialApprovalScope, FinancialApprovalPolicy, AdministratorConfirmation, AdministratorFinancialGuard, AdministratorFinancialGuardInput } from "./financial-approval-policy.js";
