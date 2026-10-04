@@ -84,6 +84,7 @@ describe("general-ledger public contract", () => {
     expect(client.summarySql).toContain("with recursive effective_accounts");
     expect(client.summarySql).toContain('select "book_account_key" from selected_account_keys');
 
+    if (page.nextCursor === undefined) throw new Error("Expected paginated ledger cursor");
     await expect(queries.listGeneralLedger({
       ...filters,
       sourceId: "source_2",

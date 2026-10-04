@@ -67,7 +67,8 @@ describe("deterministic fixture/reference report builders from canonical posting
         const right = identitySets[rightIndex];
         expect(left).toBeDefined();
         expect(right).toBeDefined();
-        expect([...left!].filter((identity) => right!.has(identity))).toEqual([]);
+        if (!left || !right) throw new Error("Missing identity fixture");
+        expect([...left].filter((identity) => right.has(identity))).toEqual([]);
       }
     }
   });

@@ -3,6 +3,10 @@ import { Pool } from "pg";
 
 import {
   persistImportedCustomerPaymentEvidence,
+  persistCanonicalFacts,
+  createPostgresStorageAdapter,
+  materializeQuickBooksBasisBackfill,
+  createPostgresQuickBooksDualBasisBackfillPersistence,
   POSTGRES_CANONICAL_SCHEMA_MANIFEST,
   createErpFinancials,
   createTransferReversalApprovalChecksum,
@@ -47,8 +51,8 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     await pool.end();
   });
 
-  async function correctionFixture(guardOverride?: CustomerPaymentCorrectionGuard) {
-    await migratePostgresSchema(runner, {appliedByRef:"synthetic:payment-correction"});
+  async function correctionFixture(guardOverride?: CustomerPaymentCorrectionGuard, targetVersion?: number) {
+    await migratePostgresSchema(runner, {appliedByRef:"synthetic:payment-correction", ...(targetVersion === undefined ? {} : {targetVersion})});
     await seedQuickBooksImportScope(pool);
     await pool.query<Record<string, unknown>>(`insert into erp_financials.accounts(account_id,tenant_id,source_id,source_account_id,name,type,classification,active)
       values('account_ar_qbo','tenant_qbo','source_qbo','ar','A/R','AccountsReceivable','asset',true);
@@ -151,16 +155,132 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     expect(await depositDatabaseState(pool)).toEqual(before);
   });
 
-  it.each(['upsert','deleted','full-replace','direct-postings','direct-transaction','reset'])('payment correction tombstone rejects delayed provider %s',async(action)=>{
+  it.each(['direct-postings','direct-transaction','direct-new-basis','direct-evidence','direct-rekey','reset'])('payment correction rejects direct mutation %s',async(action)=>{
     const f=await correctionFixture();await f.service.customerPayments.voidAndUnapply(f.input);
     const before=await depositDatabaseState(pool);
     const replay=()=>runner.transaction(async client=>{
       if(action==='direct-postings') return client.query("delete from erp_financials.ledger_postings where transaction_id='payment_accrual'");
       if(action==='direct-transaction') return client.query("update erp_financials.transactions set memo='provider replay' where transaction_id='payment_cash'");
-      if(action==='reset') return resetSourceImportState(client,{tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo'});
-      return persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:quickBooksSubledgerFacts(),replaceMissingDocuments:action==='full-replace',resources:{...f.resources,operationalDocuments:action==='full-replace'?[]:f.resources.operationalDocuments.map(r=>({...r,...(action==='deleted'?{syncAction:'deleted' as const}:{})}))}});
+      if(action==='direct-new-basis') return client.query(`insert into erp_financials.transactions(transaction_id,tenant_id,source_id,source_transaction_id,source_transaction_type,transaction_date,party_id,currency_code,status,source_payload_ref)
+        values('late-alias','tenant_qbo','source_qbo','new-basis','PaymentBasis','2025-07-03','customer_qbo','USD','posted','{"sourceObjectType":"Payment","sourceObjectId":"payment_700"}')`);
+      if(action==='direct-evidence') return client.query("update erp_financials.imported_customer_payment_evidence set source_version='2026-01-01T00:00:00Z'");
+      if(action==='direct-rekey') return client.query("update erp_financials.transactions set source_transaction_type='Other',source_payload_ref='{}' where transaction_id='payment_accrual'");
+      return resetSourceImportState(client,{tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo'});
+
     });
     await expect(replay()).rejects.toThrow();expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(['upsert','deleted','full-replace'])('payment correction preserves accounting on provider %s with a record dependency',async(action)=>{
+    const f=await correctionFixture();await f.service.customerPayments.voidAndUnapply(f.input);
+    const before=await depositDatabaseState(pool);
+    const result=await runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:quickBooksSubledgerFacts(),replaceMissingDocuments:action==='full-replace',resources:{...f.resources,operationalDocuments:action==='full-replace'?[]:f.resources.operationalDocuments.map(r=>({...r,...(action==='deleted' && r.resource.sourceTransactionType==='Payment'?{syncAction:'deleted' as const}:{}),resource:{...r.resource,...(action==='deleted' && r.resource.sourceTransactionType==='Payment'?{sourceUpdatedAt:'2026-08-11T00:00:00.000Z'}:{})}}))}}));
+    expect(result.correctionDependencies).toEqual([expect.objectContaining({code:'provider_dependency',paymentId:f.input.paymentId,sourceTransactionId:'payment_700'})]);
+    expect(result.voidedDocuments).toBe(0);
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it('payment correction upgrades v26 guards without changing existing correction evidence', async () => {
+    const f=await correctionFixture(undefined,26);
+    await f.service.customerPayments.voidAndUnapply(f.input);
+    const before=await depositDatabaseState(pool);
+    const result=await migratePostgresSchema(runner,{appliedByRef:'synthetic:correction-replay-upgrade'});
+    expect(result.currentVersion).toBe(26);
+    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[26,27]]);
+    const after=await depositDatabaseState(pool);
+    for (const table of Object.keys(before).filter(table=>table!=='schema_migrations')) expect(after[table]).toEqual(before[table]);
+    await expect(runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:quickBooksSubledgerFacts(),resources:f.resources}))).resolves.toMatchObject({correctionDependencies:[{code:'provider_dependency',paymentId:f.input.paymentId}]});
+    expect((await f.service.customerPayments.voidAndUnapply(f.input)).status).toBe('already_voided');
+  });
+
+  it.each([false,true])('payment correction retains original facts through concurrent dual-basis snapshots (legacy refs=%s)', async legacy => {
+    const f=await correctionFixture();
+    await f.service.customerPayments.voidAndUnapply(f.input);
+    await f.service.customerPayments.record({operation:sdkOperation(),idempotencyKey:'unrelated-native-credit',date:'2025-07-02',customerId:'customer_qbo',amount:'84.81',cashAccount:{accountId:'account_cash_qbo'},receivableAccount:{accountId:'account_ar_qbo'}});
+    const before=(await pool.query('select * from erp_financials.ledger_postings order by posting_id')).rows;
+    const scope={tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo',currencyCode:'USD',periodStart:'2025-07-01',periodEnd:'2025-07-31',requestedAt:'2026-08-12T12:00:00.000Z',accounts:quickBooksSubledgerFacts().accounts};
+    const reportRef={sourceObjectType:'quickbooks_report_general_ledger',sourceObjectId:'synthetic:snapshot'};
+    const project=(accountingBasis:'accrual'|'cash')=>{
+      const projection=materializeQuickBooksBasisBackfill(scope,{reportName:'general_ledger',accountingBasis,supportStatus:'supported',currencyCode:'USD',generatedAt:'2026-08-12T12:00:00.000Z',providerReportRef:reportRef,
+        ledgerRows:[['payment_700','27.56'],['payment_unrelated','5.00']].flatMap(([transactionId,amount])=>[
+          {transactionId:transactionId ?? '',transactionType:'Payment',transactionDate:'2025-07-03',accountSourceId:'cash',debitAmount:amount ?? '',creditAmount:'0.00'},
+          {transactionId:transactionId ?? '',transactionType:'Payment',transactionDate:'2025-07-03',accountSourceId:'revenue',debitAmount:'0.00',creditAmount:amount ?? ''}])});
+      return legacy ? {...projection,transactions:projection.transactions.map(t=>({...t,sourcePayloadRef:reportRef})),postings:projection.postings.map(p=>({...p,sourcePayloadRef:reportRef}))} : projection;
+    };
+    const persistence=createPostgresQuickBooksDualBasisBackfillPersistence(runner);
+    const run=()=>persistence.replaceDualBasisRange({...scope,projections:[project('accrual'),project('cash')]});
+    for (const result of await Promise.all([run(),run()])) expect(result).toMatchObject({transactions:2,postings:4,correctionDependencies:[{paymentId:f.input.paymentId,code:'provider_dependency'}]});
+    const after=(await pool.query('select * from erp_financials.ledger_postings order by posting_id')).rows;
+    expect(after).toEqual(expect.arrayContaining(before));
+    expect(after.length).toBe(before.length+4);
+    expect((await pool.query("select source_transaction_id from erp_financials.transactions where source_transaction_type='QuickBooksGeneralLedger:Payment' order by source_transaction_id")).rows).toEqual([
+      {source_transaction_id:'accrual:Payment:payment_unrelated:2025-07-03'},
+      {source_transaction_id:'cash:Payment:payment_unrelated:2025-07-03'}]);
+    expect((await pool.query("select sum(net_amount)::text as net from erp_financials.ledger_postings where account_id='account_ar_qbo' and accounting_basis='accrual'")).rows[0]).toEqual({net:'-57.25'});
+  });
+
+  it('payment correction concurrent mixed imports preserve both bases while other customers and bounded deltas continue', async () => {
+    const f = await correctionFixture();
+    await f.service.customerPayments.voidAndUnapply(f.input);
+    const originalPostings = (await pool.query('select * from erp_financials.ledger_postings order by posting_id')).rows;
+    const base = quickBooksSubledgerFacts();
+    const otherTransactions = base.transactions.map(t => ({...t,
+      transactionId: `other_${t.transactionId}`, sourceTransactionId: `other_${t.sourceTransactionId}`,
+      partyId: 'customer_other', transactionDate: '2025-07-03'}));
+    const postings: CanonicalAccountingFactSet['postings'] = [
+      ['other_transaction_invoice_qbo','accrual','account_ar_qbo','account_revenue_qbo'],
+      ['other_transaction_payment_qbo','accrual','account_cash_qbo','account_ar_qbo'],
+      ['other_transaction_payment_qbo','cash','account_cash_qbo','account_revenue_qbo']
+    ].flatMap(([tx,basis,debit,credit]) => (['debit','credit'] as const).map(side => ({
+      tenantId:'tenant_qbo',sourceId:'source_qbo',postingId:`${tx ?? ''}:${basis ?? ''}:${side}`,sourcePostingId:`${tx ?? ''}:${basis ?? ''}:${side}`,
+      transactionId:tx ?? '',accountId:(side==='debit'?debit:credit) ?? '',partyId:'customer_other',postingDate:'2025-07-03',
+      accountingBasis:basis as 'accrual'|'cash',debitAmount:side==='debit'?'10.00':'0.00',creditAmount:side==='credit'?'10.00':'0.00',
+      netAmount:side==='debit'?'10.00':'-10.00',currencyCode:'USD',dimensionHash:'a'.repeat(64),dimensionRefs:[],importBatchId:'batch_mixed'
+    })));
+    const payment = base.transactions.find(t=>t.sourceTransactionType==='Payment');
+    if (!payment) throw Error('Missing payment fixture');
+    const incoming: CanonicalAccountingFactSet = {...base,
+      source:{...base.source,importBatchId:'batch_mixed'},importBatch:{...base.importBatch,importBatchId:'batch_mixed'},
+      parties:[...base.parties,{...base.parties[0],tenantId:'tenant_qbo',sourceId:'source_qbo',partyId:'customer_other',sourcePartyId:'customer_other',partyType:'customer',displayName:'Other synthetic customer',active:true}],
+      transactions:[...base.transactions.filter(t=>t.sourceTransactionType==='Invoice').map(t=>({...t,transactionDate:'2025-07-01'})),payment,{...payment,transactionId:'late_basis',sourceTransactionType:'PaymentBasis',sourceTransactionId:'new-basis-id',sourcePayloadRef:{sourceObjectType:'Payment',sourceObjectId:'payment_700'}},...otherTransactions],
+      transactionLines:[],postings:[...postings,...postings.filter(p=>p.transactionId==='other_transaction_payment_qbo').map(p=>({...p,postingId:`late:${p.postingId}`,sourcePostingId:`late:${p.sourcePostingId}`,transactionId:'late_basis'}))]};
+    const resources = {...f.resources,operationalDocuments:[...f.resources.operationalDocuments,...f.resources.operationalDocuments.map(r=>({...r,resourceId:`other_${r.resourceId}`,resource:{...r.resource,
+      sourceTransactionId:`other_${r.resource.sourceTransactionId}`,totalAmount:'10.00',openAmount:'0.00',unappliedAmount:'0.00',
+      partyRef:{sourceObjectId:'customer_other',partyType:'customer' as const},
+      lines:r.resource.lines.map(l=>({...l,sourceAmount:'10.00',sourceQuantity:'1.00',sourceUnitAmount:'10.00',
+        ...(l.linkedTransactions ? {linkedTransactions:l.linkedTransactions.map(link=>({...link,sourceTransactionId:`other_${link.sourceTransactionId}`}))}: {})}))}}))]};
+    const run = () => runner.transaction(async client => {
+      const storage = createPostgresStorageAdapter(client);
+      const factsResult = await persistCanonicalFacts(storage,incoming);
+      const result = await storage.persistQuickBooksSubledgerResources({companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:incoming,resources});
+      await storage.deleteLedgerFactsOutsideImportBatch({tenantId:'tenant_qbo',sourceId:'source_qbo',importBatchId:'batch_mixed'});
+      return {factsResult,result};
+    });
+    const results = await Promise.all([run(),run()]);
+    for (const r of results) {
+      expect(r.factsResult.transactions).toBe(3);
+      expect(r.factsResult.postings).toBe(6);
+      expect(r.result.correctionDependencies).toEqual([expect.objectContaining({paymentId:f.input.paymentId,code:'provider_dependency'})]);
+    }
+    expect((await pool.query("select * from erp_financials.transactions where transaction_id='late_basis'")).rows).toEqual([]);
+    expect((await pool.query('select * from erp_financials.ledger_postings order by posting_id')).rows).toEqual(expect.arrayContaining(originalPostings));
+    expect((await quickBooksDocumentState(pool))).toEqual(expect.arrayContaining([
+      {source_id:'invoice_600',original_amount:'27.56',open_amount:'27.56',status:'open'},
+      {source_id:'payment_700',original_amount:'27.56',open_amount:'0',status:'voided'},
+      {source_id:'other_invoice_600',original_amount:'10.00',open_amount:'0.00',status:'settled'},
+      {source_id:'other_payment_700',original_amount:'10.00',open_amount:'0.00',status:'settled'}
+    ]));
+    const otherPayment=(await pool.query("select subledger_document_id from erp_financials.subledger_documents where metadata->>'sourceTransactionId'='other_payment_700'")).rows[0] as {subledger_document_id:string};
+    await runner.transaction(client=>persistImportedCustomerPaymentEvidence(client,{tenantId:'tenant_qbo',companyId:'company_qbo',sourceId:'source_qbo'},
+      {...f.evidence,paymentId:otherPayment.subledger_document_id,sourceTransactionId:'other_payment_700',transactionIds:['other_transaction_payment_qbo']}));
+    await expect(f.service.customerPayments.previewVoidAndUnapply({...f.input,paymentId:otherPayment.subledger_document_id,idempotencyKey:'other-preview'})).resolves.toMatchObject({replayPolicy:'preserve_corrected_payment'});
+    const bounded = {...resources,operationalDocuments:resources.operationalDocuments.filter(r=>r.resource.sourceTransactionId==='other_payment_700').map(r=>({...r,syncAction:'deleted' as const}))};
+    await runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:incoming,resources:bounded}));
+    expect(await quickBooksDocumentState(pool)).toEqual(expect.arrayContaining([
+      {source_id:'other_invoice_600',original_amount:'10.00',open_amount:'10.00',status:'open'},
+      {source_id:'invoice_600',original_amount:'27.56',open_amount:'27.56',status:'open'}
+    ]));
+    expect((await pool.query('select * from erp_financials.customer_payment_corrections')).rows).toHaveLength(1);
   });
 
   it.each(['sync','period-close','application','deposit'])('payment correction locks/revalidates concurrent %s winner from another connection',async(kind)=>{
@@ -229,7 +349,7 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     await expect(runner.transaction(async client=>{
       await client.query("select set_config('erp_financials.application_balance_update','on',true)");
       await client.query("update erp_financials.subledger_documents set metadata=metadata||'{\"depositId\":\"late\"}' where subledger_document_id=$1",[f.input.paymentId]);
-    })).rejects.toThrow('customer_payment_corrected_source');
+    })).rejects.toThrow('customer_payment_corrected_record');
     await expect(runner.transaction(client=>client.query("update erp_financials.subledger_applications set status='applied',version=version+1,ended_event_id=null where source_document_id=$1",[f.input.paymentId]))).rejects.toThrow();
     expect(await depositDatabaseState(pool)).toEqual(before);
   });
@@ -255,7 +375,7 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
       for(let i=0;i<100;i++){if((await pool.query("select 1 from pg_stat_activity where datname=current_database() and wait_event='advisory'")).rows.length){waiting=true;break;}await new Promise(resolve=>setTimeout(resolve,10));}
       expect(waiting).toBe(true);
     } finally {release();}
-    expect((await correction).status).toBe('voided');expect(await sync).toBe('rejected');
+    expect((await correction).status).toBe('voided');expect(await sync).toBe('committed');
     expect((await pool.query<Record<string,unknown>>('select status,open_amount from erp_financials.subledger_documents where subledger_document_id=$1',[f.input.paymentId])).rows[0]).toEqual({status:'voided',open_amount:'0'});
   });
 
@@ -270,7 +390,7 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     const line = await sdk.bankReconciliation.ingest({operation: sdkOperation(), externalLineId: "synthetic-bank-line", bankAccountId: "account_cash_qbo", postedDate: "2025-07-03", amount: "27.56"});
     const match = () => sdk.bankReconciliation.match({operation: sdkOperation(), bankStatementLineId: line.bankStatementLineId, transactionId: "payment_accrual", expectedVersion: line.version, idempotencyKey: "synthetic-bank-match", method: "manual"});
     if (timing === "after") {
-      await expect(match()).rejects.toThrow("customer_payment_corrected_source");
+      await expect(match()).rejects.toThrow("customer_payment_corrected_record");
     } else {
       await runner.transaction(client => persistImportedCustomerPaymentEvidence(client, {tenantId: "tenant_qbo", companyId: "company_qbo", sourceId: "source_qbo"}, {...f.evidence, bookId: "correction_book"}));
       const preview = await sdk.commands.customerPayments.previewVoidAndUnapply(f.input);
@@ -979,7 +1099,7 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
 
     expect(imported).toMatchObject({
       documents: 11,
-      documentLines: 9,
+      documentLines: 8,
       applications: 4,
       skippedTransactions: 0,
       skippedDocumentLines: 0,
@@ -1068,9 +1188,9 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
   it.each([false, true])("preserves wrapper ownership through credit-only deltas (customer=%s)", async (customer) => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:credit-delta-ownership" });
     const { facts, resources } = await creditOwnershipFixture(pool, customer);
-    const persist = (documents = resources.operationalDocuments, full = false) => runner.transaction((client) =>
+    const persist = (documents = resources.operationalDocuments ?? [], full = false) => runner.transaction((client) =>
       persistQuickBooksSubledgerResources({ client, companyId: "company_qbo", facts,
-        resources: { ...resources, operationalDocuments: documents ?? [] },
+        resources: { ...resources, operationalDocuments: documents },
         importedAt: "2026-09-11T10:00:00.000Z", replaceMissingDocuments: full }));
     await persist(resources.operationalDocuments, true);
     const before = await creditOwnershipState(pool);
@@ -1078,7 +1198,7 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
       { source_id: "2572", original_amount: "1922.58", open_amount: "0.00", status: "settled" },
       { source_id: "2573", original_amount: "1861.52", open_amount: "0.00", status: "settled" }
     ]);
-    const delta = resources.operationalDocuments?.filter(row => row.resourceId === "2572");
+    const delta = (resources.operationalDocuments ?? []).filter(row => row.resourceId === "2572");
     for (let replay = 0; replay < 2; replay += 1) {
       expect(await persist(delta)).toMatchObject({ applications: 0, removedLedgerPostings: 0 });
       expect(await creditOwnershipState(pool)).toEqual(before);
@@ -1098,11 +1218,11 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
   ] as const)("still reconciles the owning wrapper (customer=%s, action=%s)", async (customer, action) => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:credit-wrapper-retirement" });
     const { facts, resources } = await creditOwnershipFixture(pool, customer);
-    const persist = (documents = resources.operationalDocuments) => runner.transaction((client) =>
+    const persist = (documents = resources.operationalDocuments ?? []) => runner.transaction((client) =>
       persistQuickBooksSubledgerResources({ client, companyId: "company_qbo", facts,
-        resources: { ...resources, operationalDocuments: documents ?? [] }, importedAt: "2026-09-11T11:00:00.000Z" }));
+        resources: { ...resources, operationalDocuments: documents }, importedAt: "2026-09-11T11:00:00.000Z" }));
     await persist();
-    const wrapper = resources.operationalDocuments?.find(row => row.resourceId === "2574");
+    const wrapper = (resources.operationalDocuments ?? []).find(row => row.resourceId === "2574");
     if (!wrapper) throw new Error("Missing wrapper fixture");
     const delta = [{ ...wrapper,
       ...(action === "voided" || action === "deleted" ? { syncAction: action } : {}),
@@ -1128,14 +1248,14 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
   it.each([false, true])("removes only directly owned LinkedTxn applications (customer=%s)", async (customer) => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:direct-credit-ownership" });
     const { facts, resources } = await creditOwnershipFixture(pool, customer);
-    const documents = resources.operationalDocuments?.filter(row => row.resourceId !== "2574").map(row => ({
+    const documents = (resources.operationalDocuments ?? []).filter(row => row.resourceId !== "2574").map(row => ({
       ...row, resource: { ...row.resource, openAmount: row.resourceId === "2572" ? "1902.58" : "1841.52",
         lines: row.resource.lines.flatMap(line => row.resourceId === "2572" ? [{ ...line,
           sourceAmount: "20.00", linkedTransactions: [{ sourceTransactionId: "2573", sourceTransactionType: customer ? "Invoice" : "Bill" }]
         }, { ...line, sourceLineId: "2", lineNumber: 2, sourceAmount: "1902.58" }] : [line]) }
     }));
     await runner.transaction(client => persistQuickBooksSubledgerResources({ client, companyId: "company_qbo", facts,
-      resources: { ...resources, operationalDocuments: documents ?? [] }, importedAt: "2026-09-11T10:00:00.000Z" }));
+      resources: { ...resources, operationalDocuments: documents }, importedAt: "2026-09-11T10:00:00.000Z" }));
     // Same source document is not ownership: native, another provider object,
     // and a wrapper projection must all survive the ordinary credit refresh.
     for (const [id, payload] of [
@@ -1157,9 +1277,9 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
         1, currency_code, application_date, 'applied', 1, $1, $1, created_at, updated_at
         from erp_financials.subledger_applications where subledger_application_id not in ('native', 'other', 'projection') limit 1`, [id]);
     }
-    const delta = resources.operationalDocuments?.filter(row => row.resourceId === "2572");
+    const delta = (resources.operationalDocuments ?? []).filter(row => row.resourceId === "2572");
     await runner.transaction(client => persistQuickBooksSubledgerResources({ client, companyId: "company_qbo", facts,
-      resources: { ...resources, operationalDocuments: delta ?? [] }, importedAt: "2026-09-11T11:00:00.000Z" }));
+      resources: { ...resources, operationalDocuments: delta }, importedAt: "2026-09-11T11:00:00.000Z" }));
     const state = await creditOwnershipState(pool);
     expect(state.applications.filter(row => row.status === "applied").map(row => row.subledger_application_id).sort())
       .toEqual(["native", "other", "projection"]);
@@ -1173,7 +1293,7 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
     const baseResources = quickBooksAllDocumentResources();
     const resources: HandrailQuickBooksSdkResourceSet = {
       ...baseResources,
-      operationalDocuments: baseResources.operationalDocuments?.map((resource) => {
+      operationalDocuments: (baseResources.operationalDocuments ?? []).map((resource) => {
         if (resource.resource.sourceTransactionId === "vendor_credit_all") {
           return {
             ...resource,
@@ -1334,7 +1454,7 @@ insert into erp_financials.transactions (
           totalAmount: "40.00",
           openAmount: syncAction === "voided" ? "40.00" : (amount === "40.00" ? "0.00" : "10.00"),
           sourceUpdatedAt,
-          lines: []
+          lines: invoiceTemplate.resource.lines.map(line => ({ ...line, sourceAmount: "40.00", sourceQuantity: "1.00", sourceUnitAmount: "40.00" }))
         }
       };
       const payment = {
@@ -1485,7 +1605,7 @@ insert into erp_financials.ledger_postings (
     const deltaResources = quickBooksSubledgerResources("40.00", true, "2026-08-11T10:00:00.000Z");
     const deletedPayment = {
       ...deltaResources,
-      operationalDocuments: deltaResources.operationalDocuments?.map((resource) =>
+      operationalDocuments: (deltaResources.operationalDocuments ?? []).map((resource) =>
         resource.resource.sourceTransactionId === "payment_700"
           ? { ...resource, syncAction: "deleted" as const }
           : resource
@@ -1506,8 +1626,7 @@ insert into erp_financials.ledger_postings (
 
     const invoiceOnly = {
       ...quickBooksSubledgerResources("40.00", false, "2026-08-12T10:00:00.000Z"),
-      operationalDocuments: quickBooksSubledgerResources("40.00", false, "2026-08-12T10:00:00.000Z")
-        .operationalDocuments?.filter((resource) => resource.resource.sourceTransactionId === "payment_700")
+      operationalDocuments: (quickBooksSubledgerResources("40.00", false, "2026-08-12T10:00:00.000Z").operationalDocuments ?? []).filter((resource) => resource.resource.sourceTransactionId === "payment_700")
     };
     const full = await runner.transaction((client) => persistQuickBooksSubledgerResources({
       client,
@@ -1640,7 +1759,7 @@ values ('native_customer', 'tenant_1', 'source_2', 'customer:1', 'customer', 'Cu
       { bookAccountKey: "payable", accountNumber: "2000", name: "Accounts payable", classification: "liability" as const },
       { bookAccountKey: "revenue", accountNumber: "4000", name: "Service revenue", classification: "income" as const },
     ]) {
-      await sdk.books.defineAccount({ operation, bookId: "book_cutoff", expectedVersion: 0, accountRole: "posting", type: account.name, ...account });
+      await sdk.books.defineAccount({ operation, bookId: "book_cutoff", expectedVersion: 0, accountRole: "posting", ...account });
     }
     for (const mapping of [
       ["source_1", "account_cash", "cash"], ["source_1", "account_ar", "receivable"],
@@ -1815,7 +1934,7 @@ insert into erp_financials.journal_entry_links values
       expect(unavailable.rows[0]?.acquired).toBe(false);
 
       const before = await first.query<{ count: string }>("select count(*)::text as count from erp_financials.schema_migrations");
-      await second.query("insert into erp_financials.schema_migrations values ('integration_probe', 14, 15, 'probe', repeat('b', 64), 'probe', 0, 'integration', clock_timestamp())");
+      await second.query("insert into erp_financials.schema_migrations values ('integration_probe', 999, 1000, 'probe', repeat('b', 64), 'probe', 0, 'integration', clock_timestamp())");
       await second.query("commit");
       const during = await first.query<{ count: string }>("select count(*)::text as count from erp_financials.schema_migrations");
       expect(during.rows[0]?.count).toBe(before.rows[0]?.count);
@@ -2103,9 +2222,9 @@ where application.subledger_application_id = $1`,
     );
     expect(facts.rows).toEqual([{
       application_type: "write_off_to_invoice",
-      invoice_open_amount: "25",
+      invoice_open_amount: "25.00",
       invoice_status: "partially_applied",
-      write_off_open_amount: "0",
+      write_off_open_amount: "0.00",
       write_off_status: "settled"
     }]);
 
@@ -2492,11 +2611,11 @@ where subledger_document_id = $1`, [original.documentId]);
     });
     expect(compensated).toMatchObject({ status: "voided", disbursementVersion: 3 });
     await expect(sdk.queries.getVendorBill(firstBill.documentId)).resolves.toMatchObject({
-      status: "open",
+      status: "overdue",
       openAmount: "12.00"
     });
     await expect(sdk.queries.getVendorBill(secondBill.documentId)).resolves.toMatchObject({
-      status: "open",
+      status: "overdue",
       openAmount: "8.00"
     });
   });
@@ -2541,7 +2660,7 @@ where subledger_document_id = $1`, [original.documentId]);
         expectedVersion: 1 })).rejects.toThrow("must remain an active posting account");
       const upgraded = await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade" });
       expect(upgraded.currentVersion).toBe(upgrade);
-      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 25, toVersion: 26 });
+      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 26, toVersion: 27 });
       expect(await history()).toEqual(before);
       expect((await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade-replay" })).applied).toEqual([]);
     }
@@ -2834,6 +2953,9 @@ where tenant_id = 'tenant_1' and source_id = 'source_1' and transaction_id = 'jo
       name: "Consulting Revenue",
       version: 2
     });
+
+    await sdk.commands.fiscalPeriods.define({operation, fiscalYear:2026, periodNumber:8,
+      periodStart:"2026-08-01",periodEnd:"2026-08-31"});
 
     const draft = await sdk.invoices.createDraft({
       operation,
@@ -3460,7 +3582,7 @@ function quickBooksSubledgerResources(
         ...envelope, resourceType: "LedgerTransaction", resourceId: "invoice_600",
         resource: {
           sourceTransactionId: "invoice_600", sourceTransactionType: "Invoice", transactionDate: "2026-08-01",
-          transactionNumber: "INV-600", dueDate: "2026-08-31", totalAmount: "100.00", openAmount: "100.00",
+          transactionNumber: "INV-600", dueDate: "2026-08-31", totalAmount: "100.00", openAmount: linked ? (100 - Number(paymentAmount)).toFixed(2) : "100.00",
           sourceUpdatedAt, currencyCode: "USD",
           partyRef: { sourceObjectId: "customer_20", displayName: "Acme", partyType: "customer" },
           lines: [{
@@ -3584,6 +3706,8 @@ function quickBooksAllDocumentResources(): HandrailQuickBooksSdkResourceSet {
         transactionNumber: definition.number,
         ...("dueDate" in definition ? { dueDate: definition.dueDate } : {}),
         totalAmount: definition.amount,
+        ...(definition.sourceType === "Invoice" ? { openAmount: "65.00" } : {}),
+        ...(definition.sourceType === "Payment" ? { unappliedAmount: "0.00" } : {}),
         sourceUpdatedAt: "2026-08-10T10:00:00.000Z",
         currencyCode: "USD",
         ...("partySourceId" in definition ? {
@@ -3717,25 +3841,25 @@ insert into erp_financials.transactions (
   transaction_id, tenant_id, source_id, source_transaction_id, source_transaction_type, transaction_date,
   posted_at, updated_at, party_id, currency_code, status, source_payload_ref
 ) values
-  ('txn_invoice', 'tenant_1', 'source_1', 'invoice:1', 'Subledger:invoice', '2026-08-01', now(), now(), 'customer_1', 'USD', 'posted', '{}'::jsonb),
-  ('txn_payment', 'tenant_1', 'source_1', 'payment:1', 'Subledger:customer_payment', '2026-08-05', now(), now(), 'customer_1', 'USD', 'posted', '{}'::jsonb),
-  ('txn_payment_other', 'tenant_1', 'source_1', 'payment:other', 'Subledger:customer_payment', '2026-08-05', now(), now(), 'customer_2', 'USD', 'posted', '{}'::jsonb),
-  ('txn_payment_eur', 'tenant_1', 'source_1', 'payment:eur', 'Subledger:customer_payment', '2026-08-05', now(), now(), 'customer_1', 'EUR', 'posted', '{}'::jsonb);
+  ('txn_invoice', 'tenant_1', 'source_1', 'invoice:1', 'Subledger:invoice', '2026-08-01', '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz, 'customer_1', 'USD', 'posted', '{}'::jsonb),
+  ('txn_payment', 'tenant_1', 'source_1', 'payment:1', 'Subledger:customer_payment', '2026-08-05', '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz, 'customer_1', 'USD', 'posted', '{}'::jsonb),
+  ('txn_payment_other', 'tenant_1', 'source_1', 'payment:other', 'Subledger:customer_payment', '2026-08-05', '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz, 'customer_2', 'USD', 'posted', '{}'::jsonb),
+  ('txn_payment_eur', 'tenant_1', 'source_1', 'payment:eur', 'Subledger:customer_payment', '2026-08-05', '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz, 'customer_1', 'EUR', 'posted', '{}'::jsonb);
 insert into erp_financials.financial_lifecycle_events values
-  ('event_invoice', 'tenant_1', 'company_1', 'source_1', 'subledger_document', 'invoice_1', 'posted', 'user:1', null, 'request:invoice', 'correlation:1', 'test', null, now(), now(), 'event_invoice', repeat('a',64), '{}'::jsonb, null),
-  ('event_payment', 'tenant_1', 'company_1', 'source_1', 'subledger_document', 'payment_1', 'posted', 'user:1', null, 'request:payment', 'correlation:1', 'test', null, now(), now(), 'event_payment', repeat('a',64), '{}'::jsonb, null),
-  ('event_payment_other', 'tenant_1', 'company_1', 'source_1', 'subledger_document', 'payment_other_party', 'posted', 'user:1', null, 'request:payment-other', 'correlation:1', 'test', null, now(), now(), 'event_payment_other', repeat('a',64), '{}'::jsonb, null),
-  ('event_payment_eur', 'tenant_1', 'company_1', 'source_1', 'subledger_document', 'payment_eur', 'posted', 'user:1', null, 'request:payment-eur', 'correlation:1', 'test', null, now(), now(), 'event_payment_eur', repeat('a',64), '{}'::jsonb, null),
-  ('event_apply', 'tenant_1', 'company_1', 'source_1', 'subledger_application', 'application_1', 'applied', 'user:1', null, 'request:apply', 'correlation:1', 'test', null, now(), now(), 'event_apply', repeat('a',64), '{}'::jsonb, null);
+  ('event_invoice', 'tenant_1', 'company_1', 'source_1', 'subledger_document', 'invoice_1', 'posted', 'user:1', null, 'request:invoice', 'correlation:1', 'test', null, '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz, 'event_invoice', repeat('a',64), '{}'::jsonb, null),
+  ('event_payment', 'tenant_1', 'company_1', 'source_1', 'subledger_document', 'payment_1', 'posted', 'user:1', null, 'request:payment', 'correlation:1', 'test', null, '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz, 'event_payment', repeat('a',64), '{}'::jsonb, null),
+  ('event_payment_other', 'tenant_1', 'company_1', 'source_1', 'subledger_document', 'payment_other_party', 'posted', 'user:1', null, 'request:payment-other', 'correlation:1', 'test', null, '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz, 'event_payment_other', repeat('a',64), '{}'::jsonb, null),
+  ('event_payment_eur', 'tenant_1', 'company_1', 'source_1', 'subledger_document', 'payment_eur', 'posted', 'user:1', null, 'request:payment-eur', 'correlation:1', 'test', null, '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz, 'event_payment_eur', repeat('a',64), '{}'::jsonb, null),
+  ('event_apply', 'tenant_1', 'company_1', 'source_1', 'subledger_application', 'application_1', 'applied', 'user:1', null, 'request:apply', 'correlation:1', 'test', null, '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz, 'event_apply', repeat('a',64), '{}'::jsonb, null);
 insert into erp_financials.subledger_documents (
   subledger_document_id, tenant_id, company_id, source_id, document_type, transaction_id, party_id,
   document_date, currency_code, original_amount, open_amount, status, version, idempotency_key,
   lifecycle_event_id, metadata, created_at, updated_at
 ) values
-  ('invoice_1', 'tenant_1', 'company_1', 'source_1', 'invoice', 'txn_invoice', 'customer_1', '2026-08-01', 'USD', 100, 100, 'open', 1, 'invoice_1', 'event_invoice', '{}'::jsonb, now(), now()),
-  ('payment_1', 'tenant_1', 'company_1', 'source_1', 'customer_payment', 'txn_payment', 'customer_1', '2026-08-05', 'USD', 60, 60, 'open', 1, 'payment_1', 'event_payment', '{}'::jsonb, now(), now()),
-  ('payment_other_party', 'tenant_1', 'company_1', 'source_1', 'customer_payment', 'txn_payment_other', 'customer_2', '2026-08-05', 'USD', 10, 10, 'open', 1, 'payment_other_party', 'event_payment_other', '{}'::jsonb, now(), now()),
-  ('payment_eur', 'tenant_1', 'company_1', 'source_1', 'customer_payment', 'txn_payment_eur', 'customer_1', '2026-08-05', 'EUR', 10, 10, 'open', 1, 'payment_eur', 'event_payment_eur', '{}'::jsonb, now(), now());
+  ('invoice_1', 'tenant_1', 'company_1', 'source_1', 'invoice', 'txn_invoice', 'customer_1', '2026-08-01', 'USD', 100, 100, 'open', 1, 'invoice_1', 'event_invoice', '{}'::jsonb, '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz),
+  ('payment_1', 'tenant_1', 'company_1', 'source_1', 'customer_payment', 'txn_payment', 'customer_1', '2026-08-05', 'USD', 60, 60, 'open', 1, 'payment_1', 'event_payment', '{}'::jsonb, '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz),
+  ('payment_other_party', 'tenant_1', 'company_1', 'source_1', 'customer_payment', 'txn_payment_other', 'customer_2', '2026-08-05', 'USD', 10, 10, 'open', 1, 'payment_other_party', 'event_payment_other', '{}'::jsonb, '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz),
+  ('payment_eur', 'tenant_1', 'company_1', 'source_1', 'customer_payment', 'txn_payment_eur', 'customer_1', '2026-08-05', 'EUR', 10, 10, 'open', 1, 'payment_eur', 'event_payment_eur', '{}'::jsonb, '2026-08-01T00:00:00Z'::timestamptz, '2026-08-01T00:00:00Z'::timestamptz);
 `);
 }
 
@@ -3815,7 +3939,7 @@ insert into erp_financials.subledger_applications (
   applied_event_id, created_at, updated_at
 ) values
   ('application_1', 'tenant_1', 'company_1', 'source_1', 'customer_payment_to_invoice', 'payment_1',
-    'invoice_1', 60, 'USD', '2026-08-05', 'applied', 1, 'statement_apply_1', 'event_apply', now(), now()),
+    'invoice_1', 60, 'USD', '2026-08-05', 'applied', 1, 'statement_apply_1', 'event_apply', '2026-08-05T12:00:00Z', '2026-08-05T12:00:00Z'),
   ('application_full', 'tenant_1', 'company_1', 'source_1', 'customer_payment_to_invoice', 'payment_full',
     'invoice_full', 30, 'USD', '2026-08-10', 'applied', 1, 'statement_apply_full', 'event_apply_full',
     '2026-08-10T12:00:00Z', '2026-08-10T12:00:00Z');

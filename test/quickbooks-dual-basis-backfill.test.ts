@@ -5,7 +5,7 @@ import type { Account } from "../src/canonical-model.js";
 
 const accounts: readonly Account[] = ["cash", "ar", "revenue"].map((sourceAccountId) => ({
   tenantId: "tenant", sourceId: "qbo", accountId: `account-${sourceAccountId}`, sourceAccountId,
-  name: sourceAccountId, type: sourceAccountId, classification: sourceAccountId === "revenue" ? "income" : "asset", status: "active"
+  name: sourceAccountId, type: sourceAccountId, classification: sourceAccountId === "revenue" ? "income" : "asset", active: true
 }));
 const input = { tenantId: "tenant", companyId: "company", sourceId: "qbo", currencyCode: "USD", periodStart: "2026-01-01", periodEnd: "2026-12-31", requestedAt: "2027-01-01T00:00:00.000Z", accounts } as const;
 const ref = { sourceObjectType: "quickbooks_report_general_ledger", sourceObjectId: "realm:2026", checksum: "safe" } as const;
@@ -29,6 +29,8 @@ describe("QuickBooks dual-basis historical backfill", () => {
   it("materializes detailed rows, not provider totals", () => {
     const projection = materializeQuickBooksBasisBackfill(input, report("cash"));
     expect(projection.postings).toHaveLength(2);
+    expect(projection.transactions[0]?.sourcePayloadRef).toEqual({sourceObjectType:"Payment",sourceObjectId:"payment-1",preview:{providerReportRef:ref}});
+    expect(projection.postings[0]?.sourcePayloadRef).toEqual(projection.transactions[0]?.sourcePayloadRef);
     expect(projection.postings.map((posting) => posting.netAmount)).toEqual(["40.00", "-40.00"]);
     expect(projection.postings.every((posting) => posting.accountingBasis === "cash")).toBe(true);
     expect(JSON.stringify(projection)).not.toContain("999999.00");

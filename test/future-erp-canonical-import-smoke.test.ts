@@ -133,6 +133,8 @@ describe("Future ERP deterministic canonical import smoke", () => {
       "accounting_dimensions",
       "accounting_sources",
       "accounts",
+      "company_sources",
+      "financial_lifecycle_events",
       "import_batches",
       "items",
       "ledger_postings",
@@ -141,6 +143,8 @@ describe("Future ERP deterministic canonical import smoke", () => {
       "report_snapshot_lines",
       "report_snapshot_totals",
       "report_snapshots",
+      "subledger_applications",
+      "subledger_documents",
       "sync_checkpoints",
       "transaction_lines",
       "transactions"
@@ -172,7 +176,7 @@ describe("Future ERP deterministic canonical import smoke", () => {
     expect(paritySnapshot.reports.find((report) => report.reportName === "cash_flow")?.evidence).toBeUndefined();
     expect(paritySnapshot.reports.find((report) => report.reportName === "cash_flow")?.providerReport?.totals).toEqual([]);
     expect(summary).toMatchObject({
-      contractSmokeHash: "e24fe29a70b655fea68615a79b7dd038d74b7007402bcc19301cb59f5cd932b3",
+      contractSmokeHash: "d81a1ede70ed9a8d434f4e637261d930caeac63696e72c036ddc08ce63556dc6",
       import: {
         batchId: "batch_qbo_full_fixture_2026_01",
         checkpointId: "checkpoint_qbo_full_fixture_2026_01",
@@ -187,7 +191,7 @@ describe("Future ERP deterministic canonical import smoke", () => {
         }
       }
     });
-    expect(summaryHash).toBe("2f792a095b85fe514dcdecb9087f29470771921f481f97dd6eaec38e026be249");
+    expect(summaryHash).toBe("2818efff7c8723d9f8d1b79e128b42e5dd50dbaad627b32b60c5554c99b7de83");
     expect(JSON.stringify({ importResult, reports, paritySnapshot, summary })).not.toMatch(
       /access[_-]?token|refresh[_-]?token|client[_-]?secret|clientSecret|credential|rawPayload|rawProviderPayload/i
     );
@@ -230,6 +234,7 @@ class FutureErpSmokeReportStorage implements FutureErpCanonicalReportSnapshotSto
 
     return Promise.resolve({
       tenantId: input.tenantId,
+      companyId: input.companyId,
       accounts: this.facts.accounts,
       postings: this.facts.postings,
       accountingBasis: input.accountingBasis,

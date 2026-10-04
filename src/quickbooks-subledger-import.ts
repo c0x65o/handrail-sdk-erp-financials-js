@@ -1,4 +1,5 @@
-import { assertCustomerPaymentCorrectionImportAllowed, persistImportedCustomerPaymentEvidence, type ImportedCustomerPaymentEvidence } from "./customer-payment-correction.js";
+import { loadCustomerPaymentCorrectionReplayState, type CustomerPaymentCorrectionDependency } from "./customer-payment-correction-replay.js";
+import { persistImportedCustomerPaymentEvidence, type ImportedCustomerPaymentEvidence } from "./customer-payment-correction.js";
 import { createHash } from "node:crypto";
 import { planQuickBooksCommercialDetail, QuickBooksCommercialDetailError, type QuickBooksCommercialDetailPlan, type QuickBooksCommercialReferences } from "./quickbooks-commercial-detail.js";
 
@@ -27,6 +28,7 @@ type ImportedApplicationType =
   | "vendor_credit_to_bill";
 
 export type QuickBooksSubledgerImportResult = {
+  readonly correctionDependencies?: readonly CustomerPaymentCorrectionDependency[];
   readonly documents: number;
   readonly documentLines: number;
   readonly applications: number;
@@ -124,9 +126,18 @@ export class QuickBooksSubledgerProjectionError extends Error {
 }
 
 export async function persistQuickBooksSubledgerResources(
-  input: PersistQuickBooksSubledgerResourcesInput & { readonly client: PostgresQueryClient }
+  suppliedInput: PersistQuickBooksSubledgerResourcesInput & { readonly client: PostgresQueryClient }
 ): Promise<QuickBooksSubledgerImportResult> {
-  await assertCustomerPaymentCorrectionImportAllowed(input.client, input.facts.company.tenantId, input.facts.source.sourceId);
+  const corrections = await loadCustomerPaymentCorrectionReplayState(suppliedInput.client, suppliedInput.facts.company.tenantId, suppliedInput.facts.source.sourceId);
+  const correctedProviderIds = new Set(corrections.map(row => row.dependency.sourceTransactionId));
+  const correctedPaymentIds = new Set(corrections.map(row => row.dependency.paymentId));
+  const preservedInvoiceIds = corrections.flatMap(row => row.reopenedInvoiceIds);
+  // Provider timestamps are not total-order revision/deletion evidence. Preserve
+  // the local overlay for every version of this Payment, never fabricate a delete.
+  const input = { ...suppliedInput, resources: { ...suppliedInput.resources,
+    operationalDocuments: (suppliedInput.resources.operationalDocuments ?? suppliedInput.resources.ledgerTransactions ?? []).filter(row =>
+      !(row.resource.sourceTransactionType === "Payment" && correctedProviderIds.has(row.resource.sourceTransactionId))) } };
+
   await input.client.query(
     `select set_config('erp_financials.quickbooks_projection_refresh', 'on', true)`
   );
@@ -137,7 +148,7 @@ export async function persistQuickBooksSubledgerResources(
   const accountIdBySourceId = new Map(input.facts.accounts.map((account) => [account.sourceAccountId, account.accountId]));
   const itemBySourceId = new Map(input.facts.items.map((item) => [item.sourceItemId, item]));
   const partyIdBySourceId = new Map(input.facts.parties.map((party) => [party.sourcePartyId, party.partyId]));
-  const operationalDocuments = input.resources.operationalDocuments ?? input.resources.ledgerTransactions ?? [];
+  const operationalDocuments = input.resources.operationalDocuments;
   // Incremental envelopes need not repeat unchanged (including inactive) references.
   const retainedAccounts = await input.client.query<{ source_account_id: string; account_id: string }>(
     `select source_account_id, account_id from erp_financials.accounts where tenant_id=$1 and source_id=$2`,
@@ -965,7 +976,9 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
   // QuickBooks Balance/UnappliedAmt is the authoritative current snapshot.
   // Applications preserve the dated history, but a provider may omit or
   // normalize LinkedTxn evidence differently; never let that make the current
-  // operational balance disagree with QuickBooks.
+  // operational balance disagree with QuickBooks. Locally corrected invoices
+  // instead retain the canonical application balance; a late Balance snapshot
+  // cannot reinstate the voided application.
   for (const resource of operationalDocuments) {
     if (resource.syncAction === "voided" || resource.syncAction === "deleted" || resource.syncAction === "skipped") continue;
     const normalized = resource.resource;
@@ -974,7 +987,7 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
     if (documentType === undefined || originalAmount === undefined) continue;
     const openAmount = reportedQuickBooksOpenAmount(documentType, normalized, originalAmount);
     const documentId = documentIdBySourceId.get(normalized.sourceTransactionId);
-    if (openAmount === undefined || documentId === undefined) continue;
+    if (openAmount === undefined || documentId === undefined || preservedInvoiceIds.includes(documentId)) continue;
     await input.client.query(
       `update "erp_financials"."subledger_documents"
 set "open_amount" = $5,
@@ -1021,8 +1034,9 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
 from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   and "metadata" ->> 'provider' = 'quickbooks' and "status" <> 'voided'
-  and not ("metadata" ->> 'sourceTransactionId' = any($4::text[]))`,
-      [input.facts.company.tenantId, input.companyId, input.facts.source.sourceId, incomingSourceIds]
+  and not ("metadata" ->> 'sourceTransactionId' = any($4::text[]))
+  and not ("subledger_document_id" = any($5::text[]))`,
+      [input.facts.company.tenantId, input.companyId, input.facts.source.sourceId, incomingSourceIds, preservedInvoiceIds]
     );
     for (const document of missing.rows) {
       const outcome = await voidQuickBooksDocument(input, {
@@ -1045,7 +1059,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       sourceTransactionType: "JournalEntry",
       sourceTransactionId: "Id" in resource.resource ? resource.resource.Id : resource.resource.sourceTransactionId
     })),
-    ...(input.resources.operationalDocuments ?? input.resources.ledgerTransactions ?? []).map((resource) => ({
+    ...(input.resources.operationalDocuments).map((resource) => ({
       syncAction: resource.syncAction,
       sourceTransactionType: resource.resource.sourceTransactionType,
       sourceTransactionId: resource.resource.sourceTransactionId
@@ -1076,10 +1090,12 @@ where transaction."tenant_id" = $1 and transaction."source_id" = $2
     `select set_config('erp_financials.quickbooks_projection_refresh', 'off', true)`
   );
   for (const evidence of input.paymentCorrectionEvidence ?? []) {
+    if (correctedPaymentIds.has(evidence.paymentId)) continue;
     await persistImportedCustomerPaymentEvidence(input.client, {tenantId: input.facts.company.tenantId, companyId: input.companyId, sourceId: input.facts.source.sourceId}, evidence);
   }
 
   return {
+    ...(corrections.length ? { correctionDependencies: corrections.map(row => row.dependency) } : {}),
     documents,
     documentLines,
     applications,

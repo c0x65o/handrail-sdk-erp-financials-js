@@ -200,7 +200,7 @@ class FiscalDatabase implements FiscalPeriodTransactionRunner {
 class FiscalClient implements PostgresQueryClient {
   periods: Record<string, unknown>[] = [];
   events = new Map<string, Record<string, unknown>>();
-  lockDate?: string;
+  lockDate: string | undefined;
   bookVersion = 0;
   pendingDrafts = 0;
 

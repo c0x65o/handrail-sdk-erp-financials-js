@@ -1,3 +1,4 @@
+import type { CustomerPaymentCorrectionDependency } from "./customer-payment-correction-replay.js";
 import { assertNoCredentialKeys, createCompanySourceBinding } from "./canonical-model.js";
 import type { PostgresStorageAdapter } from "./postgres-storage.js";
 import type { CanonicalAccountingFactSet } from "./source-adapters.js";
@@ -16,9 +17,10 @@ export type CanonicalFactPersistenceStorage = Pick<
   | "upsertTransactions"
   | "upsertTransactionLines"
   | "upsertLedgerPostings"
->;
+> & Partial<Pick<PostgresStorageAdapter, "prepareCustomerPaymentCorrectionImport">>;
 
 export type CanonicalFactPersistenceResult = {
+  readonly correctionDependencies?: readonly CustomerPaymentCorrectionDependency[];
   readonly tenantId: string;
   readonly companyId: string;
   readonly sourceId: string;
@@ -53,9 +55,11 @@ export function createCanonicalFactPersistenceWorker(
 
 export async function persistCanonicalFacts(
   storage: CanonicalFactPersistenceStorage,
-  facts: CanonicalAccountingFactSet
+  incomingFacts: CanonicalAccountingFactSet
 ): Promise<CanonicalFactPersistenceResult> {
-  assertNoCredentialKeys(facts);
+  assertNoCredentialKeys(incomingFacts);
+  const plan = await storage.prepareCustomerPaymentCorrectionImport?.(incomingFacts);
+  const facts = plan?.facts ?? incomingFacts;
 
   const companies = await storage.upsertAccountingCompany(facts.company);
   const sources = await storage.upsertAccountingSource(facts.source);
@@ -69,6 +73,7 @@ export async function persistCanonicalFacts(
   );
 
   return {
+    ...(plan === undefined || plan.correctionDependencies.length === 0 ? {} : { correctionDependencies: plan.correctionDependencies }),
     tenantId: facts.company.tenantId,
     companyId: facts.company.companyId,
     sourceId: facts.source.sourceId,

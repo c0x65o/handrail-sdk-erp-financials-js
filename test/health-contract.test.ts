@@ -12,7 +12,7 @@ import {
 import type { PostgresQueryClient, PostgresQueryResult, PostgresSchemaManifest } from "../src/index.js";
 
 type CatalogRow = {
-  readonly object_type: "schema" | "table" | "column" | "index" | "constraint";
+  readonly object_type: "schema" | "table" | "column" | "index" | "constraint" | "trigger";
   readonly table_name: string | null;
   readonly object_name: string;
 };
@@ -114,6 +114,11 @@ function catalogRowsForManifest(manifest: PostgresSchemaManifest): readonly Cata
       table_name: null,
       object_name: manifest.namespace
     },
+    ...manifest.requiredTriggers.map(trigger => ({
+      object_type: "trigger" as const, table_name: trigger.table, object_name: trigger.name,
+      enabled: true,
+      definition: `create trigger ${trigger.name} ${trigger.timing} ${trigger.events.map(event => event === "update" && trigger.updateColumns ? `update of ${trigger.updateColumns.join(", ")}` : event).join(" or ")} on ${manifest.namespace}.${trigger.table} for each row execute function ${manifest.namespace}.${trigger.functionName}()`
+    })),
     ...manifest.tables.flatMap((table) => [
       {
         object_type: "table" as const,

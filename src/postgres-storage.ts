@@ -1,3 +1,5 @@
+import type { CanonicalAccountingFactSet } from "./source-adapters.js";
+import { prepareCustomerPaymentCorrectionImport, loadCustomerPaymentCorrectionReplayState, correctedTransactionIds, type CustomerPaymentCorrectionDependency, type CustomerPaymentCorrectionImportPlan } from "./customer-payment-correction-replay.js";
 import type {
   Account,
   AccountingBasis,
@@ -297,6 +299,7 @@ export type PostgresStorageAdapter = StandardReportPresentationReadModelStorage 
   upsertParties(parties: readonly Party[]): Promise<number>;
   upsertItems(items: readonly Item[]): Promise<number>;
   upsertDimensions(dimensions: readonly AccountingDimension[]): Promise<number>;
+  prepareCustomerPaymentCorrectionImport(facts: CanonicalAccountingFactSet): Promise<CustomerPaymentCorrectionImportPlan>;
   upsertTransactions(transactions: readonly AccountingTransaction[]): Promise<number>;
   upsertTransactionLines(lines: readonly TransactionLine[]): Promise<number>;
   upsertLedgerPostings(postings: readonly LedgerPosting[]): Promise<number>;
@@ -347,6 +350,7 @@ export type DeleteLedgerFactsOutsideImportBatchInput = {
 };
 
 export type DeleteLedgerFactsOutsideImportBatchResult = {
+  readonly correctionDependencies?: readonly CustomerPaymentCorrectionDependency[];
   readonly postings: number;
   readonly transactionLines: number;
   readonly transactions: number;
@@ -486,6 +490,9 @@ export function createPostgresStorageAdapter(
         "dimension_kind",
         "source_dimension_id"
       ]);
+    },
+    prepareCustomerPaymentCorrectionImport(facts) {
+      return prepareCustomerPaymentCorrectionImport(client, facts);
     },
     async upsertTransactions(transactions) {
       for (const transaction of transactions) {
@@ -1155,11 +1162,20 @@ async function deleteLedgerFactsOutsideImportBatch(
     throw new Error("deleteLedgerFactsOutsideImportBatch requires tenantId, sourceId, and importBatchId");
   }
 
+  const corrections = await loadCustomerPaymentCorrectionReplayState(client, input.tenantId, input.sourceId);
+  const preserved = await client.query<{transaction_id: string}>(`select transaction_id from ${qualifiedTable(manifest, "subledger_documents")}
+    where tenant_id=$1 and source_id=$2 and subledger_document_id=any($3::text[])`,
+    [input.tenantId, input.sourceId, corrections.flatMap(row => row.reopenedInvoiceIds)]);
+  const retainedIds = [...corrections.flatMap(row => row.transactionIds), ...preserved.rows.map(row => row.transaction_id)];
   await client.query(`select set_config('erp_financials.quickbooks_projection_refresh', 'on', true)`);
   const postingsResult = await client.query(
-    `delete from ${qualifiedTable(manifest, "ledger_postings")}
-where "tenant_id" = $1 and "source_id" = $2 and "import_batch_id" <> $3`,
-    [input.tenantId, input.sourceId, input.importBatchId]
+    `delete from ${qualifiedTable(manifest, "ledger_postings")} posting
+where "tenant_id" = $1 and "source_id" = $2 and "import_batch_id" <> $3
+  and not ("transaction_id" = any($4::text[]))
+  and not exists (select 1 from ${qualifiedTable(manifest, "transactions")} t
+    where t.tenant_id=posting.tenant_id and t.source_id=posting.source_id and t.transaction_id=posting.transaction_id
+      and (t.source_transaction_type like 'Subledger:%' or t.source_transaction_type in ('JournalEntry','JournalEntryAdjustment')))`,
+    [input.tenantId, input.sourceId, input.importBatchId, retainedIds]
   );
   const transactionLinesResult = await client.query(
     `delete from ${qualifiedTable(manifest, "transaction_lines")} lines
@@ -1201,6 +1217,7 @@ where transactions."tenant_id" = $1
   await client.query(`select set_config('erp_financials.quickbooks_projection_refresh', 'off', true)`);
 
   return {
+    ...(corrections.length ? { correctionDependencies: corrections.map(row => row.dependency) } : {}),
     postings: postingsResult.rowCount ?? 0,
     transactionLines: transactionLinesResult.rowCount ?? 0,
     transactions: transactionsResult.rowCount ?? 0
@@ -1218,11 +1235,17 @@ async function replaceQuickBooksDualBasisBackfillRange(
     readonly periodEnd: IsoDate;
     readonly projections: readonly [QuickBooksBasisBackfillProjection, QuickBooksBasisBackfillProjection];
   }
-): Promise<{ readonly importBatches: number; readonly transactions: number; readonly postings: number; readonly snapshotsMarkedStale: number }> {
+): Promise<{ readonly importBatches: number; readonly transactions: number; readonly postings: number; readonly snapshotsMarkedStale: number; readonly correctionDependencies: readonly CustomerPaymentCorrectionDependency[] }> {
   const methods = input.projections.map((projection) => projection.accountingBasis);
   if (new Set(methods).size !== 2 || !methods.includes("cash") || !methods.includes("accrual")) {
     throw new Error("QuickBooks dual-basis range replacement requires one cash and one accrual projection");
   }
+  const corrections = await loadCustomerPaymentCorrectionReplayState(client, input.tenantId, input.sourceId);
+  const blocked = correctedTransactionIds(corrections, input.projections.flatMap(p => p.transactions));
+  const invoiceTransactions = await client.query<{transaction_id: string}>(`select transaction_id from ${qualifiedTable(manifest, "subledger_documents")}
+    where tenant_id=$1 and source_id=$2 and subledger_document_id=any($3::text[])`,
+    [input.tenantId,input.sourceId,corrections.flatMap(row => row.reopenedInvoiceIds)]);
+  const retained = [...blocked,...invoiceTransactions.rows.map(row => row.transaction_id)];
   await client.query(
     `delete from ${qualifiedTable(manifest, "ledger_postings")} posting
 using ${qualifiedTable(manifest, "transactions")} transaction
@@ -1231,20 +1254,22 @@ where posting."tenant_id" = $1 and posting."source_id" = $2
   and transaction."tenant_id" = posting."tenant_id" and transaction."source_id" = posting."source_id"
   and transaction."source_transaction_type" like 'QuickBooksGeneralLedger:%'
   and posting."accounting_basis" = any($3::text[])
-  and posting."posting_date" between $4::date and $5::date`,
-    [input.tenantId, input.sourceId, methods, input.periodStart, input.periodEnd]
+  and posting."posting_date" between $4::date and $5::date
+  and not (posting."transaction_id"=any($6::text[]))`,
+    [input.tenantId, input.sourceId, methods, input.periodStart, input.periodEnd, retained]
   );
   await client.query(
     `delete from ${qualifiedTable(manifest, "transactions")} transaction
 where transaction."tenant_id" = $1 and transaction."source_id" = $2
   and transaction."source_transaction_type" like 'QuickBooksGeneralLedger:%'
   and transaction."transaction_date" between $3::date and $4::date
+  and not (transaction."transaction_id"=any($5::text[]))
   and not exists (
     select 1 from ${qualifiedTable(manifest, "ledger_postings")} posting
     where posting."tenant_id" = transaction."tenant_id" and posting."source_id" = transaction."source_id"
       and posting."transaction_id" = transaction."transaction_id"
   )`,
-    [input.tenantId, input.sourceId, input.periodStart, input.periodEnd]
+    [input.tenantId, input.sourceId, input.periodStart, input.periodEnd, retained]
   );
 
   let importBatches = 0;
@@ -1258,14 +1283,14 @@ where transaction."tenant_id" = $1 and transaction."source_id" = $2
     for (const transaction of projection.transactions) {
       if (transaction.sourcePayloadRef !== undefined) assertSafeSourcePayloadRef(transaction.sourcePayloadRef);
     }
-    transactions += await upsertRows(client, manifest, "transactions", projection.transactions.map(transactionRow), [
+    transactions += await upsertRows(client, manifest, "transactions", projection.transactions.filter(row => !blocked.has(row.transactionId)).map(transactionRow), [
       "tenant_id", "source_id", "source_transaction_type", "source_transaction_id"
     ]);
     for (const posting of projection.postings) {
       assertLedgerPostingAmounts(posting);
       if (posting.sourcePayloadRef !== undefined) assertSafeSourcePayloadRef(posting.sourcePayloadRef);
     }
-    postings += await upsertRows(client, manifest, "ledger_postings", projection.postings.map(ledgerPostingRow), [
+    postings += await upsertRows(client, manifest, "ledger_postings", projection.postings.filter(row => !blocked.has(row.transactionId)).map(ledgerPostingRow), [
       "tenant_id", "source_id", "accounting_basis", "source_posting_id"
     ]);
     const projectionCurrencyCode = projection.postings[0]?.currencyCode;
@@ -1280,7 +1305,7 @@ where transaction."tenant_id" = $1 and transaction."source_id" = $2
       ...(projectionCurrencyCode === undefined ? {} : { currencyCode: projectionCurrencyCode })
     });
   }
-  return { importBatches, transactions, postings, snapshotsMarkedStale };
+  return { importBatches, transactions, postings, snapshotsMarkedStale, correctionDependencies: corrections.map(row => row.dependency) };
 }
 
 async function loadReportBuilderInput(

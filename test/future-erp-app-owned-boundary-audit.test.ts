@@ -88,7 +88,7 @@ describe("Future ERP app-owned storage and reporting boundary audit", () => {
     expect(jsonColumns.length).toBeGreaterThanOrEqual(14);
     expect(jsonColumns.every((column) => column.maxBytes !== undefined)).toBe(true);
     for (const column of jsonColumns) {
-      expect(FUTURE_ERP_CANONICAL_SCHEMA_MIGRATION_SQL).toContain(
+      expect(FUTURE_ERP_CANONICAL_SCHEMA_MIGRATION_SQL.replace(/\s+/g, " ").replace(/\(\s+/g, "(").replace(/\s+\)/g, ")")).toContain(
         `"${column.tableName}_${column.columnName}_bounded_json_check" check (octet_length(coalesce("${column.columnName}"::text, '')) <= ${String(column.maxBytes ?? DEFAULT_JSON_REF_MAX_BYTES)})`
       );
     }
@@ -162,7 +162,7 @@ describe("Future ERP app-owned storage and reporting boundary audit", () => {
         "report_freshness"
       ])
     );
-    expect(client.calls.every((call) => /"erp_financials"\./.test(call.sql))).toBe(true);
+    expect(client.calls.every((call) => /(?:"erp_financials"|erp_financials)\.|^select (?:pg_advisory_xact_lock|set_config)/.test(call.sql))).toBe(true);
     expect(findForbiddenKeyPaths(preflight)).toEqual([]);
     expect(findForbiddenKeyPaths(replay)).toEqual([]);
     expect(findForbiddenKeyPaths(client.calls.map((call) => call.params))).toEqual([]);

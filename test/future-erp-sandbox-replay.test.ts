@@ -118,7 +118,7 @@ const EXPECTED_REPLAY_WRITE_ENTITIES: readonly ReplayWriteEntity[] = [
 ];
 
 const REPORT_NAMES: readonly ReportName[] = ["profit_and_loss", "balance_sheet", "trial_balance", "cash_flow"];
-const EXPECTED_REPLAY_EVIDENCE_HASH = "1d2d4a292fe7feae4bee90228d5cec9c737ca5130408f2f3c0fa53127e0807fa";
+const EXPECTED_REPLAY_EVIDENCE_HASH = "1138a5e8ac5a54ac3bc9c46209db7d47b66e59ae3127ff1dcc30a9d69b9b806f";
 
 describe("Future ERP QuickBooks sandbox replay orchestration", () => {
   it("returns a bounded deterministic replay result without credentials or raw provider payloads", async () => {
@@ -211,9 +211,9 @@ describe("Future ERP QuickBooks sandbox replay orchestration", () => {
     });
     expect(result.providerParity.status).toBe("mismatched");
     expect(result.providerParity.reports.map((report) => [report.reportName, report.status, report.evidenceTotalCount])).toEqual([
-      ["profit_and_loss", "mismatched", 3],
-      ["balance_sheet", "mismatched", 3],
-      ["trial_balance", "mismatched", 3],
+      ["profit_and_loss", "mismatched", 8],
+      ["balance_sheet", "mismatched", 4],
+      ["trial_balance", "mismatched", 2],
       ["cash_flow", "unsupported", 0]
     ]);
     expect(Object.values(result.safeDrilldownRefs).every((refs) => refs.lineRefs.length <= 4 && refs.totalRefs.length <= 4)).toBe(true);
@@ -911,6 +911,7 @@ function insertedRowsFromCall(call: QueryCall): readonly Record<string, unknown>
 }
 
 function requiredRecord(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value === "string") return requiredRecord(JSON.parse(value), label);
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`expected ${label} to be a record`);
   }

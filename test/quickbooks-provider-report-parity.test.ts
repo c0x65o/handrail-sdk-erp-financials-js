@@ -118,7 +118,7 @@ function providerTrialBalanceReport(
       { totalKey: "total_debits", amount: "1750.00", currencyCode: "USD" },
       { totalKey: "total_credits", amount: "1750.00", currencyCode: "USD" }
     ],
-    accountTotals
+    ...(accountTotals === undefined ? {} : { accountTotals })
   };
 }
 

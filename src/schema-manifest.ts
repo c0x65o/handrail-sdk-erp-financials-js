@@ -53,8 +53,8 @@ export type PostgresTableManifest = {
 };
 
 export type PostgresSchemaManifest = {
-  readonly manifestVersion: "2026-10-03.customer-payment-corrections";
-  readonly schemaVersion: 26;
+  readonly manifestVersion: "2026-10-03.customer-payment-correction-replay";
+  readonly schemaVersion: 27;
   readonly dialect: "postgres";
   readonly namespace: "erp_financials";
   readonly requiredTriggers: readonly PostgresTriggerManifest[];
@@ -144,13 +144,13 @@ const table = (
 });
 
 export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
-  manifestVersion: "2026-10-03.customer-payment-corrections",
-  schemaVersion: 26,
+  manifestVersion: "2026-10-03.customer-payment-correction-replay",
+  schemaVersion: 27,
   dialect: "postgres",
   namespace: "erp_financials",
   requiredTriggers: [
     { name: "customer_payment_corrections_immutable", table: "customer_payment_corrections", timing: "before", events: ["update", "delete"], functionName: "reject_customer_payment_correction_mutation" },
-    ...["transactions", "transaction_lines", "ledger_postings", "subledger_documents", "subledger_applications", "bank_reconciliation_matches", "imported_customer_payment_evidence"].map(table => ({name: "payment_correction_source_guard", table, timing: "before" as const, events: ["insert", "update", "delete"] as const, functionName: "guard_customer_payment_correction_source"})),
+    ...["transactions", "transaction_lines", "ledger_postings", "subledger_documents", "subledger_document_lines", "subledger_applications", "bank_reconciliation_matches", "imported_customer_payment_evidence"].map(table => ({name: "payment_correction_source_guard", table, timing: "before" as const, events: ["insert", "update", "delete"] as const, functionName: "guard_customer_payment_correction_source"})),
     {
       name: "schema_migrations_immutable",
       table: "schema_migrations",
@@ -2126,7 +2126,7 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
     table("imported_customer_payment_evidence", "Complete normalized payment basis provenance", [id("evidence_id"), text("tenant_id"), text("company_id"), text("source_id"), text("payment_id"), text("source_version"), jsonb("evidence", 65536, false)],
       [foreignKey("imported_customer_payment_evidence_document_fk", ["tenant_id","company_id","source_id","payment_id"], "subledger_documents", ["tenant_id","company_id","source_id","subledger_document_id"])],
       [{name:"imported_customer_payment_evidence_scope_uidx",columns:["tenant_id","company_id","source_id","payment_id"],unique:true}]),
-    table("customer_payment_corrections", "Permanent correction identities and source replay tombstones", [id("correction_id"), text("tenant_id"), text("company_id"), text("source_id"), text("payment_id"), text("source_version"), text("idempotency_key"), text("command_checksum"), jsonb("result",65536,false), text("lifecycle_event_id")],
+    table("customer_payment_corrections", "Immutable correction identities and record-scoped replay evidence", [id("correction_id"), text("tenant_id"), text("company_id"), text("source_id"), text("payment_id"), text("source_version"), text("idempotency_key"), text("command_checksum"), jsonb("result",65536,false), text("lifecycle_event_id")],
       [foreignKey("customer_payment_corrections_document_fk", ["tenant_id","company_id","source_id","payment_id"], "subledger_documents", ["tenant_id","company_id","source_id","subledger_document_id"]), foreignKey("customer_payment_corrections_event_fk", ["tenant_id","company_id","source_id","lifecycle_event_id"], "financial_lifecycle_events", ["tenant_id","company_id","source_id","event_id"])],
       [{name:"customer_payment_corrections_payment_uidx",columns:["tenant_id","company_id","source_id","payment_id"],unique:true},{name:"customer_payment_corrections_key_uidx",columns:["tenant_id","company_id","source_id","idempotency_key"],unique:true}])
   ]

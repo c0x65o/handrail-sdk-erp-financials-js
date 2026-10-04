@@ -11,6 +11,7 @@ export type ErpFinancialsErrorCode =
   | "missing_document"
   | "missing_party"
   | "optimistic_concurrency_conflict"
+  | "provider_dependency"
   | "posting_unbalanced"
   | "reconciliation_conflict"
   | "scope_mismatch"

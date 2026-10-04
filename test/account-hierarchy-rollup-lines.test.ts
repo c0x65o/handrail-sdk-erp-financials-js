@@ -436,7 +436,7 @@ function providerDecoratedAccount(
   return {
     ...accountInput,
     ...metadata
-  } as Account;
+  };
 }
 
 function amount(accountId: string, amountValue: string, postingId: string): AccountHierarchyRollupLineAmount {

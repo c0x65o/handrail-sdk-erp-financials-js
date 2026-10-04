@@ -160,6 +160,7 @@ const migrationFiles = {
     "../migrations/future-erp/20260825010000_add_bank_statement_line_unignore.sql",
     import.meta.url
   ),
+  customerPaymentCorrectionReplayV27: new URL("../migrations/future-erp/20261003020000_scope_customer_payment_correction_replay.sql", import.meta.url),
   customerPaymentCorrectionsV26: new URL("../migrations/future-erp/20261003010000_add_customer_payment_corrections.sql", import.meta.url),
   inactiveMappedAccountsV25: new URL("../migrations/future-erp/20260915010000_allow_inactive_mapped_accounts.sql", import.meta.url),
   commercialDocumentDetailV24: new URL("../migrations/future-erp/20260911010000_commercial_document_detail.sql", import.meta.url),
@@ -316,7 +317,8 @@ export const POSTGRES_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
   ),
   migration("20260911010000_commercial_document_detail", "Preserve signed commercial detail and provider precision", 23, 24, migrationFiles.commercialDocumentDetailV24),
   migration("20260915010000_allow_inactive_mapped_accounts", "Retain inactive reporting-book account mappings", 24, 25, migrationFiles.inactiveMappedAccountsV25),
-  migration("20261003010000_add_customer_payment_corrections", "Atomic imported customer payment correction and replay tombstones", 25, 26, migrationFiles.customerPaymentCorrectionsV26)
+  migration("20261003010000_add_customer_payment_corrections", "Atomic imported customer payment correction and replay tombstones", 25, 26, migrationFiles.customerPaymentCorrectionsV26),
+  migration("20261003020000_scope_customer_payment_correction_replay", "Scope payment correction replay to immutable affected records", 26, 27, migrationFiles.customerPaymentCorrectionReplayV27)
 ] as const;
 
 export async function planPostgresMigrations(

@@ -61,6 +61,7 @@ describe("source adapter contracts", () => {
 
   it("keeps QuickBooks COGS account subtypes in the P&L COGS section", () => {
     const input = quickBooksFixtureInput();
+    if (input.accounts[0] === undefined) throw new Error("Missing fixture account");
     const facts = mapQuickBooksJournalEntriesToCanonicalFacts({
       ...input,
       accounts: [

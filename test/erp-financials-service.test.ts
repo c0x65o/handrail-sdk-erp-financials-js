@@ -666,7 +666,7 @@ describe("reusable ERP Financials service", () => {
     expect(subledgerRow(database, invoice.documentId)).toMatchObject({ open_amount: "100.00", version: 1 });
     expect(subledgerRow(database, payment.documentId)).toMatchObject({ open_amount: "60.00", version: 1 });
 
-    database.client.postingLockDate = undefined;
+    delete database.client.postingLockDate;
     database.client.fiscalPeriodStatus = "closing";
     await expect(enforced.paymentApplications.apply({
       operation: operation("request-closing-apply"),

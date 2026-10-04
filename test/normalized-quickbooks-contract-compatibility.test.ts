@@ -264,6 +264,7 @@ function absoluteDecimal(value: string): string {
 function reportBuilderInputFromFacts(facts: CanonicalAccountingFactSet): ReportBuilderInput {
   return {
     tenantId: facts.company.tenantId,
+    companyId: facts.company.companyId,
     sourceId: facts.source.sourceId,
     accounts: facts.accounts,
     postings: facts.postings,

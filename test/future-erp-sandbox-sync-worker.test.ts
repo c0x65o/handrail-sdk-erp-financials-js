@@ -26,12 +26,12 @@ type QueryCall = {
 };
 
 type CatalogRow = {
-  readonly object_type: "schema" | "table" | "column" | "index" | "constraint";
+  readonly object_type: "schema" | "table" | "column" | "index" | "constraint" | "trigger";
   readonly table_name: string | null;
   readonly object_name: string;
 };
 
-const EXPECTED_OWNER_EVIDENCE_HASH = "b45d1e57699f37046849941eee9858d9313ec13a1f9fcb65863a1dcbc17f36ee";
+const EXPECTED_OWNER_EVIDENCE_HASH = "f8944a6849a6332610b4feb6e876819576265508080a395b62f027ca0ecdfcf0";
 
 describe("Future ERP QuickBooks sandbox sync worker", () => {
   it("preflights the SDK/service and returns safe replay import metadata", async () => {
@@ -167,9 +167,10 @@ describe("Future ERP QuickBooks sandbox sync worker", () => {
     const evidence = buildFutureErpQuickBooksSandboxSyncOwnerEvidence(result);
     const writeTables = writeQueryTables(client.calls);
 
-    expect(writeTables.slice(0, 11)).toEqual([
+    expect(writeTables.slice(0, 12)).toEqual([
       "accounting_companies",
       "accounting_sources",
+      "company_sources",
       "import_batches",
       "sync_checkpoints",
       "accounts",
@@ -218,9 +219,9 @@ describe("Future ERP QuickBooks sandbox sync worker", () => {
     expect(evidence.reports.every((report) => report.safeDrilldownRefCounts.hasReportSnapshotRef)).toBe(true);
     expect(evidence.reports.every((report) => report.safeDrilldownRefCounts.hasReconciliationDifferenceRef)).toBe(true);
     expect(evidence.providerParity?.reports.map((report) => [report.reportName, report.status, report.evidenceTotalCount])).toEqual([
-      ["profit_and_loss", "mismatched", 3],
-      ["balance_sheet", "mismatched", 3],
-      ["trial_balance", "mismatched", 3],
+      ["profit_and_loss", "mismatched", 8],
+      ["balance_sheet", "mismatched", 4],
+      ["trial_balance", "mismatched", 2],
       ["cash_flow", "unsupported", 0]
     ]);
     expect(JSON.stringify(evidence)).not.toMatch(
@@ -440,6 +441,11 @@ function catalogRowsForManifest(manifest: PostgresSchemaManifest): readonly Cata
       table_name: null,
       object_name: manifest.namespace
     },
+    ...manifest.requiredTriggers.map(trigger => ({
+      object_type: "trigger" as const, table_name: trigger.table, object_name: trigger.name,
+      enabled: true,
+      definition: `create trigger ${trigger.name} ${trigger.timing} ${trigger.events.map(event => event === "update" && trigger.updateColumns ? `update of ${trigger.updateColumns.join(", ")}` : event).join(" or ")} on ${manifest.namespace}.${trigger.table} for each row execute function ${manifest.namespace}.${trigger.functionName}()`
+    })),
     ...manifest.tables.flatMap((table) => [
       {
         object_type: "table" as const,

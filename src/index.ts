@@ -1143,3 +1143,6 @@ export { previewQuickBooksCommercialBackfill, type QuickBooksCommercialBackfillI
 
 export type { ImportedCustomerPaymentEvidence, CustomerPaymentCorrectionRequest, CustomerPaymentCorrectionGuard, CustomerPaymentCorrectionPreview, VoidAndUnapplyCustomerPaymentInput, VoidAndUnapplyCustomerPaymentResult } from "./customer-payment-correction.js";
 export { persistImportedCustomerPaymentEvidence, assertCustomerPaymentCorrectionImportAllowed, lockCustomerPaymentCorrectionSource } from "./customer-payment-correction.js";
+
+export { prepareCustomerPaymentCorrectionImport } from "./customer-payment-correction-replay.js";
+export type { CustomerPaymentCorrectionDependency, CustomerPaymentCorrectionImportPlan } from "./customer-payment-correction-replay.js";

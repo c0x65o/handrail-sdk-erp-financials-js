@@ -59,7 +59,7 @@ export function planQuickBooksCommercialDetail(
     const item = source.itemRef ? items.get(source.itemRef.sourceObjectId) : undefined;
     const accountId = source.accountRef ? accounts.get(source.accountRef.sourceObjectId)
       : sale ? item?.incomeAccountId : item?.expenseAccountId;
-    if (!accountId) fail("unresolved_line_account");
+    if (!accountId) return fail("unresolved_line_account");
     if (source.itemRef && !item) fail("unresolved_line_item");
     let quantity = source.sourceQuantity;
     let unitAmount = source.sourceUnitAmount;
@@ -69,10 +69,12 @@ export function planQuickBooksCommercialDetail(
       // Amount-only account and reimbursed-expense lines have no provider quantity semantics.
       quantity = "1"; unitAmount = money(net);
     }
+    if (quantity === undefined) return fail("missing_or_invalid_quantity");
+    if (unitAmount === undefined) return fail("missing_or_invalid_unit_price");
     const q = parse(quantity, "quantity");
     const u = parse(unitAmount, "unit_price");
     if (q === 0n && net !== 0n) fail("zero_quantity_with_amount");
-    return { source, accountId: accountId!, ...(item ? { itemId: item.itemId } : {}), quantity: quantity!, unitAmount: unitAmount!, net, gross: round(q * u, 10_000_000_000_000_000_000_000n) };
+    return { source, accountId, ...(item ? { itemId: item.itemId } : {}), quantity, unitAmount, net, gross: round(q * u, 10_000_000_000_000_000_000_000n) };
   });
   const sum = candidates.reduce((value, line) => value + line.net, 0n);
   // Old envelopes may omit tax only when their commercial amounts already explain the total.
@@ -94,12 +96,12 @@ export function planQuickBooksCommercialDetail(
   for (const { index } of order) {
     if (remainder === 0n) break;
     const cent = remainder > 0n ? 1n : -1n;
-    taxes[index] = taxes[index]! + cent;
+    taxes[index] = (taxes[index] ?? fail("missing_tax_allocation")) + cent;
     remainder -= cent;
   }
   if (remainder !== 0n) fail("unresolved_tax_rounding");
   const lines = candidates.map((line, index): QuickBooksCommercialLine => {
-    const lineTax = taxes[index]!;
+    const lineTax = taxes[index] ?? fail("missing_tax_allocation");
     const net = inclusive ? line.net - lineTax : line.net;
     const sign = line.gross < 0n ? -1n : 1n;
     const discount = (line.gross - net) * sign;
@@ -116,9 +118,9 @@ export function planQuickBooksCommercialDetail(
 
 function decimal(value: string): bigint {
   const negative = value.startsWith("-");
-  const [whole, fraction = ""] = (negative ? value.slice(1) : value).split(".");
-  return (negative ? -1n : 1n) * (BigInt(whole!) * 1_000_000_000_000n + BigInt(fraction.padEnd(12, "0")));
+  const [whole = "0", fraction = ""] = (negative ? value.slice(1) : value).split(".");
+  return (negative ? -1n : 1n) * (BigInt(whole) * 1_000_000_000_000n + BigInt(fraction.padEnd(12, "0")));
 }
 function abs(value: bigint): bigint { return value < 0n ? -value : value; }
 function round(value: bigint, divisor: bigint): bigint { return (value < 0n ? -1n : 1n) * ((abs(value) + divisor / 2n) / divisor); }
-function money(value: bigint): string { return `${value < 0n ? "-" : ""}${abs(value) / 100n}.${String(abs(value) % 100n).padStart(2, "0")}`; }
+function money(value: bigint): string { return `${value < 0n ? "-" : ""}${String(abs(value) / 100n)}.${String(abs(value) % 100n).padStart(2, "0")}`; }

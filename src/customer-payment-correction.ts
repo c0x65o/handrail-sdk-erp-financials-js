@@ -44,7 +44,7 @@ export type CustomerPaymentCorrectionGuard = (input: {
   readonly refunded: boolean;
 }>;
 export type CustomerPaymentCorrectionPreview = {
-  readonly replayPolicy: "block_source_imports";
+  readonly replayPolicy: "preserve_corrected_payment";
   readonly confirmation: string;
   readonly paymentId: string;
   readonly paymentVersion: number;
@@ -71,7 +71,7 @@ export type VoidAndUnapplyCustomerPaymentInput = CustomerPaymentCorrectionReques
   readonly approvalRef: string;
 };
 export type VoidAndUnapplyCustomerPaymentResult = {
-  readonly replayPolicy: "block_source_imports";
+  readonly replayPolicy: "preserve_corrected_payment";
   readonly status: "voided" | "already_voided";
   readonly correctionId: string;
   readonly paymentId: string;
@@ -125,12 +125,13 @@ function money(value: unknown): string { const n = minor(value); return `${n < 0
 export async function lockCustomerPaymentCorrectionSource(client: PostgresQueryClient, tenantId: string, sourceId: string): Promise<void> {
   await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [`payment-correction:${tenantId}:${sourceId}`]);
 }
-/** Conservative replay contract: never automatically reconcile provider state over a local correction. */
-export async function assertCustomerPaymentCorrectionImportAllowed(client: PostgresQueryClient, tenantId: string, sourceId: string): Promise<void> {
+/** Record-scoped guard for custom import paths. Prefer prepareCustomerPaymentCorrectionImport for batches. */
+export async function assertCustomerPaymentCorrectionImportAllowed(client: PostgresQueryClient, tenantId: string, sourceId: string, paymentId?: string): Promise<void> {
   await lockCustomerPaymentCorrectionSource(client, tenantId, sourceId);
-  const result = await client.query("select correction_id from erp_financials.customer_payment_corrections where tenant_id=$1 and source_id=$2 limit 1", [tenantId, sourceId]);
+  if (paymentId === undefined) return;
+  const result = await client.query("select correction_id from erp_financials.customer_payment_corrections where tenant_id=$1 and source_id=$2 and payment_id=$3", [tenantId, sourceId, paymentId]);
   if (result.rows.length)
-    throw new ErpFinancialsError("terminal_state_conflict", "customer_payment_corrected_source: provider replay requires explicit reconciliation; source is tombstoned");
+    throw new ErpFinancialsError("provider_dependency", "Corrected Payment requires provider reconciliation", {details: {paymentId, sourceId}});
 }
 async function assertCorrectionTransaction(client: PostgresQueryClient): Promise<void> {
   const first = await client.query("select txid_current()::text as transaction_id");
@@ -145,7 +146,7 @@ async function loadPaymentAccountingEvidence(client: PostgresQueryClient, tenant
 }
 export async function persistImportedCustomerPaymentEvidence(client: PostgresQueryClient, scope: Omit<Scope, "currencyCode" | "bookId">, evidence: ImportedCustomerPaymentEvidence): Promise<void> {
   await assertCorrectionTransaction(client);
-  await assertCustomerPaymentCorrectionImportAllowed(client, scope.tenantId, scope.sourceId);
+  await assertCustomerPaymentCorrectionImportAllowed(client, scope.tenantId, scope.sourceId, evidence.paymentId);
   for (const v of [evidence.paymentId, evidence.sourceVersion, evidence.sourceTransactionId, evidence.provenanceRef])
     nonempty(v);
   if (!Array.isArray(evidence.transactionIds) || !evidence.transactionIds.length || new Set(evidence.transactionIds).size !== evidence.transactionIds.length)
@@ -274,7 +275,7 @@ export function createCustomerPaymentCorrectionService(context: Context, post: (
     for (const date of dates)
       await assertPostingDateAllowed(client, context, date);
     const snapshot = { scope, bookId: context.bookId ?? null, request, payment, evidence, transactions, postings, applications, invoices, invoiceApplications, appEvidence };
-    const preview: CustomerPaymentCorrectionPreview = { replayPolicy: "block_source_imports", confirmation: hash(snapshot), paymentId: request.paymentId, paymentVersion: Number(payment.version), sourceVersion: evidence.sourceVersion,
+    const preview: CustomerPaymentCorrectionPreview = { replayPolicy: "preserve_corrected_payment", confirmation: hash(snapshot), paymentId: request.paymentId, paymentVersion: Number(payment.version), sourceVersion: evidence.sourceVersion,
       applications: applications.map((a, i) => ({ applicationId: String(a.subledger_application_id), version: Number(a.version), invoiceId: String(a.target_document_id), invoiceVersion: Number(invoices[i]?.version), amount: money(a.applied_amount), status: String(a.status) })),
       postingIds: postings.map(p => String(p.posting_id)), reversals: postings.map(p => ({ basis: String(p.accounting_basis), accountId: String(p.account_id), debit: money(p.credit_amount), credit: money(p.debit_amount) })) };
     return { preview, payment, evidence, postings, applications };
@@ -307,7 +308,7 @@ export function createCustomerPaymentCorrectionService(context: Context, post: (
           await guard(client, request, "confirm", { confirmation, approvalRef });
           if (replay.length !== 1 || replay[0]?.command_checksum !== commandChecksum)
             throw new ErpFinancialsError("idempotency_conflict", "Correction identity is already bound to another command");
-          return { ...replay[0].result as VoidAndUnapplyCustomerPaymentResult, status: "already_voided" };
+          return { ...replay[0].result as VoidAndUnapplyCustomerPaymentResult, status: "already_voided", replayPolicy: "preserve_corrected_payment" };
         }
         const state = await prepare(client, request, "confirm", { confirmation, approvalRef });
         if (state.preview.confirmation !== confirmation)
@@ -351,7 +352,7 @@ export function createCustomerPaymentCorrectionService(context: Context, post: (
         await client.query("select set_config('erp_financials.application_balance_update','on',true)");
         await client.query(`update erp_financials.subledger_documents set status='voided',open_amount=0,version=version+1,updated_at=$5 where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_document_id=$4`, [...scope, request.paymentId, context.now()]);
         await client.query("select set_config('erp_financials.application_balance_update','off',true)");
-        const result: VoidAndUnapplyCustomerPaymentResult = { replayPolicy: "block_source_imports", status: "voided", correctionId, paymentId: request.paymentId, sourceVersion: state.evidence.sourceVersion, endedApplicationIds, reopenedInvoiceIds, reversalTransactionIds, basisReversals, lifecycleEventId: event.eventId };
+        const result: VoidAndUnapplyCustomerPaymentResult = { replayPolicy: "preserve_corrected_payment", status: "voided", correctionId, paymentId: request.paymentId, sourceVersion: state.evidence.sourceVersion, endedApplicationIds, reopenedInvoiceIds, reversalTransactionIds, basisReversals, lifecycleEventId: event.eventId };
         await client.query(`insert into erp_financials.customer_payment_corrections(correction_id,tenant_id,company_id,source_id,payment_id,source_version,idempotency_key,command_checksum,result,lifecycle_event_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)`, [correctionId, ...scope, request.paymentId, state.evidence.sourceVersion, request.idempotencyKey, commandChecksum, JSON.stringify(result), event.eventId]);
         await appendFinancialOutboxEvent(client, { tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId, ...(context.bookId ? { bookId: context.bookId } : {}), eventType: "subledger_document.customer_payment.voided", aggregateType: "customer_payment", aggregateId: request.paymentId, idempotencyKey: correctionId, payload: result, availableAt: context.now() });
         return result;

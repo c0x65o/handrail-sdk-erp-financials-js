@@ -1,3 +1,4 @@
+import type { CustomerPaymentCorrectionDependency } from "./customer-payment-correction-replay.js";
 import { createHash } from "node:crypto";
 
 import { assertNoCredentialKeys, createDimensionHash } from "./canonical-model.js";
@@ -140,7 +141,7 @@ export type QuickBooksDualBasisBackfillPersistence = {
     readonly periodStart: IsoDate;
     readonly periodEnd: IsoDate;
     readonly projections: readonly [QuickBooksBasisBackfillProjection, QuickBooksBasisBackfillProjection];
-  }): Promise<{ readonly importBatches: number; readonly transactions: number; readonly postings: number; readonly snapshotsMarkedStale: number }>;
+  }): Promise<{ readonly importBatches: number; readonly transactions: number; readonly postings: number; readonly snapshotsMarkedStale: number; readonly correctionDependencies?: readonly CustomerPaymentCorrectionDependency[] }>;
 };
 
 export type QuickBooksDualBasisBackfillInput = {
@@ -219,6 +220,13 @@ export function materializeQuickBooksBasisBackfill(
     const first = rows[0];
     if (first === undefined) throw new Error("QuickBooks backfill transaction group is empty");
     const transactionId = stableId("qbo_basis_transaction", input.tenantId, input.sourceId, report.accountingBasis, groupKey);
+    // The report reference is provenance for the snapshot, not the object's
+    // revision. Preserve both, without inventing an object sourceUpdatedAt.
+    const sourcePayloadRef: SafeSourcePayloadRef = {
+      sourceObjectType: first.transactionType,
+      sourceObjectId: first.transactionId,
+      preview: { providerReportRef: report.providerReportRef }
+    };
     transactions.push({
       tenantId: input.tenantId,
       sourceId: input.sourceId,
@@ -231,7 +239,7 @@ export function materializeQuickBooksBasisBackfill(
       updatedAt: report.generatedAt,
       currencyCode: report.currencyCode,
       status: "posted",
-      sourcePayloadRef: report.providerReportRef
+      sourcePayloadRef
     });
     rows.forEach((row, index) => {
       const account = accounts.get(row.accountSourceId);
@@ -257,7 +265,7 @@ export function materializeQuickBooksBasisBackfill(
         currencyCode: report.currencyCode,
         dimensionHash: createDimensionHash(dimensionRefs),
         dimensionRefs,
-        sourcePayloadRef: report.providerReportRef,
+        sourcePayloadRef,
         importBatchId
       });
     });

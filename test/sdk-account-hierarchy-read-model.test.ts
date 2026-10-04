@@ -89,7 +89,7 @@ class HierarchyReadClient implements PostgresQueryClient {
     sql: string
   ): Promise<PostgresQueryResult<Row>> {
     if (sql.includes('from "erp_financials"."reporting_books"')) {
-      return rows([{ base_currency_code: "USD", accounting_basis: "accrual", status: "active" }] as Row[]);
+      return rows([{ base_currency_code: "USD", accounting_basis: "accrual", status: "active" }] as unknown as Row[]);
     }
     if (sql.includes("array_agg(account.")) {
       this.chartSql = sql;

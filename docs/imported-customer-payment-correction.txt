@@ -1,10 +1,10 @@
 Imported customer-payment correction integration contract
 
-SDK base: @handrail/erp-financials 0.3.55, commit
-93b4b2cfb2d655c7d2757164a0da54e2ee5ef324. This patch is uncommitted;
-Handrail owns the next version/commit/push. Do not pin consumers to the base
-commit expecting these APIs. Pin the resulting full 40-character HTTPS Git
-commit and refresh the consumer lockfile in the parent's integration request.
+Workspace revision based on @handrail/erp-financials 0.3.56, commit
+fbcaa67b1fa82c0f6751518bcfb7ba67ebcbdeb5. Parent review owns commit, pinning,
+app wiring and deployment. No app/provider action is performed by this patch.
+Pin the reviewed resulting full 40-character HTTPS Git commit and refresh the
+consumer lockfile in the parent's integration request.
 
 Public API (root and /sdk type exports)
 
@@ -26,7 +26,7 @@ is a SHA-256 snapshot binding, NOT authentication, a secret, or approval itself.
 Preview is read-only (transaction/row/advisory locks only). It returns payment
 and source versions, ALL payment applications (including ended history), linked
 invoice versions, exact posting IDs and reversed account amounts for both bases.
-Preview and result explicitly return replayPolicy="block_source_imports".
+Preview and result explicitly return replayPolicy="preserve_corrected_payment".
 Results include reopenedInvoiceIds and complete basisReversals mappings; the
 existing journal-link uniqueness retains one terminal link per original transaction.
 The confirmation also binds complete rows for ALL applications on those invoices,
@@ -41,7 +41,7 @@ Confirmation wiring owned by Spartan
 2. Reconstruct the operation from the actor and the persisted approval workflow.
    Store the exact request + preview.confirmation in the app's approval record.
    Show payment, invoice(s), amounts, both accounting bases, reason and effective
-   date AND the source-wide import block to the independent approver. The
+   date AND the record-scoped provider reconciliation dependency to the independent approver. The
    approver must not equal the actor.
 3. Supply customerPaymentCorrectionGuard. It receives the SAME transaction client,
    phase, full scope, request, and (on confirmation) confirmation and approvalRef.
@@ -70,15 +70,27 @@ Both Spartan QuickBooks import paths
 A. Normalized full/incremental sync worker path (createQuickBooksFullSyncWorker,
    createQuickBooksIncrementalSyncWorker and their Future ERP wrappers): fetch
    normalized resources through the QuickBooks SDK outside the DB transaction.
-   The app must supply transaction-bound persistence so canonical facts,
-   operational documents, applications and correction evidence share ONE physical
-   transaction. Call assertCustomerPaymentCorrectionImportAllowed(client, tenantId,
-   sourceId) before any canonical persistence or full-snapshot deletion. Do not
-   use a pool as if it were a transaction-bound query client.
-B. Direct/legacy operational-document path: likewise guard the source before
-   canonical storage writes and invoke persistQuickBooksSubledgerResources on
-   that same transaction client. Supply its optional paymentCorrectionEvidence
-   array, or invoke persistImportedCustomerPaymentEvidence(client, scope, evidence)
+   Supply createPostgresStorageAdapter with the SAME explicit transaction client
+   for canonical persistence, operational documents, applications and evidence.
+   persistCanonicalFacts calls prepareCustomerPaymentCorrectionImport automatically
+   when the storage supports it. Full/incremental workers return its structured
+   correctionDependencies in persistence, and in subledgerPersistence. Persist
+   and surface these dependencies independently of successful unrelated imports;
+   a provider checkpoint is not proof that local/provider accounting reconciles.
+   Do not use a pool as if it were a transaction-bound query client.
+B. Direct/legacy path: call prepareCustomerPaymentCorrectionImport(client, facts),
+   then persist the returned facts, NOT the unfiltered input, on that transaction.
+   Invoke persistQuickBooksSubledgerResources on the same client; it independently
+   excludes the corrected Payment for all incoming versions/actions and returns
+   correctionDependencies. Supply paymentCorrectionEvidence or register complete
+   evidence afterward. Evidence of already-corrected payments is retained unchanged.
+   Raw adapter upserts/direct SQL are fail-closed for protected records. They are
+   not batch reconciliation APIs; do not catch an error and continue in a failed
+   transaction. assertCustomerPaymentCorrectionImportAllowed accepts an optional
+   paymentId: with it the helper throws code=provider_dependency for that record;
+   without it the helper ONLY locks the source and never freezes all imports.
+
+ImportedCustomerPaymentEvidence(client, scope, evidence)
    after both ledger and operational projections finish in that transaction.
    Do not retain a legacy SQL path that bypasses canonical evidence/guards.
 
@@ -111,7 +123,7 @@ source files and does not claim app-path validation.
 
 Replay contract and deliberate limit
 
-customer_payment_corrections is a permanent durable identity/tombstone. The local
+customer_payment_corrections is a permanent local correction identity, NOT a provider tombstone. The local
 operation reverses both bases with append-only compensating postings, ends every
 active application, reopens invoices, and zeros/voids the original spendable
 payment in one transaction. It uses the existing posting engine, lifecycle,
@@ -120,31 +132,44 @@ original postings and does not issue a journal-only correction. Compensation
 uses the dedicated Subledger:customer_payment_correction transaction type, which
 the generic journal reversal API rejects.
 
-This release FAILS CLOSED FOR THE ENTIRE CORRECTED SOURCE on later provider
-imports, upserts, deletions, full-snapshot replacement and source reset. It does
-not silently merge provider state over a local correction, even if the incoming
-source version is newer. Import entry points throw terminal_state_conflict;
-database write guards also reject bypasses with customer_payment_corrected_source.
-Consumers must stop and surface that reconciliation requirement, not retry forever
-or advance a successful checkpoint. There is no tombstone-clear/resume-sync API.
-Continued automated sync of that source requires a separately reviewed explicit
-reconciliation contract. Native applications of OTHER existing payment credit
-remain supported. Database source locks also serialize canonical writers before
-correction, making incomplete refreshes stale against the registered checksum.
+The source remains syncable. Corrected Payment headers, all registered basis
+transactions, original postings/lines, ended applications, imported evidence and
+compensation are immutable. Import plans exclude every version of that exact
+Payment identity (including a newer deletion), and exclude children of incoming
+replacement basis IDs. Dual-basis projections now retain exact object identity
+as well as the original report reference; legacy SDK-encoded basis identities
+are matched exactly. A report generation time is never an object revision.
+They never fabricate a provider delete, replace source
+versions, add another reversal, or use last-writer-wins over the correction.
+
+The normalized contract provides timestamps but lacks a guaranteed object revision
+order and deletion envelope sufficient to reconcile provider and local corrections.
+Each correction therefore returns code=provider_dependency and reason=
+payment_correction_requires_provider_reconciliation, with correctionId, paymentId,
+sourceTransactionId and correctedSourceVersion. This is a durable discrepancy
+for that Payment, not a failed source. No resume API is needed for other objects.
+No API presently clears a local correction or claims provider-side convergence.
+
+Late invoice Balance snapshots cannot re-close reopened invoices: affected invoice
+balances continue to derive from canonical applications. Missing full snapshots
+retain those invoice documents and ledger facts because omission proves no ordered
+invoice deletion. Full-ledger and dual-basis replacement retain correction history
+and native postings. Other provider objects, customer imports, and bounded deletes
+continue normally. Native applications of other existing payment credit remain
+supported. Raw mutations of protected rows raise customer_payment_corrected_record;
+source reset cannot destroy immutable correction history and still fails atomically.
 
 Schema-only manifest
 
-Manifest: 2026-10-03.customer-payment-corrections, schema version 26.
-Migration: migrations/future-erp/20261003010000_add_customer_payment_corrections.sql
-Upgrade 25 -> 26 creates imported_customer_payment_evidence and
-customer_payment_corrections plus bounded JSON, scoped FKs, unique identities,
-immutable tombstone and canonical source write guards. No UPDATE/DELETE of
-business rows, provider calls, credential changes, business-data backfill or
-migration execution against app databases belongs to this request.
+Manifest: 2026-10-03.customer-payment-correction-replay, schema version 27.
+Migration: migrations/future-erp/20261003020000_scope_customer_payment_correction_replay.sql
+Upgrade 26 -> 27 replaces the source gate with record guards (including old/new
+identities on UPDATE and payment document lines). Released v26 SQL and checksums
+remain unchanged. There are no business-row changes or data correction migrations.
 Use planPostgresMigrations / migratePostgresSchema through the app-owned migration
-runner. Guards serialize writes by tenant/source; account for that lock ordering
-in app writers and retry PostgreSQL deadlock/serialization failures by rolling
-back the entire transaction. Never reuse a partially failed transaction.
+runner. Guards serialize writes by tenant/source; acquire that lock BEFORE row
+locks and retain it until commit. Retry deadlock/serialization failures by rolling
+back and retrying the entire transaction, never a partially failed transaction.
 
 Synthetic verification
 

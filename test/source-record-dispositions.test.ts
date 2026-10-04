@@ -163,6 +163,7 @@ describe("provider-neutral source record dispositions", () => {
     expect(compacted.items?.filter((item) => item.code === "source_record_disposition")).toHaveLength(0);
 
     const full = adaptHandrailQuickBooksSdkFullSyncEnvelope(dispositionEnvelope("full"), adapterOptions());
+    if (!full.importBatch || !full.resources.importBatch) throw new Error("Fixture must include import batches");
     const boundedEnvelope = {
       ...full,
       recordDispositions: dispositions,

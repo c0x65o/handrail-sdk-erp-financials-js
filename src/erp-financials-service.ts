@@ -4756,10 +4756,11 @@ function storedOptionalString(value: unknown): string | undefined {
 
 function storedMoney(value: unknown, field: string): DecimalString {
   const money = typeof value === "number" ? value.toFixed(2) : storedString(value, field);
-  if (!/^-?\d+\.\d{2}$/u.test(money)) {
+  if (!/^-?\d+(?:\.\d{1,2})?$/u.test(money)) {
     throw new Error(`Stored journal field ${field} must be fixed-scale money`);
   }
-  return money;
+  const [whole, fraction = ""] = money.split(".");
+  return `${whole ?? "0"}.${fraction.padEnd(2, "0")}`;
 }
 
 function storedDate(value: unknown, field: string): IsoDate {

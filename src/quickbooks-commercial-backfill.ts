@@ -99,7 +99,7 @@ export async function previewQuickBooksCommercialBackfill(
       const previous = priorById.get(line.id);
       return previous && Object.entries(line).every(([field, value]) => {
         const before = previous[field === "id" ? "subledger_document_line_id" : field];
-        return decimalFields.has(field) && value !== null && before !== null
+        return decimalFields.has(field) && (typeof value === "string" || typeof value === "number") && (typeof before === "string" || typeof before === "number")
           ? canonicalDecimal(String(value)) === canonicalDecimal(String(before))
           : JSON.stringify(value ?? null) === JSON.stringify(before ?? null);
       });

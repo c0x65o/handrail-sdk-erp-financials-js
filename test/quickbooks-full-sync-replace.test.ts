@@ -104,18 +104,21 @@ describe("full sync ledger fact replacement", () => {
     });
 
     expect(result).toEqual({ postings: 4, transactionLines: 3, transactions: 2 });
-    expect(client.calls).toHaveLength(5);
-    expect(client.calls[0]?.sql).toContain("quickbooks_projection_refresh', 'on'");
-    expect(client.calls[1]?.sql).toContain('delete from "erp_financials"."ledger_postings"');
-    expect(client.calls[1]?.sql).toContain('"import_batch_id" <> $3');
-    expect(client.calls[1]?.params).toEqual(["tenant_replace", "source_quickbooks", "batch_provider_gl_2026_07"]);
-    expect(client.calls[2]?.sql).toContain('delete from "erp_financials"."transaction_lines"');
-    expect(client.calls[2]?.sql).toContain("not exists");
-    expect(client.calls[2]?.params).toEqual(["tenant_replace", "source_quickbooks"]);
-    expect(client.calls[3]?.sql).toContain('delete from "erp_financials"."transactions"');
-    expect(client.calls[3]?.sql).toContain("not exists");
-    expect(client.calls[3]?.params).toEqual(["tenant_replace", "source_quickbooks"]);
-    expect(client.calls[4]?.sql).toContain("quickbooks_projection_refresh', 'off'");
+    expect(client.calls).toHaveLength(8);
+    expect(client.calls[0]?.sql).toContain("pg_advisory_xact_lock");
+    expect(client.calls[1]?.sql).toContain("customer_payment_corrections");
+    expect(client.calls[2]?.sql).toContain("subledger_documents");
+    expect(client.calls[3]?.sql).toContain("quickbooks_projection_refresh', 'on'");
+    expect(client.calls[4]?.sql).toContain('delete from "erp_financials"."ledger_postings"');
+    expect(client.calls[4]?.sql).toContain('"import_batch_id" <> $3');
+    expect(client.calls[4]?.params).toEqual(["tenant_replace", "source_quickbooks", "batch_provider_gl_2026_07", []]);
+    expect(client.calls[5]?.sql).toContain('delete from "erp_financials"."transaction_lines"');
+    expect(client.calls[5]?.sql).toContain("not exists");
+    expect(client.calls[5]?.params).toEqual(["tenant_replace", "source_quickbooks"]);
+    expect(client.calls[6]?.sql).toContain('delete from "erp_financials"."transactions"');
+    expect(client.calls[6]?.sql).toContain("not exists");
+    expect(client.calls[6]?.params).toEqual(["tenant_replace", "source_quickbooks"]);
+    expect(client.calls[7]?.sql).toContain("quickbooks_projection_refresh', 'off'");
   });
 
   it("rejects empty scope identifiers", async () => {

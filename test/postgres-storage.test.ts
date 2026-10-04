@@ -204,8 +204,8 @@ describe("Postgres storage adapter", () => {
       }
     });
     const accounts: readonly Account[] = [
-      { tenantId: "tenant_qbo", sourceId: "source_qbo", accountId: "account_cash", sourceAccountId: "cash", name: "Cash", type: "Bank", classification: "asset", status: "active" },
-      { tenantId: "tenant_qbo", sourceId: "source_qbo", accountId: "account_revenue", sourceAccountId: "revenue", name: "Revenue", type: "Income", classification: "income", status: "active" }
+      { tenantId: "tenant_qbo", sourceId: "source_qbo", accountId: "account_cash", sourceAccountId: "cash", name: "Cash", type: "Bank", classification: "asset", active: true },
+      { tenantId: "tenant_qbo", sourceId: "source_qbo", accountId: "account_revenue", sourceAccountId: "revenue", name: "Revenue", type: "Income", classification: "income", active: true }
     ];
     const base = {
       tenantId: "tenant_qbo", companyId: "company_qbo", sourceId: "source_qbo", currencyCode: "USD",
@@ -227,9 +227,12 @@ describe("Postgres storage adapter", () => {
       projections: [projection("accrual"), projection("cash")]
     });
 
-    expect(client.calls[0]?.sql).toContain("QuickBooksGeneralLedger:%");
-    expect(client.calls[0]?.sql).toContain('posting."accounting_basis" = any');
-    expect(client.calls[0]?.params).toEqual(["tenant_qbo", "source_qbo", ["accrual", "cash"], "2026-01-01", "2026-12-31"]);
+    expect(client.calls[0]?.sql).toContain("pg_advisory_xact_lock");
+    expect(client.calls[1]?.sql).toContain("customer_payment_corrections");
+    expect(client.calls[2]?.sql).toContain("subledger_documents");
+    expect(client.calls[3]?.sql).toContain("QuickBooksGeneralLedger:%");
+    expect(client.calls[3]?.sql).toContain('posting."accounting_basis" = any');
+    expect(client.calls[3]?.params).toEqual(["tenant_qbo", "source_qbo", ["accrual", "cash"], "2026-01-01", "2026-12-31", []]);
     expect(client.calls.filter((call) => call.sql.includes('insert into "erp_financials"."ledger_postings"'))).toHaveLength(2);
     expect(client.calls.filter((call) => call.sql.includes('update "erp_financials"."report_snapshots"'))).toHaveLength(2);
     expect(transactionCount).toBe(1);
@@ -2292,7 +2295,7 @@ function catalogRowsForManifest(manifest: PostgresSchemaManifest): readonly Cata
         object_type: "constraint" as const,
         table_name: table.name,
         object_name: constraintName,
-        definition: table.constraints.find((constraint) => constraint.name === constraintName)?.sql
+        definition: table.constraints.find((constraint) => constraint.name === constraintName)?.sql ?? null
       }))
     ]),
     ...manifest.requiredTriggers.map((trigger) => ({

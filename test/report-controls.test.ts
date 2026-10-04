@@ -591,6 +591,8 @@ function nestedPresentationReport(): BuiltReport {
       asOfDate: "2026-01-31",
       currencyCode: "USD",
       generatedAt: "2026-02-01T00:00:00.000Z",
+      companyId: "company_nested_presentation",
+      sourceId: "source_nested_presentation",
       freshness: { status: "fresh", sourceId: "source_nested_presentation" },
       reconciliationStatus: "not_reconciled",
       reconciliationDifference: "0.00"
@@ -757,6 +759,8 @@ function orderingReport(
       asOfDate: "2026-01-31",
       currencyCode: "USD",
       generatedAt: "2026-02-01T00:00:00.000Z",
+      companyId: `company_ordering_${reportName}`,
+      sourceId: `source_ordering_${reportName}`,
       freshness: { status: "fresh", sourceId: `source_ordering_${reportName}` },
       reconciliationStatus: "not_reconciled",
       reconciliationDifference: "0.00"

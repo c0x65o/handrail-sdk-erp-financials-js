@@ -221,7 +221,7 @@ class RecordingPostgresClient implements PostgresQueryClient {
 }
 
 function conflictTargetFor(calls: readonly QueryCall[], tableName: string): string {
-  const call = calls.find((entry) => entry.sql.includes(`"erp_financials"."${tableName}"`));
+  const call = calls.find((entry) => entry.sql.trimStart().startsWith("insert into ") && entry.sql.includes(`"erp_financials"."${tableName}"`));
   const conflictTarget = call?.sql.match(/on conflict \(([^)]+)\)/)?.[1];
 
   if (conflictTarget === undefined) {

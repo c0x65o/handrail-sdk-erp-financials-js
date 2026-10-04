@@ -431,6 +431,8 @@ function operationalDocumentResources(
     const currencyCode = optionalReference(header.currency)?.value ?? context.currencyCode;
     const transactionNumber = optionalString(header, "documentNumber");
     const dueDate = optionalString(header, "dueDate");
+    const totalTax = optionalNumber(header, "totalTax");
+    const taxCalculation = optionalString(header, "taxCalculation");
     const totalAmount = optionalNumber(header, "amount");
     const openAmount = optionalNumber(header, "balance");
     const unappliedAmount = optionalNumber(header, "unappliedAmount");
@@ -445,8 +447,8 @@ function operationalDocumentResources(
       ...(transactionNumber === undefined ? {} : { transactionNumber }),
       ...(dueDate === undefined ? {} : { dueDate }),
       ...(totalAmount === undefined ? {} : { totalAmount: decimalFromNumber(totalAmount) }),
-      ...(optionalNumber(header, "totalTax") === undefined ? {} : { totalTax: decimalFromNumber(optionalNumber(header, "totalTax")!) }),
-      ...(optionalString(header, "taxCalculation") === undefined ? {} : { taxCalculation: optionalString(header, "taxCalculation")! }),
+      ...(totalTax === undefined ? {} : { totalTax: decimalFromNumber(totalTax) }),
+      ...(taxCalculation === undefined ? {} : { taxCalculation }),
       ...(openAmount === undefined ? {} : { openAmount: decimalFromNumber(openAmount) }),
       ...(unappliedAmount === undefined ? {} : { unappliedAmount: decimalFromNumber(unappliedAmount) }),
       ...(emailStatus === undefined ? {} : { emailStatus }),
@@ -882,6 +884,8 @@ function ledgerTransactionResource(
     quickBooksPartyType(first.metadata.sourceObject)
   );
   const dueDate = optionalString(header, "dueDate");
+  const totalTax = optionalNumber(header, "totalTax");
+  const taxCalculation = optionalString(header, "taxCalculation");
   const totalAmount = optionalNumber(header, "amount");
   const openAmount = optionalNumber(header, "balance");
   const unappliedAmount = optionalNumber(header, "unappliedAmount");
@@ -906,8 +910,8 @@ function ledgerTransactionResource(
     ...(transactionNumber === undefined ? {} : { transactionNumber }),
     ...(dueDate === undefined ? {} : { dueDate }),
     ...(totalAmount === undefined ? {} : { totalAmount: decimalFromNumber(totalAmount) }),
-      ...(optionalNumber(header, "totalTax") === undefined ? {} : { totalTax: decimalFromNumber(optionalNumber(header, "totalTax")!) }),
-      ...(optionalString(header, "taxCalculation") === undefined ? {} : { taxCalculation: optionalString(header, "taxCalculation")! }),
+    ...(totalTax === undefined ? {} : { totalTax: decimalFromNumber(totalTax) }),
+    ...(taxCalculation === undefined ? {} : { taxCalculation }),
     ...(openAmount === undefined ? {} : { openAmount: decimalFromNumber(openAmount) }),
     ...(unappliedAmount === undefined ? {} : { unappliedAmount: decimalFromNumber(unappliedAmount) }),
     ...(emailStatus === undefined ? {} : { emailStatus }),
@@ -1470,15 +1474,15 @@ function commercialDecimalFromNumber(value: number): string {
   if (!Number.isFinite(value)) throw new Error("QuickBooks commercial value must be finite.");
   // toFixed introduces binary-float noise at high precision (e.g. 215999.9568).
   // Expand the number's shortest decimal representation without further arithmetic.
-  const [coefficient, exponent = "0"] = String(value).split("e");
-  const negative = coefficient!.startsWith("-");
-  const [whole, fraction = ""] = (negative ? coefficient!.slice(1) : coefficient!).split(".");
-  const digits = whole! + fraction;
-  const point = whole!.length + Number(exponent);
+  const [coefficient = "0", exponent = "0"] = String(value).split("e");
+  const negative = coefficient.startsWith("-");
+  const [whole = "0", fraction = ""] = (negative ? coefficient.slice(1) : coefficient).split(".");
+  const digits = whole + fraction;
+  const point = whole.length + Number(exponent);
   const expanded = point <= 0 ? `0.${"0".repeat(-point)}${digits}`
     : point >= digits.length ? digits + "0".repeat(point - digits.length)
     : `${digits.slice(0, point)}.${digits.slice(point)}`;
-  const [integer, decimal = ""] = expanded.split(".");
+  const [integer = "0", decimal = ""] = expanded.split(".");
   const precise = decimal.replace(/0+$/, "");
   if (precise.length > 12) throw new Error("QuickBooks commercial precision exceeds twelve decimal places.");
   return `${negative ? "-" : ""}${integer}.${precise.padEnd(2, "0")}`;

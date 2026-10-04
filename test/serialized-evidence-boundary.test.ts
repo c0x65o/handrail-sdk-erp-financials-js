@@ -94,7 +94,7 @@ describe("serialized evidence credential and raw payload boundary", () => {
     const serializedReplaySummary = JSON.stringify(replaySummary, null, 2);
     expect(JSON.stringify(JSON.parse(serializedReplaySummary), null, 2)).toBe(serializedReplaySummary);
     expect(createHash("sha256").update(serializedReplaySummary).digest("hex")).toBe(
-      "d68b310cb984297322957d8b7620f8a7ed156069f2e14950cf83ebb47f8dbf8b"
+      "36019e35933aa3674905545e36656e23664b592104e7c9b971e4da8388afd054"
     );
   });
 

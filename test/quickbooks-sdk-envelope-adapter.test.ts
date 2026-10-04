@@ -368,7 +368,7 @@ describe("QuickBooks SDK envelope adapter", () => {
       ]);
     }
 
-    expect(statements).toHaveLength(4);
+    expect(statements).toHaveLength(6);
     expect(statements.every((statement) => /^select\b/i.test(statement.trim()))).toBe(true);
   });
 
@@ -1929,6 +1929,7 @@ function commercialFixtureLines(amount: string) {
 }
 
 function omitFixtureField<T extends object, K extends keyof T>(value: T, key: K): Omit<T, K> {
-  const { [key]: _omitted, ...remaining } = value;
+  const remaining = { ...value };
+  Reflect.deleteProperty(remaining, key);
   return remaining;
 }
