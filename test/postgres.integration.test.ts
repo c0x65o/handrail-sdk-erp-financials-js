@@ -1723,6 +1723,211 @@ insert into erp_financials.ledger_postings (
     });
   });
 
+  describe("balance sheet retained earnings composition", () => {
+    const window = { periodStart: "2026-01-01", periodEnd: "2026-09-30", asOfDate: "2026-09-30" } as const;
+
+    async function fixture(options: { direct?: string; prior?: string; current?: string; name?: string;
+      identity?: "canonical" | "source" | "none" | "unmapped" | "override"; nested?: boolean; noAccount?: boolean } = {}) {
+      await migratePostgresSchema(runner, { appliedByRef: "integration:retained-earnings" });
+      await seedAccountingScope(pool);
+      await pool.query(`
+insert into erp_financials.company_sources values ('company_source_2', 'tenant_1', 'company_1', 'source_2', now());
+insert into erp_financials.accounts (account_id, tenant_id, source_id, source_account_id, name, type, classification, active)
+values ('native_cash', 'tenant_1', 'source_2', 'cash', 'Cash', 'Bank', 'asset', true),
+       ('native_income', 'tenant_1', 'source_2', 'income', 'Income', 'Income', 'income', true);
+insert into erp_financials.import_batches (import_batch_id, tenant_id, source_id, mode, status, started_at, completed_at, source_object_counts)
+values ('batch_2', 'tenant_1', 'source_2', 'delta', 'completed', now(), now(), '{}');
+insert into erp_financials.transactions (transaction_id, tenant_id, source_id, source_transaction_id, source_transaction_type, transaction_date, currency_code, status, source_payload_ref)
+values ('journal_2', 'tenant_1', 'source_2', 'journal:2', 'JournalEntry', '2026-09-01', 'USD', 'posted', '{}');`);
+      const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1",
+        bookId: "book_retained", writeSourceId: "source_1", currencyCode: "USD" });
+      const operation = sdkOperation();
+      await sdk.books.define({ operation, bookId: "book_retained", name: "Retained earnings test", baseCurrencyCode: "USD" });
+      await sdk.books.bindSource({ operation, bookId: "book_retained", sourceId: "source_1", sourceRole: "historical", effectiveThrough: "2026-08-31" });
+      await sdk.books.bindSource({ operation, bookId: "book_retained", sourceId: "source_2", sourceRole: "active", effectiveFrom: "2026-09-01" });
+      const define = (key: string, subtype?: string, parent?: string) => sdk.books.defineAccount({ operation,
+        bookId: "book_retained", bookAccountKey: key, name: options.name ?? "Retained Earnings", classification: "equity",
+        accountRole: key.startsWith("equity-") ? "header" : "posting", expectedVersion: 0, ...(subtype ? { accountSubtype: subtype } : {}),
+        ...(parent ? { parentBookAccountKey: parent } : {}) });
+      const identity = options.identity ?? "canonical";
+      if (!options.noAccount) {
+        if (options.nested) { await define("equity-root"); await define("equity-parent", undefined, "equity-root"); }
+        if (identity !== "unmapped") await define("retained", identity === "canonical" ? "RetainedEarnings" : identity === "override" ? "OtherEquity" : undefined, options.nested ? "equity-parent" : undefined);
+        for (const [account, source] of [["retained_import", "source_1"], ["retained_shadow", "source_1"], ["retained_native", "source_2"]] as const) {
+          await pool.query(`insert into erp_financials.accounts (account_id, tenant_id, source_id, source_account_id, name, type, subtype, classification, active)
+values ($1, 'tenant_1', $2, $1, 'Retained Earnings', 'Equity', $3, 'equity', true)`,
+          [account, source, identity === "none" || identity === "canonical" ? null : "RetainedEarnings"]);
+          if (identity !== "unmapped") await sdk.books.mapAccount({ operation, bookId: "book_retained", sourceId: source, accountId: account, bookAccountKey: "retained" });
+        }
+      }
+      let sequence = 0;
+      // Seed balanced imported postings under the real schema and its posting constraints.
+      const post = async (account: string, net: string, date: string, basis = "accrual", currency = "USD", source = "source_1") => {
+        if (net === "0.00") return; // A zero balance has no posting; zero-sided postings are invalid.
+        const native = source === "source_2";
+        for (const [accountId, amount] of [[account, net], [native ? "native_cash" : "account_cash", net]]) {
+          const offset = accountId !== account;
+          await pool.query(`insert into erp_financials.ledger_postings
+(posting_id, tenant_id, source_id, source_posting_id, transaction_id, account_id, posting_date, accounting_basis,
+ debit_amount, credit_amount, net_amount, currency_code, dimension_hash, dimension_refs, import_batch_id)
+select $1, 'tenant_1', $2, $1, $3, $4, $5::date, $6, greatest(n,0), greatest(-n,0), n, $8, repeat('a',64), '[]', $9
+from (select $7::numeric * $10::integer as n) amount`,
+          [`retained-post-${String(++sequence)}`, source, native ? "journal_2" : "journal_1", accountId, date, basis, amount, currency, native ? "batch_2" : "batch_1", offset ? -1 : 1]);
+        }
+      };
+      if (!options.noAccount) await post("retained_import", options.direct ?? "49.08", "2025-12-31");
+      await post("account_income", options.prior ?? "-589219.21", "2025-12-31");
+      await post("native_income", options.current ?? "-47326.75", "2026-09-01", "accrual", "USD", "source_2");
+      const report = (accountingMethod: "cash" | "accrual" = "accrual", asOfDate = window.asOfDate as string) => sdk.queries.getFinancialStatement({ reportName: "balance_sheet", ...window, asOfDate, accountingMethod });
+      return { sdk, post, report, define };
+    }
+
+    it("combines three mapped source accounts into one canonical row without changing the chart or ledger", async () => {
+      const f = await fixture();
+      const before = await depositDatabaseState(pool);
+      const statement = await f.report();
+      expect(statement.lines.filter(line => line.name === "Retained Earnings")).toEqual([
+        expect.objectContaining({ bookAccountKey: "retained", directAmount: "589170.13", amount: "589170.13" })
+      ]);
+      expect(statement.lines.find(line => line.name === "Net Income")).toMatchObject({ amount: "47326.75" });
+      expect(statement.totals).toEqual({ assets: "636496.88", liabilities: "0.00", equity: "636496.88", difference: "0.00" });
+      const chart = await f.sdk.queries.listChartOfAccounts({ asOfDate: window.asOfDate });
+      expect(chart.filter(account => account.bookAccountKey === "retained")).toEqual([
+        expect.objectContaining({ balance: "49.08", directBalance: "49.08" })
+      ]);
+      expect(chart.find(account => account.bookAccountKey === "retained")?.sourceAccountIds).toHaveLength(3);
+      expect(await depositDatabaseState(pool)).toEqual(before);
+      expect(statement.lines.find(line => line.bookAccountKey === "retained")).toMatchObject({
+        derivedAmount: "589219.21", debitAmount: "49.08", creditAmount: "589219.21"
+      });
+      expect(statement.lines.find(line => line.bookAccountKey === "retained")?.drilldown).toBeUndefined();
+      expect(statement.lines.find(line => line.name === "Net Income")?.drilldown).toBeUndefined();
+      expect(statement.lines.find(line => line.bookAccountKey === "source_1:account_cash")?.drilldown).toBeDefined();
+    });
+
+    it.each([
+      ["0.00", "-10.01", "10.01"], ["0.00", "0.00", "0.00"],
+      ["5.01", "0.00", "-5.01"], ["-5.01", "0.00", "5.01"],
+      ["5.01", "2.03", "-7.04"], ["-5.01", "2.03", "2.98"],
+      ["5.01", "-5.01", "0.00"], ["-5.01", "-2.03", "7.04"]
+    ])("keeps exact signs for direct net=%s and prior net=%s", async (direct, prior, expected) => {
+      const f = await fixture({ direct, prior, current: "0.00" });
+      const statement = await f.report();
+      const retained = statement.lines.filter(line => line.classification === "equity");
+      expect(retained).toHaveLength(1);
+      expect(retained[0]?.amount).toBe(expected);
+      expect(statement.totals).toMatchObject({ assets: expected, equity: expected, difference: "0.00" });
+      expect(retained[0]?.drilldown === undefined).toBe(prior !== "0.00");
+    });
+
+    it.each(["canonical", "source"] as const)("recognizes renamed retained accounts from %s subtype evidence", async (identity) => {
+      const f = await fixture({ identity, name: "Accumulated profits" });
+      const statement = await f.report();
+      expect(statement.lines.filter(line => line.bookAccountKey === "retained")).toEqual([
+        expect.objectContaining({ name: "Accumulated profits", amount: "589170.13" })
+      ]);
+      expect(statement.lines.some(line => line.bookAccountKey === "__derived_equity__:retained_earnings")).toBe(false);
+    });
+
+    it.each(["none", "override"] as const)("does not merge same-label accounts with %s subtype evidence", async (identity) => {
+      const f = await fixture({ identity });
+      const statement = await f.report();
+      expect(statement.lines.find(line => line.bookAccountKey === "retained")?.amount).toBe("-49.08");
+      expect(statement.lines.find(line => line.bookAccountKey === "retained")?.drilldown).toBeDefined();
+      expect(statement.lines.find(line => line.bookAccountKey === "__derived_equity__:retained_earnings")).toMatchObject({ amount: "589219.21" });
+      expect(statement.totals.equity).toBe("636496.88");
+    });
+
+    it("keeps unrelated same-label equity separate and current-period losses distinct", async () => {
+      const f = await fixture({ current: "47.25" });
+      await f.define("unrelated-equity", "OtherEquity");
+      const statement = await f.report();
+      expect(statement.lines.find(line => line.bookAccountKey === "retained")?.amount).toBe("589170.13");
+      expect(statement.lines.find(line => line.bookAccountKey === "unrelated-equity")).toMatchObject({
+        name: "Retained Earnings", amount: "0.00"
+      });
+      expect(statement.lines.find(line => line.bookAccountKey === "unrelated-equity")?.drilldown).toBeDefined();
+      expect(statement.lines.find(line => line.name === "Net Income")).toMatchObject({
+        amount: "-47.25", derivedAmount: "-47.25", debitAmount: "47.25", creditAmount: "0.00"
+      });
+      expect(statement.lines.some(line => line.bookAccountKey === "__derived_equity__:retained_earnings")).toBe(false);
+      expect(statement.totals).toMatchObject({ equity: "589122.88", difference: "0.00" });
+    });
+
+    it("uses synthetic fallback without an account, and a canonical zero-balance definition without mappings", async () => {
+      const f = await fixture({ noAccount: true });
+      expect((await f.report()).lines.find(line => line.bookAccountKey === "__derived_equity__:retained_earnings")?.amount).toBe("589219.21");
+      await f.define("retained", "RetainedEarnings");
+      const statement = await f.report();
+      expect(statement.lines.find(line => line.bookAccountKey === "retained")?.amount).toBe("589219.21");
+      expect(statement.lines.some(line => line.bookAccountKey === "__derived_equity__:retained_earnings")).toBe(false);
+    });
+
+    it("does not choose among distinct canonical retained identities", async () => {
+      const f = await fixture();
+      await f.define("another-retained", "RetainedEarnings");
+      const statement = await f.report();
+      expect(statement.lines.find(line => line.bookAccountKey === "retained")?.amount).toBe("-49.08");
+      expect(statement.lines.find(line => line.bookAccountKey === "another-retained")?.amount).toBe("0.00");
+      expect(statement.lines.find(line => line.bookAccountKey === "__derived_equity__:retained_earnings")?.amount).toBe("589219.21");
+      expect(statement.totals.equity).toBe("636496.88");
+    });
+
+    it("resolves unmapped source identity only when unique, excluding future source evidence", async () => {
+      const f = await fixture({ identity: "unmapped" });
+      expect((await f.report()).lines.find(line => line.bookAccountKey === "__derived_equity__:retained_earnings")?.amount).toBe("589219.21");
+      await pool.query("update erp_financials.accounts set subtype = null where account_id = 'retained_shadow'");
+      const statement = await f.report("accrual", "2026-08-31");
+      expect(statement.lines.find(line => line.bookAccountKey === "source_1:retained_import")?.amount).toBe("589170.13");
+      expect(statement.lines.some(line => line.bookAccountKey === "__derived_equity__:retained_earnings")).toBe(false);
+    });
+
+    it("rolls derived provenance through nested parents without double counting or misleading drilldowns", async () => {
+      const f = await fixture({ nested: true, name: "Accumulated profits" });
+      const statement = await f.report();
+      for (const key of ["equity-root", "equity-parent", "retained"]) {
+        expect(statement.lines.find(line => line.bookAccountKey === key)).toMatchObject({ amount: "589170.13", derivedAmount: "589219.21" });
+        expect(statement.lines.find(line => line.bookAccountKey === key)?.drilldown).toBeUndefined();
+      }
+      expect(statement.lines.find(line => line.bookAccountKey === "equity-parent")?.directAmount).toBe("0.00");
+      expect(statement.totals).toMatchObject({ equity: "636496.88", difference: "0.00" });
+    });
+
+    it("preserves source windows, as-of date, currency, basis, and unrelated statement behavior", async () => {
+      const f = await fixture();
+      const baseline = await f.report();
+      // Another book permits the historical projections, but they must never leak
+      // across this book's cutover windows. Keep all posting guards enabled.
+      for (const sourceId of ["source_1", "source_2"]) {
+        const bookId = `archive-${sourceId}`;
+        await f.sdk.books.define({ operation: sdkOperation(), bookId, name: bookId, baseCurrencyCode: "USD" });
+        await f.sdk.books.bindSource({ operation: sdkOperation(), bookId, sourceId, sourceRole: "historical" });
+      }
+      await f.post("account_income", "-100.00", "2026-09-01"); // Historical source after cutover.
+      await f.post("native_income", "-200.00", "2025-12-31", "accrual", "USD", "source_2");
+      await f.post("retained_native", "-300.00", "2026-08-31", "accrual", "USD", "source_2");
+      await f.post("account_income", "-400.00", "2025-12-31", "accrual", "EUR");
+      await f.post("retained_import", "-500.00", "2025-12-31", "accrual", "EUR");
+      await f.post("native_income", "-600.00", "2026-10-01", "accrual", "USD", "source_2");
+      await f.post("account_income", "-20.03", "2025-12-31", "cash");
+      await f.post("retained_import", "1.02", "2025-12-31", "cash");
+      await f.post("native_income", "-3.04", "2026-09-01", "cash", "USD", "source_2");
+      expect(await f.report()).toEqual(baseline);
+      const cash = await f.report("cash");
+      expect(cash.lines.find(line => line.bookAccountKey === "retained")).toMatchObject({ amount: "19.01", derivedAmount: "20.03" });
+      expect(cash.lines.find(line => line.name === "Net Income")?.amount).toBe("3.04");
+      expect(cash.totals).toMatchObject({ assets: "22.05", equity: "22.05", difference: "0.00" });
+      const prior = await f.report("accrual", "2025-12-30");
+      expect(prior.lines.every(line => line.amount === "0.00")).toBe(true);
+      const pnl = await f.sdk.queries.getFinancialStatement({ reportName: "profit_and_loss", ...window });
+      expect(pnl.totals.netIncome).toBe("47326.75");
+      expect(pnl.lines.every(line => line.drilldown !== undefined)).toBe(true);
+      const trial = await f.sdk.queries.getFinancialStatement({ reportName: "trial_balance", ...window });
+      expect(trial.lines.find(line => line.bookAccountKey === "retained")?.amount).toBe("-49.08");
+      expect(trial.totals.difference).toBe("0.00");
+    });
+  });
+
   it("reads both sides of the QuickBooks-to-Spartan cutoff through one reporting book", async () => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:cutoff-continuity" });
     await seedAccountingScope(pool);

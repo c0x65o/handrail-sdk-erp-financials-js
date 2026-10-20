@@ -803,10 +803,15 @@ export type FinancialStatementLine = {
   readonly accountNumber?: string;
   readonly name: string;
   readonly classification: AccountClassification;
-  /** Activity on this account before descendant roll-up. */
+  /** Statement amount on this account before descendant roll-up, including derived earnings. */
   readonly directAmount: DecimalString;
   /** Activity on this account plus every descendant. */
   readonly amount: DecimalString;
+  /** Portion of amount derived from P&L, including descendants, rather than this account's ledger.
+   * Subtract from amount to recover the ledger portion. Present even when derived descendants cancel.
+   * Lines containing derived earnings cannot be explained by an account-only ledger drilldown.
+   */
+  readonly derivedAmount?: DecimalString;
   readonly debitAmount: DecimalString;
   readonly creditAmount: DecimalString;
   /** Basis-locked filter that opens the exact canonical postings behind this line (including descendants). */
@@ -4640,6 +4645,9 @@ async function getFinancialStatement(
   coalesce(min(book_account."account_number"), min(account."account_number")) as "account_number",
   coalesce(min(book_account."name"), min(account."name")) as "account_name",
   coalesce(min(book_account."classification"), min(account."classification")) as "classification",
+  bool_or(regexp_replace(lower(coalesce(book_account."account_subtype", account."subtype", '')),
+    '[^a-z0-9]', '', 'g') = 'retainedearnings'
+    and (source."effective_from" is null or source."effective_from" <= $9::date)) as "is_retained_earnings",
   coalesce(sum(posting."debit_amount"), 0) as "debit_amount",
   coalesce(sum(posting."credit_amount"), 0) as "credit_amount",
   coalesce(sum(posting."net_amount"), 0) as "net_amount"
@@ -4676,7 +4684,7 @@ order by coalesce(min(book_account."account_number"), min(account."account_numbe
         input.periodStart, input.periodEnd, input.reportName, asOfDate]
     );
     const defined = await client.query(
-      `select "book_account_key", "parent_book_account_key", "account_number", "name" as "account_name", "classification"
+      `select "book_account_key", "parent_book_account_key", "account_number", "name" as "account_name", "classification", "account_subtype"
 from "erp_financials"."reporting_book_accounts"
 where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3
   and (($4 = 'profit_and_loss' and "classification" in ('income', 'cost_of_goods_sold', 'expense', 'other_income', 'other_expense'))
@@ -4685,8 +4693,15 @@ where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3
 order by "account_number" nulls last, "name", "book_account_key"`,
       [scope.tenantId, scope.companyId, scope.bookId, input.reportName]
     );
-    const derivedEquityLines: FinancialStatementLine[] = [];
+    const direct = [...mergeBookStatementLines(result.rows.map(statementLineFromRow), defined.rows)];
     if (input.reportName === "balance_sheet") {
+      // Resolve reporting identities, never display labels. Multiple source accounts
+      // mapped to the same key count once; distinct candidates remain ambiguous.
+      const retainedKeys = new Set([...result.rows, ...defined.rows]
+        .filter((row) => row.classification === "equity" && (row.is_retained_earnings === true ||
+          optionalString(row.account_subtype)?.toLowerCase().replace(/[^a-z0-9]/gu, "") === "retainedearnings"))
+        .map((row) => string(row.book_account_key, "book_account_key")));
+      const retainedKey = retainedKeys.size === 1 ? [...retainedKeys][0] : undefined;
       const earningsResult = await client.query(
         `select
   coalesce(-sum(posting."net_amount") filter (where posting."posting_date" < $6::date), 0) as "retained_earnings",
@@ -4719,17 +4734,29 @@ where account."tenant_id" = $1
       ] as const) {
         const amount = money(value, key);
         if (moneyMinor(amount) !== 0n) {
-          derivedEquityLines.push(derivedEquityStatementLine(key, name, amount));
+          const derived = derivedEquityStatementLine(key, name, amount);
+          const index = key === "retained_earnings" && retainedKey !== undefined
+            ? direct.findIndex((line) => line.bookAccountKey === retainedKey)
+            : -1;
+          const existing = direct[index];
+          if (existing === undefined) {
+            direct.push(derived);
+          } else {
+            direct[index] = {
+              ...existing,
+              directAmount: addMoney(existing.directAmount, amount),
+              amount: addMoney(existing.amount, amount),
+              debitAmount: addMoney(existing.debitAmount, derived.debitAmount),
+              creditAmount: addMoney(existing.creditAmount, derived.creditAmount),
+              derivedAmount: amount
+            };
+          }
         }
       }
     }
-    const direct = [
-      ...mergeBookStatementLines(result.rows.map(statementLineFromRow), defined.rows),
-      ...derivedEquityLines
-    ];
     const lines = rollupStatementLines(direct).map((line): FinancialStatementLine => ({
       ...line,
-      ...(line.bookAccountKey.startsWith("__derived_equity__:")
+      ...(line.derivedAmount !== undefined
         ? {}
         : {
             drilldown: {
@@ -5865,6 +5892,7 @@ function derivedEquityStatementLine(
     classification: "equity",
     directAmount: amount,
     amount,
+    derivedAmount: amount,
     debitAmount: amountMinor < 0n ? minorMoney(-amountMinor) : "0.00",
     creditAmount: amountMinor > 0n ? amount : "0.00"
   };
@@ -5907,22 +5935,27 @@ function rollupStatementLines(lines: readonly FinancialStatementLine[]): readonl
       children.set(line.parentBookAccountKey, entries);
     }
   }
-  const memo = new Map<string, Pick<FinancialStatementLine, "amount" | "debitAmount" | "creditAmount">>();
-  const visit = (line: FinancialStatementLine, path: ReadonlySet<string>): Pick<FinancialStatementLine, "amount" | "debitAmount" | "creditAmount"> => {
+  type StatementTotal = Pick<FinancialStatementLine, "amount" | "debitAmount" | "creditAmount" | "derivedAmount">;
+  const memo = new Map<string, StatementTotal>();
+  const visit = (line: FinancialStatementLine, path: ReadonlySet<string>): StatementTotal => {
     const cached = memo.get(line.bookAccountKey);
     if (cached !== undefined) return cached;
     if (path.has(line.bookAccountKey)) throw new ErpFinancialsError("invalid_account_hierarchy", "Reporting-book account hierarchy contains a cycle");
     const nextPath = new Set(path).add(line.bookAccountKey);
-    const total = (children.get(line.bookAccountKey) ?? []).reduce(
+    const total = (children.get(line.bookAccountKey) ?? []).reduce<StatementTotal>(
       (current, child) => {
         const childTotal = visit(child, nextPath);
         return {
           amount: addMoney(current.amount, childTotal.amount),
           debitAmount: addMoney(current.debitAmount, childTotal.debitAmount),
-          creditAmount: addMoney(current.creditAmount, childTotal.creditAmount)
+          creditAmount: addMoney(current.creditAmount, childTotal.creditAmount),
+          ...(current.derivedAmount === undefined && childTotal.derivedAmount === undefined ? {} : {
+            derivedAmount: addMoney(current.derivedAmount ?? "0.00", childTotal.derivedAmount ?? "0.00")
+          })
         };
       },
-      { amount: line.directAmount, debitAmount: line.debitAmount, creditAmount: line.creditAmount }
+      { amount: line.directAmount, debitAmount: line.debitAmount, creditAmount: line.creditAmount,
+        ...(line.derivedAmount === undefined ? {} : { derivedAmount: line.derivedAmount }) }
     );
     memo.set(line.bookAccountKey, total);
     return total;
