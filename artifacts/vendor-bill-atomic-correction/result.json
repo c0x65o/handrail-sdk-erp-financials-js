@@ -1,0 +1,80 @@
+{
+  "checkpoint": "Atomic applied vendor bill correction command",
+  "sdkBaseCommit": "e90d82bfd25e26cf4dba375bb40e0dc8b53e329a",
+  "sdkVersion": "0.3.110",
+  "schemaVersion": 38,
+  "status": "locally verified SDK command; unpublished; full goal incomplete",
+  "publicAPI": [
+    "commands.vendorBills.correctPosted",
+    "CorrectPostedVendorBillInput",
+    "CorrectPostedVendorBillResult",
+    "FinancialAction:vendorBills.correctPosted"
+  ],
+  "behavior": [
+    "Explicit complete active-application release plan with reviewed bill, application and pre-command payment/credit source versions; exact nonnegative reapplication amounts.",
+    "One source-locked savepoint transaction releases applications, compensates native bill accrual, optionally replaces, applies approved amounts and records immutable completion receipt/outbox.",
+    "Payment cash facts preserved; excess remains available. Zero reapplication allows void without cash cancellation. Held replacements retain hold and reject new reapplication while held.",
+    "Book/currency/vendor/native provenance enforced. Independently created replacement keys cannot masquerade as composite retries.",
+    "Receipt binds scope, accounting settings, actor/approver/reason and economic payload; reordered releases or new transport metadata can replay, but changed business data cannot. Receipt remains a historical result after later applications or period close."
+  ],
+  "executed": {
+    "postgres": {
+      "passed": 63,
+      "unselected": 292,
+      "total": 355,
+      "log": "postgres-final.log",
+      "newAtomicCases": 18,
+      "publicFacadeExecution": true,
+      "engine": "PostgreSQL15.19",
+      "isolation": "Verified Unix-socket-only disposable cluster; removed after run"
+    },
+    "serviceUnit": {
+      "passed": 37,
+      "log": "unit.log"
+    },
+    "build": {
+      "result": "passed",
+      "log": "build.log"
+    },
+    "consumerImports": {
+      "result": "BLU/CoreERP/FutureERP passed; BLU fixture exercises new public types",
+      "logs": [
+        "blu-imports.log",
+        "core-imports.log",
+        "future-imports.log"
+      ]
+    },
+    "typecheck": {
+      "result": "passed full SDK source/tests",
+      "log": "typecheck-final.log"
+    },
+    "lint": {
+      "result": "passed all changed typed files; final test addition also passed",
+      "logs": [
+        "lint-final.log",
+        "test-lint-final.log"
+      ]
+    }
+  },
+  "acceptance": [
+    "Partial/full original payments; explicit zero/partial reapplication; multiple applications from same source.",
+    "Gross AP register/aging and net AP GL reconcile with remaining unapplied cash; original payment postings unchanged.",
+    "Hold preservation, scope mismatch, invalid/incomplete/stale/duplicate plans and incorrect versions leave SDK state unchanged.",
+    "Captured independent/admin authorization; command snapshot protects against caller mutation.",
+    "Concurrent identical/reordered retries post once; competing application/correction winner orders verified using pg_blocking_pids.",
+    "Injected caught failures after release/replacement/reapplication/completion/outbox restore full SDK table snapshots.",
+    "Actual PostgreSQL test backend terminated after replacement insertion; transaction facts fully rolled back; same command retries successfully.",
+    "Closed period rejection; completed correction receipt replay after close and after later unapplication."
+  ],
+  "fixups": [
+    "Typecheck/lint caught test-fixture readonly/literal mutation and Array.isArray any narrowing; repaired without changing business behavior. Initial full lint failed; changed files rechecked after fixes."
+  ],
+  "remaining": [
+    "Add public bounded correction-review read with application source versions. Existing getVendorBill lacks source versions and collects application history, so BLU must not introduce private SQL or per-row detail fanout to construct plans.",
+    "Implement BLU independent immutable correction approval, canonical replacement-link resolution, operator UI and full host transaction/recovery tests.",
+    "Validate canonical close/post races, scheduled-payment clear/cancel/compensation lock order and provider/native vendor-credit behavior; no complete coverage claimed.",
+    "Review legacy replacePosted hold semantics; additive correctPosted preserves holds but the older API is unchanged.",
+    "AP aging uses current balances and gross bills, excludes unapplied AP offsets; historical/net report semantics remain broader goal work.",
+    "No new scale measurement, migration/archive/recovery/cutover, full consumer app regression, publication, dependency upgrade, production SQL, deployment or live proof."
+  ]
+}

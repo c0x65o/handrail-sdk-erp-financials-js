@@ -1,0 +1,50 @@
+{
+  "checkpoint": "Historical cleared vendor payment receipts after bill corrections",
+  "sdkBaseCommit": "3e7025b4c5676e60dd1f1e4ebed10fc77d576de0",
+  "sdkVersion": "0.3.112",
+  "schemaVersion": 38,
+  "status": "locally verified; unpublished; complete BLU goal remains active and incomplete",
+  "cause": "Cleared disbursement replay called application writers; a later unapplication made the original clear retry fail and current source balances leaked into its completion receipt.",
+  "changes": [
+    "Use read-only native evidence validation for already_cleared in immediate and scheduled clear paths.",
+    "Validate both accounting-basis journals, native book provenance, payment and lifecycle evidence, and all immutable original application identities/payloads. Missing or inconsistent evidence fails closed without re-posting.",
+    "Return original completed payment and application versions/event IDs rather than current changed positions. Current query APIs remain authoritative for balances.",
+    "Keep generic ended-application replay and voided-cash-payment terminal behavior unchanged. No schema change or startup backfill."
+  ],
+  "executed": {
+    "postgres": {
+      "passed": 52,
+      "unselected": 312,
+      "total": 364,
+      "seconds": 83.28,
+      "log": "postgres-final.log",
+      "database": "isolated socket-only PostgreSQL 15.19, removed after run"
+    },
+    "focusedPostgres": {
+      "passed": 5,
+      "unselected": 359,
+      "log": "replay-regression.log"
+    },
+    "serviceUnit": {
+      "passed": 37,
+      "log": "unit.log"
+    },
+    "build": "pass; build.log",
+    "typecheck": "pass; full source/tests; typecheck.log",
+    "lint": "full lint passed; changed source/tests lint repeated after final change: lint-final.log",
+    "consumerImports": "BLU/Core ERP/Future ERP import compile fixtures passed; *-imports.log; not full consumer apps",
+    "diffCheck": "pass"
+  },
+  "proof": [
+    "Real correction after immediate or scheduled payment releases 20.00 and reapplies 10.00, while retry remains the original settled receipt.",
+    "All SDK tables unchanged by receipt retries, including after fiscal close; fresh transport metadata accepted, changed authorization/payload and wrong scope rejected.",
+    "Faults injected into real database reads hide/change original application evidence; retries fail without repair writes. Actual DB guards independently reject deleting/changing application history.",
+    "Existing multi-bill payment/compensation, correction crash/rollback/race/replay and bounded correction review regressions pass."
+  ],
+  "limitations": [
+    "Initial corruption fixture tried writes that DB guards correctly rejected. Test now asserts those protections then injects faulty reads. Initial failed log retained, final selected run passes.",
+    "Does not resolve remaining scheduled-clear/cancel/compensation lifecycle or lock-order audit work.",
+    "Older data lacking complete native dual-basis evidence must be reconciled through the explicit migration/recovery process; retries never synthesize missing evidence.",
+    "No publication, installed BLU dependency upgrade, live migration/deployment, browser check or new scale benchmark. Existing publication access rejection remains unresolved."
+  ]
+}

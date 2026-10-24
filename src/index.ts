@@ -1,3 +1,7 @@
+export type { AccountingReferenceGuardRequest, AccountingReferenceGuard } from "./accounting-reference-guard.js";
+export type { ReportingCalendarRequest, ReportingCalendarPeriod, ReportingCalendarMonth, ReportingCalendar } from "./reporting-calendar.js";
+export type { CashFlowAccountRole, CashFlowSummaryRequest, CashFlowSummary } from "./cash-flow-summary.js";
+export type { InvoiceAccountPolicy } from "./invoice-account-policy.js";
 export {
   AccountHierarchyValidationError,
   assertValidAccountHierarchy,
@@ -316,6 +320,8 @@ export type { FinancialOutboxEvent, FinancialOutboxService, FinancialOutboxStatu
 export type { FinancialRuntime, FinancialRuntimeHandlers, FinancialRuntimeRunResult } from "./financial-runtime.js";
 export type {
   AgingReport,
+  AgingPage,
+  AgingPageRequest,
   AgingRow,
   AdjustmentApplicationReadModel,
   AdjustmentDetail,
@@ -324,28 +330,52 @@ export type {
   AdjustmentStatus,
   AdjustmentType,
   AccountingLifecycleProvenance,
+  BankMatchCommandReceipt,
+  VendorBillHoldCommandReceipt,
   BankReconciliationListItem,
   BankReconciliationSummary,
   BillPaymentAccountEvidence,
   BillPaymentDetail,
+  BillPaymentCommandReceipt,
+  BillPaymentCorrectionReviewRequest,
+  BillPaymentCorrectionReviewApplication,
+  BillPaymentCorrectionReviewPage,
   BillPaymentLifecycleEvidence,
   BillPaymentLifecycleStatus,
   BillPaymentListItem,
   BillPaymentMethod,
   BillPaymentSummary,
   ChartOfAccountsItem,
+  OperationalAccountDefinition,
+  OperationalAccountsRequest,
+  OperationalAccountRequest,
+  OperationalAccountKeyRequest,
+  OperationalAccountListRequest,
+  OperationalAccountListItem,
   CommercialDocumentLineReadModel,
   CustomerStatement,
+  CustomerStatementBalance,
   CustomerStatementApplicationEvidence,
   CustomerStatementRequest,
   CustomerStatementRow,
   CustomerStatementSourceIdentity,
   CustomerStatementTotals,
+  CustomerStatementSettlementAmounts,
   CustomerPaymentDetail,
+  CollectionReceiptPageRequest,
+  CollectionReceipt,
+  ReceivableCollectionPositionRequest,
+  ReceivableCollectionPositionsRequest,
+  ReceivableCollectionCoverageHistory,
+  ReceivableCollectionGuard,
+  ReceivableCollectionPosition,
   CustomerPaymentProvenanceReadModel,
   FinancialLifecycleProvenance,
   FinancialDashboardSummary,
+  OutstandingDocumentSummary,
   FinancialStatement,
+  FinancialStatementRequest,
+  FinancialStatementsRequest,
   FinancialStatementLine,
   FinancialStatementName,
   FinancialReadModels,
@@ -372,7 +402,53 @@ export type {
   ReportAccountingMethod,
   GeneralLedgerSourceProvenance,
   GeneralLedgerSummary,
+  IncomeAttributionStatus,
+  IncomeAttributionRequest,
+  IncomeAttributionTotals,
+  IncomeAttributionItem,
+  IncomeAttributionPage,
+  JournalOriginGroup,
+  JournalRegisterRequest,
+  JournalRegisterTotals,
+  JournalRegisterItem,
+  JournalRegisterPage,
+  JournalPostingRequest,
+  JournalPostingPage,
+  ReportingAccountReferenceRequest,
+  ReportingAccountDefinition,
+  AccountChartRequest,
+  AccountChartTotals,
+  AccountChartItem,
+  AccountChartPage,
+  AccountRegisterRequest,
+  AccountRegisterLine,
+  AccountRegisterPage,
   InvoiceDetail,
+  InvoiceReceiptApplication,
+  InvoiceRegisterStatus,
+  InvoiceRegisterFilter,
+  InvoiceRegisterRequest,
+  InvoiceRegisterItem,
+  InvoiceRegisterSummary,
+  InvoiceRegisterPage,
+  InvoiceReceiptPage,
+  InvoiceReceiptPageRequest,
+  InvoiceSettlementSummary,
+  InvoiceAuditEvent,
+  VendorBillAuditEvent,
+  VendorBillRegisterStatus,
+  VendorBillRegisterRequest,
+  VendorBillRegisterItem,
+  VendorBillRegisterSummary,
+  CurrentInvoiceLineRequest,
+  CurrentInvoiceLineItem,
+  CurrentInvoiceLinePage,
+  CurrentVendorBillRequest,
+  CurrentVendorBillItem,
+  CurrentVendorBillPage,
+  SourceAccountBalanceRequest,
+  SourceAccountBalanceSummary,
+  VendorBillRegisterPage,
   InvoiceDeliveryEvent,
   InvoiceListItem,
   InvoiceListStatus,
@@ -392,6 +468,7 @@ export type {
   PageRequest,
   PaymentListItem,
   PaymentApplicationDetail,
+  PaymentApplicationCommandReceipt,
   PaymentApplicationListItem,
   PaymentApplicationMatchProvenance,
   PaymentSummary,
@@ -401,6 +478,12 @@ export type {
   WriteOffDetail,
   WriteOffListItem,
   VendorBillApplicationReadModel,
+  InvoiceCorrectionReviewRequest,
+  InvoiceCorrectionReviewPage,
+  InvoiceCorrectionReviewApplication,
+  VendorBillCorrectionReviewRequest,
+  VendorBillCorrectionReviewPage,
+  VendorBillCorrectionReviewApplication,
   VendorBillDetail,
   VendorBillLineReadModel,
   VendorBillListItem,
@@ -408,6 +491,9 @@ export type {
   VendorBillSummary
 } from "./sdk-read-models.js";
 export type {
+  InvoiceReplacementAccountPolicy,
+  CorrectIssuedInvoiceInput,
+  CorrectIssuedInvoiceResult,
   InvoiceDraft,
   InvoiceDraftStatus,
   InvoiceWorkflow,
@@ -416,6 +502,7 @@ export type {
   RecordInvoiceDeliveryInput,
   SaveInvoiceDraftInput,
   UpdateInvoiceDraftInput,
+  UpdateInvoiceDraftDatesInput,
   VoidIssuedInvoiceInput,
   VoidIssuedInvoiceResult
 } from "./invoice-workflow.js";
@@ -662,7 +749,17 @@ export type {
   CreateInvoiceInput,
   CreateVendorBillInput,
   CustomerPaymentProvenance,
+  CorrectInvoiceDatesInput,
+  CorrectInvoiceDatesResult,
+  ReturnCustomerPaymentCashInput,
+  PreviewCustomerPaymentCashReturnInput,
+  PreviewCustomerPaymentCashReturnResult,
+  ReturnCustomerPaymentCashResult,
   ApplySubledgerPaymentInput,
+  RetireBillPaymentRecordingInput,
+  RetireBillPaymentRecordingResult,
+  RetireReceiptApplicationInput,
+  RetireReceiptApplicationResult,
   EndSubledgerApplicationInput,
   ErpFinancials,
   ErpFinancialsAccountDefinition,
@@ -678,10 +775,19 @@ export type {
   IssuedAdjustmentType,
   IssueCreditMemoInput,
   IssueRefundInput,
+  EnsureActivePartyInput,
+  EnsureActivePartyResult,
   PostJournalEntryInput,
+  JournalEntryOrigin,
   PostJournalEntryLineInput,
   PostJournalEntryResult,
   PostedVendorBillLifecycleResult,
+  CorrectPostedVendorBillInput,
+  CorrectPostedVendorBillResult,
+  SetVendorBillPaymentHoldInput,
+  VendorBillPaymentHoldResult,
+  RetireVendorBillPaymentHoldInput,
+  RetireVendorBillPaymentHoldResult,
   PostedBillPaymentLifecycleResult,
   ReplaceIssuedVendorBillInput,
   ReplaceJournalEntryInput,
@@ -693,6 +799,10 @@ export type {
   RecordBillPaymentInput,
   RecordAndApplyBillPaymentInput,
   RecordCustomerPaymentInput,
+  RecordAndApplyCustomerPaymentInput,
+  RecordAndApplyCustomerPaymentResult,
+  RetireCustomerPaymentCollectionInput,
+  RetireCustomerPaymentCollectionResult,
   RecordDepositInput,
   ReverseDepositInput,
   ReverseDepositResult,
@@ -1149,3 +1259,25 @@ export type { CustomerPaymentCorrectionDependency, CustomerPaymentCorrectionImpo
 
 export { createFinancialActionCommandChecksum } from "./financial-approval-policy.js";
 export type { FinancialAction, FinancialApprovalScope, FinancialApprovalPolicy, AdministratorConfirmation, AdministratorFinancialGuard, AdministratorFinancialGuardInput } from "./financial-approval-policy.js";
+
+export type { FiscalCloseDiagnostics } from "./fiscal-close-diagnostics.js";
+
+export type { BankStatement, BankStatementService, PrepareBankStatementInput, BankStatementTransitionInput, BankStatementActivityPage, BankStatementSelectionPage, BankStatementClearingHistoryItem, BankStatementClearingHistoryPage, BankStatementListInput, BankStatementPage } from "./bank-statements.js";
+
+export type { CanonicalFiscalCloseReadiness, CanonicalFiscalCloseBankCheck } from "./fiscal-close-diagnostics.js";
+
+export type { CanonicalFiscalCloseResult, FiscalCloseTotalsVerification, FiscalCloseStateVerification, FiscalCloseCertificate, FiscalCloseControlTotal, FiscalCloseBankEvidence, FiscalCloseBankReceipt, FiscalCloseBankReceiptInput, FiscalCloseCertificatePageInput, FiscalCloseCertificatePage, FiscalCloseCertificateQueries } from "./fiscal-close-certificates.js";
+export type { CloseCanonicalFiscalPeriodInput } from "./fiscal-periods.js";
+
+export type { InvoicePostingComponents } from "./invoice-components.js";
+
+export type { CashFlowPurposeAmounts, CorrectCashFlowPurposeInput, CorrectCashFlowPurposeResult, CashFlowPurposeCorrection } from "./cash-flow-purpose.js";
+
+export type {JournalAccountRequirement,JournalAccountPolicyRequest,JournalAccountPolicyPage} from "./journal-account-policy.js";
+
+export {withPostgresAccountingMaintenance} from './accounting-maintenance.js';
+export type {AccountingMaintenanceClient,AccountingMaintenanceRequest,AccountingMaintenanceGuard} from './accounting-maintenance.js';
+export {changePostgresAccountingAccess,withPostgresAccountingAccess,readPostgresAccountingAccess,installPostgresAccountingHostGuards,verifyPostgresAccountingHostGuards} from './accounting-access.js';
+export type {AccountingAccessState,AccountingAccessCommand,AccountingHostRelation,AccountingHostGuardsRequest} from './accounting-access.js';
+
+export type { BankStatementCommandAttempt, RetireBankStatementCommandInput, RetireBankStatementCommandResult } from "./bank-statements.js";

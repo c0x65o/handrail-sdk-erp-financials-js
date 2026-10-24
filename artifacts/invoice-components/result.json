@@ -1,0 +1,169 @@
+{
+  "checkpoint": "Explicit invoice tax and discount posting",
+  "sdkBaseCommit": "3d1f3ba36065f3f92f57d63b150fb06ac157f61a",
+  "sdkVersion": "0.3.132",
+  "schemaVersion": 43,
+  "status": "SDK candidate locally verified; unpublished; BLU component integration and full goal incomplete",
+  "readyForRelease": false,
+  "changes": [
+    "Explicit scoped tax/discount account identities and new-execution classification policy; old payloads retain original posting treatment.",
+    "Nullable schema43 provenance with foreign keys; no historical amount rewrite.",
+    "Net AR control and remaining-component cash allocation; exact reversal of saved allocations; partial refund preflight models planned release.",
+    "Native draft/issue/cancel/correct/read provenance and idempotency preserve components.",
+    "Legacy invoice-linked generic refunds reject new component invoices; receipt returnCash is the supported cash-return command."
+  ],
+  "executed": {
+    "focusedPostgres": {
+      "passed": 6,
+      "unselected": 496,
+      "log": "focused-postgres.log"
+    },
+    "componentUnits": {
+      "passed": 8,
+      "log": "component-unit.log"
+    },
+    "initialFullUnit": {
+      "passed": 492,
+      "failed": 1,
+      "skipped": 565,
+      "cause": "stale migration-sequence assertion; corrected, final rerun pending",
+      "log": "unit-initial.log"
+    },
+    "correctionInitial": {
+      "passed": 1,
+      "failed": 1,
+      "cause": "retry correctly returned already_corrected; corrected assertion, rerun pending",
+      "log": "correction-initial.log"
+    },
+    "fullPostgresInitial": {
+      "passed": 497,
+      "failed": 8,
+      "total": 505,
+      "durationSeconds": 811.27,
+      "log": "postgres-full-initial.log",
+      "failureCause": "Historical fixtures used new component columns before their migration; other assertions still expected latest schema41. All failures corrected in tests, not runtime fallbacks."
+    },
+    "migrationRechecks": {
+      "passed": 9,
+      "unselected": 496,
+      "log": "postgres-migration-recheck.log",
+      "finalPostUpgradeRunnerCheck": {
+        "passed": 3,
+        "unselected": 502,
+        "log": "postgres-migration-final.log"
+      },
+      "note": "These rechecks cover all eight initially failing cases. No second complete 505-case run was performed."
+    },
+    "unitFinal": {
+      "passed": 493,
+      "skipped": 565,
+      "log": "unit-final.log"
+    },
+    "typecheck": {
+      "exitCode": 0,
+      "log": "typecheck.log"
+    },
+    "build": {
+      "exitCode": 0,
+      "log": "build.log"
+    },
+    "lint": {
+      "exitCode": 0,
+      "log": "lint.log"
+    },
+    "importedCreditPostgres": {
+      "passed": 54,
+      "durationSeconds": 120.61,
+      "log": "imported-credit-postgres.log"
+    },
+    "scopeRecheck": {
+      "passed": 1,
+      "unselected": 504,
+      "log": "scope-final.log"
+    },
+    "consumerImportChecks": {
+      "exitCode": 0,
+      "logs": [
+        "blu-imports.log",
+        "core-imports.log",
+        "future-imports.log"
+      ]
+    },
+    "finalChangedTestLint": {
+      "exitCode": 0,
+      "log": "test-lint-final.log"
+    },
+    "futureActualConsumer": {
+      "commit": "3a26c929ffe2f8dfb21c2b6c494e0f2131bcac63",
+      "typecheckExitCode": 0,
+      "testsPassed": 100,
+      "testsSkipped": 1,
+      "candidateVersionVerified": "0.3.132",
+      "log": "future-actual.log",
+      "installedPinUnchanged": true
+    },
+    "bluCandidate": {
+      "commit": "d1f63ae7c6d334cec6cc9d44cbca93fec87aded0",
+      "scopedTypecheckExitCode": 0,
+      "nativeInvoicePostgresPassed": 1,
+      "logs": [
+        "blu-typecheck.log",
+        "blu-native-postgres.log"
+      ],
+      "installedPinUnchanged": true,
+      "limitation": "Native untaxed invoice compatibility only; taxed/discounted BLU command gate remains and payment-method fixture failure is not repaired by this SDK checkpoint."
+    }
+  },
+  "requiredRemaining": [
+    "Adapt BLU contracts/router/service/client builder/SDK payload/read model and correction mapping; configure strict component policy, retain historical retry format, remove temporary tax/discount gate only with unchanged payment-method fixture economics passing.",
+    "Verify zero-total/zero-line sales, partial credits, all remaining goal workflows, browser cutover, million-entry reports/posting locks, archival/recovery migration reconciliation and production approval/deployment/live proof.",
+    "SDK publication remains blocked by saved HTTP403 and invalid_recovery_target. No retry without repaired access."
+  ],
+  "effects": {
+    "productionWrites": false,
+    "deployment": false,
+    "dependencyInstall": false,
+    "consumerPinsChanged": false
+  },
+  "testLimitations": [
+    "Focused tests use isolated PostgreSQL15.19; no production facts or live authority proof.",
+    "This candidate does not complete BLU integration or remove its failing tax/discount safety gate.",
+    "Old generic invoices retain legacy cash projection semantics; new exact residual allocation applies to explicit component invoices.",
+    "Historical migration fixtures emit pre-component SQL through a test-only adapter; all SQL executes on PostgreSQL, but this is not an old SDK binary compatibility test.",
+    "565 unit-run skips are PostgreSQL-dependent tests, including the separately executed 505-case main file; the 54 imported-credit cases passed separately. Scale and separate company-scope test files were not executed in this checkpoint.",
+    "The full main PostgreSQL file initially had eight migration-test failures; corrected cases passed targeted rechecks. A second full 505-case execution was not performed.",
+    "Actual Future ERP test run skips one environment-dependent test. QuickBooks and other deployed consumer runtimes were not exercised here."
+  ],
+  "bluIntegrationTrace": [
+    {
+      "file": "src/server/finance/contracts.ts:InvoiceLineInput; router.ts:invoiceLine; service.ts:createInvoice",
+      "work": "Carry explicit tax/discount amounts and validate exact net line arithmetic; default legacy omitted components to zero only for historical payload compatibility."
+    },
+    {
+      "file": "src/client/finance/invoice-model.ts:invoiceInputForOrder",
+      "work": "Build from gross commercial lines and existing order tax/discount evidence, never collection balance; reconcile subtotal/discount/tax/shipping and preserve line provenance. Decide/document allocation when only header component totals exist."
+    },
+    {
+      "file": "src/server/finance/erp-financials-invoice-commands.ts:create",
+      "work": "Under order lock reconcile submitted component totals to operational sale; map scoped tax/discount accounts through public SDK identities; preserve prior SDK payload marker for historical replays; remove temporary gate only when tests pass."
+    },
+    {
+      "file": "src/server/finance/invoice-account-policy.ts; erp-financials-runtime.ts",
+      "work": "Require liability tax and income discount policy for new BLU execution; update compatibility gates for component-aware invoice and collection behavior."
+    },
+    {
+      "file": "src/server/finance/erp-financials-reads.ts:invoice line mapping",
+      "work": "Retain SDK tax/discount amounts and account identities in invoice presentation/correction input; do not drop components."
+    },
+    {
+      "file": "src/server/finance/invoice-economic-corrections.ts:command and approve",
+      "work": "Strict allowed fields currently reject taxAccount/discountAccount; extend deliberate scoped mapping and immutable approval payloads. Preserve original policy for accepted replay; pending policy mismatch must be withdrawn/re-requested, not silently rewritten."
+    },
+    {
+      "file": "test/payment-methods-postgres.test.ts:217",
+      "work": "Unchanged fixture economics subtotal18000 discount1200 tax1008 shipping995 total18803; current one-line income payload is incorrect and safety-gated. Provide real components and prove receipt/GL/order eligibility agreement."
+    }
+  ],
+  "updatedAt": "2026-10-22T08:59:39.969871+00:00",
+  "goalStatus": "active"
+}

@@ -543,6 +543,14 @@ class StatementClient implements PostgresQueryClient {
     sql: string,
     params: readonly unknown[] = []
   ): Promise<PostgresQueryResult<Row>> {
+    if (sql.includes("/* financial_statement_snapshot */")) {
+      const windows = JSON.parse(String(params[3])) as Array<{ ordinal: number; accounting_method: string | null }>;
+      return Promise.all(windows.map(async window => {
+        const statement = await this.query('from "erp_financials"."accounts"', [null, null, null, window.accounting_method ?? "accrual"]);
+        const defined = await this.query('from "erp_financials"."reporting_book_accounts"');
+        return { ordinal: window.ordinal, base_currency_code: "USD", accounting_basis: "accrual", status: "active", statement_lines: statement.rows, defined_lines: defined.rows, earnings: null };
+      })).then(rows => ({ rows: rows as unknown as Row[] }));
+    }
     if (sql.includes('from "erp_financials"."reporting_books"')) {
       return Promise.resolve({
         rows: [{ base_currency_code: "USD", accounting_basis: "accrual", status: "active" } as unknown as Row]
@@ -604,8 +612,17 @@ class StatementClient implements PostgresQueryClient {
 
 class BalanceSheetStatementClient implements PostgresQueryClient {
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
-    sql: string
+    sql: string, params: readonly unknown[] = []
   ): Promise<PostgresQueryResult<Row>> {
+    if (sql.includes("/* financial_statement_snapshot */")) {
+      const windows = JSON.parse(String(params[3])) as Array<{ ordinal: number; accounting_method: string | null }>;
+      return Promise.all(windows.map(async window => {
+        const statement = await this.query('from "erp_financials"."accounts"', [null, null, null, window.accounting_method ?? "accrual"]);
+        const defined = await this.query('from "erp_financials"."reporting_book_accounts"');
+        const earnings = await this.query('as "retained_earnings"');
+        return { ordinal: window.ordinal, base_currency_code: "USD", accounting_basis: "accrual", status: "active", statement_lines: statement.rows, defined_lines: defined.rows, earnings: earnings.rows[0] };
+      })).then(rows => ({ rows: rows as unknown as Row[] }));
+    }
     if (sql.includes('from "erp_financials"."reporting_books"')) {
       return Promise.resolve({
         rows: [{ base_currency_code: "USD", accounting_basis: "accrual", status: "active" } as unknown as Row]
@@ -654,14 +671,10 @@ class DashboardClient implements PostgresQueryClient {
     sql: string,
     params: readonly unknown[] = []
   ): Promise<PostgresQueryResult<Row>> {
-    if (sql.includes('from "erp_financials"."reporting_books"')) {
-      return Promise.resolve({
-        rows: [{ base_currency_code: "USD", accounting_basis: "accrual", status: "active" } as unknown as Row]
-      });
-    }
-    if (sql.includes("with scoped_postings as")) {
-      this.requestedAccountingBases.push(params[3]);
+    if (sql.includes("financial_dashboard_snapshot")) {
+      this.requestedAccountingBases.push(params[5] ?? "accrual");
       return Promise.resolve({ rows: [{
+        base_currency_code: "USD", accounting_basis: "accrual", status: "active",
         assets: "680",
         liabilities: "50",
         equity: "630",
@@ -796,6 +809,7 @@ class BillPaymentClient implements PostgresQueryClient {
         currency_code: "USD",
         original_amount: "20",
         open_amount: "0",
+        returned_amount: "0",
         payment_status: "voided",
         version: 2,
         lifecycle_event_id: "event_payment_posted",

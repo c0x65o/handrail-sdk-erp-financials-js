@@ -1,0 +1,19 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-H3HksF/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (322 tests | 315 skipped) 6916ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections require the originating book and currency before writes or replay: voided  869ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections require the originating book and currency before writes or replay: replaced  1029ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject active applications and preserve unapplied cash: 20.00  1113ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject active applications and preserve unapplied cash: 100.00  1075ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject changed replay versions and preserve original commands  983ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill correction snapshots preserve a scoped administrator grant and its audit  903ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections snapshot independent commands before waiting for a transaction  812ms
+
+ Test Files  1 passed (1)
+      Tests  7 passed | 315 skipped (322)
+   Start at  15:32:42
+   Duration  9.15s (transform 1.56s, setup 0ms, collect 1.97s, tests 6.92s, environment 0ms, prepare 64ms)
+
+EPHEMERAL POSTGRES REMOVED

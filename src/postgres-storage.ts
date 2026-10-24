@@ -1,3 +1,4 @@
+import { ErpFinancialsError } from "./sdk-errors.js";
 import type { CanonicalAccountingFactSet } from "./source-adapters.js";
 import { prepareCustomerPaymentCorrectionImport, loadCustomerPaymentCorrectionReplayState, correctedTransactionIds, type CustomerPaymentCorrectionDependency, type CustomerPaymentCorrectionImportPlan } from "./customer-payment-correction-replay.js";
 import type {
@@ -437,7 +438,11 @@ export function createPostgresStorageAdapter(
       // example, Spartan owns the company natively before QuickBooks history is
       // imported. Reconcile that shared reporting entity by its canonical ID;
       // source-specific identity belongs in accounting_sources.
-      return upsertRows(client, manifest, "accounting_companies", [companyRow(company)], ["company_id"]);
+      const affected = await upsertRows(client, manifest, "accounting_companies", [companyRow(company)], ["company_id"], "update", ["tenant_id"]);
+      if (affected !== 1) {
+        throw new ErpFinancialsError("scope_mismatch", "Accounting company belongs to another tenant");
+      }
+      return affected;
     },
     async upsertAccountingSource(source) {
       return upsertRows(client, manifest, "accounting_sources", [sourceRow(source)], [
@@ -822,7 +827,7 @@ export async function validatePostgresSchema(
         });
       } else if (
         catalogIndex.definition != null &&
-        !indexDefinitionMatches(catalogIndex.definition, index.columns, index.unique === true, index.whereSql)
+        !indexDefinitionMatches(catalogIndex.definition, index.columns, index.unique === true, index.whereSql, index.method)
       ) {
         issues.push({
           kind: "incompatible_index_definition",
@@ -1340,14 +1345,14 @@ order by "account_number" nulls last, "name", "account_id"`,
     [input.tenantId, input.sourceId]
   );
   const postingResult = await client.query<Row>(
-    `select "posting_id", "tenant_id", "source_id", "source_posting_id", "transaction_id", "transaction_line_id", "account_id", "party_id", "item_id", "posting_date", "accounting_basis", "debit_amount", "credit_amount", "net_amount", "currency_code", "dimension_hash", "dimension_refs", "source_payload_ref", "import_batch_id", "checkpoint_id"
+    `select "posting_id", "tenant_id", "source_id", "source_posting_id", "transaction_id", "transaction_line_id", "account_id", "party_id", "item_id", "posting_date"::text as "posting_date", "accounting_basis", "debit_amount", "credit_amount", "net_amount", "currency_code", "dimension_hash", "dimension_refs", "source_payload_ref", "import_batch_id", "checkpoint_id"
 from ${qualifiedTable(manifest, "ledger_postings")}
 where "tenant_id" = $1
   and "source_id" = $2
   and "accounting_basis" = $3
   and "currency_code" = $4
   and "posting_date" <= coalesce($5::date, $6::date)
-order by "posting_date", "transaction_id", "posting_id"`,
+order by "ledger_postings"."posting_date", "transaction_id", "posting_id"`,
     [input.tenantId, input.sourceId, input.accountingBasis, input.currencyCode, input.asOfDate, input.periodEnd]
   );
   const freshnessResult = await client.query<Row>(
@@ -1405,7 +1410,7 @@ async function loadLatestReportSnapshot(
   input: LoadReportSnapshotInput
 ): Promise<StoredReportSnapshot | undefined> {
   const snapshotResult = await client.query<Row>(
-    `select "report_snapshot_id", "tenant_id", "company_id", "source_id", "report_name", "snapshot_source", "accounting_basis", "period_start", "period_end", "as_of_date", "currency_code", "generated_at", "freshness", "reconciliation_status", "reconciliation_difference"
+    `select "report_snapshot_id", "tenant_id", "company_id", "source_id", "report_name", "snapshot_source", "accounting_basis", "period_start"::text as "period_start", "period_end"::text as "period_end", "as_of_date"::text as "as_of_date", "currency_code", "generated_at", "freshness", "reconciliation_status", "reconciliation_difference"
 from ${qualifiedTable(manifest, "report_snapshots")}
 where "tenant_id" = $1
   and "company_id" = $2
@@ -1491,10 +1496,10 @@ async function loadRollupBuckets(
   appendRollupBucketTextFilter(filters, parameters, "item_id", input.itemId, input.itemIds);
 
   const result = await client.query<Row>(
-    `select "rollup_bucket_id", "tenant_id", "company_id", "source_id", "account_id", "accounting_basis", "bucket_grain", "bucket_start", "bucket_end", "currency_code", "dimension_hash", "party_id", "party_type", "item_id", "debit_amount", "credit_amount", "net_amount", "posting_count", "source_posting_max_updated_at", "import_batch_id", "generated_at"
+    `select "rollup_bucket_id", "tenant_id", "company_id", "source_id", "account_id", "accounting_basis", "bucket_grain", "bucket_start"::text as "bucket_start", "bucket_end"::text as "bucket_end", "currency_code", "dimension_hash", "party_id", "party_type", "item_id", "debit_amount", "credit_amount", "net_amount", "posting_count", "source_posting_max_updated_at", "import_batch_id", "generated_at"
 from ${qualifiedTable(manifest, "rollup_buckets")}
 where ${filters.join("\n  and ")}
-order by "bucket_start", "account_id", "dimension_hash", "party_type", "party_id", "item_id"`,
+order by "rollup_buckets"."bucket_start", "account_id", "dimension_hash", "party_type", "party_id", "item_id"`,
     parameters
   );
 
@@ -2698,7 +2703,8 @@ async function upsertRows(
   tableName: string,
   rows: readonly Row[],
   conflictColumns: readonly string[],
-  conflictAction: "update" | "nothing" = "update"
+  conflictAction: "update" | "nothing" = "update",
+  immutableScopeColumns: readonly string[] = []
 ): Promise<number> {
   if (rows.length === 0) {
     return 0;
@@ -2718,7 +2724,8 @@ async function upsertRows(
       columns,
       rows.slice(start, start + rowsPerBatch),
       conflictColumns,
-      conflictAction
+      conflictAction,
+      immutableScopeColumns
     );
   }
 
@@ -2733,7 +2740,8 @@ async function upsertRowBatch(
   columns: readonly string[],
   rows: readonly Row[],
   conflictColumns: readonly string[],
-  conflictAction: "update" | "nothing"
+  conflictAction: "update" | "nothing",
+  immutableScopeColumns: readonly string[]
 ): Promise<number> {
   const parameters: unknown[] = [];
   const valuesSql = rows
@@ -2756,10 +2764,15 @@ async function upsertRowBatch(
       : `do update set ${nonConflictColumns
           .map((column) => `${quoteIdentifier(column)} = excluded.${quoteIdentifier(column)}`)
           .join(", ")}`;
+  // Evaluate ownership in the INSERT ... ON CONFLICT statement itself: a
+  // separate SELECT would race a concurrent company creation/reassignment.
+  const scopeSql = immutableScopeColumns.length && conflictAction === "update"
+    ? ` where ${immutableScopeColumns.map((column) => `${quoteIdentifier(tableName)}.${quoteIdentifier(column)} = excluded.${quoteIdentifier(column)}`).join(" and ")}`
+    : "";
   const sql = `insert into ${qualifiedTable(manifest, tableName)} (${columns.map(quoteIdentifier).join(", ")})
 values
   ${valuesSql}
-on conflict (${conflictColumns.map(quoteIdentifier).join(", ")}) ${updateSql}`;
+on conflict (${conflictColumns.map(quoteIdentifier).join(", ")}) ${updateSql}${scopeSql}`;
   const result = await client.query(sql, parameters);
 
   return result.rowCount ?? rows.length;
@@ -2830,8 +2843,11 @@ function indexDefinitionMatches(
   definition: string,
   expectedColumns: readonly string[],
   expectedUnique: boolean,
-  expectedWhereSql?: string
+  expectedWhereSql?: string,
+  expectedMethod = "btree"
 ): boolean {
+  const actualMethod = /\busing\s+(\w+)/i.exec(definition)?.[1]?.toLowerCase() ?? "btree";
+  if (actualMethod !== expectedMethod) return false;
   const actualUnique = /\bcreate\s+unique\s+index\b/i.test(definition);
   const columnsMatch = /\(([^()]*)\)\s*(?:where\b.*)?$/i.exec(definition);
   if (columnsMatch?.[1] === undefined || actualUnique !== expectedUnique) {
@@ -2871,11 +2887,15 @@ function triggerDefinitionMatches(
   expected: PostgresTriggerManifest
 ): boolean {
   const normalized = definition.toLowerCase().replaceAll('"', "").replace(/\s+/gu, " ").trim();
-  const prefix = `create trigger ${expected.name} ${expected.timing}`;
+  const prefix = `create ${expected.deferredConstraint ? "constraint " : ""}trigger ${expected.name} ${expected.timing}`;
   const tableClause = ` on ${namespace}.${expected.table} `;
   if (
     !normalized.startsWith(prefix) ||
+    (expected.deferredConstraint === true && !normalized.includes("deferrable initially deferred")) ||
     !normalized.includes(tableClause) ||
+    (expected.level !== undefined && !normalized.includes(`for each ${expected.level}`)) ||
+    (expected.transitionTables?.old !== undefined && !normalized.includes(`old table as ${expected.transitionTables.old}`)) ||
+    (expected.transitionTables?.new !== undefined && !normalized.includes(`new table as ${expected.transitionTables.new}`)) ||
     !normalized.includes(`execute function ${namespace}.${expected.functionName}()`)
   ) {
     return false;

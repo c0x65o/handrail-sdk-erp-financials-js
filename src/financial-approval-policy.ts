@@ -8,14 +8,16 @@ import type { PostgresQueryClient } from "./postgres-storage.js";
 
 /** Stable operation names, selected by trusted server configuration only. */
 export type FinancialAction =
+  | "cashFlow.correctPurpose"
   | "journalEntries.postAdjustment" | "journalEntries.reverse" | "journalEntries.void" | "journalEntries.correct" | "journalEntries.replace"
-  | "customerPayments.voidAndUnapply"
+  | "customerPayments.voidAndUnapply" | "customerPayments.returnCash"
   | "adjustments.voidIssued" | "adjustments.replaceIssued" | "credits.voidIssued" | "credits.replaceIssued"
   | "refunds.voidIssued" | "refunds.replaceIssued" | "vendorBills.voidIssued" | "vendorBills.replaceIssued"
+  | "vendorBills.correctPosted"
   | "billPayments.cancel" | "billPayments.voidAndUnapply" | "billPayments.void"
   | "writeOffs.voidIssued" | "writeOffs.replaceIssued" | "deposits.reverse" | "transfers.reverse"
   | "paymentApplications.unapply" | "paymentApplications.void"
-  | "invoices.voidDraft" | "invoices.voidIssued"
+  | "invoices.voidDraft" | "invoices.voidIssued" | "invoices.correctIssued" | "invoices.correctDates"
   | "bankReconciliation.ignore" | "bankReconciliation.unignore" | "bankReconciliation.unmatch"
   | "fiscalPeriods.close" | "fiscalPeriods.reopen" | "fiscalPeriods.setPostingLockDate";
 
@@ -106,7 +108,7 @@ export function runFinancialAction<C extends FinancialActionContext, I extends {
     return Promise.reject(denied("Explicit administrator confirmation of this exact command is required"));
   }
   const guard = policy.guard;
-  return context.database.transaction(async client => {
+  return context.database.transaction(client => withFinancialActionSavepoint(client, async () => {
     const first = await client.query("select txid_current()::text as transaction_id");
     const second = await client.query("select txid_current()::text as transaction_id");
     if (!first.rows[0]?.transaction_id || first.rows[0].transaction_id !== second.rows[0]?.transaction_id) {
@@ -137,7 +139,22 @@ export function runFinancialAction<C extends FinancialActionContext, I extends {
     } finally {
       grant.active = false;
     }
-  });
+  }));
+}
+
+/** Authorization evidence and the command are one unit even when a host catches
+ * the rejection and commits its surrounding transaction. */
+async function withFinancialActionSavepoint<R>(client: PostgresQueryClient, work: () => Promise<R>): Promise<R> {
+  await client.query("savepoint erp_financial_action");
+  try {
+    const result = await work();
+    await client.query("release savepoint erp_financial_action");
+    return result;
+  } catch (error) {
+    await client.query("rollback to savepoint erp_financial_action");
+    await client.query("release savepoint erp_financial_action");
+    throw error;
+  }
 }
 
 export function assertFinancialApproval(scope: FinancialLifecycleScope, operation: FinancialOperationContext): void {

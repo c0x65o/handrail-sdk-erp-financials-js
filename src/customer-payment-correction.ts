@@ -286,11 +286,18 @@ function correctionService(context: Context, post: (client: PostgresQueryClient,
     const nativeProjection = await client.query(`select 1 from erp_financials.ledger_postings where tenant_id=$1 and source_id=$2 and source_posting_id like 'cash-application:%' and transaction_id=any($3::text[])`, [context.tenantId, context.sourceId, invoices.map(i => i.transaction_id)]);
     if (nativeProjection.rows.length)
       fail("Mixed native/imported cash evidence requires reconciliation");
-    const dates = new Set([request.date, String(payment.document_date instanceof Date ? payment.document_date.toISOString().slice(0, 10) : payment.document_date), ...postings.map(p => p.posting_date instanceof Date ? p.posting_date.toISOString().slice(0, 10) : String(p.posting_date)), ...applications.filter(a => a.status === 'applied').map(a => a.application_date instanceof Date ? a.application_date.toISOString().slice(0, 10) : String(a.application_date))]);
-    for (const invoice of invoices)
-      dates.add(invoice.document_date instanceof Date ? invoice.document_date.toISOString().slice(0, 10) : String(invoice.document_date));
-    if ([...dates].some(date => date > request.date))
-      fail("Effective date precedes payment or application accounting");
+    // Keep raw evidence rows unchanged: their representation is part of existing
+    // checksums. Read civil dates separately from the same locked records.
+    const dateRows = await client.query(`
+      select coalesce((to_jsonb(d)->>'recognition_date')::date,d.document_date)::text as civil_date from erp_financials.subledger_documents d
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_document_id=any($4::text[])
+      union select posting_date::text from erp_financials.ledger_postings
+      where tenant_id=$1 and source_id=$3 and transaction_id=any($5::text[])
+      union select application_date::text from erp_financials.subledger_applications
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_application_id=any($6::text[]) and status='applied'`,
+      [...scope, [request.paymentId, ...invoices.map(invoice => invoice.subledger_document_id)], evidence.transactionIds,
+        applications.map(application => application.subledger_application_id)]);
+    const dates = new Set([request.date, ...dateRows.rows.map(row => String(row.civil_date))]);
     for (const date of dates)
       await assertPostingDateAllowed(client, context, date);
     const snapshot = { scope, bookId: context.bookId ?? null, request, payment, evidence, transactions, postings, applications, invoices, invoiceApplications, appEvidence };

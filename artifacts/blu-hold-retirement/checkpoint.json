@@ -1,0 +1,64 @@
+{
+  "phase": 262,
+  "classification": "progress",
+  "goalComplete": false,
+  "launchReady": false,
+  "version": "0.3.185",
+  "schemaVersion": 49,
+  "baseCommit": "857b2fa0dbd2b2ddfac81adc931f4fcc1745dba2",
+  "cause": [
+    "BLU AP hold/release UI retains only memory keys and its adapter discards exact SDK receipts for current bill projection; SDK already safely replays accepted holds but had no fence for an unaccepted uncertain command.",
+    "A cancellation operation must not become a local hold shadow or reverse a historically accepted command."
+  ],
+  "changes": [
+    "Add public commands.vendorBills.retirePaymentHoldAttempt with exported root and /sdk input/result types.",
+    "Share original checksum normalization and native bill provenance checks with setPaymentHold, preserving existing setter payload/hash/replay behavior.",
+    "Use original source/key lock and exact original lifecycle key; unaccepted retirement stores no result so previous setter implementations also fail closed. Same actor and original normalized payload/audit are bound, retirement audit reason separately bound.",
+    "Accepted recovery returns immutable original receipt plus separate current hold/version, with no DML; stale versions, later settlement or close do not prevent recovery.",
+    "Unaccepted retirement validates original native tenant/company/source/book/currency provenance and appends one immutable lifecycle event. No hold mutation, ledger posting, balance, outbox or schema change.",
+    "Wrap retirement in existing native payable savepoint to roll back after-insert failure even when a host catches it. No automatic retry or direct DB workaround.",
+    "Correct stale pre-existing hold schema31-upgrade test to include existing48->49 migration; verifies facts unchanged."
+  ],
+  "validation": {
+    "postgres": {
+      "passed": 20,
+      "failed": 0,
+      "unselected": 667,
+      "seconds": 25.17,
+      "evidence": "postgres.txt",
+      "coverage": [
+        "hold and release retirement after current changes/close; exact cancellation replay",
+        "original accepted hold/release receipts after later settlement/close without DML",
+        "changed actor/payload/reason/key and foreign tenant/company/source/book/currency/provider failures",
+        "caught after-insert rollback and real committed cancellation with lost acknowledgement",
+        "four actual PostgreSQL advisory waiters, both actions and both race winners",
+        "input snapshots and original idempotency namespace fence",
+        "existing SDK hold enforcement/payment schedules/raw applications/corrections/version/concurrency regression"
+      ]
+    },
+    "red": "One targeted after-insert rollback test failed before savepoint (1 failed686unselected); then passed in final selection.",
+    "migration": {
+      "passed": 1,
+      "unselected": 686,
+      "seconds": 3.86,
+      "evidence": "upgrade.txt",
+      "red": "Existing expected migrations omitted48->49; test exposed mismatch, expectation corrected, financial-fact preservation passed."
+    },
+    "build": "npm run build passed",
+    "types": "Scoped full SDK source and postgres.integration + BLU/Core/Future public consumer type imports passed with4GiB heap; not runtime consumer regression",
+    "lint": "Explicit changed source/test files passed",
+    "isolation": "Disposable socket-only PostgreSQL15.19, one worker/no-file-parallelism, verified and removed",
+    "limitations": "No full suite, browser, production data/provider effect, deployment, SDK publication or installed BLU pin change. Native backend-termination tests from phase259 remain separate; this phase tested caught insert rollback and lost commit acknowledgement, not a new backend-kill scenario."
+  },
+  "next": "Wire new public native operation plus exact hold receipt into BLU AP adapter/runtime/service/strict frozen-context API and durable browser recovery. Keep canonical instance identity through correction; original root reference cannot silently retarget a replacement. Operational AP approval cancellation needs separate host-owned review/receipt handling, without another accounting authority. Reuse AP modal standards and verify actual route/narrow states. Then required publication, migrations/recovery/custody/ownership, scale/consumer/Ship/live evidence.",
+  "evidenceSha256": {
+    "red.txt": "c0c13d0b5f64ad6f58b9ec3df709a44ecab8ddfc525dff24137f6fbf69a5b468",
+    "postgres.txt": "71f12d4ed1495499651fc3bba6e220bed697e24bbaada3b1c1fcded431fd9a49",
+    "upgrade-red.txt": "165cf99d6f378ff2514aec641bfbd1f5362e41be8abb0879ae21ae3496ae21cb",
+    "upgrade.txt": "54d38470e20eb3becf305ea9b1d05abb00be1658aa04b2eee4fcbc96dc82432a",
+    "build.txt": "da1ff8bc86fe8b34bf894e4056567ba3637d8d35fc1b7724b325cbce621db873",
+    "types.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "lint.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tsconfig.json": "2dacd698423e5f783becb2745ba3a29268145a7ffcfd650f51d51ea5f5faa2ea"
+  }
+}

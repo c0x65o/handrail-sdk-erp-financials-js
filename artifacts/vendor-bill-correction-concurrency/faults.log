@@ -1,0 +1,18 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-hVTqcZ/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (335 tests | 329 skipped) 5743ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught reversal-link failure  924ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught original failure  888ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught replacement failure  937ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught lifecycle failure  958ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught outbox failure  989ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught sql-error failure  944ms
+
+ Test Files  1 passed (1)
+      Tests  6 passed | 329 skipped (335)
+   Start at  15:46:44
+   Duration  8.01s (transform 1.58s, setup 0ms, collect 2.00s, tests 5.74s, environment 0ms, prepare 71ms)
+
+EPHEMERAL POSTGRES REMOVED

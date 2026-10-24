@@ -57,7 +57,17 @@ describe("Postgres schema migrations", () => {
       [23, 24],
       [24, 25],
       [25, 26],
-      [26, 27]
+      [26, 27],
+      [27, 28],
+      [28, 29],
+      [29, 30],
+      [30, 31],
+      [31, 32],
+      [32, 33],
+      [33, 34],
+      [34, 35],
+      [35, 36],
+      [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]
     ]);
     expect(POSTGRES_MIGRATIONS.every((entry) => /^[a-f0-9]{64}$/.test(entry.checksum))).toBe(true);
     expect(new Set(POSTGRES_MIGRATIONS.map((entry) => entry.migrationId)).size).toBe(
@@ -71,7 +81,7 @@ describe("Postgres schema migrations", () => {
     const plan = await planPostgresMigrations(client);
 
     expect(plan.currentVersion).toBe(0);
-    expect(plan.targetVersion).toBe(27);
+    expect(plan.targetVersion).toBe(49);
     expect(plan.requiresBaselineAdoption).toBe(false);
     expect(plan.pendingMigrations).toEqual(POSTGRES_MIGRATIONS);
     expect(client.calls.some((call) => call.includes("pg_advisory_xact_lock"))).toBe(false);
@@ -85,7 +95,7 @@ describe("Postgres schema migrations", () => {
     const result = await migratePostgresSchema(runner, { appliedByRef: "deploy:future-erp:42" });
 
     expect(result.currentVersion).toBe(0);
-    expect(result.targetVersion).toBe(27);
+    expect(result.targetVersion).toBe(49);
     expect(result.adoptedBaselineVersion).toBeUndefined();
     expect(result.applied.map((entry) => [entry.fromVersion, entry.toVersion])).toEqual([
       [0, 6],
@@ -109,9 +119,19 @@ describe("Postgres schema migrations", () => {
       [23, 24],
       [24, 25],
       [25, 26],
-      [26, 27]
+      [26, 27],
+      [27, 28],
+      [28, 29],
+      [29, 30],
+      [30, 31],
+      [31, 32],
+      [32, 33],
+      [33, 34],
+      [34, 35],
+      [35, 36],
+      [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]
     ]);
-    expect(client.state.version).toBe(27);
+    expect(client.state.version).toBe(49);
     expect(client.state.ledger.map((entry) => entry.migrationId)).toEqual(
       POSTGRES_MIGRATIONS.map((entry) => entry.migrationId)
     );
@@ -143,7 +163,7 @@ describe("Postgres schema migrations", () => {
 
     expect(plan.currentVersion).toBe(7);
     expect(plan.requiresBaselineAdoption).toBe(true);
-    expect(plan.pendingMigrations.map((entry) => entry.toVersion)).toEqual([8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+    expect(plan.pendingMigrations.map((entry) => entry.toVersion)).toEqual([8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]);
   });
 
   it("reports an existing unversioned schema as requiring baseline adoption", async () => {
@@ -418,11 +438,11 @@ function catalogRowsForManifest(manifest: PostgresSchemaManifest): readonly Cata
       table_name: trigger.table,
       object_name: trigger.name,
       enabled: true,
-      definition: `create trigger ${trigger.name} ${trigger.timing} ${trigger.events
+      definition: `create ${trigger.deferredConstraint ? "constraint " : ""}trigger ${trigger.name} ${trigger.timing} ${trigger.events
         .map((event) => event === "update" && trigger.updateColumns !== undefined
           ? `update of ${trigger.updateColumns.join(", ")}`
           : event)
-        .join(" or ")} on ${manifest.namespace}.${trigger.table} for each row execute function ${manifest.namespace}.${trigger.functionName}()`
+        .join(" or ")} on ${manifest.namespace}.${trigger.table}${trigger.deferredConstraint ? " deferrable initially deferred" : ""}${trigger.transitionTables ? ` referencing${trigger.transitionTables.old ? ` old table as ${trigger.transitionTables.old}` : ""}${trigger.transitionTables.new ? ` new table as ${trigger.transitionTables.new}` : ""}` : ""} for each ${trigger.level ?? "row"} execute function ${manifest.namespace}.${trigger.functionName}()`
     }))
   ];
 }

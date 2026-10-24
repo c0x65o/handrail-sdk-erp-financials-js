@@ -1,0 +1,120 @@
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ↓ test/postgres.integration.test.ts (505 tests | 505 skipped)
+ ✓ test/erp-financials-service.test.ts (37 tests) 217ms
+ ✓ test/future-erp-app-owned-boundary-audit.test.ts (7 tests) 172ms
+ ✓ test/postgres-storage.test.ts (33 tests) 191ms
+ ✓ test/serialized-evidence-boundary.test.ts (3 tests) 83ms
+ ✓ test/future-erp-reporting-read-model.test.ts (30 tests) 94ms
+ ✓ test/rollup-jobs.test.ts (19 tests) 61ms
+ ✓ test/future-erp-sandbox-replay.test.ts (3 tests) 79ms
+ ✓ test/quickbooks-sdk-envelope-adapter.test.ts (26 tests) 73ms
+ ✓ test/future-erp-sandbox-sync-worker.test.ts (6 tests) 71ms
+ ✓ test/future-erp-install-health-preflight.test.ts (5 tests) 75ms
+ ✓ test/report-controls.test.ts (21 tests) 59ms
+ ✓ test/report-builders-fixtures.test.ts (32 tests) 50ms
+ ✓ test/core-erp-reporting-read-model.test.ts (9 tests) 61ms
+ ✓ test/freshness-drilldown-health.test.ts (6 tests) 53ms
+ ✓ test/health-contract.test.ts (2 tests) 74ms
+ ✓ test/quickbooks-sync-service.test.ts (28 tests) 66ms
+ ✓ test/install-health.test.ts (3 tests) 33ms
+ ✓ test/sdk-foundation.test.ts (19 tests) 26ms
+ ✓ test/normalized-quickbooks-contract-smoke.test.ts (2 tests) 44ms
+ ✓ test/postgres-migrations.test.ts (9 tests) 32ms
+ ✓ test/future-erp-canonical-import-smoke.test.ts (1 test) 46ms
+ ✓ test/fixture-smoke-health.test.ts (3 tests) 35ms
+ ✓ test/source-adapters.test.ts (12 tests) 22ms
+ ✓ test/source-record-dispositions.test.ts (19 tests) 27ms
+ ✓ test/future-erp-preflight.test.ts (3 tests) 30ms
+ ✓ test/future-erp-snapshot-workers.test.ts (4 tests) 24ms
+ ✓ test/fiscal-periods.test.ts (6 tests) 18ms
+ ❯ test/canonical-schema-manifest.test.ts (15 tests | 1 failed) 40ms
+   ✓ canonical schema manifest > is versioned and covers the documented canonical entities 3ms
+   ✓ canonical schema manifest > renders deterministic Postgres SQL with idempotency and accounting constraints 6ms
+   ✓ canonical schema manifest > preserves provider-neutral account hierarchy storage and lookup coverage 1ms
+   ✓ canonical schema manifest > keeps credential custody out of financial tables 6ms
+   ✓ canonical schema manifest > rejects audited credential and raw payload schema column variants 2ms
+   × canonical schema manifest > keeps historical migrations immutable and exposes an ordered path to the canonical renderer 12ms
+     → expected [ Array(38) ] to deeply equal [ Array(37) ]
+   ✓ canonical schema manifest > adds only the guarded ignored-to-unmatched bank statement line transition 0ms
+   ✓ canonical schema manifest > ships a fail-closed v6 to v7 report snapshot scope upgrade 0ms
+   ✓ canonical schema manifest > database-enforces versioned reporting-book account roles and account-number uniqueness 1ms
+   ✓ canonical schema manifest > database-enforces canonical write-off-to-invoice document roles 2ms
+   ✓ canonical model constraints > rejects negative debit or credit amounts 0ms
+   ✓ canonical model constraints > builds tenant-scoped idempotent source identity keys 0ms
+   ✓ canonical model constraints > enforces bounded safe source payload refs with no credential-like fields 1ms
+   ✓ canonical model constraints > rejects audited credential and raw provider payload field names 2ms
+   ✓ canonical model constraints > creates deterministic dimension hashes independent of input order 1ms
+ ✓ test/future-erp-persistence.test.ts (4 tests) 22ms
+ ✓ test/future-erp-rollup-workers.test.ts (3 tests) 21ms
+ ✓ test/normalized-quickbooks-sync-fixtures.test.ts (3 tests) 22ms
+ ✓ test/quickbooks-full-sync-replace.test.ts (5 tests) 22ms
+ ✓ test/quickbooks-sync-workers.test.ts (3 tests) 14ms
+ ✓ test/general-ledger-contract.test.ts (5 tests) 13ms
+ ✓ test/transaction-matching.test.ts (10 tests) 18ms
+ ✓ test/future-erp-quickbooks-incremental-sync.test.ts (3 tests) 13ms
+ ✓ test/release-publication.test.ts (3 tests) 18ms
+ ✓ test/account-hierarchy-persistence.test.ts (6 tests) 16ms
+ ✓ test/customer-statement-read-model.test.ts (3 tests) 11ms
+ ✓ test/quickbooks-dual-basis-backfill.test.ts (5 tests) 17ms
+ ✓ test/receivables-provenance.test.ts (4 tests) 15ms
+ ✓ test/accounting-basis-projection.test.ts (4 tests) 11ms
+ ✓ test/recurring-financials.test.ts (8 tests) 13ms
+ ✓ test/accounting-controls-read-models.test.ts (4 tests) 16ms
+ ✓ test/account-hierarchy-rollup-lines.test.ts (9 tests) 10ms
+ ✓ test/receivables-register-read-models.test.ts (4 tests) 14ms
+ ✓ test/sdk-account-hierarchy-read-model.test.ts (2 tests) 8ms
+ ✓ test/financial-lifecycle.test.ts (6 tests) 13ms
+ ✓ test/collection-position-input.test.ts (3 tests) 11ms
+ ✓ test/quickbooks-provider-report-parity.test.ts (8 tests) 12ms
+ ✓ test/package-boundary.test.ts (7 tests) 9ms
+ ✓ test/future-erp-quickbooks-full-sync.test.ts (2 tests) 10ms
+ ✓ test/core-erp-persistence-evidence.test.ts (2 tests) 9ms
+ ✓ test/quickbooks-commercial-detail.test.ts (7 tests) 10ms
+ ✓ test/invoice-components.test.ts (4 tests) 8ms
+ ✓ test/normalized-quickbooks-contract-compatibility.test.ts (2 tests) 9ms
+ ✓ test/review-surface.test.ts (1 test) 4ms
+ ↓ test/account-register-scale.postgres.test.ts (1 test | 1 skipped)
+ ↓ test/company-scope.postgres.test.ts (2 tests | 2 skipped)
+ ↓ test/fiscal-diagnostics-scale.postgres.test.ts (1 test | 1 skipped)
+ ↓ test/imported-credit.postgres.test.ts (54 tests | 54 skipped)
+ ↓ test/income-attribution-scale.postgres.test.ts (1 test | 1 skipped)
+ ↓ test/journal-mixed-scale.postgres.test.ts (1 test | 1 skipped)
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/canonical-schema-manifest.test.ts > canonical schema manifest > keeps historical migrations immutable and exposes an ordered path to the canonical renderer
+AssertionError: expected [ Array(38) ] to deeply equal [ Array(37) ]
+
+- Expected
++ Received
+
+@@ -145,6 +145,10 @@
+    ],
+    [
+      41,
+      42,
+    ],
++   [
++     42,
++     43,
++   ],
+  ]
+
+ ❯ test/canonical-schema-manifest.test.ts:259:95
+    257|       ])
+    258|     );
+    259|     expect(POSTGRES_MIGRATIONS.map(({ fromVersion, toVersion }) => [fr…
+       |                                                                                               ^
+    260|       [0, 6],
+    261|       [6, 7],
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 56 passed | 7 skipped (64)
+      Tests  1 failed | 492 passed | 565 skipped (1058)
+   Start at  03:34:39
+   Duration  33.53s (transform 3.81s, setup 0ms, collect 18.01s, tests 2.24s, environment 13ms, prepare 4.29s)
+

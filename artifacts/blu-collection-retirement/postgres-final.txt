@@ -1,0 +1,20 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/blu-sdk240-final/epg-BTOJpH/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (632 tests | 624 skipped) 7581ms
+   ✓ ERP Financials real PostgreSQL > collection attempt retirement fences delayed posting without changing any accounting rows  819ms
+   ✓ ERP Financials real PostgreSQL > collection attempt retirement recovers committed cash after settlement and close without reversal  886ms
+   ✓ ERP Financials real PostgreSQL > collection attempt retirement enforces original book and rolls back or recovers uncertain commits  826ms
+   ✓ ERP Financials real PostgreSQL > collection attempt retirement never hides independently recorded cash or allows reuse through raw record  889ms
+   ✓ ERP Financials real PostgreSQL > collection attempt retirement serializes with post starting first and permits exactly one terminal outcome  915ms
+   ✓ ERP Financials real PostgreSQL > collection attempt retirement serializes with retire starting first and permits exactly one terminal outcome  856ms
+   ✓ ERP Financials real PostgreSQL > records historical cash with a later explicit invoice application atomically  1223ms
+   ✓ ERP Financials real PostgreSQL > atomically collects invoice cash with payload-bound replay and no orphan receipt  1050ms
+
+ Test Files  1 passed (1)
+      Tests  8 passed | 624 skipped (632)
+   Start at  16:57:43
+   Duration  10.16s (transform 1.91s, setup 0ms, collect 2.35s, tests 7.58s, environment 0ms, prepare 60ms)
+
+EPHEMERAL POSTGRES REMOVED

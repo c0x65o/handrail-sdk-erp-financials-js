@@ -1,3 +1,13 @@
+export type { RetireBillPaymentRecordingInput, RetireBillPaymentRecordingResult } from "./erp-financials-service.js";
+export type { RetireReceiptApplicationInput, RetireReceiptApplicationResult } from "./erp-financials-service.js";
+export type { RecordAndApplyCustomerPaymentInput, RecordAndApplyCustomerPaymentResult, RetireCustomerPaymentCollectionInput, RetireCustomerPaymentCollectionResult } from "./erp-financials-service.js";
+export type { BankStatementSelectionPage } from "./bank-statements.js";
+export type { AccountingReferenceGuardRequest, AccountingReferenceGuard } from "./accounting-reference-guard.js";
+export type { ReportingCalendarRequest, ReportingCalendarPeriod, ReportingCalendarMonth, ReportingCalendar } from "./reporting-calendar.js";
+export type { CashFlowAccountRole, CashFlowSummaryRequest, CashFlowSummary } from "./cash-flow-summary.js";
+import { normalizeInvoiceAccountPolicy, type InvoiceAccountPolicy } from "./invoice-account-policy.js";
+import { createFiscalCloseCertificateQueries, type FiscalCloseCertificateQueries } from "./fiscal-close-certificates.js";
+import { createBankStatementService, type BankStatementService } from "./bank-statements.js";
 import type { FinancialApprovalPolicy } from "./financial-approval-policy.js";
 import type { CustomerPaymentCorrectionGuard } from "./customer-payment-correction.js";
 import { createBankReconciliationService } from "./bank-reconciliation.js";
@@ -32,7 +42,7 @@ export type {
   TransferReversalApproval,
   TransferReversalApprovalScope
 } from "./erp-financials-service.js";
-import { createErpFinancials } from "./erp-financials-service.js";
+import { createErpFinancials, createPostgresTransactionRunner } from "./erp-financials-service.js";
 import { createFinancialOutboxService } from "./financial-outbox.js";
 import { createFinancialRuntime } from "./financial-runtime.js";
 import { createInvoiceWorkflow } from "./invoice-workflow.js";
@@ -51,7 +61,6 @@ import type { PaymentMatchingService } from "./payment-matching.js";
 import type { RecurringFinancials } from "./recurring-financials.js";
 import type { ReportingBookService } from "./reporting-books.js";
 import type { FinancialReadModels } from "./sdk-read-models.js";
-import type { PostgresQueryClient } from "./postgres-storage.js";
 
 /**
  * Stable host-facing entry point. A host supplies scope and a transaction
@@ -67,12 +76,15 @@ export type ErpFinancialsSdk = {
   /** Deterministic, non-posting recurrence planning and command materialization. */
   readonly recurring: RecurringFinancials;
   readonly bankReconciliation: BankReconciliationService;
+  readonly bankStatements: BankStatementService;
+  readonly fiscalCloseCertificates: FiscalCloseCertificateQueries;
   readonly queries: FinancialReadModels;
   readonly outbox: FinancialOutboxService;
   createRuntime(handlers: FinancialRuntimeHandlers): FinancialRuntime;
 };
 
 export type CreateErpFinancialsSdkInput = {
+  readonly invoiceAccountPolicy?: InvoiceAccountPolicy;
   readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly customerPaymentCorrectionGuard?: CustomerPaymentCorrectionGuard;
   readonly database: ErpFinancialsDatabase;
@@ -89,7 +101,9 @@ export type CreateErpFinancialsSdkInput = {
 
 export function createErpFinancialsSdk(input: CreateErpFinancialsSdkInput): ErpFinancialsSdk {
   const database = asTransactionRunner(input.database);
+  const invoiceAccountPolicy = normalizeInvoiceAccountPolicy(input.invoiceAccountPolicy);
   const shared = {
+    ...(invoiceAccountPolicy === undefined ? {} : { invoiceAccountPolicy }),
     ...(input.financialApprovalPolicy === undefined ? {} : { financialApprovalPolicy: input.financialApprovalPolicy }),
     database,
     tenantId: input.tenantId,
@@ -110,6 +124,7 @@ export function createErpFinancialsSdk(input: CreateErpFinancialsSdkInput): ErpF
   });
   return {
     commands: createErpFinancials({
+      ...(invoiceAccountPolicy === undefined ? {} : { invoiceAccountPolicy }),
       ...(input.financialApprovalPolicy === undefined ? {} : { financialApprovalPolicy: input.financialApprovalPolicy }),
       ...(input.customerPaymentCorrectionGuard === undefined ? {} : { customerPaymentCorrectionGuard: input.customerPaymentCorrectionGuard }),
       database,
@@ -123,6 +138,7 @@ export function createErpFinancialsSdk(input: CreateErpFinancialsSdkInput): ErpF
       ...(input.postingPolicy === undefined ? {} : { postingPolicy: input.postingPolicy }),
       ...(input.now === undefined ? {} : { now: input.now })
     }),
+    fiscalCloseCertificates: createFiscalCloseCertificateQueries({ ...shared }),
     books: createReportingBookService({
       database,
       tenantId: input.tenantId,
@@ -133,6 +149,7 @@ export function createErpFinancialsSdk(input: CreateErpFinancialsSdkInput): ErpF
     paymentMatching: createPaymentMatchingService(shared),
     recurring: createRecurringFinancials(),
     bankReconciliation: createBankReconciliationService(shared),
+    bankStatements: createBankStatementService(shared),
     queries: createFinancialReadModels({
       database,
       tenantId: input.tenantId,
@@ -150,25 +167,7 @@ export function createErpFinancialsSdk(input: CreateErpFinancialsSdkInput): ErpF
 
 function asTransactionRunner(database: ErpFinancialsDatabase): ErpFinancialsTransactionRunner {
   if ("transaction" in database) return database;
-  const pool = database;
-  return {
-    async transaction<Result>(work: (client: PostgresQueryClient) => Promise<Result>): Promise<Result> {
-      const client = await pool.connect();
-      let started = false;
-      try {
-        await client.query("begin");
-        started = true;
-        const result = await work(client);
-        await client.query("commit");
-        return result;
-      } catch (error) {
-        if (started) await client.query("rollback");
-        throw error;
-      } finally {
-        client.release();
-      }
-    }
-  };
+  return createPostgresTransactionRunner(database);
 }
 
 export { ErpFinancialsError, erpFinancialsError, isErpFinancialsError } from "./sdk-errors.js";
@@ -201,6 +200,8 @@ export type {
 } from "./recurring-financials.js";
 export type {
   AgingReport,
+  AgingPage,
+  AgingPageRequest,
   AgingRow,
   AdjustmentApplicationReadModel,
   AdjustmentDetail,
@@ -209,28 +210,50 @@ export type {
   AdjustmentStatus,
   AdjustmentType,
   AccountingLifecycleProvenance,
+  BankMatchCommandReceipt,
+  VendorBillHoldCommandReceipt,
   BankReconciliationListItem,
   BankReconciliationSummary,
   BillPaymentAccountEvidence,
   BillPaymentDetail,
+  BillPaymentCommandReceipt,
+  BillPaymentCorrectionReviewRequest,
+  BillPaymentCorrectionReviewApplication,
+  BillPaymentCorrectionReviewPage,
   BillPaymentLifecycleEvidence,
   BillPaymentLifecycleStatus,
   BillPaymentListItem,
   BillPaymentMethod,
   BillPaymentSummary,
   ChartOfAccountsItem,
+  OperationalAccountDefinition,
+  OperationalAccountsRequest,
+  OperationalAccountRequest,
+  OperationalAccountKeyRequest,
+  OperationalAccountListRequest,
+  OperationalAccountListItem,
   CommercialDocumentLineReadModel,
   CustomerStatement,
+  CustomerStatementBalance,
   CustomerStatementApplicationEvidence,
   CustomerStatementRequest,
   CustomerStatementRow,
   CustomerStatementSourceIdentity,
   CustomerStatementTotals,
+  CustomerStatementSettlementAmounts,
   CustomerPaymentDetail,
+  ReceivableCollectionPositionRequest,
+  ReceivableCollectionPositionsRequest,
+  ReceivableCollectionCoverageHistory,
+  ReceivableCollectionGuard,
+  ReceivableCollectionPosition,
   CustomerPaymentProvenanceReadModel,
   FinancialLifecycleProvenance,
   FinancialDashboardSummary,
+  OutstandingDocumentSummary,
   FinancialStatement,
+  FinancialStatementRequest,
+  FinancialStatementsRequest,
   FinancialStatementLine,
   FinancialStatementName,
   FinancialReadModels,
@@ -257,8 +280,52 @@ export type {
   ReportAccountingMethod,
   GeneralLedgerSourceProvenance,
   GeneralLedgerSummary,
+  IncomeAttributionStatus,
+  IncomeAttributionRequest,
+  IncomeAttributionTotals,
+  IncomeAttributionItem,
+  IncomeAttributionPage,
+  JournalOriginGroup,
+  JournalRegisterRequest,
+  JournalRegisterTotals,
+  JournalRegisterItem,
+  JournalRegisterPage,
+  JournalPostingRequest,
+  JournalPostingPage,
+  ReportingAccountReferenceRequest,
+  ReportingAccountDefinition,
+  AccountChartRequest,
+  AccountChartTotals,
+  AccountChartItem,
+  AccountChartPage,
+  AccountRegisterRequest,
+  AccountRegisterLine,
+  AccountRegisterPage,
   InvoiceDetail,
+  InvoiceSettlementSummary,
+  InvoiceAuditEvent,
+  VendorBillAuditEvent,
+  VendorBillRegisterStatus,
+  VendorBillRegisterRequest,
+  VendorBillRegisterItem,
+  VendorBillRegisterSummary,
+  CurrentInvoiceLineRequest,
+  CurrentInvoiceLineItem,
+  CurrentInvoiceLinePage,
+  CurrentVendorBillRequest,
+  CurrentVendorBillItem,
+  CurrentVendorBillPage,
+  VendorBillRegisterPage,
   InvoiceDeliveryEvent,
+  InvoiceRegisterFilter,
+  InvoiceRegisterStatus,
+  InvoiceRegisterRequest,
+  InvoiceRegisterItem,
+  InvoiceRegisterSummary,
+  InvoiceRegisterPage,
+  InvoiceReceiptApplication,
+  InvoiceReceiptPageRequest,
+  InvoiceReceiptPage,
   InvoiceListItem,
   InvoiceListStatus,
   InvoiceSummary,
@@ -277,6 +344,7 @@ export type {
   PageRequest,
   PaymentListItem,
   PaymentApplicationDetail,
+  PaymentApplicationCommandReceipt,
   PaymentApplicationListItem,
   PaymentApplicationMatchProvenance,
   PaymentSummary,
@@ -286,6 +354,12 @@ export type {
   WriteOffDetail,
   WriteOffListItem,
   VendorBillApplicationReadModel,
+  InvoiceCorrectionReviewRequest,
+  InvoiceCorrectionReviewPage,
+  InvoiceCorrectionReviewApplication,
+  VendorBillCorrectionReviewRequest,
+  VendorBillCorrectionReviewPage,
+  VendorBillCorrectionReviewApplication,
   VendorBillDetail,
   VendorBillLineReadModel,
   VendorBillListItem,
@@ -304,8 +378,21 @@ export type {
   IssueCreditMemoInput,
   IssueRefundInput,
   CustomerPaymentProvenance,
+  CorrectInvoiceDatesInput,
+  CorrectInvoiceDatesResult,
+  ReturnCustomerPaymentCashInput,
+  PreviewCustomerPaymentCashReturnInput,
+  PreviewCustomerPaymentCashReturnResult,
+  JournalEntryOrigin,
+  ReturnCustomerPaymentCashResult,
   PostedBillPaymentLifecycleResult,
   PostedVendorBillLifecycleResult,
+  CorrectPostedVendorBillInput,
+  CorrectPostedVendorBillResult,
+  SetVendorBillPaymentHoldInput,
+  VendorBillPaymentHoldResult,
+  RetireVendorBillPaymentHoldInput,
+  RetireVendorBillPaymentHoldResult,
   ReplaceIssuedVendorBillInput,
   ReplaceIssuedAdjustmentInput,
   ReplaceIssuedCreditMemoInput,
@@ -327,6 +414,9 @@ export type {
   VoidPostedVendorBillInput
 } from "./erp-financials-service.js";
 export type {
+  InvoiceReplacementAccountPolicy,
+  CorrectIssuedInvoiceInput,
+  CorrectIssuedInvoiceResult,
   InvoiceDraft,
   InvoiceDraftStatus,
   InvoiceWorkflow,
@@ -335,6 +425,7 @@ export type {
   RecordInvoiceDeliveryInput,
   SaveInvoiceDraftInput,
   UpdateInvoiceDraftInput,
+  UpdateInvoiceDraftDatesInput,
   VoidIssuedInvoiceInput,
   VoidIssuedInvoiceResult
 } from "./invoice-workflow.js";
@@ -373,3 +464,25 @@ export type { CustomerPaymentCorrectionDependency, CustomerPaymentCorrectionImpo
 
 export { createFinancialActionCommandChecksum } from "./financial-approval-policy.js";
 export type { FinancialAction, FinancialApprovalScope, FinancialApprovalPolicy, AdministratorConfirmation, AdministratorFinancialGuard, AdministratorFinancialGuardInput } from "./financial-approval-policy.js";
+
+export type { FiscalCloseDiagnostics } from "./fiscal-close-diagnostics.js";
+
+export type { CanonicalFiscalCloseReadiness, CanonicalFiscalCloseBankCheck } from "./fiscal-close-diagnostics.js";
+
+export type { CanonicalFiscalCloseResult, FiscalCloseTotalsVerification, FiscalCloseStateVerification, FiscalCloseCertificate, FiscalCloseControlTotal, FiscalCloseBankEvidence, FiscalCloseBankReceipt, FiscalCloseBankReceiptInput, FiscalCloseCertificatePageInput, FiscalCloseCertificatePage, FiscalCloseCertificateQueries } from "./fiscal-close-certificates.js";
+export type { CloseCanonicalFiscalPeriodInput } from "./fiscal-periods.js";
+
+export type { InvoicePostingComponents } from "./invoice-components.js";
+
+export type { InvoiceAccountPolicy } from "./invoice-account-policy.js";
+
+export type { CashFlowPurposeAmounts, CorrectCashFlowPurposeInput, CorrectCashFlowPurposeResult, CashFlowPurposeCorrection } from "./cash-flow-purpose.js";
+
+export type {JournalAccountRequirement,JournalAccountPolicyRequest,JournalAccountPolicyPage} from "./journal-account-policy.js";
+
+export {withPostgresAccountingMaintenance} from './accounting-maintenance.js';
+export type {AccountingMaintenanceClient,AccountingMaintenanceRequest,AccountingMaintenanceGuard} from './accounting-maintenance.js';
+export {changePostgresAccountingAccess,withPostgresAccountingAccess,readPostgresAccountingAccess,installPostgresAccountingHostGuards,verifyPostgresAccountingHostGuards} from './accounting-access.js';
+export type {AccountingAccessState,AccountingAccessCommand,AccountingHostRelation,AccountingHostGuardsRequest} from './accounting-access.js';
+
+export type { BankStatementCommandAttempt, RetireBankStatementCommandInput, RetireBankStatementCommandResult } from "./bank-statements.js";

@@ -1,0 +1,24 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-PNoO5B/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (349 tests | 337 skipped) 12346ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases 20.00 and explicitly reapplies 10.00  876ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases 100.00 and explicitly reapplies 80.00  904ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction void preserves funds and replaces held bills without releasing their hold  868ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rejects stale, incomplete, changed and unauthorized plans without writes  1387ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught release interruption  928ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught replacement interruption  999ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught reapply interruption  1017ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught receipt interruption  1025ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught outbox interruption  1036ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases repeated payment sources and serializes identical retries  1089ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back an actual lost PostgreSQL connection and retries cleanly  842ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction honors a closed fiscal period and can replay after close  1198ms
+
+ Test Files  1 passed (1)
+      Tests  12 passed | 337 skipped (349)
+   Start at  15:57:44
+   Duration  14.59s (transform 1.62s, setup 0ms, collect 2.02s, tests 12.35s, environment 0ms, prepare 62ms)
+
+EPHEMERAL POSTGRES REMOVED

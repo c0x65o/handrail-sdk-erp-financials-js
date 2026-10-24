@@ -1,0 +1,70 @@
+{
+  "phase": 250,
+  "classification": "progress",
+  "goalComplete": false,
+  "launchReady": false,
+  "baseCommit": "b33485a6d7e7c3dbb376d0adf1e29030d8d89c5e",
+  "version": "0.3.182",
+  "schemaVersion": 49,
+  "cause": [
+    "BLU AP payment keys live only in browser memory; reload recovery needs an SDK-native command that can retire an uncertain exact attempt without re-executing money movement.",
+    "Proven SDK defect: unapply then direct void changed the native payment document to voided while leaving its disbursement instruction cleared/version2."
+  ],
+  "changes": [
+    "Add billPayments.retireRecordingAttempt with exact original payload/actor/audit binding, immutable retirement receipt, shared source/instruction locks and permanent raw/immediate/scheduled write fencing.",
+    "Return original retained payment/application/GL evidence for already-recorded attempts, with current native payment status; do not post, reapply or mutate historical accounting. Reject missing evidence, unsupported scheduled state and independent raw payments.",
+    "Direct native void atomically updates its associated cleared instruction to voided in the same savepoint; composite compensation retains ownership of its own instruction event. Historical stale instructions are not silently rewritten."
+  ],
+  "validation": {
+    "build": "passed normal TypeScript pipeline",
+    "scopedTypes": "passed src, PostgreSQL tests and BLU/Core/Future public consumer types",
+    "lint": "passed",
+    "unit": {
+      "passed": 7,
+      "notSelected": 30,
+      "seconds": 2.27
+    },
+    "postgres": {
+      "passed": 16,
+      "notSelected": 634,
+      "seconds": 24.68,
+      "database": "disposable socket-only PostgreSQL15.19 removed",
+      "coverage": [
+        "exact retries/payload conflicts",
+        "hold/close/void/replaced-history recovery",
+        "native direct-void instruction update",
+        "caught final-write rollback and lost commit acknowledgement",
+        "four real advisory-lock waiter races: raw/immediate recording vs retirement, both winners",
+        "scope/actor/source/independent-document conflicts",
+        "missing immutable clear evidence fails closed",
+        "existing raw/composite void atomicity and immediate/scheduled correction retry regressions"
+      ]
+    },
+    "bluCompatibility": {
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 7.954,
+      "database": "disposable PostgreSQL removed",
+      "coverage": "real AP request, SDK approval and payment share one transaction with legacy accounting storage inaccessible"
+    },
+    "redProof": "direct-void-before.txt captures the original stale-cleared instruction defect before the fix; not a final test failure"
+  },
+  "limitations": [
+    "BLU AP route/browser recovery integration remains next; this SDK API alone does not resolve its reload UX.",
+    "Historical stale-instruction fixture deliberately suppresses only the new update; proves readonly recovery of old state, not actual production incidence. Approved migration must inspect/reconcile historical instruction/document mismatches.",
+    "No full suite, scale benchmark, production data, provider effect, publication or deployment. Installed BLU dependency remains0.3.50/cdc00ad35ff956b63b6c3942e23afe11e192f90b; candidate loader is test-only.",
+    "Saved GitHub push403/native repair outside scope, production storage provisioning, gateway ownership uncertainty and other full goal gates remain unresolved; no unchanged rejected operation retried."
+  ],
+  "next": "Connect SDK182 recovery to BLU AP command/service/router preserving original canonical bill target across corrections, then durable actor/scope-bound browser recovery with UI verification.",
+  "evidenceSha256": {
+    "build-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "types-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "lint-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "unit-final.txt": "64d94c8a17567c20141f81a452dd32311a7b5fec6d93c7970abf06d82e0f049d",
+    "postgres-final.txt": "24b7a4f5334dba8c068cd2310c4eb662c6275eec8f3b1d60fcc9cccb88907d82",
+    "blu-postgres-final.txt": "58a0f8c2edc03b2f9f99b04afdcba1b0a65f121bc227afd3295a6ffbfdfe5ee7",
+    "direct-void-before.txt": "aa5f30789c5c451045f44e8741fe3d5ef69b9b9505e04a7d0f94a930c26b4b63",
+    "tsconfig.json": "2dacd698423e5f783becb2745ba3a29268145a7ffcfd650f51d51ea5f5faa2ea"
+  }
+}

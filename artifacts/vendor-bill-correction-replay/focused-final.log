@@ -1,0 +1,15 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-choumg/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (318 tests | 315 skipped) 2588ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject changed replay versions and preserve original commands  910ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill correction snapshots preserve a scoped administrator grant and its audit  767ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections snapshot independent commands before waiting for a transaction  826ms
+
+ Test Files  1 passed (1)
+      Tests  3 passed | 315 skipped (318)
+   Start at  15:03:57
+   Duration  5.06s (transform 1.72s, setup 0ms, collect 2.20s, tests 2.59s, environment 0ms, prepare 72ms)
+
+EPHEMERAL POSTGRES REMOVED

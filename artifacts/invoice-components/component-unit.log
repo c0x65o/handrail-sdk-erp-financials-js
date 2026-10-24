@@ -1,0 +1,11 @@
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/accounting-basis-projection.test.ts (4 tests) 11ms
+ ✓ test/invoice-components.test.ts (4 tests) 8ms
+
+ Test Files  2 passed (2)
+      Tests  8 passed (8)
+   Start at  03:27:32
+   Duration  631ms (transform 115ms, setup 0ms, collect 137ms, tests 19ms, environment 0ms, prepare 148ms)
+

@@ -1,0 +1,55 @@
+{
+  "phase": 274,
+  "version": "0.3.186",
+  "schemaVersion": 49,
+  "parentCommit": "d1130800358fece06f34f982de27577bad2e8412",
+  "classification": "SDK defect fixed locally; publication outstanding",
+  "finding": "getJournalEntry joined lifecycle rows for immutable journal links but omitted event.event_id. The mapper required event_id, so real reversal/void/correction/replacement detail reads threw Stored event_id must be a non-empty string. Existing mocked read tests supplied the missing field and did not expose the projection defect.",
+  "change": "Select the joined event_id with existing lifecycle provenance. No schema, API-shape, posting, approval, custody or historical data mutation. Version and root package lock metadata advance together.",
+  "validation": {
+    "postgres": {
+      "red": "4 selected cases fail on parent source with exact missing event_id error",
+      "green": "4 selected real PostgreSQL cases pass; 687 other cases deselected, not executed",
+      "durationSeconds": 6.95,
+      "cases": [
+        "reverse",
+        "void",
+        "correct",
+        "replace"
+      ],
+      "assertions": [
+        "Original lifecycle outcome and exact link IDs match public command results",
+        "Every linked lifecycle identity is in the command result, with original actor/approver/request/correlation/reason/checksum",
+        "Related-journal detail returns identical immutable link provenance",
+        "All reads run in PostgreSQL read-only transactions"
+      ],
+      "database": "Socket-only disposable PostgreSQL15.19; removed after run"
+    },
+    "unit": "4 accounting-control read model cases pass; 1.91 seconds",
+    "build": "Normal tsc build passes",
+    "types": "Scoped changed reader/integration fixture and BLU/Core/Future consumer imports pass",
+    "lint": "Changed TypeScript files pass ESLint",
+    "logFormat": "Text evidence normalized only for trailing whitespace."
+  },
+  "limitations": [
+    "Local candidate only; no SDK publication, BLU dependency upgrade or deployment.",
+    "Full suites, actual consumer builds against public installed revision, full/browser/live acceptance and all current-version million-entry measurements remain outstanding.",
+    "Existing SDK publication403 and native repair scope rejection were not retried or bypassed."
+  ],
+  "hashes": {
+    "src/sdk-read-models.ts": "bef38f34c616f6a00195186e3aebdde22fd3051e2887bfdab65689357ca2f658",
+    "test/postgres.integration.test.ts": "da917b7f5ff5bf4cb6e6149294405ccf0bd0525b3f27019b1fc83a7c88e9eefb",
+    "package.json": "b6f74583ca20ace69cbe7596b150d34860562d93da8819cef1ae309ceb475944",
+    "package-lock.json": "a41eab4d5f72f06d429b28aebc563523dfaa514a9b611f09c629cb56f8aab6ec",
+    "README.md": "bc034a672248e8048518fe471c3cbfd8a20673b63a9f296c729e9385431f16bf"
+  },
+  "evidenceHashes": {
+    "postgres-red.txt": "89c2e78d2e7f64f53a33c071a0e4c39ce9e61f8e1b3511fa4cc7287bc2bb2f5f",
+    "postgres.txt": "484875453c97e1f2e29b954300cef5ea025635b361bc6b65ce70f6f2e6362a53",
+    "build.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "types.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "unit.txt": "0a6079c104292f64def9b5e618533725367f72e934a5e074edb97e9a66ad10cc",
+    "lint.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tsconfig.json": "2353a5e8ede69705210aab69d0503eafba0ec8ce049ef0d9b356cb86baaeac09"
+  }
+}

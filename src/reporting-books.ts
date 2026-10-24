@@ -359,7 +359,7 @@ async function bindSource(
 ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 on conflict ("tenant_id", "company_id", "book_id", "source_id") do update
 set "source_role" = excluded."source_role", "effective_from" = excluded."effective_from", "effective_through" = excluded."effective_through"
-returning *`,
+returning *, "effective_from"::text as "effective_from", "effective_through"::text as "effective_through"`,
       [
         bookSourceId,
         tenantId,
@@ -450,7 +450,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3`,
       });
     }
     const sourceResult = await client.query(
-      `select * from "erp_financials"."reporting_book_sources"
+      `select *, "effective_from"::text as "effective_from", "effective_through"::text as "effective_through" from "erp_financials"."reporting_book_sources"
 where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3
   and ($4::date is null or "effective_from" is null or "effective_from" <= $4::date)
   and ($4::date is null or "effective_through" is null or "effective_through" >= $4::date)

@@ -1,0 +1,16 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-phase274-links/epg-Ft9Itu/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (691 tests | 687 skipped) 3739ms
+   ✓ ERP Financials real PostgreSQL > reads persisted journal reverse lifecycle link provenance through the public SDK  843ms
+   ✓ ERP Financials real PostgreSQL > reads persisted journal void lifecycle link provenance through the public SDK  856ms
+   ✓ ERP Financials real PostgreSQL > reads persisted journal correct lifecycle link provenance through the public SDK  957ms
+   ✓ ERP Financials real PostgreSQL > reads persisted journal replace lifecycle link provenance through the public SDK  952ms
+
+ Test Files  1 passed (1)
+      Tests  4 passed | 687 skipped (691)
+   Start at  23:00:07
+   Duration  6.95s (transform 2.38s, setup 0ms, collect 2.97s, tests 3.74s, environment 0ms, prepare 59ms)
+
+EPHEMERAL POSTGRES REMOVED

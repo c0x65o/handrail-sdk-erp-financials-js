@@ -1,0 +1,4 @@
+
+> @handrail/erp-financials@0.3.111 typecheck:future-erp-imports
+> tsc --noEmit -p tsconfig.future-erp-consumer.json
+

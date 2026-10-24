@@ -1,0 +1,673 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-financials-goal-tests/epg-UWXrhc/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+(node:1283270) DeprecationWarning: Calling client.query() when the client is already executing a query is deprecated and will be removed in pg@9.0. Use async/await or an external async flow control mechanism instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+ ❯ test/postgres.integration.test.ts (505 tests | 8 failed) 808363ms
+   ✓ ERP Financials real PostgreSQL > explicit invoice components preserve tax and discount postings through receipts, unapply, and cancellation  1170ms
+   ✓ ERP Financials real PostgreSQL > invoice component policies reject missing, inactive, wrong-role and foreign accounts atomically and retain exact historical replay  1196ms
+   ✓ ERP Financials real PostgreSQL > explicit invoice component partial cash return previews and posts without cancelling the sale or duplicating a retry  1070ms
+   ✓ ERP Financials real PostgreSQL > invoice component posting rolls back after journal persistence and serializes concurrent identical retries  979ms
+   ✓ ERP Financials real PostgreSQL > invoice component correction releases and reapplies cash while reversing exact original components  981ms
+   ✓ ERP Financials real PostgreSQL > tax-only invoice allocations consume the final cent exactly across tiny receipts  1060ms
+   ✓ ERP Financials real PostgreSQL > reporting account references resolve one scoped chart identity without reading financial facts  974ms
+   ✓ ERP Financials real PostgreSQL > reporting account references reject ambiguity and malformed requests and capture inputs before awaiting  1161ms
+   ✓ ERP Financials real PostgreSQL > operational account selector pages source IDs and mapped labels without financial reads  934ms
+   ✓ ERP Financials real PostgreSQL > operational account selector binds cursors, captures inputs and rechecks dated source and book scope  858ms
+   ✓ ERP Financials real PostgreSQL > operational account selector traverses more than ten thousand definitions in bounded pages  2600ms
+   ✓ ERP Financials real PostgreSQL > journal register includes imported facts without native events or transaction lines and uses posting dates  1207ms
+   ✓ ERP Financials real PostgreSQL > journal register aggregates dated sources independently without leaking other books, bases or currencies  980ms
+   ✓ ERP Financials real PostgreSQL > income attribution partitions exact P&L facts once and reconciles every page to statement controls  1223ms
+   ✓ ERP Financials real PostgreSQL > income attribution snapshots inputs and controls while concurrent posts invalidate subsequent pages  1053ms
+   ✓ ERP Financials real PostgreSQL > journal income effects reconcile to SDK statements across classifications, groups and posting windows  1342ms
+   ✓ ERP Financials real PostgreSQL > journal pages and detail round-trip long canonical source, transaction and posting identities  1006ms
+   ✓ ERP Financials real PostgreSQL > journal origin groups and exact references preserve whole-book controls and unknown provenance  1186ms
+   ✓ ERP Financials real PostgreSQL > journal register preserves native preparer and reversal facts with filter-bound stale cursors  1304ms
+   ✓ ERP Financials real PostgreSQL > journal register keeps controls and detail in one snapshot during concurrent posting and book changes  1203ms
+   ✓ ERP Financials real PostgreSQL > account chart pages exact direct and inclusive totals without counting parents twice  1225ms
+   ✓ ERP Financials real PostgreSQL > account chart scopes cursors, captures inputs and invalidates backdated changes  1204ms
+   ✓ ERP Financials real PostgreSQL > account chart rejects cyclic source hierarchies and colliding fallback identities  1163ms
+   ✓ ERP Financials real PostgreSQL > account chart returns one financial snapshot during concurrent posting  1242ms
+   ✓ ERP Financials real PostgreSQL > account register returns exact bounded pages and one-snapshot opening, closing and running balances  1418ms
+   ✓ ERP Financials real PostgreSQL > account register isolates direct and descendant activity, effective sources and mapping revisions  1451ms
+   ✓ ERP Financials real PostgreSQL > account register snapshots caller input and financial facts across concurrent committed writes  1353ms
+   ✓ ERP Financials real PostgreSQL > account register rejects book archival between metadata and financial snapshots  1217ms
+   ✓ ERP Financials real PostgreSQL > account register preserves credit signs and inactive history without including an unbound source  1400ms
+   ✓ ERP Financials real PostgreSQL > account register rejects sub-cent stored facts instead of silently truncating balances  1424ms
+   ✓ ERP Financials real PostgreSQL > canonical fiscal review invalidates changed facts while no-op statements and rollback preserve approval  1588ms
+   ✓ ERP Financials real PostgreSQL > canonical fiscal review rejects accounting changes after capture in the same host transaction  989ms
+   ✓ ERP Financials real PostgreSQL > canonical fiscal review remains valid across unrelated future-period posting  983ms
+   ✓ ERP Financials real PostgreSQL > canonical fiscal review tracks both sides of date moves without allowing approval resurrection  993ms
+   ✓ ERP Financials real PostgreSQL > canonical fiscal review revisions are source isolated and advance per date per statement, not per row  959ms
+   ✓ ERP Financials real PostgreSQL > canonical close certificates capture exact immutable totals and bank evidence with scoped pagination and durable retries  1108ms
+   ✓ ERP Financials real PostgreSQL > close bank receipt preserves immutable completion after reopening without reading current statement or ledger  995ms
+   ✓ ERP Financials real PostgreSQL > canonical close certificates roll back host failures and reject corrupted capture at commit  1024ms
+   ✓ ERP Financials real PostgreSQL > canonical close certificates serialize statement reopening when close wins  937ms
+   ✓ ERP Financials real PostgreSQL > canonical close certificates serialize statement reopening when reopen wins  906ms
+   ✓ ERP Financials real PostgreSQL > canonical close certificates serialize native posting when close wins  1008ms
+   ✓ ERP Financials real PostgreSQL > canonical close certificates serialize native posting when post wins  922ms
+   ✓ ERP Financials real PostgreSQL > canonical close certificates serialize draft creation when close wins  952ms
+   ✓ ERP Financials real PostgreSQL > canonical close certificates serialize draft creation when draft wins  893ms
+   ✓ ERP Financials real PostgreSQL > canonical fiscal readiness requires exact cutoff statements including inactive banks and prior-period activity  981ms
+   ✓ ERP Financials real PostgreSQL > canonical fiscal readiness isolates scope, rejects missing configuration, snapshots inputs and uses a fixed query count  975ms
+   ✓ ERP Financials real PostgreSQL > bank statements own exact balances, completion and outstanding carryover without posting money  1280ms
+   ✓ ERP Financials real PostgreSQL > bank statements list current receipts in bounded scope-bound pages including cancelled replacements  1073ms
+   ✓ ERP Financials real PostgreSQL > bank statements roll back, snapshot commands and guard evidence against unversioned writes  1238ms
+   ✓ ERP Financials real PostgreSQL > bank statements cancel drafts to unwind dependencies while preserving historical receipts  898ms
+   ✓ ERP Financials real PostgreSQL > bank statements preserve money beyond safe integer cents and cancel selected drafts atomically  1045ms
+   ✓ ERP Financials real PostgreSQL > bank statements serialize completion against fiscal close when complete wins  911ms
+   ✓ ERP Financials real PostgreSQL > bank statements serialize completion against fiscal close when close wins  899ms
+   ✓ ERP Financials real PostgreSQL > bank reconciliation uses the reporting book's accrual basis exactly once  890ms
+   ✓ ERP Financials real PostgreSQL > bank reconciliation uses the reporting book's cash basis exactly once  964ms
+   ✓ ERP Financials real PostgreSQL > bank reconciliation uses the reporting book's modified_cash basis exactly once  933ms
+   ✓ ERP Financials real PostgreSQL > bank reconciliation commands cannot cross sources within one reporting book  1028ms
+   ✓ ERP Financials real PostgreSQL > fiscal command retries bind prior version and semantic evidence without duplicate writes  1089ms
+   ✓ ERP Financials real PostgreSQL > fiscal close rolls back with its host transaction and snapshots mutable command evidence  913ms
+   ✓ ERP Financials real PostgreSQL > fiscal close diagnostics return canonical counts without collecting posting rows  882ms
+   ✓ ERP Financials real PostgreSQL > fiscal close rejects currency posting defects that a net total can conceal  951ms
+   ✓ ERP Financials real PostgreSQL > fiscal close rejects basis posting defects that a net total can conceal  868ms
+   ✓ ERP Financials real PostgreSQL > fiscal close rejects day posting defects that a net total can conceal  904ms
+   ✓ ERP Financials real PostgreSQL > fiscal close rejects transaction posting defects that a net total can conceal  809ms
+   ✓ ERP Financials real PostgreSQL > fiscal close rejects exact_money posting defects that a net total can conceal  964ms
+   ✓ ERP Financials real PostgreSQL > fiscal close rejects nonfinite posting defects that a net total can conceal  925ms
+   ✓ ERP Financials real PostgreSQL > operational account lookup is scoped, bounded and works without ledger access  1056ms
+   ✓ ERP Financials real PostgreSQL > native account key lookup reuses command identities without ledger or crosswalk access  1020ms
+   ✓ ERP Financials real PostgreSQL > bill payment lifecycle rejects schedule from another book without changing accounting  939ms
+   ✓ ERP Financials real PostgreSQL > bill payment lifecycle rejects schedule-retry from another book without changing accounting  1025ms
+   ✓ ERP Financials real PostgreSQL > bill payment lifecycle rejects record-and-apply from another book without changing accounting  1001ms
+   ✓ ERP Financials real PostgreSQL > bill payment lifecycle rejects clear from another book without changing accounting  1022ms
+   ✓ ERP Financials real PostgreSQL > bill payment lifecycle rejects cancel from another book without changing accounting  1070ms
+   ✓ ERP Financials real PostgreSQL > bill payment lifecycle rejects compensate from another book without changing accounting  1068ms
+   ✓ ERP Financials real PostgreSQL > bill payment lifecycle rejects void from another book without changing accounting  1161ms
+   ✓ ERP Financials real PostgreSQL > scheduled bill clear orders its source lock before bill rows when a correction races  1137ms
+   ✓ ERP Financials real PostgreSQL > bill payment compensation orders source locks before application rows when correction races  1091ms
+   ✓ ERP Financials real PostgreSQL > canonical close and reviewed 'payment' correction serialize with 'correction' first  1399ms
+   ✓ ERP Financials real PostgreSQL > canonical close and reviewed 'payment' correction serialize with 'close' first  1314ms
+   ✓ ERP Financials real PostgreSQL > canonical close and reviewed 'bill' correction serialize with 'correction' first  1517ms
+   ✓ ERP Financials real PostgreSQL > canonical close and reviewed 'bill' correction serialize with 'close' first  1509ms
+   ✓ ERP Financials real PostgreSQL > bill payment cancel snapshots the authorized command before awaiting a transaction  1322ms
+   ✓ ERP Financials real PostgreSQL > bill payment compensate snapshots the authorized command before awaiting a transaction  1464ms
+   ✓ ERP Financials real PostgreSQL > bill payment void snapshots the authorized command before awaiting a transaction  1375ms
+   ✓ ERP Financials real PostgreSQL > scheduled cancellation retries accept new transport metadata and reject changed authorization without writing  1518ms
+   ✓ ERP Financials real PostgreSQL > bill payment schedule rolls back a caught late interruption while preserving outer host work  1488ms
+   ✓ ERP Financials real PostgreSQL > bill payment recordAndApply rolls back a caught late interruption while preserving outer host work  1704ms
+   ✓ ERP Financials real PostgreSQL > bill payment clear rolls back a caught late interruption while preserving outer host work  1717ms
+   ✓ ERP Financials real PostgreSQL > bill payment cancel rolls back a caught late interruption while preserving outer host work  1655ms
+   ✓ ERP Financials real PostgreSQL > bill payment compensate rolls back a caught late interruption while preserving outer host work  1796ms
+   ✓ ERP Financials real PostgreSQL > bill payment void rolls back a caught late interruption while preserving outer host work  2016ms
+   ✓ ERP Financials real PostgreSQL > bill payment cancel retains administrator confirmation through defensive snapshots and savepoints  1696ms
+   ✓ ERP Financials real PostgreSQL > bill payment compensate retains administrator confirmation through defensive snapshots and savepoints  1784ms
+   ✓ ERP Financials real PostgreSQL > bill payment void retains administrator confirmation through defensive snapshots and savepoints  1965ms
+   ✓ ERP Financials real PostgreSQL > bill payment savepoint rejects an autocommit host runner before changing accounting  2122ms
+   ✓ ERP Financials real PostgreSQL > bill payment void completion is a payload-bound read-only receipt after close  2184ms
+   ✓ ERP Financials real PostgreSQL > bill payment compensate completion is a payload-bound read-only receipt after close  2410ms
+   ✓ ERP Financials real PostgreSQL > bill payment raw-compensate completion is a payload-bound read-only receipt after close  2399ms
+   ✓ ERP Financials real PostgreSQL > bill payment void completion receipt is atomic under a caught final-write failure and concurrent retries  2536ms
+   ✓ ERP Financials real PostgreSQL > bill payment compensate completion receipt is atomic under a caught final-write failure and concurrent retries  2582ms
+   ✓ ERP Financials real PostgreSQL > bill payment correction review exposes scoped native scheduled evidence in one read-only snapshot  2456ms
+   ✓ ERP Financials real PostgreSQL > bill payment correction review exposes scoped native cleared evidence in one read-only snapshot  2550ms
+   ✓ ERP Financials real PostgreSQL > bill payment correction review exposes scoped native raw evidence in one read-only snapshot  2587ms
+   ✓ ERP Financials real PostgreSQL > bill payment correction review prevents stale approvals despite unchanged disbursement version and supports immutable completion retry  2833ms
+   ✓ ERP Financials real PostgreSQL > bill payment correction review pages beyond 200 active applications and rejects stale or foreign cursors  5439ms
+   ✓ ERP Financials real PostgreSQL > bill payment correction review binds target bill state and allows reviewed compensation of a held bill  2915ms
+   ✓ ERP Financials real PostgreSQL > bill payment correction review returns one coherent snapshot during concurrent unapplication and exports the public facade  3943ms
+   ✓ ERP Financials real PostgreSQL > cleared payment immediate retry is a historical receipt after bill correction  3046ms
+   ✓ ERP Financials real PostgreSQL > cleared payment scheduled retry is a historical receipt after bill correction  3306ms
+   ✓ ERP Financials real PostgreSQL > cleared payment retry fails closed for missing application evidence  3053ms
+   ✓ ERP Financials real PostgreSQL > cleared payment retry fails closed for changed application evidence  1016ms
+   ✓ ERP Financials real PostgreSQL > vendor bill register pages and exact global totals agree across payments, holds and corrections  1252ms
+   ✓ ERP Financials real PostgreSQL > vendor bill register preserves replacement history and aggregates beyond safe integer cents  892ms
+   ✓ ERP Financials real PostgreSQL > vendor bill register keeps page and totals consistent when a payment commits before the response  901ms
+   ✓ ERP Financials real PostgreSQL > vendor bill register includes imported vendor credits without counting them as cash payments  938ms
+   ✓ ERP Financials real PostgreSQL > vendor bill register scopes cursors, snapshots requests and needs no posting or detail-table access  895ms
+   ✓ ERP Financials real PostgreSQL > payment holds have one versioned authority, payload-bound retries and current public reads  1114ms
+   ✓ ERP Financials real PostgreSQL > payment holds block scheduling, clearing, immediate payments and generic or raw applications without partial money  1126ms
+   ✓ ERP Financials real PostgreSQL > payment holds allow exact completed-payment replay and corrective unapplication  935ms
+   ✓ ERP Financials real PostgreSQL > payment holds reject direct writes and roll back an interrupted lifecycle even if a host catches the failure  881ms
+   ✓ ERP Financials real PostgreSQL > payment holds serialize competing versions and race safely with payment posting  915ms
+   × ERP Financials real PostgreSQL > payment holds upgrade schema 31 without rewriting existing financial facts 790ms
+     → column "tax_account_id" of relation "subledger_document_lines" does not exist
+   ✓ ERP Financials real PostgreSQL > payment holds enforce the committed winner when hold takes the row lock first  1034ms
+   ✓ ERP Financials real PostgreSQL > payment holds enforce the committed winner when payment takes the row lock first  841ms
+   ✓ ERP Financials real PostgreSQL > payment holds reject invalid actors, foreign scopes and provider ownership without writes  1078ms
+   ✓ ERP Financials real PostgreSQL > payment holds preserve input snapshots and support multiple complete transitions in one transaction  1065ms
+   ✓ ERP Financials real PostgreSQL > enforces vendor bill account policy before writes and binds it to issuance replay  1469ms
+   ✓ ERP Financials real PostgreSQL > vendor bill account policy serializes when post acquires the account lock first  1143ms
+   ✓ ERP Financials real PostgreSQL > vendor bill account policy serializes when reclassify acquires the account lock first  928ms
+   ✓ ERP Financials real PostgreSQL > scheduled bill payment retries preserve original evidence with fresh transport metadata  1228ms
+   ✓ ERP Financials real PostgreSQL > round-trips civil dates through native registers, details and pagination  1408ms
+   ✓ ERP Financials real PostgreSQL > changes and removes existing posting locks with optimistic versions and no partial stale writes  1168ms
+   ✓ ERP Financials real PostgreSQL > preserves fiscal civil dates across definition replay and lock boundaries  1191ms
+   ✓ ERP Financials real PostgreSQL > rejects posting on the exact civil lock date without changing accounting  1362ms
+   ✓ ERP Financials real PostgreSQL > source-scoped outbox claims and acknowledgements isolate sources while omitted scope remains compatible  1098ms
+   ✓ ERP Financials real PostgreSQL > payment correction synthetic 27.56 preserves both bases, retires phantom and applies existing PAYMENT credit  1209ms
+   ✓ ERP Financials real PostgreSQL > payment correction concurrent confirmations commit exactly once and different keys fail  1362ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects stale/incomplete payment evidence without writes  928ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects stale/incomplete invoice evidence without writes  862ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects stale/incomplete application evidence without writes  891ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects stale/incomplete posting evidence without writes  892ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects stale/incomplete source evidence without writes  967ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects stale/incomplete book evidence without writes  1037ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects stale/incomplete omitted-basis evidence without writes  963ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects stale/incomplete omitted-application evidence without writes  1079ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects stale/incomplete cash-missing evidence without writes  1167ms
+   ✓ ERP Financials real PostgreSQL > payment correction denies app guard authorized and rollback is exact  1303ms
+   ✓ ERP Financials real PostgreSQL > payment correction denies app guard complete and rollback is exact  1261ms
+   ✓ ERP Financials real PostgreSQL > payment correction denies app guard deposited and rollback is exact  1312ms
+   ✓ ERP Financials real PostgreSQL > payment correction denies app guard reconciled and rollback is exact  1497ms
+   ✓ ERP Financials real PostgreSQL > payment correction denies app guard refunded and rollback is exact  1594ms
+   ✓ ERP Financials real PostgreSQL > payment correction rolls back compensation, applications, audit and outbox after a late failure  1588ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects direct mutation direct-postings  1696ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects direct mutation direct-transaction  1546ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects direct mutation direct-new-basis  1493ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects direct mutation direct-evidence  1570ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects direct mutation direct-rekey  1828ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects direct mutation reset  1878ms
+   ✓ ERP Financials real PostgreSQL > payment correction preserves accounting on provider upsert with a record dependency  1885ms
+   ✓ ERP Financials real PostgreSQL > payment correction preserves accounting on provider deleted with a record dependency  1975ms
+   ✓ ERP Financials real PostgreSQL > payment correction preserves accounting on provider full-replace with a record dependency  2257ms
+   × ERP Financials real PostgreSQL > payment correction upgrades v26 guards without changing existing correction evidence 2161ms
+     → expected [ [ 26, 27 ], [ 27, 28 ], …(15) ] to deeply equal [ [ 26, 27 ], [ 27, 28 ], …(13) ]
+   ✓ ERP Financials real PostgreSQL > payment correction retains original facts through concurrent dual-basis snapshots (legacy refs=false)  2449ms
+   ✓ ERP Financials real PostgreSQL > payment correction retains original facts through concurrent dual-basis snapshots (legacy refs=true)  915ms
+   ✓ ERP Financials real PostgreSQL > payment correction concurrent mixed imports preserve both bases while other customers and bounded deltas continue  2344ms
+   ✓ ERP Financials real PostgreSQL > payment correction locks/revalidates concurrent sync winner from another connection  824ms
+   ✓ ERP Financials real PostgreSQL > payment correction locks/revalidates concurrent period-close winner from another connection  932ms
+   ✓ ERP Financials real PostgreSQL > payment correction locks/revalidates concurrent application winner from another connection  1275ms
+   ✓ ERP Financials real PostgreSQL > payment correction locks/revalidates concurrent deposit winner from another connection  908ms
+   ✓ ERP Financials real PostgreSQL > payment correction preview is read-only and rejects an unbound confirmation  1011ms
+   ✓ ERP Financials real PostgreSQL > payment correction handles both bases on one separate transaction and records complete basis links  1019ms
+   ✓ ERP Financials real PostgreSQL > payment correction registers evidence through the operational importer and rejects delayed evidence  1014ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects tenant scope or authorization wiring  1123ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects company scope or authorization wiring  1154ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects source scope or authorization wiring  1170ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects book scope or authorization wiring  1257ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects currency scope or authorization wiring  1222ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects missing-guard scope or authorization wiring  1300ms
+   ✓ ERP Financials real PostgreSQL > payment correction protects a retired payment from later deposit and reapplication writes  1432ms
+   ✓ ERP Financials real PostgreSQL > payment correction rejects application-pool clients without an explicit transaction  1375ms
+   ✓ ERP Financials real PostgreSQL > payment correction wins the source lock against concurrent provider sync without resurrection  1491ms
+   ✓ ERP Financials real PostgreSQL > payment correction enforces native bank reconciliation before correction  866ms
+   ✓ ERP Financials real PostgreSQL > payment correction enforces native bank reconciliation after correction  849ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal preserves original identity and attribution, reverses both bases, and links canonical evidence  809ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal denies missing approval without writes  825ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal denies self approval without writes  794ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal retains a configured book and stored bases despite the caller's default basis  836ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal denies changed scope {"tenantId":"other_tenant"} without writes  856ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal denies changed scope {"companyId":"other_company"} without writes  843ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal denies changed scope {"sourceId":"source_2"} without writes  941ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal denies changed scope {"bookId":"other_book"} without writes  1012ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal denies changed scope {"currencyCode":"EUR"} without writes  1057ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal rejects generic journal routing and non-deposit documents  1087ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal enforces closed fiscal periods even for legacy callers  1055ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal enforces missing fiscal periods even for legacy callers  1073ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal enforces lock fiscal periods even for legacy callers  1162ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal replays after pool/service recreation and period closure with identical persistent IDs  1204ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal rejects conflicting date replay atomically  1193ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal rejects conflicting memo replay atomically  1205ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal rejects conflicting actor replay atomically  1256ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal rejects conflicting approver replay atomically  1347ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal rejects conflicting request replay atomically  1419ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal rejects conflicting reason replay atomically  1348ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal rejects conflicting deposit replay atomically  1452ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal rolls back postings, links, events, outbox and snapshot invalidation on late SQL failure  1558ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal serializes real concurrent transactions (same key: true)  1428ms
+   ✓ ERP Financials real PostgreSQL > deposit reversal serializes real concurrent transactions (same key: false)  955ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal preserves original identity and attribution, reverses both bases, and links canonical evidence  1496ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies missing approval without writes  1545ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies self approval without writes  1529ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal retains a configured book and stored bases despite the caller's default basis  1697ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies changed scope {"tenantId":"other_tenant"} without writes  1686ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies changed scope {"companyId":"other_company"} without writes  1646ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies changed scope {"sourceId":"source_2"} without writes  1909ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies changed scope {"bookId":"other_book"} without writes  1657ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies changed scope {"currencyCode":"EUR"} without writes  1788ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects generic journal routing and non-transfer documents  1985ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal enforces closed fiscal periods even for legacy callers  2027ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal enforces missing fiscal periods even for legacy callers  1905ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal enforces lock fiscal periods even for legacy callers  2074ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal replays after pool/service recreation and period closure with identical persistent IDs  2193ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting date replay atomically  2117ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting memo replay atomically  2211ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting actor replay atomically  2162ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting approver replay atomically  2206ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting request replay atomically  2022ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting reason replay atomically  2108ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting transfer replay atomically  2283ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting correlation replay atomically  2364ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting occurredAt replay atomically  2197ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting reasonDetail replay atomically  2321ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rejects conflicting approvalRef replay atomically  2132ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal rolls back postings, links, events, outbox and snapshot invalidation on late SQL failure  2333ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal serializes real concurrent transactions (identical)  2418ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal serializes real concurrent transactions (conflicting)  850ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal serializes real concurrent transactions (competing)  2365ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal serializes real concurrent transactions (different-transfer)  920ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies missing tampering before the first write  2409ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies checksum tampering before the first write  2419ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies date tampering before the first write  2207ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies transfer tampering before the first write  2279ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies memo tampering before the first write  2378ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies actor tampering before the first write  2323ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies approver tampering before the first write  2853ms
+   ✓ ERP Financials real PostgreSQL > transfer reversal denies scope tampering before the first write  2690ms
+   ✓ ERP Financials real PostgreSQL > migrates a blank database transactionally and validates schema plus immutable migration history  2574ms
+   ✓ ERP Financials real PostgreSQL > imports and safely replays QuickBooks documents, lines, and applications  795ms
+   ✓ ERP Financials real PostgreSQL > completely resets one imported source while preserving identities, configuration, native facts, and another import source  961ms
+   ✓ ERP Financials real PostgreSQL > rolls back every source reset mutation when the surrounding transaction fails  856ms
+   ✓ ERP Financials real PostgreSQL > preserves every QuickBooks operational document family and application relationship  1007ms
+   ✓ ERP Financials real PostgreSQL > preserves wrapper ownership through credit-only deltas (customer=false)  945ms
+   ✓ ERP Financials real PostgreSQL > preserves wrapper ownership through credit-only deltas (customer=true)  1014ms
+   ✓ ERP Financials real PostgreSQL > still reconciles the owning wrapper (customer=false, action=changed)  1018ms
+   ✓ ERP Financials real PostgreSQL > still reconciles the owning wrapper (customer=false, action=voided)  1065ms
+   ✓ ERP Financials real PostgreSQL > still reconciles the owning wrapper (customer=false, action=deleted)  952ms
+   ✓ ERP Financials real PostgreSQL > still reconciles the owning wrapper (customer=false, action=malformed)  1042ms
+   ✓ ERP Financials real PostgreSQL > still reconciles the owning wrapper (customer=true, action=changed)  1095ms
+   ✓ ERP Financials real PostgreSQL > still reconciles the owning wrapper (customer=true, action=voided)  1066ms
+   ✓ ERP Financials real PostgreSQL > still reconciles the owning wrapper (customer=true, action=deleted)  1148ms
+   ✓ ERP Financials real PostgreSQL > still reconciles the owning wrapper (customer=true, action=malformed)  1189ms
+   ✓ ERP Financials real PostgreSQL > removes only directly owned LinkedTxn applications (customer=false)  1252ms
+   ✓ ERP Financials real PostgreSQL > removes only directly owned LinkedTxn applications (customer=true)  1349ms
+   ✓ ERP Financials real PostgreSQL > persists and idempotently replays a zero-cash BillPayment as a vendor-credit application  1556ms
+   ✓ ERP Financials real PostgreSQL > persists, replays, revises, and voids a zero-cash Payment credit application without cash activity  1354ms
+   ✓ ERP Financials real PostgreSQL > retires deleted delta documents and documents missing from an authoritative full snapshot  1428ms
+   ✓ ERP Financials real PostgreSQL > reads canonical journal and fiscal controls through the public SDK  1426ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > combines three mapped source accounts into one canonical row without changing the chart or ledger  1232ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > keeps exact signs for direct net=0.00 and prior net=-10.01  1388ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > keeps exact signs for direct net=0.00 and prior net=0.00  1468ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > keeps exact signs for direct net=5.01 and prior net=0.00  1511ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > keeps exact signs for direct net=-5.01 and prior net=0.00  1643ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > keeps exact signs for direct net=5.01 and prior net=2.03  1594ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > keeps exact signs for direct net=-5.01 and prior net=2.03  1734ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > keeps exact signs for direct net=5.01 and prior net=-5.01  1780ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > keeps exact signs for direct net=-5.01 and prior net=-2.03  1775ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > recognizes renamed retained accounts from canonical subtype evidence  1873ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > recognizes renamed retained accounts from source subtype evidence  1964ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > does not merge same-label accounts with none subtype evidence  1874ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > does not merge same-label accounts with override subtype evidence  1943ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > keeps unrelated same-label equity separate and current-period losses distinct  1951ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > uses synthetic fallback without an account, and a canonical zero-balance definition without mappings  2412ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > does not choose among distinct canonical retained identities  2021ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > resolves unmapped source identity only when unique, excluding future source evidence  1963ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > rolls derived provenance through nested parents without double counting or misleading drilldowns  1922ms
+   ✓ ERP Financials real PostgreSQL > balance sheet retained earnings composition > preserves source windows, as-of date, currency, basis, and unrelated statement behavior  1938ms
+   ✓ ERP Financials real PostgreSQL > reads both sides of the QuickBooks-to-Spartan cutoff through one reporting book  2152ms
+   ✓ ERP Financials real PostgreSQL > upgrades a real v6 database through the scoped v7 migration before continuing  1019ms
+   ✓ ERP Financials real PostgreSQL > rolls back every DDL and ledger row when an ordered migration fails  521ms
+   ✓ ERP Financials real PostgreSQL > enforces scoped foreign keys, posting arithmetic, and immutable posted journal facts  1409ms
+   ✓ ERP Financials real PostgreSQL > serializes advisory locks and preserves repeatable-read snapshot isolation  759ms
+   ✓ ERP Financials real PostgreSQL > atomically enforces application balance, party, currency, terminal state, and unapply restoration  836ms
+   ✓ ERP Financials real PostgreSQL > reads bounded historical customer statements with scoped lifecycle evidence  880ms
+   ✓ ERP Financials real PostgreSQL > native receipt cash return preserves invoice and cash agreement (applied=false)  1109ms
+   ✓ ERP Financials real PostgreSQL > native receipt cash return preserves invoice and cash agreement (applied=true)  1132ms
+   ✓ ERP Financials real PostgreSQL > native receipt refund consumes available credit before releasing invoices  996ms
+   ✓ ERP Financials real PostgreSQL > native receipt void consumes available credit before releasing invoices  981ms
+   ✓ ERP Financials real PostgreSQL > pages scoped invoice audit across draft, posting, correction and application evidence without timestamp loss  1086ms
+   ✓ ERP Financials real PostgreSQL > pages vendor bill audit across posting, holds, scheduled cancellation and settlement without unrelated evidence  1180ms
+   × ERP Financials real PostgreSQL > vendor bill audit index upgrades schema 32 without changing accounting data 725ms
+     → column "tax_account_id" of relation "subledger_document_lines" does not exist
+   ✓ ERP Financials real PostgreSQL > reads current scoped bill summaries without loading lines or payment history  1080ms
+   ✓ ERP Financials real PostgreSQL > summarizes first cash coverage from effective receipt and application history independently of delivery order  1394ms
+   ✓ ERP Financials real PostgreSQL > queries a collection position from unused cash, current invoice allocations and returns without double counting  1355ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'refund' with 'guard' first  1183ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'refund' with 'writer' first  1284ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'apply' with 'guard' first  1529ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'apply' with 'writer' first  1235ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'unapply' with 'guard' first  1203ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'unapply' with 'writer' first  1380ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'draft_update' with 'guard' first  1343ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'draft_update' with 'writer' first  1400ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'draft_issue' with 'guard' first  1557ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'draft_issue' with 'writer' first  1521ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'draft_void' with 'guard' first  1502ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'draft_void' with 'writer' first  1663ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'invoice_void' with 'guard' first  1751ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'invoice_void' with 'writer' first  1716ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'receipt' with 'guard' first  1859ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'receipt' with 'writer' first  1748ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'date_correction' with 'guard' first  2214ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'date_correction' with 'writer' first  2123ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'source_window' with 'guard' first  2113ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes 'source_window' with 'writer' first  2293ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes imported-source reset with guard first  2274ms
+   ✓ ERP Financials real PostgreSQL > collection guard serializes imported-source reset with reset first  2199ms
+   ✓ ERP Financials real PostgreSQL > collection guard shares read locks, rejects unsafe transactions and rolls back operational callbacks  2226ms
+   ✓ ERP Financials real PostgreSQL > atomically collects invoice cash with payload-bound replay and no orphan receipt  2346ms
+   ✓ ERP Financials real PostgreSQL > cannot claim an independently recorded receipt as a composite collection retry  2045ms
+   ✓ ERP Financials real PostgreSQL > atomically retains excess cash as receipt credit with payload-bound partial application  2210ms
+   ✓ ERP Financials real PostgreSQL > rejects reusing one issuance key across two identical drafts  994ms
+   ✓ ERP Financials real PostgreSQL > reads receipt balances and application evidence from one snapshot during concurrent allocation  1138ms
+   ✓ ERP Financials real PostgreSQL > pages receipt application history beyond the former silent101 cap with receipt-scoped cursors  2073ms
+   ✓ ERP Financials real PostgreSQL > reads invoice headers and lines from the same snapshot during a concurrent draft edit  1330ms
+   ✓ ERP Financials real PostgreSQL > reads scoped draft provenance after issuance and preserves order dimensions through cancellation  1086ms
+   ✓ ERP Financials real PostgreSQL > invoice component migration upgrades populated schema42 atomically and preserves old draft economics  1110ms
+   ✓ ERP Financials real PostgreSQL > invoice register revision migration upgrades populated schema41 atomically without rewriting financial facts  1149ms
+   ✓ ERP Financials real PostgreSQL > invoice register pages share global summaries and reject changed scope, filters, deliveries and draft lines  1511ms
+   ✓ ERP Financials real PostgreSQL > invoice register pages retain one financial snapshot during concurrent application changes  1365ms
+   ✓ ERP Financials real PostgreSQL > invoice register pages exceed 200 without loading line history or losing exact summaries  2528ms
+   ✓ ERP Financials real PostgreSQL > invoice receipt pages share the invoice snapshot, classify cash and reject stale or cross-scope continuation  1471ms
+   ✓ ERP Financials real PostgreSQL > invoice book snapshot rejects archival between preflight and the receipt query  1280ms
+   ✓ ERP Financials real PostgreSQL > invoice book snapshot rejects archival between preflight and the invoice query  2066ms
+   ✓ ERP Financials real PostgreSQL > invoice book snapshot rejects archival between preflight and the statement query  1585ms
+   ✓ ERP Financials real PostgreSQL > invoice book snapshot rejects archival between preflight and the register query  1662ms
+   ✓ ERP Financials real PostgreSQL > invoice receipt pages bound many allocations without per-receipt queries or duplicate applications  4527ms
+   ✓ ERP Financials real PostgreSQL > invoice receipt pages handle drafts and cancellations and fail closed for excluded receipt evidence  1898ms
+   ✓ ERP Financials real PostgreSQL > configured invoice policy enforces original drafts, updates, direct postings and issuance without partial effects  1849ms
+   ✓ ERP Financials real PostgreSQL > configured invoice policy also constrains replacement commands without a caller policy and rolls back released cash  1939ms
+   ✓ ERP Financials real PostgreSQL > configured invoice policy preserves old receipts, remains opt-in, and snapshots caller configuration  2005ms
+   ✓ ERP Financials real PostgreSQL > configured invoice policy holds account edits until direct commits  1986ms
+   ✓ ERP Financials real PostgreSQL > configured invoice policy holds account edits until issue commits  953ms
+   ✓ ERP Financials real PostgreSQL > configured invoice policy holds account edits until draft commits  2181ms
+   ✓ ERP Financials real PostgreSQL > configured invoice policy observes an earlier account edit before direct  955ms
+   ✓ ERP Financials real PostgreSQL > configured invoice policy observes an earlier account edit before issue  954ms
+   ✓ ERP Financials real PostgreSQL > configured invoice policy observes an earlier account edit before draft  1099ms
+   ✓ ERP Financials real PostgreSQL > statement cursors reject offsetting accounting changes and scoped customer metadata changes  1159ms
+   ✓ ERP Financials real PostgreSQL > historical statement settlement classifies cash, credit and write-off using effective application dates  1265ms
+   ✓ ERP Financials real PostgreSQL > historical statement cancellation follows its accounting date rather than recording time and never duplicates replacements  1225ms
+   ✓ ERP Financials real PostgreSQL > invoice settlement summaries separate cash, credit and write-off allocations and exclude ended applications  1167ms
+   ✓ ERP Financials real PostgreSQL > invoice settlement summaries distinguish cancellation from cash retained and reapplied to a replacement  1168ms
+   ✓ ERP Financials real PostgreSQL > invoice settlement summaries share a snapshot with the header during concurrent unapplication  1110ms
+   ✓ ERP Financials real PostgreSQL > invoice settlement summaries refuse inconsistent evidence instead of attributing a negative residual to cash  1129ms
+   ✓ ERP Financials real PostgreSQL > overdue invoice drafts retain valid calendar dates through edits, issuance and restatement  1048ms
+   ✓ ERP Financials real PostgreSQL > overdue invoice schema upgrade is atomic and preserves facts and unrelated date guards  981ms
+   ✓ ERP Financials real PostgreSQL > overdue invoice correction preserves contractual terms, historical aging and cash  1204ms
+   ✓ ERP Financials real PostgreSQL > invoice replacement account policy rejects prohibited classification without releasing cash  1454ms
+   ✓ ERP Financials real PostgreSQL > invoice replacement account policy validates scope, activity, both classifications and malformed lists  970ms
+   ✓ ERP Financials real PostgreSQL > invoice replacement account policy binds the immutable receipt but preserves old unconfigured callers  1252ms
+   ✓ ERP Financials real PostgreSQL > invoice replacement account policy remains opt-in for existing generic consumers  1122ms
+   ✓ ERP Financials real PostgreSQL > invoice replacement account policy holds classification validation through commit  1137ms
+   ✓ ERP Financials real PostgreSQL > invoice replacement account policy holds active validation through commit  892ms
+   ✓ ERP Financials real PostgreSQL > invoice replacement account policy observes prior committed classification edits  1307ms
+   ✓ ERP Financials real PostgreSQL > invoice replacement account policy observes prior committed active edits  1220ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction preserves cash with receipt 10.00 and replacement false  1224ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction preserves cash with receipt 25.00 and replacement false  1422ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction preserves cash with receipt 10.00 and replacement true  1474ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction preserves cash with receipt 25.00 and replacement true  1533ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction validates complete releases and native scope without partial writes  1676ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction serializes exact retries and rejects a changed concurrent plan  1567ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction rolls back swallowed release failure  1038ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction rolls back swallowed cancel failure  1085ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction rolls back swallowed replacement failure  1210ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction rolls back swallowed reapply failure  1196ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction rolls back swallowed completion failure  1346ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction rolls back swallowed outbox failure  1273ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction releases shared receipts and credits using reviewed initial versions  1318ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction and new payment serialize with correction first  1292ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction and new payment serialize with application first  1447ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction and canonical close serialize with correction first  1424ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction and canonical close serialize with close first  1431ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction preserves administrator confirmation across nested releases and replacement  1373ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction rolls back an actual lost PostgreSQL connection and retries cleanly  1423ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction snapshots a mutable command and exports the built public facade  1581ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction refuses independently posted child credit ownership for correction  1554ms
+   ✓ ERP Financials real PostgreSQL > invoice economic correction refuses independently posted child credit ownership for cancellation  1529ms
+   ✓ ERP Financials real PostgreSQL > invoice correction review supplies a scoped read-only command plan  1743ms
+   ✓ ERP Financials real PostgreSQL > invoice correction review pages beyond 200 and detects shared receipt changes outside the invoice  4055ms
+   ✓ ERP Financials real PostgreSQL > invoice correction review exposes empty and credit plans but refuses unsupported write-off allocations  1840ms
+   ✓ ERP Financials real PostgreSQL > invoice correction review uses one bounded SQL snapshot during a concurrent unapplication  1901ms
+   ✓ ERP Financials real PostgreSQL > invoice correction review snapshots requests before awaiting and exports its built public API  1752ms
+   ✓ ERP Financials real PostgreSQL > invoice correction review rejects foreign-book receipt provenance without changing money  2007ms
+   ✓ ERP Financials real PostgreSQL > invoice correction review needs no posting, line or full-history detail access  2058ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation selects original receivable after cash-basis application reversal  2265ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation fails closed on missing accrual receivable evidence  2153ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation fails closed on ambiguous accrual receivable evidence  2208ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation fails closed on amount accrual receivable evidence  2062ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation fails closed on currency accrual receivable evidence  2122ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation respects fiscal close under enforce_fiscal_periods  2254ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation respects fiscal close under legacy_unrestricted  2344ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation and canonical close serialize with cancellation first  2648ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation and canonical close serialize with close first  2511ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation cannot be reopened by generic credit unapply  2615ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation cannot be reopened by generic credit void  2574ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation database invariant rejects older writers at read committed  2415ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation database invariant rejects older writers at repeatable read  2560ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation database invariant rejects older writers at serializable  2607ms
+   × ERP Financials real PostgreSQL > invoice cancellation migration preserves history and refuses detached legacy settlement (detached=false) 2624ms
+     → column "tax_account_id" of relation "subledger_document_lines" does not exist
+   × ERP Financials real PostgreSQL > invoice cancellation migration preserves history and refuses detached legacy settlement (detached=true) 2680ms
+     → column "tax_account_id" of relation "subledger_document_lines" does not exist
+   ✓ ERP Financials real PostgreSQL > invoice cancellation binds retries to the original business command  2910ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation snapshots callers, serializes retries and rolls back interrupted completion  3113ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation isolates swallowed credit failure from its host transaction  3117ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation isolates swallowed application failure from its host transaction  3159ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation isolates swallowed receipt failure from its host transaction  3152ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation isolates swallowed outbox failure from its host transaction  3225ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation rejects unprovable historical retry without rewriting its receipt  3259ms
+   ✓ ERP Financials real PostgreSQL > replays invoice draft creation, edits, date changes and issuance without duplicate state  3433ms
+   ✓ ERP Financials real PostgreSQL > isolates invoice draft commands by write source and validates cancellation replay  3310ms
+   ✓ ERP Financials real PostgreSQL > serializes invoice draft create, edit and issue retries  3447ms
+   ✓ ERP Financials real PostgreSQL > snapshots invoice draft command input before asynchronous database work  797ms
+   ✓ ERP Financials real PostgreSQL > restates native invoice dates without changing receipts or applications (applied=0)  2074ms
+   ✓ ERP Financials real PostgreSQL > restates native invoice dates without changing receipts or applications (applied=60)  3550ms
+   ✓ ERP Financials real PostgreSQL > restates native invoice dates without changing receipts or applications (applied=100)  1068ms
+   ✓ ERP Financials real PostgreSQL > rejects an incomplete invoice date correction even if host swallows second-journal failure  918ms
+   ✓ ERP Financials real PostgreSQL > rejects an incomplete invoice date correction even if host swallows lifecycle failure  837ms
+   ✓ ERP Financials real PostgreSQL > rejects an incomplete invoice date correction even if host swallows document failure  859ms
+   ✓ ERP Financials real PostgreSQL > rejects an incomplete invoice date correction even if host swallows outbox failure  866ms
+   ✓ ERP Financials real PostgreSQL > rejects two correction completions claiming one invoice version after a swallowed failure  1049ms
+   ✓ ERP Financials real PostgreSQL > serializes competing invoice date corrections and rejects missing approval  1050ms
+   ✓ ERP Financials real PostgreSQL > preserves journal origin and original audit across transport retries  931ms
+   ✓ ERP Financials real PostgreSQL > serializes in-flight posting against posting-lock including the first book lock  878ms
+   ✓ ERP Financials real PostgreSQL > serializes in-flight posting against begin-close including the first book lock  972ms
+   ✓ ERP Financials real PostgreSQL > rejects changed unapply replay dates and versions without altering accounting  916ms
+   ✓ ERP Financials real PostgreSQL > rejects changed void replay dates and versions without altering accounting  949ms
+   ✓ ERP Financials real PostgreSQL > atomically settles invoice write-offs and rejects locked application transitions  895ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections require the originating book and currency before writes or replay: voided  968ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections require the originating book and currency before writes or replay: replaced  1025ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject active applications and preserve unapplied cash: 20.00  1090ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject active applications and preserve unapplied cash: 100.00  1124ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'voided', 'correction' first  1099ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'voided', 'payment' first  1198ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'replaced', 'correction' first  1118ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'replaced', 'payment' first  1234ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections avoid a payment lock inversion: voided  1361ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections avoid a payment lock inversion: replaced  1093ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections respect an in-flight hold writer  1251ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections respect an in-flight payment writer  1115ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections roll back a rejected replacement even when the host catches it  1125ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught reversal-link failure  1352ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught original failure  1748ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught replacement failure  1439ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught lifecycle failure  1407ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught outbox failure  1500ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught sql-error failure  1716ms
+   ✓ ERP Financials real PostgreSQL > bill correction preserves contractual due dates with replacement posting on 2026-08-01  1570ms
+   ✓ ERP Financials real PostgreSQL > bill correction preserves contractual due dates with replacement posting on 2026-08-12  1769ms
+   × ERP Financials real PostgreSQL > overdue recognition supports invoices and vendor bills and the v38 upgrade preserves existing facts 1603ms
+     → expected [ [ 38, 39 ], [ 39, 40 ], …(3) ] to deeply equal [ [ 38, 39 ], [ 39, 40 ], [ 40, 41 ] ]
+   ✓ ERP Financials real PostgreSQL > payable aging preserves effective history through payment, correction and later void  1943ms
+   ✓ ERP Financials real PostgreSQL > payable aging uses historical due buckets and book source scope without netting unapplied funds  1815ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases 20.00 and explicitly reapplies 10.00  1954ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases 100.00 and explicitly reapplies 80.00  2115ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction void preserves funds and replaces held bills without releasing their hold  2077ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rejects stale, incomplete, changed and unauthorized plans without writes  2532ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught release interruption  2144ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught replacement interruption  2430ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught reapply interruption  2633ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught receipt interruption  2612ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught outbox interruption  2552ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases repeated payment sources and serializes identical retries  2545ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back an actual lost PostgreSQL connection and retries cleanly  964ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction honors a closed fiscal period and can replay after close  2775ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction snapshots approval and rejects independently created replacement keys  2774ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rejects a payment from another book before releasing it  2749ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction respects committed correction winner  2943ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction respects committed application winner  2934ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction preserves administrator confirmation across nested releases and replacement  3066ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction is available through the built public SDK facade  3090ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review pages active evidence beyond 200 without collecting ended history  5641ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review is scoped, read-only and provides a complete public command plan  3167ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review returns an empty plan and detects bill hold changes between pages  3232ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review uses one bounded SQL snapshot during a concurrent unapplication  3269ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review snapshots requests before awaiting and exports its built public API  3249ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject changed replay versions and preserve original commands  3332ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill correction snapshots preserve a scoped administrator grant and its audit  3332ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections snapshot independent commands before waiting for a transaction  3411ms
+   ✓ ERP Financials real PostgreSQL > voids and reloads a canonical bill payment through real PostgreSQL  3301ms
+   ✓ ERP Financials real PostgreSQL > round-trips four-place bill rates with cent-rounded extensions and exact replay  3314ms
+   ✓ ERP Financials real PostgreSQL > retains native bill-line customers through reads, replay, replacement, and void  3479ms
+   ✓ ERP Financials real PostgreSQL > validates native bill-line customer identity and scope and rolls back failed replacements  3427ms
+   ✓ ERP Financials real PostgreSQL > atomically clears ordered vendor bills, exposes provenance and summary, and compensates applications  3620ms
+   ✓ ERP Financials real PostgreSQL > retains inactive mapped account history and posting eligibility (from version=0)  3775ms
+   × ERP Financials real PostgreSQL > retains inactive mapped account history and posting eligibility (from version=16) 723ms
+     → expected { …(10) } to match object { fromVersion: 40, toVersion: 41 }
+(8 matching properties omitted from actual)
+   × ERP Financials real PostgreSQL > retains inactive mapped account history and posting eligibility (from version=24) 785ms
+     → expected { …(10) } to match object { fromVersion: 40, toVersion: 41 }
+(8 matching properties omitted from actual)
+   ✓ ERP Financials real PostgreSQL > creates inactive source and book accounts with retained mappings and rolls back the whole host transaction  796ms
+   ✓ ERP Financials real PostgreSQL > blocks new cash-basis applications and refunds while inactive without breaking replay  975ms
+   ✓ ERP Financials real PostgreSQL > uses the scoped transaction identity index for an important journal lookup  759ms
+   ✓ ERP Financials real PostgreSQL > runs the host-facing SDK from book setup through invoice, atomic match, reconciliation, reads, and outbox delivery  2092ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 8 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/postgres.integration.test.ts > ERP Financials real PostgreSQL > payment holds upgrade schema 31 without rewriting existing financial facts
+error: column "tax_account_id" of relation "subledger_document_lines" does not exist
+ ❯ ../handrail-sdk-erp-financials-js/node_modules/pg/lib/client.js:694:17
+ ❯ PgQueryClient.query test/postgres.integration.test.ts:10003:20
+    10001|     params: readonly unknown[] = []
+    10002|   ): Promise<PostgresQueryResult<Row>> {
+    10003|     const result = await this.queryable.query<QueryResultRow>(sql, [..…
+       |                    ^
+    10004|     return { rows: result.rows as unknown as readonly Row[], rowCount:…
+    10005|   }
+ ❯ writeSubledgerDocumentLines src/erp-financials-service.ts:3340:5
+ ❯ src/erp-financials-service.ts:3182:9
+ ❯ PgTransactionRunner.transaction test/postgres.integration.test.ts:10015:22
+ ❯ test/postgres.integration.test.ts:2759:18
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/8]⎯
+
+ FAIL  test/postgres.integration.test.ts > ERP Financials real PostgreSQL > payment correction upgrades v26 guards without changing existing correction evidence
+AssertionError: expected [ [ 26, 27 ], [ 27, 28 ], …(15) ] to deeply equal [ [ 26, 27 ], [ 27, 28 ], …(13) ]
+
+- Expected
++ Received
+
+@@ -57,6 +57,14 @@
+    ],
+    [
+      40,
+      41,
+    ],
++   [
++     41,
++     42,
++   ],
++   [
++     42,
++     43,
++   ],
+  ]
+
+ ❯ test/postgres.integration.test.ts:3216:70
+    3214|     const result=await migratePostgresSchema(runner,{appliedByRef:'syn…
+    3215|     expect(result.currentVersion).toBe(26);
+    3216|     expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).t…
+       |                                                                      ^
+    3217|     const after=await depositDatabaseState(pool);
+    3218|     for (const table of Object.keys(before).filter(table=>table!=='sch…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/8]⎯
+
+ FAIL  test/postgres.integration.test.ts > ERP Financials real PostgreSQL > vendor bill audit index upgrades schema 32 without changing accounting data
+error: column "tax_account_id" of relation "subledger_document_lines" does not exist
+ ❯ ../handrail-sdk-erp-financials-js/node_modules/pg/lib/client.js:694:17
+ ❯ PgQueryClient.query test/postgres.integration.test.ts:10003:20
+    10001|     params: readonly unknown[] = []
+    10002|   ): Promise<PostgresQueryResult<Row>> {
+    10003|     const result = await this.queryable.query<QueryResultRow>(sql, [..…
+       |                    ^
+    10004|     return { rows: result.rows as unknown as readonly Row[], rowCount:…
+    10005|   }
+ ❯ writeSubledgerDocumentLines src/erp-financials-service.ts:3340:5
+ ❯ src/erp-financials-service.ts:3182:9
+ ❯ PgTransactionRunner.transaction test/postgres.integration.test.ts:10015:22
+ ❯ test/postgres.integration.test.ts:5714:18
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/8]⎯
+
+ FAIL  test/postgres.integration.test.ts > ERP Financials real PostgreSQL > invoice cancellation migration preserves history and refuses detached legacy settlement (detached=false)
+ FAIL  test/postgres.integration.test.ts > ERP Financials real PostgreSQL > invoice cancellation migration preserves history and refuses detached legacy settlement (detached=true)
+error: column "tax_account_id" of relation "subledger_document_lines" does not exist
+ ❯ ../handrail-sdk-erp-financials-js/node_modules/pg/lib/client.js:694:17
+ ❯ PgQueryClient.query test/postgres.integration.test.ts:10003:20
+    10001|     params: readonly unknown[] = []
+    10002|   ): Promise<PostgresQueryResult<Row>> {
+    10003|     const result = await this.queryable.query<QueryResultRow>(sql, [..…
+       |                    ^
+    10004|     return { rows: result.rows as unknown as readonly Row[], rowCount:…
+    10005|   }
+ ❯ writeSubledgerDocumentLines src/erp-financials-service.ts:3340:5
+ ❯ src/erp-financials-service.ts:3182:9
+ ❯ PgTransactionRunner.transaction test/postgres.integration.test.ts:10015:22
+ ❯ test/postgres.integration.test.ts:7615:21
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/8]⎯
+
+ FAIL  test/postgres.integration.test.ts > ERP Financials real PostgreSQL > overdue recognition supports invoices and vendor bills and the v38 upgrade preserves existing facts
+AssertionError: expected [ [ 38, 39 ], [ 39, 40 ], …(3) ] to deeply equal [ [ 38, 39 ], [ 39, 40 ], [ 40, 41 ] ]
+
+- Expected
++ Received
+
+@@ -9,6 +9,14 @@
+    ],
+    [
+      40,
+      41,
+    ],
++   [
++     41,
++     42,
++   ],
++   [
++     42,
++     43,
++   ],
+  ]
+
+ ❯ test/postgres.integration.test.ts:8503:75
+    8501|     const before = await depositDatabaseState(pool);
+    8502|     const migrated = await migratePostgresSchema(runner, { appliedByRe…
+    8503|     expect(migrated.applied.map(row => [row.fromVersion, row.toVersion…
+       |                                                                           ^
+    8504|     // Migration evidence changes; no business facts are rewritten.
+    8505|     const after = await depositDatabaseState(pool);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/8]⎯
+
+ FAIL  test/postgres.integration.test.ts > ERP Financials real PostgreSQL > retains inactive mapped account history and posting eligibility (from version=16)
+ FAIL  test/postgres.integration.test.ts > ERP Financials real PostgreSQL > retains inactive mapped account history and posting eligibility (from version=24)
+AssertionError: expected { …(10) } to match object { fromVersion: 40, toVersion: 41 }
+(8 matching properties omitted from actual)
+
+- Expected
++ Received
+
+  {
+-   "fromVersion": 40,
+-   "toVersion": 41,
++   "fromVersion": 42,
++   "toVersion": 43,
+  }
+
+ ❯ test/postgres.integration.test.ts:9401:39
+    9399|       const upgraded = await migratePostgresSchema(runner, { appliedBy…
+    9400|       expect(upgraded.currentVersion).toBe(upgrade);
+    9401|       expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 40,…
+       |                                       ^
+    9402|       expect(await history()).toEqual(before);
+    9403|       expect((await migratePostgresSchema(runner, { appliedByRef: "int…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/8]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  8 failed | 497 passed (505)
+   Start at  03:35:24
+   Duration  811.27s (transform 3.24s, setup 0ms, collect 2.66s, tests 808.36s, environment 0ms, prepare 59ms)
+
+EPHEMERAL POSTGRES REMOVED

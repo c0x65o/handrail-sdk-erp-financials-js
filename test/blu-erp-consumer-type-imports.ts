@@ -1,13 +1,45 @@
 import { createErpFinancialsSdk } from "@handrail/erp-financials/sdk";
 
 import type {
+  InvoicePostingComponents,
+  InvoiceAccountPolicy,
+  VendorBillCorrectionReviewRequest,
+  VendorBillCorrectionReviewPage,
+  CorrectPostedVendorBillInput,
+  CorrectPostedVendorBillResult,
   AgingReport,
+  JournalRegisterRequest,
+  JournalRegisterPage,
+  JournalRegisterItem,
+  JournalRegisterTotals,
+  JournalPostingRequest,
+  JournalPostingPage,
+  AccountChartRequest,
+  AccountChartPage,
+  AccountChartItem,
+  AccountChartTotals,
+  AccountRegisterRequest,
+  AccountRegisterPage,
+  AccountRegisterLine,
+  ReceivableCollectionPositionsRequest,
+  ReceivableCollectionCoverageHistory,
+  ReceivableCollectionPosition,
+  ReceivableCollectionGuard,
   BankReconciliationListItem,
   BankReconciliationSummary,
   BillPaymentDetail,
+  BillPaymentCorrectionReviewRequest,
+  BillPaymentCorrectionReviewPage,
+  VoidAndUnapplyBillPaymentInput,
+  VoidAndUnapplyBillPaymentResult,
   BillPaymentListItem,
   BillPaymentSummary,
   ChartOfAccountsItem,
+  OperationalAccountDefinition,
+  OperationalAccountRequest,
+  OperationalAccountKeyRequest,
+  OperationalAccountListRequest,
+  OperationalAccountListItem,
   CreateErpFinancialsSdkInput,
   CustomerPaymentDetail,
   CustomerStatement,
@@ -15,6 +47,8 @@ import type {
   FinancialDashboardSummary,
   FinancialStatement,
   FiscalPeriodReadModel,
+  FiscalCloseBankReceipt,
+  FiscalCloseBankReceiptInput,
   GeneralLedgerLine,
   GeneralLedgerSummary,
   InvoiceDetail,
@@ -28,6 +62,10 @@ import type {
   PaymentSummary,
   PostingLockReadModel,
   UnignoreBankStatementLineInput,
+  SetVendorBillPaymentHoldInput,
+  VendorBillPaymentHoldResult,
+  VendorBillAuditEvent,
+  VendorBillRegisterPage,
   VendorBillDetail,
   VendorBillListItem,
   VendorBillSummary
@@ -253,6 +291,15 @@ export async function compileBluCommandContract(sdk: ErpFinancialsSdk): Promise<
 }
 
 export async function compileBluReadContract(sdk: ErpFinancialsSdk): Promise<void> {
+  const bankReceiptInput: FiscalCloseBankReceiptInput = { certificateId: "close-certificate", accountId: "cash-account" };
+  const bankReceipt: FiscalCloseBankReceipt | null = await sdk.fiscalCloseCertificates.bankReceipt(bankReceiptInput);
+  void bankReceipt;
+  const accountLookup: OperationalAccountRequest = { sourceId: BLU_FINANCIAL_SCOPE.writeSourceId, accountId: "canonical_account_id", asOfDate: "2026-08-31" };
+  const account: OperationalAccountDefinition = await sdk.queries.getOperationalAccount(accountLookup);
+  const accounts: readonly OperationalAccountDefinition[] = await sdk.queries.getOperationalAccounts({sourceId:accountLookup.sourceId,accountIds:[accountLookup.accountId],asOfDate:accountLookup.asOfDate});
+  void accounts;
+  const accountKeyLookup: OperationalAccountKeyRequest = { sourceId: BLU_FINANCIAL_SCOPE.writeSourceId, accountKey: "blu-1000", asOfDate: "2026-08-31" };
+  await sdk.queries.getOperationalAccountByKey(accountKeyLookup);
   const chart: readonly ChartOfAccountsItem[] = await sdk.queries.listChartOfAccounts({
     asOfDate: "2026-08-31",
     includeInactive: false
@@ -302,6 +349,9 @@ export async function compileBluReadContract(sdk: ErpFinancialsSdk): Promise<voi
     limit: 50
   });
   const vendorBills: readonly VendorBillListItem[] = vendorBillPage.items;
+  const vendorBillRegister: VendorBillRegisterPage = await sdk.queries.getVendorBillRegister({ asOfDate: "2026-08-31", status: "open", limit: 50 });
+  void vendorBillRegister;
+  const vendorBillAudit: readonly VendorBillAuditEvent[] = (await sdk.queries.listVendorBillAudit(BLU_FINANCIAL_IDS.vendorBillId, { limit: 50 })).items;
   const vendorBill: VendorBillDetail = await sdk.queries.getVendorBill(BLU_FINANCIAL_IDS.vendorBillId, "2026-08-31");
   const vendorBillSummary: VendorBillSummary = await sdk.queries.getVendorBillSummary({
     vendorId: BLU_FINANCIAL_IDS.vendorId,
@@ -381,6 +431,7 @@ export async function compileBluReadContract(sdk: ErpFinancialsSdk): Promise<voi
   });
 
   void [
+    account,
     chart,
     journals,
     journal,
@@ -393,6 +444,7 @@ export async function compileBluReadContract(sdk: ErpFinancialsSdk): Promise<voi
     invoiceSummary,
     customerStatement,
     vendorBills,
+    vendorBillAudit,
     vendorBill,
     vendorBillSummary,
     customerPayments,
@@ -676,4 +728,120 @@ function bluOperation(requestId: string, independentlyApproved = false): BluOper
     reasonDetail: "Compile the supported BLU financial kernel contract",
     occurredAt: "2026-08-01T12:00:00.000Z"
   };
+}
+
+export function readBluOrderCollectionPage(sdk: ErpFinancialsSdk, input: ReceivableCollectionPositionsRequest): Promise<readonly ReceivableCollectionPosition[]> {
+  return sdk.queries.getReceivableCollectionPositions(input);
+}
+
+export function runBluCollectionGate<Result>(sdk: ErpFinancialsSdk, input: ReceivableCollectionPositionsRequest, work: (guard: ReceivableCollectionGuard) => Promise<Result>): Promise<Result> {
+  return sdk.queries.withLockedReceivableCollectionPositions(input, work);
+}
+
+export function readBluCashCoverageHistory(sdk: ErpFinancialsSdk, input: ReceivableCollectionPositionsRequest): Promise<readonly ReceivableCollectionCoverageHistory[]> {
+  return sdk.queries.getReceivableCollectionCoverageHistory(input);
+}
+
+export function readBluCurrentPayableSummary(sdk: ErpFinancialsSdk, billId: string) {
+  return sdk.queries.getOperationalDocumentSummary(billId, BLU_FINANCIAL_SCOPE.writeSourceId);
+}
+
+export function setBluVendorBillPaymentHold(sdk: ErpFinancialsSdk, input: SetVendorBillPaymentHoldInput): Promise<VendorBillPaymentHoldResult> {
+  return sdk.commands.vendorBills.setPaymentHold(input);
+}
+
+export async function readBluAccountRegister(sdk: ErpFinancialsSdk, request: AccountRegisterRequest): Promise<AccountRegisterPage> {
+  const page = await sdk.queries.getAccountRegister(request);
+  const lines: readonly AccountRegisterLine[] = page.items;
+  return { ...page, items: lines };
+}
+
+export async function readBluAccountChart(sdk: ErpFinancialsSdk, request: AccountChartRequest): Promise<AccountChartPage> {
+  const page = await sdk.queries.getAccountChart(request);
+  const items: readonly AccountChartItem[] = page.items;
+  const controls: AccountChartTotals = page.summary;
+  return { ...page, items, summary: { ...page.summary, ...controls } };
+}
+
+export async function readBluJournalRegister(sdk: ErpFinancialsSdk, request: JournalRegisterRequest): Promise<JournalRegisterPage> {
+  const page = await sdk.queries.getJournalRegister(request);
+  const items: readonly JournalRegisterItem[] = page.items;
+  const summary: JournalRegisterTotals = page.summary;
+  return { ...page, items, summary };
+}
+
+export function readBluJournalPostings(sdk: ErpFinancialsSdk, request: JournalPostingRequest): Promise<JournalPostingPage> {
+  return sdk.queries.getJournalPostingPage(request);
+}
+
+export async function readBluAccountChoices(sdk: ErpFinancialsSdk, request: OperationalAccountListRequest): Promise<{ readonly items: readonly OperationalAccountListItem[]; readonly nextCursor?: string }> {
+  return sdk.queries.listOperationalAccounts(request);
+}
+
+export function correctBluPostedBill(sdk: ErpFinancialsSdk, input: CorrectPostedVendorBillInput): Promise<CorrectPostedVendorBillResult> {
+  return sdk.commands.vendorBills.correctPosted(input);
+}
+
+export function reviewBluBillCorrection(sdk: ErpFinancialsSdk, input: VendorBillCorrectionReviewRequest): Promise<VendorBillCorrectionReviewPage> {
+  return sdk.queries.getVendorBillCorrectionReview(input);
+}
+
+export function reviewBluPaymentCorrection(sdk: ErpFinancialsSdk, input: BillPaymentCorrectionReviewRequest): Promise<BillPaymentCorrectionReviewPage> {
+  return sdk.queries.getBillPaymentCorrectionReview(input);
+}
+
+export function compensateReviewedBluPayment(sdk: ErpFinancialsSdk, input: VoidAndUnapplyBillPaymentInput & { readonly expectedReviewToken: string }): Promise<VoidAndUnapplyBillPaymentResult> {
+  return sdk.commands.billPayments.voidAndUnapply(input);
+}
+
+// BLU can opt into component postings through the public SDK entry point.
+export const BLU_COMPONENT_ACCOUNT_POLICY: InvoiceAccountPolicy = {
+  revenueClassifications:["income"],receivableClassifications:["asset"],
+  taxClassifications:["liability"],discountClassifications:["income"]
+};
+export const BLU_INVOICE_COMPONENTS: InvoicePostingComponents = {
+  taxAccount:{accountKey:"liability.sales-tax"},discountAccount:{accountKey:"income.discount"}
+};
+
+/** Public boundary only: the host supplies authorization, approval and review. */
+export async function bluCorrectCashPurpose(sdk: ErpFinancialsSdk, input: import("@handrail/erp-financials/sdk").CorrectCashFlowPurposeInput) {
+  const receipt = await sdk.commands.cashFlow.correctPurpose(input);
+  const current = await sdk.queries.getCashFlowPurpose({ sourceId: BLU_FINANCIAL_SCOPE.writeSourceId, documentId: input.documentId });
+  return { receipt, current };
+}
+
+/** BLU can resolve an uncertain collection without accessing SDK storage. */
+export async function bluRetireCollectionAttempt(
+  sdk: import("@handrail/erp-financials/sdk").ErpFinancialsSdk,
+  input: import("@handrail/erp-financials/sdk").RetireCustomerPaymentCollectionInput,
+): Promise<import("@handrail/erp-financials/sdk").RetireCustomerPaymentCollectionResult> {
+  return sdk.commands.customerPayments.retireCollectionAttempt(input);
+}
+
+export async function bluRetireReceiptAllocation(
+  sdk: import("@handrail/erp-financials/sdk").ErpFinancialsSdk,
+  input: import("@handrail/erp-financials/sdk").RetireReceiptApplicationInput,
+): Promise<import("@handrail/erp-financials/sdk").RetireReceiptApplicationResult> {
+  return sdk.commands.paymentApplications.retireReceiptAttempt(input);
+}
+
+export async function bluRetireBillPaymentRecording(
+  sdk: import("@handrail/erp-financials/sdk").ErpFinancialsSdk,
+  input: import("@handrail/erp-financials/sdk").RetireBillPaymentRecordingInput,
+): Promise<import("@handrail/erp-financials/sdk").RetireBillPaymentRecordingResult> {
+  return sdk.commands.billPayments.retireRecordingAttempt(input);
+}
+
+export async function bluRetireBankStatementCommand(
+  sdk: import("@handrail/erp-financials/sdk").ErpFinancialsSdk,
+  input: import("@handrail/erp-financials/sdk").RetireBankStatementCommandInput,
+): Promise<import("@handrail/erp-financials/sdk").RetireBankStatementCommandResult> {
+  return sdk.bankStatements.retireCommandAttempt(input);
+}
+
+export async function bluRetireVendorBillHold(
+  sdk: import("@handrail/erp-financials/sdk").ErpFinancialsSdk,
+  input: import("@handrail/erp-financials/sdk").RetireVendorBillPaymentHoldInput,
+): Promise<import("@handrail/erp-financials/sdk").RetireVendorBillPaymentHoldResult> {
+  return sdk.commands.vendorBills.retirePaymentHoldAttempt(input);
 }

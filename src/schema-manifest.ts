@@ -1,3 +1,7 @@
+import {ACCOUNTING_ACCESS_TABLES,ACCOUNTING_ACCESS_GUARDED_TABLES} from './accounting-access-schema.js';
+import { FISCAL_CLOSE_CERTIFICATE_TABLES } from "./fiscal-close-certificate-schema.js";
+import { BANK_STATEMENT_TABLES } from "./bank-statement-schema.js";
+
 export type PostgresColumnType =
   | "boolean"
   | "date"
@@ -27,15 +31,19 @@ export type PostgresIndexManifest = {
   readonly columns: readonly string[];
   readonly unique?: boolean;
   readonly whereSql?: string;
+  readonly method?: "btree" | "gin";
 };
 
 export type PostgresTriggerManifest = {
   readonly name: string;
   readonly table: string;
   readonly timing: "before" | "after";
-  readonly events: readonly ("insert" | "update" | "delete")[];
+  readonly events: readonly ("insert" | "update" | "delete" | "truncate")[];
   readonly updateColumns?: readonly string[];
   readonly functionName: string;
+  readonly deferredConstraint?: boolean;
+  readonly level?: "row" | "statement";
+  readonly transitionTables?: { readonly old?: string; readonly new?: string };
 };
 
 export type PostgresTableManifest = {
@@ -53,8 +61,8 @@ export type PostgresTableManifest = {
 };
 
 export type PostgresSchemaManifest = {
-  readonly manifestVersion: "2026-10-03.customer-payment-correction-replay";
-  readonly schemaVersion: 27;
+  readonly manifestVersion: "2026-10-23.accounting-access-control";
+  readonly schemaVersion: 49;
   readonly dialect: "postgres";
   readonly namespace: "erp_financials";
   readonly requiredTriggers: readonly PostgresTriggerManifest[];
@@ -144,11 +152,45 @@ const table = (
 });
 
 export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
-  manifestVersion: "2026-10-03.customer-payment-correction-replay",
-  schemaVersion: 27,
+  manifestVersion: "2026-10-23.accounting-access-control",
+  schemaVersion: 49,
   dialect: "postgres",
   namespace: "erp_financials",
   requiredTriggers: [
+    ...ACCOUNTING_ACCESS_GUARDED_TABLES.map(table=>({name:'accounting_access_guard',table,timing:'before' as const,events:['insert','update','delete','truncate'] as const,functionName:'guard_accounting_access',level:'statement' as const})),
+    {name:'accounting_access_control_command',table:'accounting_access_control',timing:'before',events:['insert','update','delete'],functionName:'guard_accounting_access_control'},
+    {name:'accounting_access_control_no_truncate',table:'accounting_access_control',timing:'before',events:['truncate'],functionName:'preserve_accounting_access_evidence',level:'statement'},
+    {name:'accounting_access_command_insert',table:'accounting_access_commands',timing:'before',events:['insert'],functionName:'guard_accounting_access_command'},
+    {name:'accounting_access_commands_immutable',table:'accounting_access_commands',timing:'before',events:['update','delete','truncate'],functionName:'preserve_accounting_access_evidence',level:'statement'},
+    { name: "receipt_application_date_guard", table: "subledger_applications", timing: "before", events: ["insert"], functionName: "guard_receipt_application_date" },
+    { name: "invoice_application_recognition_guard", table: "subledger_applications", timing: "before", events: ["insert"], functionName: "guard_invoice_application_recognition" },
+    { name: "invoice_cancellation_recognition_guard", table: "invoice_voids", timing: "before", events: ["insert"], functionName: "guard_invoice_cancellation_recognition" },
+    { name: "invoice_initial_recognition_guard", table: "subledger_documents", timing: "before", events: ["insert"], functionName: "guard_invoice_initial_recognition" },
+    { name: "cash_flow_purpose_guard", table: "cash_flow_purpose_corrections", timing: "before", events: ["insert","update","delete"], functionName: "guard_cash_flow_purpose" },
+    { name: "cash_flow_purpose_revision", table: "cash_flow_purpose_corrections", timing: "after", events: ["insert"], functionName: "advance_cash_flow_purpose_revision" },
+    { name: "close_review_revision_guard", table: "fiscal_close_certificates", timing: "after", events: ["insert"], functionName: "assert_close_review_revision", deferredConstraint: true },
+    { name: "accounting_source_revision_guard", table: "accounting_source_revisions", timing: "before", events: ["insert", "update", "delete"], functionName: "guard_accounting_source_revision" },
+    ...["transactions", "transaction_lines", "ledger_postings", "subledger_documents", "subledger_document_lines", "subledger_applications", "invoice_drafts", "bank_statements", "invoice_draft_lines", "subledger_document_delivery_events"].flatMap(table => (["insert", "update", "delete"] as const).map(event => ({ name: `accounting_revision_${event}`, table, timing: "after" as const, events: [event], functionName: "advance_accounting_source_revision", level: "statement" as const, transitionTables: { ...(event === "insert" ? {} : { old: "revision_old" }), ...(event === "delete" ? {} : { new: "revision_new" }) } }))),
+    { name: "payment_correction_source_guard", table: "invoice_drafts", timing: "before", events: ["insert", "update", "delete"], functionName: "guard_customer_payment_correction_source" },
+    ...[{ table: "fiscal_close_certificates", name: "close_certificate_write_guard" }, { table: "fiscal_close_totals", name: "close_totals_write_guard" }, { table: "fiscal_close_banks", name: "close_banks_write_guard" }].map(({ table, name }) => ({ name, table, timing: "before" as const, events: ["insert", "update", "delete"] as const, functionName: "guard_close_certificate_write" })),
+    { name: "close_certificate_complete", table: "fiscal_close_certificates", timing: "after", events: ["insert"], functionName: "assert_close_certificate_complete", deferredConstraint: true },
+    { name: "bank_statement_history_guard", table: "bank_statement_clearing_history", timing: "before", events: ["insert","update","delete"], functionName: "guard_bank_statement_history" },
+    { name: "bank_statement_write_guard", table: "bank_statements", timing: "before", events: ["insert","update","delete"], functionName: "guard_bank_statement_write" },
+    { name: "bank_statement_clearing_write_guard", table: "bank_statement_clearings", timing: "before", events: ["insert","update","delete"], functionName: "guard_bank_statement_write" },
+    { name: "bank_statement_evidence_guard", table: "bank_statements", timing: "after", events: ["insert","update"], functionName: "assert_bank_statement_evidence", deferredConstraint: true },
+    { name: "bank_statement_clearing_evidence_guard", table: "bank_statement_clearings", timing: "after", events: ["insert","update","delete"], functionName: "assert_bank_statement_evidence", deferredConstraint: true },
+    { name: "statement_cleared_posting_guard", table: "ledger_postings", timing: "before", events: ["update","delete"], functionName: "guard_statement_cleared_fact" },
+    { name: "statement_cleared_transaction_guard", table: "transactions", timing: "before", events: ["update","delete"], functionName: "guard_statement_cleared_fact" },
+    { name: "statement_cleared_reversal_guard", table: "journal_entry_links", timing: "before", events: ["insert"], functionName: "guard_statement_cleared_fact" },
+    { name: "subledger_document_initial_hold_guard", table: "subledger_documents", timing: "before", events: ["insert"], functionName: "guard_vendor_bill_initial_hold" },
+    { name: "subledger_application_payment_hold_guard", table: "subledger_applications", timing: "before", events: ["insert"], functionName: "guard_vendor_bill_payment_application" },
+    { name: "vendor_bill_hold_event_complete", deferredConstraint: true, table: "financial_lifecycle_events", timing: "after", events: ["insert"], functionName: "guard_vendor_bill_hold_complete" },
+    { name: "receipt_collection_ref_guard", table: "subledger_documents", timing: "before", events: ["insert", "update"], functionName: "guard_receipt_collection_ref" },
+    { name: "invoice_date_correction_event_complete", deferredConstraint: true, table: "financial_lifecycle_events", timing: "after", events: ["insert"], functionName: "guard_invoice_date_correction_complete" },
+    { name: "invoice_date_correction_journal_complete", deferredConstraint: true, table: "transactions", timing: "after", events: ["insert"], functionName: "guard_invoice_date_correction_complete" },
+    { name: "customer_payment_return_complete_guard", deferredConstraint: true, table: "subledger_documents", timing: "after", events: ["insert"], functionName: "assert_customer_payment_return_complete" },
+    { name: "customer_payment_return_application_guard", table: "subledger_applications", timing: "before", events: ["update", "delete"], functionName: "guard_customer_payment_return_application" },
+    { name: "customer_payment_return_document_guard", table: "subledger_documents", timing: "before", events: ["update", "delete"], functionName: "guard_customer_payment_return_document" },
     { name: "customer_payment_corrections_immutable", table: "customer_payment_corrections", timing: "before", events: ["update", "delete"], functionName: "reject_customer_payment_correction_mutation" },
     ...["transactions", "transaction_lines", "ledger_postings", "subledger_documents", "subledger_document_lines", "subledger_applications", "bank_reconciliation_matches", "imported_customer_payment_evidence"].map(table => ({name: "payment_correction_source_guard", table, timing: "before" as const, events: ["insert", "update", "delete"] as const, functionName: "guard_customer_payment_correction_source"})),
     {
@@ -568,6 +610,10 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
           columns: ["tenant_id", "company_id", "source_id", "aggregate_type", "aggregate_id", "occurred_at"]
         },
         {
+          name: "financial_lifecycle_events_recorded_page_idx",
+          columns: ["tenant_id", "company_id", "source_id", "aggregate_type", "aggregate_id", "recorded_at", "event_id"]
+        },
+        {
           name: "financial_lifecycle_events_correlation_idx",
           columns: ["tenant_id", "correlation_id", "occurred_at"]
         }
@@ -921,6 +967,11 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
           columns: ["tenant_id", "source_id", "transaction_date"]
         },
         {
+          name: "transactions_fiscal_drafts_idx",
+          columns: ["tenant_id", "source_id", "transaction_date"],
+          whereSql: `"status" = 'draft'::text`
+        },
+        {
           name: "transactions_scope_uidx",
           columns: ["tenant_id", "source_id", "transaction_id"],
           unique: true
@@ -1076,6 +1127,18 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
           columns: ["tenant_id", "posting_date", "accounting_basis", "account_id", "currency_code"]
         },
         {
+          name: "ledger_postings_bank_activity_idx",
+          columns: ["tenant_id", "source_id", "account_id", "accounting_basis", "currency_code", "posting_date", "posting_id"]
+        },
+        {
+          name: "ledger_postings_fiscal_groups_idx",
+          columns: ["tenant_id", "source_id", "posting_date", "transaction_id", "accounting_basis", "currency_code", "debit_amount", "credit_amount"]
+        },
+        {
+          name: "ledger_postings_transaction_read_idx",
+          columns: ["tenant_id", "source_id", "transaction_id", "accounting_basis", "currency_code", "posting_date", "posting_id"]
+        },
+        {
           name: "ledger_postings_import_batch_idx",
           columns: ["tenant_id", "import_batch_id"]
         }
@@ -1164,8 +1227,11 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
         text("document_type"),
         text("transaction_id"),
         text("party_id", true),
+        { name: "payment_hold", type: "boolean", defaultSql: "false" },
+        text("payment_hold_reason", true),
         text("document_number", true),
         date("document_date"),
+        date("recognition_date", true),
         date("due_date", true),
         text("currency_code"),
         numeric("original_amount"),
@@ -1179,6 +1245,10 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
         timestamp("updated_at")
       ],
       [
+        {
+          name: "subledger_documents_payment_hold_check",
+          sql: "(not payment_hold and payment_hold_reason is null) or (document_type='vendor_bill' and payment_hold and length(btrim(payment_hold_reason)) between 1 and 1000 and payment_hold_reason is not null)"
+        },
         {
           name: "subledger_documents_type_check",
           sql: "document_type in ('invoice', 'customer_payment', 'credit_memo', 'refund', 'vendor_bill', 'bill_payment', 'write_off', 'deposit', 'transfer', 'sales_receipt', 'purchase', 'vendor_credit')"
@@ -1196,8 +1266,12 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
           sql: "version >= 1"
         },
         {
+          name: "subledger_documents_recognition_date_check",
+          sql: "recognition_date is null or document_type='invoice'"
+        },
+        {
           name: "subledger_documents_due_date_check",
-          sql: "due_date is null or due_date >= document_date"
+          sql: "due_date is null or document_type in ('vendor_bill', 'invoice') or due_date >= document_date"
         },
         {
           name: "subledger_documents_timestamp_check",
@@ -1244,6 +1318,15 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
           columns: ["tenant_id", "company_id", "source_id", "document_type", "status", "due_date", "document_date"]
         },
         {
+          name: "subledger_documents_payment_page_idx",
+          columns: ["tenant_id", "company_id", "currency_code", "document_date", "subledger_document_id"],
+          whereSql: `"document_type" = any (array['customer_payment'::text, 'bill_payment'::text])`
+        },
+        {
+          name: "subledger_documents_transaction_idx",
+          columns: ["tenant_id", "company_id", "source_id", "transaction_id", "document_type"]
+        },
+        {
           name: "subledger_documents_party_idx",
           columns: ["tenant_id", "company_id", "source_id", "party_id", "document_type", "status"]
         }
@@ -1279,7 +1362,7 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
       [
         {
           name: "subledger_applications_type_check",
-          sql: "application_type in ('customer_payment_to_invoice', 'bill_payment_to_bill', 'credit_to_invoice', 'vendor_credit_to_bill', 'write_off_to_invoice')"
+          sql: "application_type in ('customer_payment_to_invoice', 'bill_payment_to_bill', 'credit_to_invoice', 'vendor_credit_to_bill', 'write_off_to_invoice', 'customer_payment_to_refund')"
         },
         {
           name: "subledger_applications_amount_check",
@@ -1358,6 +1441,11 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
         {
           name: "subledger_applications_idempotency_uidx",
           columns: ["tenant_id", "company_id", "source_id", "idempotency_key"],
+          unique: true
+        },
+        {
+          name: "subledger_applications_status_scope_uidx",
+          columns: ["tenant_id", "company_id", "source_id", "subledger_application_id", "status"],
           unique: true
         },
         {
@@ -1481,12 +1569,21 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
           unique: true
         },
         {
+          name: "bill_payment_disbursements_page_idx",
+          columns: ["tenant_id", "company_id", "currency_code", "payment_date", "bill_payment_id"]
+        },
+        {
           name: "bill_payment_disbursements_register_idx",
           columns: ["tenant_id", "company_id", "source_id", "status", "payment_date", "bill_payment_id"]
         },
         {
           name: "bill_payment_disbursements_vendor_idx",
           columns: ["tenant_id", "company_id", "source_id", "vendor_id", "payment_date"]
+        },
+        {
+          name: "bill_payment_disbursements_allocations_gin_idx",
+          columns: ["allocations"],
+          method: "gin"
         }
       ]
     ),
@@ -2123,6 +2220,19 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
       ]
     ),
     ...sdkV1Tables(),
+    ...ACCOUNTING_ACCESS_TABLES,
+    ...BANK_STATEMENT_TABLES,
+    ...FISCAL_CLOSE_CERTIFICATE_TABLES,
+    table("cash_flow_purpose_corrections", "Immutable approved native cash purpose revisions, no balances.",
+      [id("tenant_id"), id("company_id"), id("source_id"), id("document_id"), { ...integer("revision"), primaryKey: true }, text("book_id"), numeric("operating"), numeric("investing"), numeric("financing"), text("lifecycle_event_id")],
+      [foreignKey("cash_flow_purpose_document_fk", ["tenant_id","company_id","source_id","document_id"], "subledger_documents", ["tenant_id","company_id","source_id","subledger_document_id"]),
+       foreignKey("cash_flow_purpose_event_fk", ["tenant_id","company_id","source_id","lifecycle_event_id"], "financial_lifecycle_events", ["tenant_id","company_id","source_id","event_id"]),
+       foreignKey("cash_flow_purpose_book_fk", ["tenant_id","company_id","book_id"], "reporting_books", ["tenant_id","company_id","book_id"]),
+       { name: "cash_flow_purpose_amounts_check", sql: "revision>0 and operating>=0 and investing>=0 and financing>=0 and operating+investing+financing>0 and operating+investing+financing<1e18 and operating=trunc(operating,2) and investing=trunc(investing,2) and financing=trunc(financing,2)" }], []),
+    table("accounting_source_revisions", "Database-managed source mutation revision for approval freshness; contains no balances.",
+      [id("tenant_id"), id("source_id"), { ...date("effective_date"), primaryKey: true }, numeric("revision")],
+      [{ name: "accounting_source_revisions_value_check", sql: "revision > 0 and revision = trunc(revision) and revision::text not in ('NaN','Infinity','-Infinity')" },
+       foreignKey("accounting_source_revisions_source_fk", ["tenant_id", "source_id"], "accounting_sources", ["tenant_id", "source_id"])], []),
     table("imported_customer_payment_evidence", "Complete normalized payment basis provenance", [id("evidence_id"), text("tenant_id"), text("company_id"), text("source_id"), text("payment_id"), text("source_version"), jsonb("evidence", 65536, false)],
       [foreignKey("imported_customer_payment_evidence_document_fk", ["tenant_id","company_id","source_id","payment_id"], "subledger_documents", ["tenant_id","company_id","source_id","subledger_document_id"])],
       [{name:"imported_customer_payment_evidence_scope_uidx",columns:["tenant_id","company_id","source_id","payment_id"],unique:true}]),
@@ -2434,7 +2544,6 @@ function sdkV1Tables(): readonly PostgresTableManifest[] {
       [
         { name: "invoice_drafts_status_check", sql: "status in ('draft', 'issued', 'voided')" },
         { name: "invoice_drafts_version_check", sql: "version >= 1" },
-        { name: "invoice_drafts_due_date_check", sql: "due_date >= document_date" },
         {
           name: "invoice_drafts_issued_check",
           sql: "(status = 'issued' and issued_document_id is not null and issue_idempotency_key is not null) or (status <> 'issued' and issued_document_id is null and issue_idempotency_key is null)"
@@ -2489,6 +2598,10 @@ function sdkV1Tables(): readonly PostgresTableManifest[] {
           unique: true
         },
         {
+          name: "invoice_drafts_issued_lookup_idx",
+          columns: ["tenant_id", "company_id", "source_id", "issued_document_id"]
+        },
+        {
           name: "invoice_drafts_list_idx",
           columns: ["tenant_id", "company_id", "book_id", "status", "document_date", "invoice_draft_id"]
         }
@@ -2519,6 +2632,11 @@ function sdkV1LineTables(): readonly PostgresTableManifest[] {
       sql: "jsonb_typeof(dimension_refs) = 'array'"
     }
   ];
+  const componentConstraints = (prefix:string): readonly PostgresConstraintManifest[] => [
+    foreignKey(`${prefix}_tax_account_scope_fk`,["tenant_id","source_id","tax_account_id"],"accounts",["tenant_id","source_id","account_id"]),
+    foreignKey(`${prefix}_discount_account_scope_fk`,["tenant_id","source_id","discount_account_id"],"accounts",["tenant_id","source_id","account_id"]),
+    {name:`${prefix}_component_amount_check`,sql:"(tax_account_id is null or tax_amount>0) and (discount_account_id is null or discount_amount>0)"}
+  ];
   const lineColumns = (): readonly PostgresColumnManifest[] => [
     integer("line_number"),
     text("account_id"),
@@ -2533,7 +2651,9 @@ function sdkV1LineTables(): readonly PostgresTableManifest[] {
     date("service_period_start", true),
     date("service_period_end", true),
     jsonb("dimension_refs", 4096, false),
-    numeric("line_amount")
+    numeric("line_amount"),
+    text("tax_account_id",true),
+    text("discount_account_id",true)
   ];
   return [
     table(
@@ -2550,6 +2670,7 @@ function sdkV1LineTables(): readonly PostgresTableManifest[] {
       ],
       [
         ...amountConstraints("invoice_draft_lines"),
+        ...componentConstraints("invoice_draft_lines"),
         {
           name: "invoice_draft_lines_unit_cost_check",
           sql: "unit_cost is null or (unit_cost >= 0 and scale(unit_cost) <= 6)"
@@ -2599,6 +2720,7 @@ function sdkV1LineTables(): readonly PostgresTableManifest[] {
       ],
       [
         ...amountConstraints("subledger_document_lines"),
+        ...componentConstraints("subledger_document_lines"),
         {
           name: "subledger_document_lines_unit_cost_check",
           sql: "unit_cost is null or (unit_cost >= 0 and scale(unit_cost) <= 6)"
@@ -2693,11 +2815,16 @@ function sdkV1LineTables(): readonly PostgresTableManifest[] {
         text("invoice_document_id"),
         text("credit_document_id"),
         text("application_id"),
+        { ...text("application_status"), defaultSql: "'applied'" },
         text("idempotency_key"),
         text("lifecycle_event_id"),
         timestamp("created_at")
       ],
       [
+        { name: "invoice_voids_application_status_check", sql: "application_status = 'applied'" },
+        foreignKey("invoice_voids_active_application_fk",
+          ["tenant_id", "company_id", "source_id", "application_id", "application_status"], "subledger_applications",
+          ["tenant_id", "company_id", "source_id", "subledger_application_id", "status"]),
         foreignKey(
           "invoice_voids_book_scope_fk",
           ["tenant_id", "company_id", "book_id"],
@@ -2736,6 +2863,10 @@ function sdkV1LineTables(): readonly PostgresTableManifest[] {
         )
       ],
       [
+        {
+          name: "invoice_voids_application_scope_idx",
+          columns: ["tenant_id", "company_id", "source_id", "application_id", "application_status"]
+        },
         {
           name: "invoice_voids_invoice_uidx",
           columns: ["tenant_id", "company_id", "book_id", "invoice_document_id"],
@@ -2980,7 +3111,7 @@ function renderTableSql(namespace: string, tableManifest: PostgresTableManifest)
     ...tableManifest.indexes.map((index) => {
       const uniqueSql = index.unique === true ? "unique " : "";
       const whereSql = index.whereSql === undefined ? "" : ` where ${index.whereSql}`;
-      return `create ${uniqueSql}index if not exists ${quoteIdentifier(index.name)} on ${qualifiedTableName} (${index.columns
+      return `create ${uniqueSql}index if not exists ${quoteIdentifier(index.name)} on ${qualifiedTableName}${index.method === undefined ? "" : ` using ${index.method}`} (${index.columns
         .map(quoteIdentifier)
         .join(", ")})${whereSql};`;
     })

@@ -1,0 +1,12 @@
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/future-erp-reporting-read-model.test.ts (30 tests) 88ms
+ ✓ test/core-erp-reporting-read-model.test.ts (9 tests) 41ms
+ ✓ test/accounting-controls-read-models.test.ts (4 tests) 13ms
+
+ Test Files  3 passed (3)
+      Tests  43 passed (43)
+   Start at  16:15:47
+   Duration  2.62s (transform 1.18s, setup 0ms, collect 1.89s, tests 143ms, environment 0ms, prepare 170ms)
+

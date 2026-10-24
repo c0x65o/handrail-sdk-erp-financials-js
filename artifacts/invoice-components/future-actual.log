@@ -1,0 +1,95 @@
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/hitcents-future-erp/hitcents-erp-future
+
+stdout | tests/future-erp-shell.test.ts
+Verified candidate SDK 0.3.132
+
+stderr | tests/future-erp-shell.test.ts > Future ERP shell > synthesizes bounded source refs and checkpoint metadata for the retryable SDK resource fallback path
+[future-erp-shell] Pulling QuickBooks accounts feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks items feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks ledger_entries feed for fallback sync persistence.
+[future-erp-shell] Pulled 2 QuickBooks accounts resource(s) across 1 page(s).
+[future-erp-shell] Pulled 0 QuickBooks items resource(s) across 1 page(s).
+[future-erp-shell] Pulled 2 QuickBooks ledger_entries resource(s) across 1 page(s).
+
+stderr | tests/future-erp-shell.test.ts > Future ERP shell > keeps /api/sync source and persisted parity counts scoped to canonical families
+[future-erp-shell] Pulling QuickBooks accounts feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks items feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks ledger_entries feed for fallback sync persistence.
+[future-erp-shell] Pulled 2 QuickBooks accounts resource(s) across 1 page(s).
+[future-erp-shell] Pulled 0 QuickBooks items resource(s) across 1 page(s).
+[future-erp-shell] Pulled 2 QuickBooks ledger_entries resource(s) across 1 page(s).
+
+stderr | tests/future-erp-shell.test.ts > Future ERP shell > routes raw QuickBooks sync requests through SDK syncJobs.start
+[future-erp-shell] Pulling QuickBooks accounts feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks items feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks ledger_entries feed for fallback sync persistence.
+[future-erp-shell] Pulled 2 QuickBooks accounts resource(s) across 1 page(s).
+[future-erp-shell] Pulled 0 QuickBooks items resource(s) across 1 page(s).
+[future-erp-shell] Pulled 2 QuickBooks ledger_entries resource(s) across 1 page(s).
+
+stderr | tests/future-erp-shell.test.ts > Future ERP shell > starts real QuickBooks SDK sync jobs before reading normalized resource feeds
+[future-erp-shell] Pulling QuickBooks accounts feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks items feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks ledger_entries feed for fallback sync persistence.
+[future-erp-shell] Pulled 2 QuickBooks accounts resource(s) across 1 page(s).
+[future-erp-shell] Pulled 0 QuickBooks items resource(s) across 1 page(s).
+[future-erp-shell] Pulled 2 QuickBooks ledger_entries resource(s) across 1 page(s).
+
+stderr | tests/future-erp-shell.test.ts > Future ERP shell > persists normalized QuickBooks resource feeds when the sync job endpoint returns a retryable 5xx
+[future-erp-shell] QuickBooks full-sync endpoint failed (HTTP 500); persisted normalized resource feeds instead.
+[future-erp-shell] Pulling QuickBooks accounts feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks items feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks ledger_entries feed for fallback sync persistence.
+[future-erp-shell] Pulled 2 QuickBooks accounts resource(s) across 1 page(s).
+[future-erp-shell] Pulled 0 QuickBooks items resource(s) across 1 page(s).
+[future-erp-shell] Pulled 2 QuickBooks ledger_entries resource(s) across 1 page(s).
+
+stderr | tests/future-erp-shell.test.ts > Future ERP shell > falls back to required canonical resource feeds when an optional QuickBooks entity import fails
+[future-erp-shell] QuickBooks full-sync endpoint failed (HTTP 502; entity classes; object Class); persisted normalized resource feeds instead.
+[future-erp-shell] Pulling QuickBooks accounts feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks items feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks ledger_entries feed for fallback sync persistence.
+[future-erp-shell] Pulled 2 QuickBooks accounts resource(s) across 1 page(s).
+[future-erp-shell] Pulled 0 QuickBooks items resource(s) across 1 page(s).
+[future-erp-shell] Pulled 2 QuickBooks ledger_entries resource(s) across 1 page(s).
+
+stderr | tests/future-erp-shell.test.ts > Future ERP shell > persists normalized resource feeds when a retryable required provider page parse failure returns HTTP 500
+[future-erp-shell] QuickBooks full-sync endpoint failed (HTTP 500; entity ledger_entries; object JournalEntry; import batch import_20260624185810_e95940e07bdd0f57; sync job sync_20260624185810_d470c8fb1ecefa14); persisted normalized resource feeds instead.
+[future-erp-shell] Pulling QuickBooks accounts feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks items feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks ledger_entries feed for fallback sync persistence.
+[future-erp-shell] Pulled 2 QuickBooks accounts resource(s) across 1 page(s).
+[future-erp-shell] Pulled 0 QuickBooks items resource(s) across 1 page(s).
+[future-erp-shell] Pulled 2 QuickBooks ledger_entries resource(s) across 1 page(s).
+
+stderr | tests/future-erp-shell.test.ts > Future ERP shell > persists normalized resource feeds when a retryable required provider page parse failure returns HTTP 502
+[future-erp-shell] QuickBooks full-sync endpoint failed (HTTP 502; entity ledger_entries; object JournalEntry; import batch import_20260624185810_e95940e07bdd0f57; sync job sync_20260624185810_d470c8fb1ecefa14); persisted normalized resource feeds instead.
+[future-erp-shell] Pulling QuickBooks accounts feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks items feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks ledger_entries feed for fallback sync persistence.
+[future-erp-shell] Pulled 2 QuickBooks accounts resource(s) across 1 page(s).
+[future-erp-shell] Pulled 0 QuickBooks items resource(s) across 1 page(s).
+[future-erp-shell] Pulled 2 QuickBooks ledger_entries resource(s) across 1 page(s).
+
+stderr | tests/future-erp-shell.test.ts > Future ERP shell > keeps retryable fallback sync successful with provider debit-credit ledger entries
+[future-erp-shell] QuickBooks full-sync endpoint failed (HTTP 500); persisted normalized resource feeds instead.
+[future-erp-shell] Pulling QuickBooks accounts feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks items feed for fallback sync persistence.
+[future-erp-shell] Pulling QuickBooks ledger_entries feed for fallback sync persistence.
+[future-erp-shell] Pulled 2 QuickBooks accounts resource(s) across 1 page(s).
+[future-erp-shell] Pulled 0 QuickBooks items resource(s) across 1 page(s).
+[future-erp-shell] Pulled 2 QuickBooks ledger_entries resource(s) across 1 page(s).
+
+ ✓ tests/future-erp-shell.test.ts (97 tests) 616ms
+stdout | tests/seed-administrator.test.ts
+Verified candidate SDK 0.3.132
+
+ ✓ tests/seed-administrator.test.ts (4 tests | 1 skipped) 342ms
+   ✓ seeded administrator > creates, safely reruns, and rotates the configured credential  335ms
+
+ Test Files  2 passed (2)
+      Tests  100 passed | 1 skipped (101)
+   Start at  03:57:46
+   Duration  3.62s (transform 1.53s, setup 1.52s, collect 748ms, tests 958ms, environment 0ms, prepare 113ms)
+

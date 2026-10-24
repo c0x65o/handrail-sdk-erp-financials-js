@@ -1,0 +1,21 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-0gJlWm/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (346 tests | 337 skipped) 9703ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases 20.00 and explicitly reapplies 10.00  949ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases 100.00 and explicitly reapplies 80.00  873ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction void preserves funds and replaces held bills without releasing their hold  943ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rejects stale, incomplete, changed and unauthorized plans without writes  1366ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught release interruption  923ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught replacement interruption  995ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught reapply interruption  1175ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught receipt interruption  1175ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught outbox interruption  1146ms
+
+ Test Files  1 passed (1)
+      Tests  9 passed | 337 skipped (346)
+   Start at  15:55:59
+   Duration  12.05s (transform 1.67s, setup 0ms, collect 2.09s, tests 9.70s, environment 0ms, prepare 58ms)
+
+EPHEMERAL POSTGRES REMOVED

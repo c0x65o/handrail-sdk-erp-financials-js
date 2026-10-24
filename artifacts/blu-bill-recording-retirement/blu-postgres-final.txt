@@ -1,0 +1,19 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/blu-phase250-ap-final/epg-JCOiBH/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+TAP version 13
+# LOCAL SDK CANDIDATE ONLY {"root":"/opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal","version":"0.3.182"}
+# Subtest: real AP request, SDK approval and payment share one transaction without legacy financial privileges
+ok 1 - real AP request, SDK approval and payment share one transaction without legacy financial privileges
+  ---
+  duration_ms: 6396.395789
+  type: 'test'
+  ...
+1..1
+# tests 1
+# suites 0
+# pass 1
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 7953.764358
+EPHEMERAL POSTGRES REMOVED

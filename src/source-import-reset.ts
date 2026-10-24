@@ -1,3 +1,4 @@
+import { lockCustomerPaymentCorrectionSource } from "./customer-payment-correction.js";
 import type { PostgresQueryClient } from "./postgres-storage.js";
 
 /**
@@ -78,6 +79,8 @@ export async function resetSourceImportState(
 ): Promise<SanitizedSourceResetCounts> {
   assertResetInput(input);
   await assertExplicitTransaction(client);
+  // Serialize with imports, corrections and collection guards before row locks.
+  await lockCustomerPaymentCorrectionSource(client, input.tenantId, input.sourceId);
 
   const scope = await client.query<ScopeRow>(
     `select source."source_system", source."provider_environment",

@@ -1,0 +1,47 @@
+{
+  "phase": 240,
+  "classification": "progress",
+  "goalComplete": false,
+  "launchReady": false,
+  "version": "0.3.180",
+  "schemaVersion": 49,
+  "baseCommit": "d087ed9d08841b5412ab55dba5000da9ae3ba6c6",
+  "cause": "BLU client loses receipt retry identity across remount; abandoning an uncertain request requires an SDK-authoritative terminal outcome, not a client-only discard.",
+  "changes": [
+    "Public customerPayments.retireCollectionAttempt accepts exact original collection plus same-actor retirement operation.",
+    "Existing committed cash returns original receipt without refund/reversal, including after close; absent cash receives immutable retirement evidence using original collection key.",
+    "Same source/command locks fence delayed collection and direct raw receipt reuse. Independent cash under the same key conflicts. Original invoice posting provenance verifies book/customer/source.",
+    "Payload-bound replay, retirement reason binding, rollback and lost-ack recovery; no schema change."
+  ],
+  "validation": {
+    "postgres": {
+      "pass": 8,
+      "notSelected": 624,
+      "seconds": 10.16,
+      "database": "disposable socket-only PostgreSQL 15.19",
+      "coverage": [
+        "retirement replay/payload mismatches",
+        "committed recovery after settlement/close",
+        "wrong actor/book",
+        "rollback and lost commit acknowledgement",
+        "raw cash conflict and bypass prevention",
+        "post versus retirement race, both start orders",
+        "existing atomic collection and explicit-date regressions"
+      ]
+    },
+    "scopedTypes": "passed including BLU/Core/Future consumer type fixtures",
+    "build": "passed normal TypeScript build",
+    "lint": "passed focused files"
+  },
+  "limitations": [
+    "No public publication or installed BLU SHA/lock upgrade.",
+    "BLU endpoint and durable client recovery not yet implemented.",
+    "No production financial data or provider operations; broader migration/live/scale/full goal requirements outstanding."
+  ],
+  "evidenceSha256": {
+    "postgres-final.txt": "e3f297d11a8f2f2c031280e27d09ed3ef304bc82a6af5a53fc7fe0ca46aa357a",
+    "types-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "build-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "lint-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

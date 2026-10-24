@@ -1,0 +1,42 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-bank-retirement-phase258-final/epg-4p8Vxg/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (673 tests | 643 skipped) 28320ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement fences exact prepare command without changing accounting  865ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement fences exact complete command without changing accounting  879ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement fences exact reopen command without changing accounting  876ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement fences exact cancel command without changing accounting  838ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement recovers accepted prepare historical receipt without writes  871ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement recovers accepted complete historical receipt without writes  935ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement recovers accepted reopen historical receipt without writes  899ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement recovers accepted cancel historical receipt without writes  932ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement remains possible after prepare command becomes stale and fiscal closing begins  841ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement remains possible after complete command becomes stale and fiscal closing begins  914ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement remains possible after reopen command becomes stale and fiscal closing begins  962ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement remains possible after cancel command becomes stale and fiscal closing begins  1051ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement actual lock race: 'prepare', 'retirement' wins  1033ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement actual lock race: 'prepare', 'command' wins  850ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement actual lock race: 'complete', 'retirement' wins  1004ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement actual lock race: 'complete', 'command' wins  843ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement actual lock race: 'reopen', 'retirement' wins  1043ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement actual lock race: 'reopen', 'command' wins  853ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement actual lock race: 'cancel', 'retirement' wins  1134ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement actual lock race: 'cancel', 'command' wins  860ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement rolls back its receipt and recovers a lost commit acknowledgement  1071ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement snapshots caller-owned payload before waiting  1088ms
+   ✓ ERP Financials real PostgreSQL > bank statement retirement survives actual backend termination before commit  1185ms
+   ✓ ERP Financials real PostgreSQL > bank statements own exact balances, completion and outstanding carryover without posting money  999ms
+   ✓ ERP Financials real PostgreSQL > bank statements list current receipts in bounded scope-bound pages including cancelled replacements  914ms
+   ✓ ERP Financials real PostgreSQL > bank statements roll back, snapshot commands and guard evidence against unversioned writes  1026ms
+   ✓ ERP Financials real PostgreSQL > bank statements cancel drafts to unwind dependencies while preserving historical receipts  820ms
+   ✓ ERP Financials real PostgreSQL > bank statements preserve money beyond safe integer cents and cancel selected drafts atomically  988ms
+   ✓ ERP Financials real PostgreSQL > bank statements serialize completion against fiscal close when complete wins  859ms
+   ✓ ERP Financials real PostgreSQL > bank statements serialize completion against fiscal close when close wins  770ms
+
+ Test Files  1 passed (1)
+      Tests  30 passed | 643 skipped (673)
+   Start at  19:41:17
+   Duration  31.46s (transform 2.36s, setup 0ms, collect 2.90s, tests 28.32s, environment 0ms, prepare 65ms)
+
+EPHEMERAL POSTGRES REMOVED

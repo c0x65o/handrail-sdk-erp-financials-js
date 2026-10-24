@@ -1,0 +1,63 @@
+{
+  "status": "locally_verified",
+  "baseCommit": "660993085fb0669d70c5fe35fe74ec4e1143ea71",
+  "version": "0.3.108",
+  "schemaVersion": 38,
+  "published": false,
+  "observedDefects": [
+    {
+      "behavior": "A different reporting book bound to the same native source could void the original bill.",
+      "proof": "before.log: expected scope_mismatch, received successful voided result in real PostgreSQL.",
+      "cause": "The lifecycle loader checked tenant/company/source and vendor-bill type but omitted original posting-book provenance."
+    },
+    {
+      "behavior": "Vendor-bill lifecycle loading failed with mixed accounting basis after an application added cash-recognition postings.",
+      "proof": "targeted.log: partial/full applied bill corrections failed invalid_input (mixed journal basis) before lifecycle validation. Native application/unapplication retains original cash posting evidence; targeted-fixed and final regression verify correction after unapplication.",
+      "cause": "The loader collected every basis associated with the original transaction, although native bill liability is posted on accrual and application cash recognition has its own reversal lifecycle."
+    }
+  ],
+  "changes": [
+    "Require original ledger.posted outbox identity/book to match correction context before writes and replay; lookup uses existing scoped unique idempotency index. No new schema.",
+    "Reverse only original accrual vendor-bill postings. Active applications still reject; after authorized unapplication, replacement uses current version and preserves available cash payment.",
+    "Version/package lock0.3.108 and public correction documentation; no public API signature change."
+  ],
+  "checks": {
+    "serviceUnit": {
+      "passed": 37,
+      "failed": 0,
+      "log": "unit.log"
+    },
+    "postgres": {
+      "passed": 20,
+      "failed": 0,
+      "intentionallyUnselected": 302,
+      "log": "regression-postgres.log",
+      "coverage": [
+        "wrong-book and wrong-currency rejection without writes",
+        "correct-book void/replace and exact replay",
+        "partial/full payment applications block correction",
+        "after unapplication: original accrual compensated, cash postings unchanged, payment evidence/open credit preserved",
+        "original version/payload/audit retries and input snapshots",
+        "administrator-grant preservation",
+        "vendor bill register, imported credits, line customer provenance, rollback, account policy and concurrency"
+      ]
+    },
+    "typecheck": "full SDK passed",
+    "lint": "full SDK passed",
+    "build": "passed",
+    "consumerImportTypechecks": [
+      "BLU passed",
+      "Core ERP passed",
+      "Future ERP passed"
+    ]
+  },
+  "limitations": [
+    "Only selected PostgreSQL tests executed for this checkpoint; no claim that all322 source integration tests or the whole SDK suite were rerun.",
+    "Consumer import fixtures are not full consumer application regression.",
+    "BLU posted-bill correction operator workflow and independent approval integration remain outstanding.",
+    "Concurrent payment/correction ordering and complete applied-correction orchestration need further acceptance tests; existing active-application rejection and explicit unapplication are verified here.",
+    "Bill-payment and adjustment correction scope/replay paths were inspected but not changed by this vendor-bill fix.",
+    "Existing hold/deposit provenance lookups still use aggregate filters; this new correction lookup is indexed, but no new million-entry measurement was made.",
+    "SDK publication403 and native invalid_recovery_target remain unresolved; no push/dependency installation/production writes/deployment attempted."
+  ]
+}

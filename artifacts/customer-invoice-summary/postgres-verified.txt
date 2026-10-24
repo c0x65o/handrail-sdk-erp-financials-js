@@ -1,0 +1,16 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-customer-summary-231d/epg-KR3Xv9/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (626 tests | 622 skipped) 4495ms
+   ✓ ERP Financials real PostgreSQL > invoice register pages share global summaries and reject changed scope, filters, deliveries and draft lines  944ms
+   ✓ ERP Financials real PostgreSQL > customer invoice summary batches preserve register settlement without lines or foreign-customer reads  1019ms
+   ✓ ERP Financials real PostgreSQL > invoice register page presentation preserves delivery precedence, customer names and all financial status filters  1290ms
+   ✓ ERP Financials real PostgreSQL > invoice register pages retain one financial snapshot during concurrent application changes  1108ms
+
+ Test Files  1 passed (1)
+      Tests  4 passed | 622 skipped (626)
+   Start at  15:31:26
+   Duration  7.41s (transform 2.08s, setup 0ms, collect 2.67s, tests 4.49s, environment 0ms, prepare 74ms)
+
+EPHEMERAL POSTGRES REMOVED

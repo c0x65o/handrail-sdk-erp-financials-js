@@ -1,0 +1,16 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-default-pool-phase259-verified/epg-B4ho4r/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (677 tests | 673 skipped) 3451ms
+   ✓ ERP Financials real PostgreSQL > default SDK pool boundary survives real backend termination through facade  800ms
+   ✓ ERP Financials real PostgreSQL > default SDK pool boundary survives real backend termination through runner  818ms
+   ✓ ERP Financials real PostgreSQL > default SDK pool boundary preserves uncertain commit and recovers exact statement through facade  886ms
+   ✓ ERP Financials real PostgreSQL > default SDK pool boundary preserves uncertain commit and recovers exact statement through runner  847ms
+
+ Test Files  1 passed (1)
+      Tests  4 passed | 673 skipped (677)
+   Start at  19:51:05
+   Duration  6.07s (transform 1.91s, setup 0ms, collect 2.39s, tests 3.45s, environment 0ms, prepare 57ms)
+
+EPHEMERAL POSTGRES REMOVED

@@ -1,0 +1,15 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-financials-goal-tests/epg-jWQrHC/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (505 tests | 502 skipped) 2700ms
+   ✓ ERP Financials real PostgreSQL > payment holds upgrade schema 31 without rewriting existing financial facts  721ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation migration preserves history and refuses detached legacy settlement (detached=false)  936ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation migration preserves history and refuses detached legacy settlement (detached=true)  957ms
+
+ Test Files  1 passed (1)
+      Tests  3 passed | 502 skipped (505)
+   Start at  03:52:34
+   Duration  5.81s (transform 2.29s, setup 0ms, collect 2.81s, tests 2.70s, environment 0ms, prepare 97ms)
+
+EPHEMERAL POSTGRES REMOVED

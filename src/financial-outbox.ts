@@ -7,6 +7,8 @@ import type { IsoDateTime, JsonValue } from "./canonical-model.js";
 import type { ErpFinancialsTransactionRunner } from "./erp-financials-service.js";
 import type { PostgresQueryClient } from "./postgres-storage.js";
 
+export const FINANCIAL_OUTBOX_MAX_PAYLOAD_BYTES = 4096;
+
 export type FinancialOutboxStatus = "pending" | "processing" | "published" | "failed";
 
 export type FinancialOutboxEvent = {
@@ -45,8 +47,13 @@ export function createFinancialOutboxService(input: {
   readonly tenantId: string;
   readonly companyId: string;
   readonly bookId?: string;
+  /** Optional independent source consumer. Omission preserves company/book delivery. */
+  readonly sourceId?: string;
   readonly now?: () => IsoDateTime;
 }): FinancialOutboxService {
+  if (input.sourceId !== undefined && (typeof input.sourceId !== "string" || !input.sourceId.trim())) {
+    throw new ErpFinancialsError("invalid_input", "Outbox sourceId must be nonempty when provided");
+  }
   const now = input.now ?? (() => new Date().toISOString());
   return {
     claim: (request = {}) => claimEvents(input.database, input, now, request),
@@ -72,7 +79,7 @@ export async function appendFinancialOutboxEvent(
 ): Promise<string> {
   assertNoCredentialKeys(input.payload);
   const serialized = JSON.stringify(input.payload);
-  if (Buffer.byteLength(serialized, "utf8") > 4096) {
+  if (Buffer.byteLength(serialized, "utf8") > FINANCIAL_OUTBOX_MAX_PAYLOAD_BYTES) {
     throw new ErpFinancialsError("invalid_input", "Financial outbox payload exceeds 4096 bytes");
   }
   const outboxEventId = stableId("outbox", input.tenantId, input.companyId, input.sourceId, input.idempotencyKey);
@@ -137,7 +144,7 @@ for key share`,
 
 async function claimEvents(
   database: ErpFinancialsTransactionRunner,
-  scope: { readonly tenantId: string; readonly companyId: string; readonly bookId?: string },
+  scope: { readonly tenantId: string; readonly companyId: string; readonly bookId?: string; readonly sourceId?: string },
   now: () => IsoDateTime,
   input: { readonly limit?: number; readonly leaseSeconds?: number }
 ): Promise<readonly FinancialOutboxEvent[]> {
@@ -156,6 +163,7 @@ async function claimEvents(
   from "erp_financials"."financial_outbox"
   where "tenant_id" = $1 and "company_id" = $2
     and ($3::text is null or "book_id" = $3)
+    and ($7::text is null or "source_id" = $7)
     and "available_at" <= $4::timestamptz
     and ("status" in ('pending', 'failed') or ("status" = 'processing' and "lease_expires_at" <= $4::timestamptz))
   order by "created_at", "outbox_event_id"
@@ -168,7 +176,7 @@ set "status" = 'processing', "attempt_count" = "attempt_count" + 1,
 from claimable
 where outbox."outbox_event_id" = claimable."outbox_event_id"
 returning outbox.*`,
-      [scope.tenantId, scope.companyId, scope.bookId, now(), limit, leaseSeconds]
+      [scope.tenantId, scope.companyId, scope.bookId, now(), limit, leaseSeconds, scope.sourceId]
     );
     return result.rows.map(outboxEventFromRow);
   });
@@ -176,7 +184,7 @@ returning outbox.*`,
 
 async function markPublished(
   database: ErpFinancialsTransactionRunner,
-  scope: { readonly tenantId: string; readonly companyId: string; readonly bookId?: string },
+  scope: { readonly tenantId: string; readonly companyId: string; readonly bookId?: string; readonly sourceId?: string },
   now: () => IsoDateTime,
   outboxEventId: string
 ): Promise<void> {
@@ -185,8 +193,9 @@ async function markPublished(
       `update "erp_financials"."financial_outbox"
 set "status" = 'published', "published_at" = $5, "lease_expires_at" = null, "last_error" = null
 where "tenant_id" = $1 and "company_id" = $2 and ($3::text is null or "book_id" = $3)
-  and "outbox_event_id" = $4 and "status" = 'processing'`,
-      [scope.tenantId, scope.companyId, scope.bookId, outboxEventId, now()]
+  and "outbox_event_id" = $4 and "status" = 'processing'
+  and ($6::text is null or "source_id" = $6)`,
+      [scope.tenantId, scope.companyId, scope.bookId, outboxEventId, now(), scope.sourceId]
     );
     if (result.rowCount !== 1) {
       throw new ErpFinancialsError("terminal_state_conflict", `Outbox event ${outboxEventId} is not processing`);
@@ -196,7 +205,7 @@ where "tenant_id" = $1 and "company_id" = $2 and ($3::text is null or "book_id" 
 
 async function markFailed(
   database: ErpFinancialsTransactionRunner,
-  scope: { readonly tenantId: string; readonly companyId: string; readonly bookId?: string },
+  scope: { readonly tenantId: string; readonly companyId: string; readonly bookId?: string; readonly sourceId?: string },
   now: () => IsoDateTime,
   input: { readonly outboxEventId: string; readonly error: string; readonly retryAt?: IsoDateTime; readonly terminal?: boolean }
 ): Promise<void> {
@@ -205,14 +214,16 @@ async function markFailed(
       `update "erp_financials"."financial_outbox"
 set "status" = 'failed', "available_at" = $5, "lease_expires_at" = null, "last_error" = $6
 where "tenant_id" = $1 and "company_id" = $2 and ($3::text is null or "book_id" = $3)
-  and "outbox_event_id" = $4 and "status" = 'processing'`,
+  and "outbox_event_id" = $4 and "status" = 'processing'
+  and ($7::text is null or "source_id" = $7)`,
       [
         scope.tenantId,
         scope.companyId,
         scope.bookId,
         input.outboxEventId,
         input.terminal === true ? "9999-12-31T23:59:59.999Z" : (input.retryAt ?? now()),
-        input.error.slice(0, 2000)
+        input.error.slice(0, 2000),
+        scope.sourceId
       ]
     );
     if (result.rowCount !== 1) {

@@ -1,0 +1,18 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-financials-goal-tests/epg-2AClNL/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (502 tests | 496 skipped) 8210ms
+   ✓ ERP Financials real PostgreSQL > explicit invoice components preserve tax and discount postings through receipts, unapply, and cancellation  1516ms
+   ✓ ERP Financials real PostgreSQL > invoice component policies reject missing, inactive, wrong-role and foreign accounts atomically and retain exact historical replay  1529ms
+   ✓ ERP Financials real PostgreSQL > explicit invoice component partial cash return previews and posts without cancelling the sale or duplicating a retry  1400ms
+   ✓ ERP Financials real PostgreSQL > invoice component migration upgrades populated schema42 atomically and preserves old draft economics  1192ms
+   ✓ ERP Financials real PostgreSQL > invoice register revision migration upgrades populated schema41 atomically without rewriting financial facts  1196ms
+   ✓ ERP Financials real PostgreSQL > overdue invoice schema upgrade is atomic and preserves facts and unrelated date guards  1218ms
+
+ Test Files  1 passed (1)
+      Tests  6 passed | 496 skipped (502)
+   Start at  03:29:32
+   Duration  11.16s (transform 2.18s, setup 0ms, collect 2.67s, tests 8.21s, environment 0ms, prepare 80ms)
+
+EPHEMERAL POSTGRES REMOVED

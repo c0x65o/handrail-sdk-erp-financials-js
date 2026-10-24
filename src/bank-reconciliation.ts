@@ -1,4 +1,5 @@
-import { assertFinancialApproval, financialApprovalAudit, runFinancialAction, type FinancialApprovalPolicy } from "./financial-approval-policy.js";
+import { lockCustomerPaymentCorrectionSource } from "./customer-payment-correction.js";
+import { assertFinancialApproval, copyFinancialOperation, runFinancialAction, type FinancialApprovalPolicy } from "./financial-approval-policy.js";
 import { createHash } from "node:crypto";
 
 import { assertSafeSourcePayloadRef } from "./canonical-model.js";
@@ -113,6 +114,7 @@ export function createBankReconciliationService(input: {
 }
 
 async function ingest(scope: Scope, input: IngestBankStatementLineInput): Promise<BankStatementLineResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialOperationContext(input.operation);
   assertNonEmpty(input.externalLineId, "externalLineId");
   assertNonEmpty(input.bankAccountId, "bankAccountId");
@@ -122,7 +124,8 @@ async function ingest(scope: Scope, input: IngestBankStatementLineInput): Promis
   assertCurrency(scope, currencyCode);
   if (input.sourcePayloadRef !== undefined) assertSafeSourcePayloadRef(input.sourcePayloadRef);
   const bankStatementLineId = stableId("bank_line", scope.tenantId, scope.companyId, scope.bookId, input.externalLineId);
-  return scope.database.transaction(async (client) => {
+  return bankTransaction(scope, async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, scope.tenantId, scope.sourceId);
     await assertBankScope(client, scope, input.bankAccountId);
     const result = await client.query(
       `insert into "erp_financials"."bank_statement_lines" (
@@ -130,7 +133,7 @@ async function ingest(scope: Scope, input: IngestBankStatementLineInput): Promis
   "posted_date", "amount", "currency_code", "description", "reference", "status", "version", "source_payload_ref",
   "created_at", "updated_at"
 ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'unmatched', 1, $13, $14, $14)
-on conflict ("tenant_id", "company_id", "book_id", "external_line_id") do nothing returning *`,
+on conflict ("tenant_id", "company_id", "book_id", "external_line_id") do nothing returning *, "posted_date"::text as "posted_date"`,
       [bankStatementLineId, scope.tenantId, scope.companyId, scope.bookId, scope.sourceId, input.bankAccountId,
         input.externalLineId, input.postedDate, amount, currencyCode, input.description, input.reference,
         input.sourcePayloadRef === undefined ? undefined : JSON.stringify(input.sourcePayloadRef), scope.now()]
@@ -138,11 +141,11 @@ on conflict ("tenant_id", "company_id", "book_id", "external_line_id") do nothin
     let row = result.rows[0];
     if (row === undefined) {
       const existing = await client.query(
-        `select * from "erp_financials"."bank_statement_lines"
+        `select *, "posted_date"::text as "posted_date" from "erp_financials"."bank_statement_lines"
 where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "external_line_id" = $4 for key share`,
         [scope.tenantId, scope.companyId, scope.bookId, input.externalLineId]
       );
-      row = requiredRow(existing.rows[0], "bank statement line");
+      row = sourceRow(existing.rows[0], scope, "bank statement line");
       if (row.bank_statement_line_id !== bankStatementLineId || row.bank_account_id !== input.bankAccountId ||
         date(row.posted_date, "posted_date") !== input.postedDate || money(row.amount, "amount") !== amount ||
         row.currency_code !== currencyCode || optionalString(row.description) !== input.description ||
@@ -151,11 +154,11 @@ where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "external_li
         throw new ErpFinancialsError("idempotency_conflict", `Bank line ${input.externalLineId} already has different content`);
       }
     }
-    const lifecycleEvent = await appendFinancialLifecycleEvent(client, lifecycle(scope, input.operation, {
+    const lifecycleEvent = await appendFinancialLifecycleEvent(client, { ...lifecycle(scope, input.operation, {
       aggregateType: "bank_statement_line", aggregateId: bankStatementLineId,
       eventType: "bank_statement_line.ingested", idempotencyKey: `bank-line:${input.externalLineId}:ingested`,
       payload: { amount, bankAccountId: input.bankAccountId, postedDate: input.postedDate }
-    }));
+    }), allowTransportReplay: true });
     await outbox(client, scope, "bank_statement_line.ingested", "bank_statement_line", bankStatementLineId,
       `bank-line:${input.externalLineId}:outbox:ingested`, { amount, bankStatementLineId });
     void lifecycleEvent;
@@ -164,6 +167,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "external_li
 }
 
 async function match(scope: Scope, input: MatchBankStatementLineInput): Promise<BankReconciliationMatchResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialOperationContext(input.operation);
   assertVersion(input.expectedVersion);
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
@@ -175,26 +179,34 @@ async function match(scope: Scope, input: MatchBankStatementLineInput): Promise<
     throw new ErpFinancialsError("authorization_context_invalid", "Manual reconciliation requires an actorRef");
   }
   const matchId = stableId("bank_match", scope.tenantId, scope.companyId, scope.bookId, input.idempotencyKey);
-  return scope.database.transaction(async (client) => {
+  const commandChecksum = bankMatchCommandChecksum(scope, input);
+  return bankTransaction(scope, async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, scope.tenantId, scope.sourceId);
     const existing = await client.query(
       `select * from "erp_financials"."bank_reconciliation_matches"
 where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "idempotency_key" = $4 for key share`,
       [scope.tenantId, scope.companyId, scope.bookId, input.idempotencyKey]
     );
     if (existing.rows[0] !== undefined) {
-      const row = existing.rows[0];
-      if (row.bank_statement_line_id !== input.bankStatementLineId || row.transaction_id !== input.transactionId || row.method !== input.method) {
+      const row = sourceRow(existing.rows[0], scope, "bank reconciliation match");
+      if (row.bank_reconciliation_match_id !== matchId || row.bank_statement_line_id !== input.bankStatementLineId || row.transaction_id !== input.transactionId || row.method !== input.method) {
         throw new ErpFinancialsError("idempotency_conflict", `Reconciliation key ${input.idempotencyKey} has different content`);
       }
       if (row.status !== "matched") throw new ErpFinancialsError("terminal_state_conflict", `Reconciliation match is ${String(row.status)}`);
+      const evidence=await bankEvent(client,scope,string(row.lifecycle_event_id,"lifecycle_event_id"));
+      if(evidence.payload.commandVersion!==1 || typeof evidence.payload.commandChecksum!=="string" || typeof evidence.payload.expectedVersion!=="number") {
+        throw new ErpFinancialsError("unsupported_operation", "Historical bank match lacks its original command version evidence; reconcile retained facts instead of inventing a version or posting a new match");
+      }
+      assertBankReplay(evidence, input.operation, "bank_reconciliation_match", matchId, "bank_reconciliation.matched", `bank-match:${input.idempotencyKey}:matched`);
+      if(evidence.payload.commandChecksum!==commandChecksum || evidence.payload.expectedVersion!==input.expectedVersion)throw bankReplayConflict();
       return matchResult(row, "already_matched");
     }
     const lineResult = await client.query(
-      `select * from "erp_financials"."bank_statement_lines"
+      `select *, "posted_date"::text as "posted_date" from "erp_financials"."bank_statement_lines"
 where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "bank_statement_line_id" = $4 for update`,
       [scope.tenantId, scope.companyId, scope.bookId, input.bankStatementLineId]
     );
-    const line = requiredRow(lineResult.rows[0], "bank statement line");
+    const line = sourceRow(lineResult.rows[0], scope, "bank statement line");
     if (line.status !== "unmatched") throw new ErpFinancialsError("reconciliation_conflict", `Bank line is already ${String(line.status)}`);
     if (integer(line.version, "version") !== input.expectedVersion) throw concurrency(input.bankStatementLineId, input.expectedVersion);
     const transactionResult = await client.query(
@@ -205,9 +217,13 @@ join "erp_financials"."ledger_postings" posting
   on posting."tenant_id" = transaction."tenant_id" and posting."source_id" = transaction."source_id" and posting."transaction_id" = transaction."transaction_id"
 where transaction."tenant_id" = $1 and transaction."source_id" = $2 and transaction."transaction_id" = $3
   and transaction."status" = 'posted' and posting."currency_code" = $4
+  and posting."accounting_basis" = (
+    select book."accounting_basis" from "erp_financials"."reporting_books" book
+    where book."tenant_id" = $1 and book."company_id" = $6 and book."book_id" = $7 and book."status" = 'active'
+  )
 group by transaction."transaction_id", transaction."currency_code", transaction."transaction_date"
 `,
-      [scope.tenantId, scope.sourceId, input.transactionId, scope.currencyCode, line.bank_account_id]
+      [scope.tenantId, scope.sourceId, input.transactionId, scope.currencyCode, line.bank_account_id, scope.companyId, scope.bookId]
     );
     const transaction = transactionResult.rows[0];
     if (transaction === undefined) throw new ErpFinancialsError("missing_document", `Transaction ${input.transactionId} does not exist in the bank line source`);
@@ -219,7 +235,7 @@ group by transaction."transaction_id", transaction."currency_code", transaction.
     const lifecycleEvent = await appendFinancialLifecycleEvent(client, lifecycle(scope, input.operation, {
       aggregateType: "bank_reconciliation_match", aggregateId: matchId,
       eventType: "bank_reconciliation.matched", idempotencyKey: `bank-match:${input.idempotencyKey}:matched`,
-      payload: { bankStatementLineId: input.bankStatementLineId, method: input.method, transactionId: input.transactionId }
+      payload: { bankStatementLineId: input.bankStatementLineId, method: input.method, transactionId: input.transactionId, commandVersion: 1, commandChecksum, expectedVersion: input.expectedVersion }
     }));
     const inserted = await client.query(
       `insert into "erp_financials"."bank_reconciliation_matches" (
@@ -247,16 +263,23 @@ async function unmatch(
   scope: Scope,
   input: { readonly operation: FinancialOperationContext; readonly bankReconciliationMatchId: string; readonly expectedVersion: number }
 ): Promise<BankReconciliationMatchResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialApproval(scope, input.operation);
   assertVersion(input.expectedVersion);
-  return scope.database.transaction(async (client) => {
+  return bankTransaction(scope, async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, scope.tenantId, scope.sourceId);
     const result = await client.query(
       `select * from "erp_financials"."bank_reconciliation_matches"
 where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "bank_reconciliation_match_id" = $4 for update`,
       [scope.tenantId, scope.companyId, scope.bookId, input.bankReconciliationMatchId]
     );
-    const row = requiredRow(result.rows[0], "bank reconciliation match");
-    if (row.status === "unmatched") return matchResult(row, "unmatched");
+    const row = sourceRow(result.rows[0], scope, "bank reconciliation match");
+    if (row.status === "unmatched") {
+      const evidence=await bankEvent(client,scope,string(row.lifecycle_event_id,"lifecycle_event_id"));
+      assertBankReplay(evidence,input.operation,"bank_reconciliation_match",input.bankReconciliationMatchId,"bank_reconciliation.unmatched",`bank-match:${input.bankReconciliationMatchId}:unmatched:v${String(input.expectedVersion)}`);
+      if(evidence.payload.priorVersion!==input.expectedVersion || evidence.payload.bankStatementLineId!==row.bank_statement_line_id || integer(row.version,"version")!==input.expectedVersion+1)throw bankReplayConflict();
+      return matchResult(row, "unmatched");
+    }
     if (row.status !== "matched") throw new ErpFinancialsError("terminal_state_conflict", `Reconciliation match is ${String(row.status)}`);
     if (integer(row.version, "version") !== input.expectedVersion) throw concurrency(input.bankReconciliationMatchId, input.expectedVersion);
     const lifecycleEvent = await appendFinancialLifecycleEvent(client, lifecycle(scope, input.operation, {
@@ -290,34 +313,35 @@ async function ignore(
   scope: Scope,
   input: { readonly operation: FinancialOperationContext; readonly bankStatementLineId: string; readonly expectedVersion: number }
 ): Promise<BankStatementLineResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialApproval(scope, input.operation);
   assertVersion(input.expectedVersion);
-  return scope.database.transaction(async (client) => {
-    if (financialApprovalAudit(client, scope, input.operation) !== undefined) {
-      const locked = await client.query(
-        `select * from "erp_financials"."bank_statement_lines"
+  return bankTransaction(scope, async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, scope.tenantId, scope.sourceId);
+    const locked = await client.query(
+      `select *, "posted_date"::text as "posted_date" from "erp_financials"."bank_statement_lines"
 where "tenant_id"=$1 and "company_id"=$2 and "book_id"=$3 and "bank_statement_line_id"=$4 and "source_id"=$5 for update`,
-        [scope.tenantId, scope.companyId, scope.bookId, input.bankStatementLineId, scope.sourceId]
-      );
-      const line = requiredRow(locked.rows[0], "bank statement line");
-      const event = await appendFinancialLifecycleEvent(client, lifecycle(scope, input.operation, {
-        aggregateType: "bank_statement_line", aggregateId: input.bankStatementLineId,
-        eventType: "bank_statement_line.ignored",
-        idempotencyKey: `bank-line:${input.bankStatementLineId}:ignored:v${String(input.expectedVersion)}`,
-        payload: { priorVersion: input.expectedVersion }
-      }));
-      if (event.status === "already_recorded") {
-        if (line.status !== "ignored" || integer(line.version, "version") !== input.expectedVersion + 1) {
-          throw new ErpFinancialsError("idempotency_conflict", "Confirmed ignore no longer has its stable resulting state");
-        }
-        return bankLineResult(line);
-      }
+      [scope.tenantId,scope.companyId,scope.bookId,input.bankStatementLineId,scope.sourceId]
+    );
+    const current=locked.rows[0];
+    if(!current)throw new ErpFinancialsError("reconciliation_conflict", "Only an unmatched bank line in this source can be ignored");
+    // A versioned ignore receipt remains authoritative after a reopen. Look it
+    // up before treating an unmatched current row as a new command opportunity.
+    const event=(await client.query(`select event_id from erp_financials.financial_lifecycle_events
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+    [scope.tenantId,scope.companyId,scope.sourceId,`bank-line:${input.bankStatementLineId}:ignored:v${String(input.expectedVersion)}`])).rows[0];
+    if(event||current.status==="ignored"){
+      if(!event)throw bankReplayConflict();
+      const evidence=await bankEvent(client,scope,string(event.event_id,"event_id"));
+      assertBankReplay(evidence,input.operation,"bank_statement_line",input.bankStatementLineId,"bank_statement_line.ignored",`bank-line:${input.bankStatementLineId}:ignored:v${String(input.expectedVersion)}`);
+      if(evidence.payload.priorVersion!==input.expectedVersion || current.status!=="ignored" || integer(current.version,"version")!==input.expectedVersion+1)throw bankReplayConflict();
+      return bankLineResult(current);
     }
     const result = await client.query(
       `update "erp_financials"."bank_statement_lines" set "status" = 'ignored', "version" = "version" + 1, "updated_at" = $5
 where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "bank_statement_line_id" = $4
-  and "status" = 'unmatched' and "version" = $6 returning *`,
-      [scope.tenantId, scope.companyId, scope.bookId, input.bankStatementLineId, scope.now(), input.expectedVersion]
+  and "status" = 'unmatched' and "version" = $6 and "source_id" = $7 returning *, "posted_date"::text as "posted_date"`,
+      [scope.tenantId, scope.companyId, scope.bookId, input.bankStatementLineId, scope.now(), input.expectedVersion, scope.sourceId]
     );
     const row = result.rows[0];
     if (row === undefined) throw new ErpFinancialsError("reconciliation_conflict", "Only an unmatched bank line at the expected version can be ignored");
@@ -336,6 +360,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "bank_statem
 }
 
 async function unignore(scope: Scope, input: UnignoreBankStatementLineInput): Promise<BankStatementLineResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialApproval(scope, input.operation);
   if (input.operation.reasonDetail === undefined) {
     throw new ErpFinancialsError(
@@ -350,13 +375,14 @@ async function unignore(scope: Scope, input: UnignoreBankStatementLineInput): Pr
     priorVersion: input.expectedVersion,
     resultingVersion: input.expectedVersion + 1
   } as const;
-  return scope.database.transaction(async (client) => {
+  return bankTransaction(scope, async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, scope.tenantId, scope.sourceId);
     const result = await client.query(
-      `select * from "erp_financials"."bank_statement_lines"
+      `select *, "posted_date"::text as "posted_date" from "erp_financials"."bank_statement_lines"
 where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "bank_statement_line_id" = $4 for update`,
       [scope.tenantId, scope.companyId, scope.bookId, input.bankStatementLineId]
     );
-    const row = requiredRow(result.rows[0], "bank statement line");
+    const row = sourceRow(result.rows[0], scope, "bank statement line");
     const lifecycleEvent = await appendFinancialLifecycleEvent(client, lifecycle(scope, input.operation, {
       aggregateType: "bank_statement_line",
       aggregateId: input.bankStatementLineId,
@@ -392,7 +418,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "bank_statem
       `update "erp_financials"."bank_statement_lines"
 set "status" = 'unmatched', "version" = "version" + 1, "updated_at" = $5
 where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "bank_statement_line_id" = $4
-  and "status" = 'ignored' and "version" = $6 returning *`,
+  and "status" = 'ignored' and "version" = $6 returning *, "posted_date"::text as "posted_date"`,
       [scope.tenantId, scope.companyId, scope.bookId, input.bankStatementLineId, scope.now(), input.expectedVersion]
     );
     const reopened = updated.rows[0];
@@ -408,6 +434,46 @@ where "tenant_id" = $1 and "company_id" = $2 and "book_id" = $3 and "bank_statem
     );
     return bankLineResult(reopened);
   });
+}
+
+/** Preserve command atomicity when a host catches an error inside a larger
+ * transaction. Never leave a bank row without its audit/outbox evidence. */
+async function bankTransaction<Result>(scope: Scope, work:(client:PostgresQueryClient)=>Promise<Result>):Promise<Result>{
+  return scope.database.transaction(async client=>{
+    await client.query("savepoint erp_bank_command");
+    try{const result=await work(client);await client.query("release savepoint erp_bank_command");return result;}
+    catch(error){await client.query("rollback to savepoint erp_bank_command");await client.query("release savepoint erp_bank_command");throw error;}
+  });
+}
+
+function bankMatchCommandChecksum(scope:Scope,input:MatchBankStatementLineInput):string{
+  return createHash("sha256").update(stableJson({commandVersion:1,tenantId:scope.tenantId,companyId:scope.companyId,sourceId:scope.sourceId,
+    bookId:scope.bookId,currencyCode:scope.currencyCode,idempotencyKey:input.idempotencyKey,bankStatementLineId:input.bankStatementLineId,
+    transactionId:input.transactionId,method:input.method,expectedVersion:input.expectedVersion,
+    actorRef:input.operation.actorRef,approverRef:input.operation.approverRef??null,reasonCode:input.operation.reasonCode,reasonDetail:input.operation.reasonDetail??null})).digest("hex");
+}
+
+type BankEventEvidence={event:Record<string,unknown>;payload:Readonly<Record<string,import("./canonical-model.js").JsonValue>>};
+async function bankEvent(client:PostgresQueryClient,scope:Scope,eventId:string):Promise<BankEventEvidence>{
+  const event=(await client.query(`select aggregate_type,aggregate_id,event_type,idempotency_key,actor_ref,approver_ref,reason_code,reason_detail,payload
+    from erp_financials.financial_lifecycle_events where tenant_id=$1 and company_id=$2 and source_id=$3 and event_id=$4 for key share`,
+  [scope.tenantId,scope.companyId,scope.sourceId,eventId])).rows[0];
+  const raw=parsedOptionalJson(event?.payload);
+  if(!event || raw===undefined || raw===null || typeof raw!=="object" || Array.isArray(raw))throw new ErpFinancialsError("unsupported_operation","Retained bank command evidence is missing");
+  return {event,payload:raw as Readonly<Record<string,import("./canonical-model.js").JsonValue>>};
+}
+function bankReplayConflict():ErpFinancialsError{return new ErpFinancialsError("idempotency_conflict","Bank command differs from its retained original intent");}
+function assertBankReplay({event}:BankEventEvidence,operation:FinancialOperationContext,aggregateType:string,aggregateId:string,eventType:string,key:string):void{
+  if(event.aggregate_type!==aggregateType || event.aggregate_id!==aggregateId || event.event_type!==eventType || event.idempotency_key!==key ||
+    event.actor_ref!==operation.actorRef || (event.approver_ref??null)!==(operation.approverRef??null) ||
+    event.reason_code!==operation.reasonCode || (event.reason_detail??null)!==(operation.reasonDetail??null))throw bankReplayConflict();
+}
+
+/** A reporting book may contain multiple sources; its write facade must never
+ * mutate (or acknowledge a replay of) another source's reconciliation facts. */
+function sourceRow(row: Readonly<Record<string, unknown>> | undefined, scope: Scope, label: string) {
+  if (row?.source_id !== scope.sourceId) throw new ErpFinancialsError("missing_document", `${label} does not exist in the selected source`);
+  return row;
 }
 
 async function assertBankScope(client: PostgresQueryClient, scope: Scope, accountId: string): Promise<void> {

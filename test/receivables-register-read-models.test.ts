@@ -143,7 +143,7 @@ class CustomerPaymentRegisterClient implements PostgresQueryClient {
         payment_id: "payment_1", source_id: "source_1", document_type: "customer_payment",
         transaction_id: "transaction_1", party_id: "party_1", party_name: "Acme",
         document_number: "PAY-1", document_date: "2026-08-20", currency_code: "USD",
-        original_amount: "100", open_amount: "49.08", version: 1, lifecycle_event_id: "event_1",
+        original_amount: "100", open_amount: "49.08", returned_amount: "0", version: 1, lifecycle_event_id: "event_1",
         application_count: 1, payment_method: "ACH", applied_to: "INV-42", matching_mode: "automatic",
         match_label: "Automatically matched", payment_status: "partial", sort_key: "100"
       }]);
@@ -161,7 +161,7 @@ class CustomerPaymentRegisterClient implements PostgresQueryClient {
     if (sql.includes('as "received_amount"')) {
       this.totalsSql = sql;
       return rows<Row>([{
-        received_amount: "100", received_count: 1, unapplied_amount: "49.08", unapplied_count: 1,
+        received_amount: "100", returned_amount: "0", retained_amount: "100", received_count: 1, unapplied_amount: "49.08", unapplied_count: 1,
         automatic_count: 1, matched_count: 1, filtered_amount: "100", filtered_count: 1
       }]);
     }
@@ -178,7 +178,7 @@ class AgingClient implements PostgresQueryClient {
     parameters: readonly unknown[] = []
   ): Promise<PostgresQueryResult<Row>> {
     if (sql.includes('from "erp_financials"."reporting_books"')) return rows<Row>([book()]);
-    if (sql.includes("with aging_documents as")) {
+    if (sql.includes("aging_documents as")) {
       this.agingSql = sql;
       this.parameters = parameters;
       return rows<Row>([{

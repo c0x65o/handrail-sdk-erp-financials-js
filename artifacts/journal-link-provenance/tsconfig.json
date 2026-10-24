@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "../../src/sdk-read-models.ts",
+    "../../test/postgres.integration.test.ts",
+    "../../test/blu-erp-consumer-type-imports.ts",
+    "../../test/core-erp-consumer-type-imports.ts",
+    "../../test/future-erp-consumer-type-imports.ts"
+  ]
+}

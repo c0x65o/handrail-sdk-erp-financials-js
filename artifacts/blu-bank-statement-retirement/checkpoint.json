@@ -1,0 +1,51 @@
+{
+  "phase": 258,
+  "classification": "progress",
+  "goalComplete": false,
+  "launchReady": false,
+  "baseCommit": "5e704664325376f8e79463ee1022a00a06b97294",
+  "version": "0.3.183",
+  "schemaVersion": 49,
+  "cause": "BLU cannot safely forget an unresolved bank statement command after a reload or later eligibility change. The SDK had exact historical replay but no terminal fence for an unaccepted statement command.",
+  "changes": [
+    "Add public bankStatements.retireCommandAttempt for prepare/complete/reopen/cancel; original input and separate same-actor cancellation operation are immutable and payload-bound.",
+    "Use existing source lock and original lifecycle key. A terminal cancellation event makes delayed normal replay conflict, including the pre-change writer path. No extra financial table, ledger, balance, posting or statement status.",
+    "Accepted commands return original historical statement and separate currentStatement without writes; unaccepted commands check original account/book/source provenance without current version/fiscal eligibility.",
+    "Share command normalization between execution and retirement, preserving existing exact-money and bounded sorted selection behavior. Export types from both package entry points and add BLU public consumer compile coverage."
+  ],
+  "validation": {
+    "build": "passed normal TypeScript build",
+    "postgres": {
+      "passed": 30,
+      "failed": 0,
+      "intentionallyUnselected": 643,
+      "seconds": 31.46,
+      "evidence": "postgres-final.txt",
+      "coverage": [
+        "four command kinds exact retry/content/actor/retirement reason conflicts",
+        "foreign scope rejection and immutable retirement evidence",
+        "historical accepted receipts/current state separated with DML rejected",
+        "fiscal closing/stale version does not strand cancellation",
+        "eight real PostgreSQL waiter races, each action and both winners",
+        "outer rollback and lost commit acknowledgement",
+        "caller payload snapshot before wait",
+        "actual owned backend termination after receipt insert before commit",
+        "existing statement exact-money, selection, cancel/reopen, pagination, immutable evidence and close/completion races"
+      ]
+    },
+    "types": "scoped source, PostgreSQL test and BLU/Core/Future public consumer typecheck passed with4GiB heap",
+    "lint": "explicit source/test/entry points passed",
+    "bluRegression": "SDK183 candidate tested in BLU finance-bank-statements.postgres.test.ts:1 passed,0 skipped,6.256s; actual BLU crash/retry/authorization and inaccessible legacy relations retained. Evidence in BLU artifacts/accounting-authority/bank-statement-connection-recovery/sdk183-regression.txt",
+    "intermediate": "Typecheck found an unchecked possibly empty Promise.allSettled result in the crash test; corrected to optional result assertion.",
+    "database": "disposable socket-only PostgreSQL15.19, isolation verified and removed",
+    "limits": "focused checks only; no full-suite or production effects. Actual termination test uses an explicitly owned test runner/client; it does not establish resilience of SDK default pool wrappers."
+  },
+  "remaining": "BLU public adapter/strict frozen scope guard and durable browser command integration are still required. Inspection also found both SDK default pool adapters lack checked-out connection error tracking and discard-on-failed-rollback; reproduce and correct using the proven BLU boundary approach before relying on shared-consumer crash safety. SDK403 publication/pin, production resource/custody/migration, million-entry payment-reader admission and Ship/live evidence remain outstanding.",
+  "evidenceSha256": {
+    "build-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "postgres-final.txt": "95641a1f03edded0b39bed799fddcbddddd1f827079af7d50daa0fa8e0a5d6fe",
+    "types-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "lint.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tsconfig.json": "2dacd698423e5f783becb2745ba3a29268145a7ffcfd650f51d51ea5f5faa2ea"
+  }
+}

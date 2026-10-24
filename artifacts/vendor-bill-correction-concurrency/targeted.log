@@ -1,0 +1,19 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-MphP3u/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (329 tests | 322 skipped) 6163ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'voided', 'correction' first  822ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'voided', 'payment' first  856ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'replaced', 'correction' first  920ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'replaced', 'payment' first  939ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections avoid a payment lock inversion: voided  860ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections avoid a payment lock inversion: replaced  819ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections roll back a rejected replacement even when the host catches it  812ms
+
+ Test Files  1 passed (1)
+      Tests  7 passed | 322 skipped (329)
+   Start at  15:45:49
+   Duration  8.23s (transform 1.48s, setup 0ms, collect 1.84s, tests 6.16s, environment 0ms, prepare 61ms)
+
+EPHEMERAL POSTGRES REMOVED

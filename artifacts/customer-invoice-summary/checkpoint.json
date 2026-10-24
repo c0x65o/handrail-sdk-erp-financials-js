@@ -1,0 +1,48 @@
+{
+  "phase": 231,
+  "classification": "progress",
+  "goalComplete": false,
+  "launchReady": false,
+  "cause": "BLU customer portal still reads cached orders invoiceRef/invoiceStatus/paymentStatus and has an unbounded order list. Existing SDK batch invoice details load lines/history, while register paging cannot efficiently enrich a known order page without scanning customer history.",
+  "changes": [
+    "SDK0.3.179 public getInvoiceSummariesByIds accepts at most200 unique known invoice IDs and a customerId, returning scoped register/settlement summaries in request order.",
+    "Reused invoice SQL status logic and extracted the same settlement joins used by the register; no host accounting calculations or SDK-internal-table access needed.",
+    "Query bounds both draft and posted lookups before enrichment, omits foreign/missing identities, separates cash/credits/writeoffs/cancellation, and checks current reporting-book state in its SQL snapshot.",
+    "README documents current (not historical) semantics, omitted identities, authorization responsibilities and noncash settlement."
+  ],
+  "validation": {
+    "postgres": {
+      "pass": 4,
+      "unselected": 622,
+      "testDurationMs": 4495,
+      "runnerDurationSeconds": 7.41,
+      "database": "socket-only disposable PostgreSQL15.19",
+      "coverage": [
+        "new summary matches register on issued/partial and draft",
+        "no lines/lifecycle detail",
+        "200 max accepted;201/duplicate/empty IDs rejected",
+        "foreign customer omitted; foreign tenant/company/book rejected",
+        "cancellation releases payment and remains noncash",
+        "book archive between validation/query rejected",
+        "existing register summaries/cursors/presentation/concurrent-application snapshot regressions"
+      ]
+    },
+    "normalBuild": "passed",
+    "scopedTypes": "passed SDK public entries, selected PostgreSQL file and BLU/Core/Future consumer import contracts",
+    "targetedLint": "passed",
+    "diffCheck": "passed"
+  },
+  "limitations": [
+    "BLU portal is not yet wired; its cached accounting reads and unbounded list still require replacement.",
+    "No million-entry measurement for the new query, full suite, deployed proof or SDK publication.",
+    "Fixture initially expected missing_document instead of established missing_book; book currency-race setup hit existing immutability trigger, replaced with allowed archive race. Source compile and lint findings corrected; final checks pass.",
+    "No schema migration or production financial/provider effects. SDK public Git publication remains denied; BLU installed SDK stays0.3.50 until the authorized public SHA/lockfile upgrade can be completed."
+  ],
+  "next": "Wire customer portal through scoped stable invoice identities plus this public summary API in a coherent transaction. Fail missing/wrong-source linked ownership explicitly, hide draft/voided invoices and distinguish cash paid from noncash settlement. Add bounded order pagination through repo/service/router/client, auth/account-isolation real PostgreSQL proof, no-legacy-column proof and browser comparison. Then resume full order DTO cleanup and remaining complete goal requirements.",
+  "evidence": {
+    "build-final.txt": "a8f561e9e0ea068b87d019c52859d441a0df43ff8dbcc64dafb38640b94308b3",
+    "postgres-verified.txt": "958865959884415f04b726c47f372b3fae77b133de885230d1b7710e924126ce",
+    "types-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "lint-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

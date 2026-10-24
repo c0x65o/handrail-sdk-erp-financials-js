@@ -444,7 +444,7 @@ function catalogRowsForManifest(manifest: PostgresSchemaManifest): readonly Cata
     ...manifest.requiredTriggers.map(trigger => ({
       object_type: "trigger" as const, table_name: trigger.table, object_name: trigger.name,
       enabled: true,
-      definition: `create trigger ${trigger.name} ${trigger.timing} ${trigger.events.map(event => event === "update" && trigger.updateColumns ? `update of ${trigger.updateColumns.join(", ")}` : event).join(" or ")} on ${manifest.namespace}.${trigger.table} for each row execute function ${manifest.namespace}.${trigger.functionName}()`
+      definition: `create ${trigger.deferredConstraint ? "constraint " : ""}trigger ${trigger.name} ${trigger.timing} ${trigger.events.map(event => event === "update" && trigger.updateColumns ? `update of ${trigger.updateColumns.join(", ")}` : event).join(" or ")} on ${manifest.namespace}.${trigger.table}${trigger.deferredConstraint ? " deferrable initially deferred" : ""}${trigger.transitionTables ? ` referencing${trigger.transitionTables.old ? ` old table as ${trigger.transitionTables.old}` : ""}${trigger.transitionTables.new ? ` new table as ${trigger.transitionTables.new}` : ""}` : ""} for each ${trigger.level ?? "row"} execute function ${manifest.namespace}.${trigger.functionName}()`
     })),
     ...manifest.tables.flatMap((table) => [
       {

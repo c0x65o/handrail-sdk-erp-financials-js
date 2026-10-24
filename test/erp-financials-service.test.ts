@@ -608,6 +608,12 @@ describe("reusable ERP Financials service", () => {
 
     expect(unapplied).toMatchObject({ status: "unapplied", version: 2 });
     expect(unapplyRetry).toEqual(unapplied);
+    for (const changed of [{ effectiveDate: "2026-08-07" }, { expectedVersion: 2 }]) {
+      await expect(financials.paymentApplications.unapply({
+        operation: approvedOperation("request-unapply-changed"), applicationId: applied.applicationId,
+        effectiveDate: "2026-08-06", expectedVersion: 1, ...changed,
+      })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
     expect(subledgerRow(database, payment.documentId)).toMatchObject({ open_amount: "60.00", status: "open", version: 3 });
     expect(subledgerRow(database, invoice.documentId)).toMatchObject({ open_amount: "100.00", status: "open", version: 3 });
     expect(database.client.subledgerApplications).toHaveLength(1);
@@ -1855,6 +1861,20 @@ class ServiceTestClient implements PostgresQueryClient {
       return Promise.resolve({ rows: [{ outbox_event_id: row.outbox_event_id }] as unknown as readonly Row[], rowCount: 1 });
     }
 
+    if (sql.includes("from erp_financials.financial_outbox") && sql.includes("aggregate_id=any($4::text[])")) {
+      const ids = params[3] as readonly string[];
+      return Promise.resolve({ rows: this.financialOutbox.filter(event => event.tenant_id === params[0] && event.company_id === params[1]
+        && event.source_id === params[2] && event.event_type === "ledger.posted" && ids.includes(String(event.aggregate_id))) as unknown as readonly Row[] });
+    }
+
+    if ((sql.includes('from "erp_financials"."financial_outbox"') && sql.includes('"aggregate_id" = $4'))
+      || (sql.includes("from erp_financials.financial_outbox") && sql.includes("aggregate_id=$4"))) {
+      const rows = this.financialOutbox.filter(event => event.tenant_id === params[0] && event.company_id === params[1]
+        && event.source_id === params[2] && event.aggregate_id === params[3]
+        && event.event_type === (sql.includes("event_type='bill_payment.scheduled'") ? "bill_payment.scheduled" : "ledger.posted") && event.idempotency_key === params[4]);
+      return Promise.resolve({ rows: rows as unknown as readonly Row[] });
+    }
+
     if (sql.includes('from "erp_financials"."financial_outbox"')) {
       const row = this.financialOutbox.find(
         (event) =>
@@ -1939,7 +1959,7 @@ class ServiceTestClient implements PostgresQueryClient {
       return Promise.resolve({ rows: [{ version: row.version }] as unknown as readonly Row[], rowCount: 1 });
     }
 
-    if (sql.includes('from "erp_financials"."subledger_documents"')) {
+    if (sql.includes('from "erp_financials"."subledger_documents"') || sql.includes("from erp_financials.subledger_documents")) {
       if (sql.includes('"idempotency_key" = $4')) {
         const row = this.subledgerDocuments.find((document) => document.idempotency_key === params[3]);
         return Promise.resolve({ rows: (row === undefined ? [] : [row]) as unknown as readonly Row[] });
@@ -2064,14 +2084,20 @@ class ServiceTestClient implements PostgresQueryClient {
         reason_detail: params[12] ?? null,
         occurred_at: params[13],
         payload_checksum: params[16],
+        payload: JSON.parse(String(params[17])) as unknown,
         prior_event_id: params[18] ?? null
       };
       this.lifecycleEvents.set(idempotencyKey, row);
       return Promise.resolve({ rows: [row] as unknown as readonly Row[], rowCount: 1 });
     }
 
-    if (sql.includes('from "erp_financials"."financial_lifecycle_events"')) {
-      if (sql.includes('select "idempotency_key"')) {
+    if (sql.includes('from "erp_financials"."financial_lifecycle_events"')
+      || sql.includes('from erp_financials.financial_lifecycle_events')) {
+      if (sql.includes("event_id=any($4::text[])")) {
+        const ids = params[3] as readonly unknown[];
+        return Promise.resolve({ rows: [...this.lifecycleEvents.values()].filter(event => ids.includes(event.event_id)) as unknown as readonly Row[] });
+      }
+      if (sql.includes('select "idempotency_key"') || sql.includes('where tenant_id=$1 and company_id=$2 and source_id=$3 and event_id=$4')) {
         const row = [...this.lifecycleEvents.values()].find((event) => event.event_id === params[3]);
         return Promise.resolve({ rows: (row === undefined ? [] : [row]) as unknown as readonly Row[] });
       }

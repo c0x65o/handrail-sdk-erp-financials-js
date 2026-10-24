@@ -42,4 +42,45 @@ describe("cash-basis application projection", () => {
     if (firstPosting === undefined) throw new Error("projection fixture requires a posting");
     expect(() => projectCashBasisApplication({ applicationId: "x", applicationType: "bill_payment_to_bill", action: "recognize", appliedAmount: "1.00", effectiveDate: "2026-01-01", importBatchId: "batch", accrualPostings: [{ ...firstPosting, accountingBasis: "cash" }] })).toThrow(/accrual postings only/);
   });
+  it("uses net control balances for contra journals and consumes exact remaining cents", () => {
+    const [control,firstRevenue,secondRevenue]=postings;
+    if(!control||!firstRevenue||!secondRevenue)throw Error("Missing fixture postings");
+    const source: LedgerPosting[] = [
+      {...control,debitAmount:"0.02",netAmount:"0.02"},
+      {...firstRevenue,creditAmount:"0.02",netAmount:"-0.02"},
+      {...secondRevenue,creditAmount:"0.01",netAmount:"-0.01"},
+      {...control,postingId:"discount",sourcePostingId:"discount",accountId:"discount",debitAmount:"0.01",netAmount:"0.01"}
+    ];
+    const input = {applicationId:"first",applicationType:"customer_payment_to_invoice" as const,action:"recognize" as const,
+      appliedAmount:"0.01",effectiveDate:"2026-02-01",importBatchId:"batch",controlAccountId:"ar",accrualPostings:source};
+    const first = projectCashBasisApplication(input);
+    expect(first.map(p=>[p.accountId,p.debitAmount,p.creditAmount])).toEqual([
+      ["ar","0.01","0.00"],["revenue","0.00","0.01"],["revenue","0.00","0.01"],["discount","0.01","0.00"]
+    ]);
+    const remaining = source.map(p=>{
+      const used=first.find(row=>row.sourcePostingId===`cash-application:first:recognize:${p.sourcePostingId}`);
+      const debitAmount=money(cents(p.debitAmount)-cents(used?.debitAmount??"0.00"));
+      const creditAmount=money(cents(p.creditAmount)-cents(used?.creditAmount??"0.00"));
+      return {...p,debitAmount,creditAmount,netAmount:money(cents(debitAmount)-cents(creditAmount))};
+    });
+    const second=projectCashBasisApplication({...input,applicationId:"second",accrualPostings:remaining});
+    expect(second.map(p=>[p.accountId,p.debitAmount,p.creditAmount])).toEqual([["ar","0.01","0.00"],["revenue","0.00","0.01"]]);
+    const originalAllocation=source.map(p=>{
+      const allocated=first.find(row=>row.sourcePostingId===`cash-application:first:recognize:${p.sourcePostingId}`);
+      if(!allocated)throw Error("Missing allocated posting");
+      return {...p,debitAmount:allocated.debitAmount,creditAmount:allocated.creditAmount,netAmount:allocated.netAmount};
+    });
+    const reversed=projectCashBasisApplication({...input,action:"reverse",accrualPostings:originalAllocation});
+    expect(reversed.map(p=>[p.debitAmount,p.creditAmount])).toEqual(first.map(p=>[p.creditAmount,p.debitAmount]));
+    const payable=source.map(p=>({...p,debitAmount:p.creditAmount,creditAmount:p.debitAmount,netAmount:money(-cents(p.netAmount))}));
+    expect(projectCashBasisApplication({...input,applicationType:"bill_payment_to_bill",accrualPostings:payable}).map(p=>[p.debitAmount,p.creditAmount])).toEqual(first.map(p=>[p.creditAmount,p.debitAmount]));
+    expect(()=>projectCashBasisApplication({...input,appliedAmount:"0.03"})).toThrow(/control balance/);
+    expect(()=>projectCashBasisApplication({...input,controlAccountId:"missing"})).toThrow(/one explicit control/);
+    expect(()=>projectCashBasisApplication({...input,controlAccountId:"revenue"})).toThrow(/one explicit control/);
+    expect(()=>projectCashBasisApplication({...input,applicationType:"bill_payment_to_bill"})).toThrow(/control balance/);
+  });
+
 });
+
+function cents(value:string):bigint{return BigInt(value.replace(".",""));}
+function money(value:bigint):string{const sign=value<0n?"-":"",abs=value<0n?-value:value;return `${sign}${String(abs/100n)}.${String(abs%100n).padStart(2,"0")}`;}

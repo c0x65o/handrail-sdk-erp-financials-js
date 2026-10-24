@@ -156,6 +156,19 @@ describe("Postgres storage adapter", () => {
     );
   });
 
+  it("rejects a receipt-return completeness guard changed to an immediate trigger", async () => {
+    const rows = catalogRowsForManifest(POSTGRES_CANONICAL_SCHEMA_MANIFEST).map((row) =>
+      row.object_type === "trigger" && row.object_name === "customer_payment_return_complete_guard"
+        ? { ...row, definition: (row.definition ?? "").replace("constraint ", "").replace(" deferrable initially deferred", "") }
+        : row);
+    const result = await validatePostgresSchema(new RecordingClient(rows));
+    expect(result.compatible).toBe(false);
+    expect(result.issues).toContainEqual(expect.objectContaining({
+      kind: "incompatible_trigger_definition",
+      objectName: "customer_payment_return_complete_guard"
+    }));
+  });
+
   it("generates tenant/source idempotent upserts for reprocessed ledger postings", async () => {
     const client = new RecordingClient();
     const adapter = createPostgresStorageAdapter(client);
@@ -580,7 +593,7 @@ describe("Postgres storage adapter", () => {
     expect(client.calls[0]?.sql).toContain('"party_id" = any($12::text[])');
     expect(client.calls[0]?.sql).toContain('"item_id" = any($13::text[])');
     expect(client.calls[0]?.sql).toContain(
-      'order by "bucket_start", "account_id", "dimension_hash", "party_type", "party_id", "item_id"'
+      'order by "rollup_buckets"."bucket_start", "account_id", "dimension_hash", "party_type", "party_id", "item_id"'
     );
     expect(client.calls[0]?.sql).not.toMatch(/Intuit|OAuth|access[_-]?token|refresh[_-]?token|client[_-]?secret/i);
     expect(client.calls[0]?.sql).not.toMatch(/quickbooks_.*archive|provider_.*archive|raw_.*payload/i);
@@ -2283,7 +2296,7 @@ function catalogRowsForManifest(manifest: PostgresSchemaManifest): readonly Cata
         object_type: "index" as const,
         table_name: table.name,
         object_name: index.name,
-        definition: `create ${index.unique === true ? "unique " : ""}index ${index.name} on ${manifest.namespace}.${table.name} using btree (${index.columns.join(", ")})${index.whereSql === undefined ? "" : ` where ${index.whereSql}`}`
+        definition: `create ${index.unique === true ? "unique " : ""}index ${index.name} on ${manifest.namespace}.${table.name} using ${index.method ?? "btree"} (${index.columns.join(", ")})${index.whereSql === undefined ? "" : ` where ${index.whereSql}`}`
       })),
       ...[
         `${table.name}_pkey`,
@@ -2303,11 +2316,11 @@ function catalogRowsForManifest(manifest: PostgresSchemaManifest): readonly Cata
       table_name: trigger.table,
       object_name: trigger.name,
       enabled: true,
-      definition: `create trigger ${trigger.name} ${trigger.timing} ${trigger.events
+      definition: `create ${trigger.deferredConstraint ? "constraint " : ""}trigger ${trigger.name} ${trigger.timing} ${trigger.events
         .map((event) => event === "update" && trigger.updateColumns !== undefined
           ? `update of ${trigger.updateColumns.join(", ")}`
           : event)
-        .join(" or ")} on ${manifest.namespace}.${trigger.table} for each row execute function ${manifest.namespace}.${trigger.functionName}()`
+        .join(" or ")} on ${manifest.namespace}.${trigger.table}${trigger.deferredConstraint ? " deferrable initially deferred" : ""}${trigger.transitionTables ? ` referencing${trigger.transitionTables.old ? ` old table as ${trigger.transitionTables.old}` : ""}${trigger.transitionTables.new ? ` new table as ${trigger.transitionTables.new}` : ""}` : ""} for each ${trigger.level ?? "row"} execute function ${manifest.namespace}.${trigger.functionName}()`
     }))
   ];
 }

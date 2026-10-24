@@ -44,9 +44,16 @@ const CUSTOMER_DEPOSIT_INVOICE_APPLICATIONS_UPGRADE_SQL = readFileSync(
 );
 
 describe("canonical schema manifest", () => {
+  it("guards every financial table while keeping maintenance evidence under its dedicated immutable controls", () => {
+    const guarded=POSTGRES_CANONICAL_SCHEMA_MANIFEST.requiredTriggers.filter(t=>t.name==='accounting_access_guard');
+    expect(guarded.map(t=>t.table).sort()).toEqual(POSTGRES_CANONICAL_SCHEMA_MANIFEST.tables
+      .map(t=>t.name).filter(name=>!['accounting_access_control','accounting_access_commands'].includes(name)).sort());
+    for(const trigger of guarded) expect(trigger.events).toEqual(['insert','update','delete','truncate']);
+  });
+
   it("is versioned and covers the documented canonical entities", () => {
-    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.manifestVersion).toBe("2026-10-03.customer-payment-correction-replay");
-    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion).toBe(27);
+    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.manifestVersion).toBe("2026-10-23.accounting-access-control");
+    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion).toBe(49);
 
     const tableNames = POSTGRES_CANONICAL_SCHEMA_MANIFEST.tables.map((table) => table.name);
 
@@ -92,6 +99,16 @@ describe("canonical schema manifest", () => {
       "invoice_voids",
       "bank_statement_lines",
       "bank_reconciliation_matches",
+      "accounting_access_control",
+      "accounting_access_commands",
+      "bank_statements",
+      "bank_statement_clearings",
+      "bank_statement_clearing_history",
+      "fiscal_close_certificates",
+      "fiscal_close_totals",
+      "fiscal_close_banks",
+      "cash_flow_purpose_corrections",
+      "accounting_source_revisions",
       "imported_customer_payment_evidence",
       "customer_payment_corrections"
     ]);
@@ -271,7 +288,18 @@ describe("canonical schema manifest", () => {
       [23, 24],
       [24, 25],
       [25, 26],
-      [26, 27]
+      [26, 27],
+      [27, 28],
+      [28, 29],
+      [29, 30],
+      [30, 31],
+      [31, 32],
+      [32, 33],
+      [33, 34],
+      [34, 35],
+      [35, 36],
+      [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42],
+      [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]
     ]);
     expect(renderPostgresSchemaSql()).toContain('create table if not exists "erp_financials"."schema_migrations"');
     expect(FUTURE_ERP_CANONICAL_SCHEMA_MIGRATION_SQL).not.toMatch(
@@ -325,7 +353,7 @@ describe("canonical schema manifest", () => {
     expect(WRITE_OFF_APPLICATION_UPGRADE_SQL).toContain("source_document_type is distinct from 'write_off'");
     expect(WRITE_OFF_APPLICATION_UPGRADE_SQL).toContain("target_document_type is distinct from 'invoice'");
     expect(renderPostgresSchemaSql()).toContain(
-      "application_type in ('customer_payment_to_invoice', 'bill_payment_to_bill', 'credit_to_invoice', 'vendor_credit_to_bill', 'write_off_to_invoice')"
+      "application_type in ('customer_payment_to_invoice', 'bill_payment_to_bill', 'credit_to_invoice', 'vendor_credit_to_bill', 'write_off_to_invoice', 'customer_payment_to_refund')"
     );
   });
 });

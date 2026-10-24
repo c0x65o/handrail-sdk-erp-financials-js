@@ -1,0 +1,13 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/blu-hold-upgrade-final262/epg-jQS3it/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (687 tests | 686 skipped) 880ms
+   ✓ ERP Financials real PostgreSQL > payment holds upgrade schema 31 without rewriting existing financial facts  795ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 686 skipped (687)
+   Start at  20:17:00
+   Duration  3.86s (transform 2.20s, setup 0ms, collect 2.73s, tests 880ms, environment 0ms, prepare 61ms)
+
+EPHEMERAL POSTGRES REMOVED

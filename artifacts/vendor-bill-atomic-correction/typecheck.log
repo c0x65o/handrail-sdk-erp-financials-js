@@ -1,0 +1,5 @@
+
+> @handrail/erp-financials@0.3.109 typecheck
+> tsc --noEmit -p tsconfig.json
+
+test/postgres.integration.test.ts(6528,68): error TS2540: Cannot assign to 'actorRef' because it is a read-only property.

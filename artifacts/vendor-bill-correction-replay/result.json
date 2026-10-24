@@ -1,0 +1,42 @@
+{
+  "status": "verified_local_candidate",
+  "version": "0.3.107",
+  "schemaVersion": 38,
+  "baseCommit": "311a3a239006ac28dcc755fcfceaf92ca594bb12",
+  "provenBeforeFix": [
+    "Changed expectedVersion was incorrectly accepted on an already-voided bill replay (before-version.log)",
+    "Identical independent-approval command with fresh transport request ID was rejected by lifecycle append (before.log)",
+    "Mutating expectedVersion while waiting for the transaction changed execution (before.log)"
+  ],
+  "changes": [
+    "Snapshot complete vendor bill void/replacement invocation and preserve active SDK administrator authorization capability",
+    "Require original pre-void expectedVersion on replay, including bills whose version advanced through hold/release",
+    "Opt only vendor-bill lifecycle events into transport-metadata replay; preserve original audit rows and strict actor/approval/reason/business payload matching",
+    "Make imported-credit race test observe the actual contender PID, allow a bounded scheduling interval, retain lock assertion, and drain both commands before cleanup"
+  ],
+  "checks": {
+    "serviceAndLifecycleUnit": "43 passed",
+    "sourcePostgresFile": "317 passed, 0 skipped in initial full run; production source unchanged afterward",
+    "latestFocusedPostgres": "3 passed, 315 deliberately unselected; covers replay version/date/memo/actor/approver/reason/replacement amount, unchanged event/posting/outbox counts and audit metadata, noninitial version after holds, input snapshot and administrator grant/audit",
+    "publicBuiltPackagePostgres": "54 passed, 0 skipped after rebuilding package; both imported-credit race outcomes passed without leaked-query errors",
+    "typecheck": "passed, including latest tests",
+    "lint": "full SDK passed",
+    "build": "passed through normal tsc build",
+    "consumerImportChecks": "BLU/Core ERP/Future ERP fixture compile checks passed"
+  },
+  "initialRegressionFailure": {
+    "initialCombinedResult": "370 passed, 1 failed, 1 unhandled cleanup error",
+    "failure": "Imported-credit correction-wins race did not observe an advisory wait within its short polling window; failed assertion left contender running into next schema cleanup",
+    "reproduction": "Both races passed in focused diagnostic rerun; underlying accounting locking defect not established",
+    "repair": "Explicit contender-start/PID observation, bounded 5-second wait, 15-second race-test allowance and finally draining both commands; final full 54-test file passed",
+    "buildLimitation": "Initial public-package run preceded rebuild for this candidate; final public-package run used rebuilt 0.3.107"
+  },
+  "limitations": [
+    "No publication, application dependency upgrade or production schema/data changes",
+    "Consumer checks are import fixtures, not complete consumer applications",
+    "Administrator-direct retry still requires exact validated confirmation/checksum; transport replay allowance does not relax this",
+    "Posted bill UI/host approval integration and originating-book scope/lifecycle follow-up remain to be completed",
+    "Bill payment and adjustment lifecycle replay paths need separate review; this fix targets vendor bills",
+    "Full selected goal remains incomplete; this is not launch acceptance"
+  ]
+}

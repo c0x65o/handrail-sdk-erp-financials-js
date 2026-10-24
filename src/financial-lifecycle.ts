@@ -33,6 +33,9 @@ export type AppendFinancialLifecycleEventInput = FinancialLifecycleScope & {
   readonly payload?: JsonValue;
   readonly priorEventId?: string;
   readonly recordedAt: IsoDateTime;
+  /** Command-specific opt-in after validating business idempotency. Preserve the
+   * original event's transport metadata; actor, approval, reason and payload must match. */
+  readonly allowTransportReplay?: boolean;
 };
 
 export type FinancialLifecycleEventResult = {
@@ -169,11 +172,11 @@ for key share`,
     row.event_type !== input.eventType ||
     row.actor_ref !== input.operation.actorRef ||
     normalizeNullable(row.approver_ref) !== normalizeNullable(input.operation.approverRef) ||
-    row.request_id !== input.operation.requestId ||
-    row.correlation_id !== input.operation.correlationId ||
+    (input.allowTransportReplay !== true && (row.request_id !== input.operation.requestId ||
+      row.correlation_id !== input.operation.correlationId)) ||
     row.reason_code !== input.operation.reasonCode ||
     normalizeNullable(row.reason_detail) !== normalizeNullable(input.operation.reasonDetail) ||
-    normalizeDateTime(row.occurred_at) !== normalizeDateTime(input.operation.occurredAt) ||
+    (input.allowTransportReplay !== true && normalizeDateTime(row.occurred_at) !== normalizeDateTime(input.operation.occurredAt)) ||
     row.payload_checksum !== payloadChecksum ||
     normalizeNullable(row.prior_event_id) !== normalizeNullable(input.priorEventId)
   ) {

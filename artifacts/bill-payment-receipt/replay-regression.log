@@ -1,0 +1,17 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-sQV4jA/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (364 tests | 359 skipped) 4905ms
+   ✓ ERP Financials real PostgreSQL > cleared payment immediate retry is a historical receipt after bill correction  993ms
+   ✓ ERP Financials real PostgreSQL > cleared payment scheduled retry is a historical receipt after bill correction  1094ms
+   ✓ ERP Financials real PostgreSQL > cleared payment retry fails closed for missing application evidence  926ms
+   ✓ ERP Financials real PostgreSQL > cleared payment retry fails closed for changed application evidence  914ms
+   ✓ ERP Financials real PostgreSQL > atomically clears ordered vendor bills, exposes provenance and summary, and compensates applications  896ms
+
+ Test Files  1 passed (1)
+      Tests  5 passed | 359 skipped (364)
+   Start at  17:17:24
+   Duration  7.21s (transform 1.66s, setup 0ms, collect 2.09s, tests 4.90s, environment 0ms, prepare 56ms)
+
+EPHEMERAL POSTGRES REMOVED

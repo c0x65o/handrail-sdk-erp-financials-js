@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.json",
+  "include": [
+    "../../src/**/*.ts",
+    "../../test/postgres.integration.test.ts",
+    "../../test/blu-erp-consumer-type-imports.ts",
+    "../../test/core-erp-consumer-type-imports.ts",
+    "../../test/future-erp-consumer-type-imports.ts",
+    "../../test/postgres-transaction-runner.test.ts"
+  ]
+}

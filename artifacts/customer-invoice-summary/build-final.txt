@@ -1,0 +1,3 @@
+
+> @handrail/erp-financials@0.3.179 build
+> tsc -p tsconfig.build.json

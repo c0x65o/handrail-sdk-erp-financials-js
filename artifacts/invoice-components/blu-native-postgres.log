@@ -1,0 +1,19 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/blu-financials-goal-tests/epg-PAiodw/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+TAP version 13
+# LOCAL SDK CANDIDATE ONLY {"root":"/opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal","version":"0.3.132"}
+# Subtest: native invoice command transaction leaves only SDK accounting plus immutable operational links
+ok 1 - native invoice command transaction leaves only SDK accounting plus immutable operational links
+  ---
+  duration_ms: 3012.372463
+  type: 'test'
+  ...
+1..1
+# tests 1
+# suites 0
+# pass 1
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 4835.362248
+EPHEMERAL POSTGRES REMOVED

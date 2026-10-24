@@ -1,0 +1,28 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-phase250-ap-retirement-verified/epg-1rby3B/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (650 tests | 634 skipped) 21534ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement fences delayed immediate, raw and scheduled payment commands after close  1038ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement resolves recorded money after later void=false without changing any accounting  1104ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement resolves recorded money after later void=true without changing any accounting  1205ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement reports direct document void for current instruction state  1242ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement reports direct document void for legacy instruction state  1258ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement rejects foreign actor/book and independent raw or scheduled money  1133ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement fails closed when a retained clear receipt is missing  1223ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement rolls back caught receipt failures and recovers lost commit acknowledgement  1109ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement observes a real lock waiter for 'immediate', retire first=false  1229ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement observes a real lock waiter for 'immediate', retire first=true  1278ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement observes a real lock waiter for 'raw', retire first=false  1314ms
+   ✓ ERP Financials real PostgreSQL > bill recording retirement observes a real lock waiter for 'raw', retire first=true  1396ms
+   ✓ ERP Financials real PostgreSQL > bill payment void completion receipt is atomic under a caught final-write failure and concurrent retries  1519ms
+   ✓ ERP Financials real PostgreSQL > bill payment compensate completion receipt is atomic under a caught final-write failure and concurrent retries  1628ms
+   ✓ ERP Financials real PostgreSQL > cleared payment immediate retry is a historical receipt after bill correction  1800ms
+   ✓ ERP Financials real PostgreSQL > cleared payment scheduled retry is a historical receipt after bill correction  1775ms
+
+ Test Files  1 passed (1)
+      Tests  16 passed | 634 skipped (650)
+   Start at  18:20:26
+   Duration  24.68s (transform 2.31s, setup 0ms, collect 2.87s, tests 21.53s, environment 0ms, prepare 82ms)
+
+EPHEMERAL POSTGRES REMOVED

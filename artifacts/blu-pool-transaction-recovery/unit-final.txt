@@ -1,0 +1,11 @@
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres-transaction-runner.test.ts (9 tests) 11ms
+ ✓ test/erp-financials-service.test.ts (37 tests | 36 skipped) 5ms
+
+ Test Files  2 passed (2)
+      Tests  10 passed | 36 skipped (46)
+   Start at  19:50:55
+   Duration  2.33s (transform 1.36s, setup 0ms, collect 1.93s, tests 16ms, environment 0ms, prepare 115ms)
+

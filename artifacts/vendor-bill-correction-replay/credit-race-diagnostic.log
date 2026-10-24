@@ -1,0 +1,14 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-9TNbJB/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/imported-credit.postgres.test.ts (54 tests | 52 skipped) 1837ms
+   ✓ importer-generated imported credit public package PostgreSQL > serializes competing application/correction of existing credit: application wins  909ms
+   ✓ importer-generated imported credit public package PostgreSQL > serializes competing application/correction of existing credit: correction wins  848ms
+
+ Test Files  1 passed (1)
+      Tests  2 passed | 52 skipped (54)
+   Start at  15:00:54
+   Duration  3.42s (transform 977ms, setup 0ms, collect 1.36s, tests 1.84s, environment 0ms, prepare 71ms)
+
+EPHEMERAL POSTGRES REMOVED

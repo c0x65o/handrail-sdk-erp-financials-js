@@ -1,0 +1,32 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/blu-hold-retirement262/epg-lsFYT2/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (687 tests | 667 skipped) 22338ms
+   ✓ ERP Financials real PostgreSQL > hold retirement fences unaccepted paymentHold=true without changing current accounting  996ms
+   ✓ ERP Financials real PostgreSQL > hold retirement fences unaccepted paymentHold=false without changing current accounting  988ms
+   ✓ ERP Financials real PostgreSQL > hold retirement preserves accepted hold and release receipts after later settlement without DML  1052ms
+   ✓ ERP Financials real PostgreSQL > hold retirement rejects foreign scope, caller and provider provenance without writes  1064ms
+   ✓ ERP Financials real PostgreSQL > hold retirement rolls back a caught insert failure and recovers a genuinely lost commit acknowledgement  983ms
+   ✓ ERP Financials real PostgreSQL > hold retirement observes a real PostgreSQL waiter, hold=true retireFirst=true  886ms
+   ✓ ERP Financials real PostgreSQL > hold retirement observes a real PostgreSQL waiter, hold=true retireFirst=false  968ms
+   ✓ ERP Financials real PostgreSQL > hold retirement observes a real PostgreSQL waiter, hold=false retireFirst=true  1030ms
+   ✓ ERP Financials real PostgreSQL > hold retirement observes a real PostgreSQL waiter, hold=false retireFirst=false  1225ms
+   ✓ ERP Financials real PostgreSQL > hold retirement snapshots caller payload and does not overwrite an accepted command identity  1620ms
+   ✓ ERP Financials real PostgreSQL > exact vendor bill hold receipt preserves original version across release and enforces posting book scope  1330ms
+   ✓ ERP Financials real PostgreSQL > payment holds have one versioned authority, payload-bound retries and current public reads  1398ms
+   ✓ ERP Financials real PostgreSQL > payment holds block scheduling, clearing, immediate payments and generic or raw applications without partial money  1537ms
+   ✓ ERP Financials real PostgreSQL > payment holds allow exact completed-payment replay and corrective unapplication  981ms
+   ✓ ERP Financials real PostgreSQL > payment holds reject direct writes and roll back an interrupted lifecycle even if a host catches the failure  885ms
+   ✓ ERP Financials real PostgreSQL > payment holds serialize competing versions and race safely with payment posting  1038ms
+   ✓ ERP Financials real PostgreSQL > payment holds enforce the committed winner when hold takes the row lock first  1101ms
+   ✓ ERP Financials real PostgreSQL > payment holds enforce the committed winner when payment takes the row lock first  874ms
+   ✓ ERP Financials real PostgreSQL > payment holds reject invalid actors, foreign scopes and provider ownership without writes  1055ms
+   ✓ ERP Financials real PostgreSQL > payment holds preserve input snapshots and support multiple complete transitions in one transaction  1178ms
+
+ Test Files  1 passed (1)
+      Tests  20 passed | 667 skipped (687)
+   Start at  20:15:25
+   Duration  25.17s (transform 2.06s, setup 0ms, collect 2.59s, tests 22.34s, environment 0ms, prepare 68ms)
+
+EPHEMERAL POSTGRES REMOVED

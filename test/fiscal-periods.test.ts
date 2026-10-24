@@ -36,7 +36,7 @@ describe("fiscal period and posting lock controls", () => {
     const closingRetry = await periods.beginClose({
       fiscalPeriodId: defined.fiscalPeriodId,
       expectedVersion: 1,
-      operation: operation("begin-close-retry", false)
+      operation: { ...operation("begin-close", false), requestId: "request:begin-close-retry" }
     });
     expect(closing).toMatchObject({ outcome: "closing", status: "closing", version: 2 });
     expect(closingRetry).toMatchObject({ outcome: "already_closing", status: "closing", version: 2 });
@@ -63,6 +63,31 @@ describe("fiscal period and posting lock controls", () => {
     await expect(assertPostingDateAllowed(database.client, scope(), "2026-08-15")).resolves.toBeUndefined();
     expect(database.commits).toBe(5);
     expect(database.rollbacks).toBe(0);
+  });
+
+  it("binds lifecycle retries to original version, evidence and approving actors", async () => {
+    const database = new FiscalDatabase(), periods = service(database);
+    const defined = await periods.define({ fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31", operation: operation("define", false) });
+    const begin = { fiscalPeriodId: defined.fiscalPeriodId, expectedVersion: 1, operation: operation("begin", false) };
+    await periods.beginClose(begin);
+    for (const changed of [{ expectedVersion: 2 }, { operation: { ...begin.operation, actorRef: "other" } }, { operation: operation("different-reason", false) }]) {
+      await expect(periods.beginClose({ ...begin, ...changed })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    const close = { fiscalPeriodId: defined.fiscalPeriodId, expectedVersion: 2, operation: operation("close", true), evidence: closeEvidence() };
+    const closed = await periods.close(close), before = database.client.snapshot();
+    const retry = await periods.close({ ...close, operation: { ...close.operation, requestId: "fresh-request", correlationId: "fresh-correlation", occurredAt: "2026-09-01T00:00:00Z" } });
+    expect(retry).toEqual({ ...closed, outcome: "already_closed" });
+    const changedEvidence = { ...close.evidence, checklistRef: "changed" };
+    for (const changed of [{ expectedVersion: 3 }, { operation: { ...close.operation, approverRef: "other" } },
+      { evidence: { ...changedEvidence, evidenceChecksum: createFiscalCloseEvidenceChecksum(changedEvidence) } }]) {
+      await expect(periods.close({ ...close, ...changed })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    expect(database.client.snapshot()).toEqual(before);
+    const reopen = { fiscalPeriodId: defined.fiscalPeriodId, expectedVersion: 3, operation: operation("reopen", true) };
+    const reopened = await periods.reopen(reopen), after = database.client.snapshot();
+    await expect(periods.reopen({ ...reopen, operation: { ...reopen.operation, requestId: "retry-reopen" } })).resolves.toEqual(reopened);
+    await expect(periods.reopen({ ...reopen, operation: operation("wrong-reopen", true) })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(database.client.snapshot()).toEqual(after);
   });
 
   it("requires independent approval for close, reopen, lock-date, and adjustment-class operations", async () => {
@@ -248,6 +273,7 @@ class FiscalClient implements PostgresQueryClient {
         reason_detail: params[12] ?? null,
         occurred_at: params[13],
         payload_checksum: params[16],
+        payload: JSON.parse(String(params[17])) as unknown,
         prior_event_id: params[18] ?? null
       };
       this.events.set(key, row);
@@ -276,8 +302,11 @@ class FiscalClient implements PostgresQueryClient {
       const row = this.periods.find((candidate) => candidate.fiscal_period_id === params[3]);
       return this.result<Row>(row === undefined ? [] : [row]);
     }
-    if (sql.includes("count(*)::integer") && sql.includes('"status" = \'draft\'')) {
-      return this.result<Row>([{ pending_count: this.pendingDrafts }]);
+    if (sql.startsWith("with fiscal_close_period as")) {
+      const period = this.periods.find(row => row.fiscal_period_id === params[3]);
+      return this.result<Row>(period ? [{ ...period, source_id: params[2], posting_count: "0", posted_transaction_count: "0",
+        posting_group_count: "0", unbalanced_posting_group_count: "0",
+        draft_transaction_count: String(this.pendingDrafts), draft_invoice_count: "0" }] : []);
     }
     if (sql.startsWith('update "erp_financials"."fiscal_periods"')) {
       const row = this.periods.find((candidate) => candidate.fiscal_period_id === params[3]);

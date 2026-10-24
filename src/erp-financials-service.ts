@@ -1,3 +1,9 @@
+import {retainJournalAccountPolicy} from "./journal-account-policy.js";
+import { correctCashFlowPurpose, type CorrectCashFlowPurposeInput, type CorrectCashFlowPurposeResult } from "./cash-flow-purpose.js";
+import { normalizeInvoiceComponents, invoiceComponentJournalLines, invoiceComponentRequirements, assertInvoiceComponentPolicy, type InvoicePostingComponents } from "./invoice-components.js";
+import { normalizeInvoiceAccountPolicy, type InvoiceAccountPolicy } from "./invoice-account-policy.js";
+import { getBillPaymentCorrectionReview } from "./sdk-read-models.js";
+import { scopedRecordId } from "./scoped-record-id.js";
 import { assertFinancialApproval, runFinancialAction, type FinancialApprovalPolicy, copyFinancialOperation } from "./financial-approval-policy.js";
 import { createCustomerPaymentCorrectionService, lockCustomerPaymentCorrectionSource, type CustomerPaymentCorrectionGuard } from "./customer-payment-correction.js";
 import { createHash } from "node:crypto";
@@ -9,7 +15,7 @@ import { createPostgresStorageAdapter } from "./postgres-storage.js";
 import { appendFinancialLifecycleEvent, assertFinancialOperationContext } from "./financial-lifecycle.js";
 import { assertPostingDateAllowed, createFiscalPeriodService } from "./fiscal-periods.js";
 import { ErpFinancialsError } from "./sdk-errors.js";
-import { appendFinancialOutboxEvent } from "./financial-outbox.js";
+import { appendFinancialOutboxEvent, FINANCIAL_OUTBOX_MAX_PAYLOAD_BYTES } from "./financial-outbox.js";
 import { normalizeCommercialDocumentLine } from "./commercial-lines.js";
 import { projectCashBasisApplication } from "./accounting-basis-projection.js";
 
@@ -56,7 +62,11 @@ export type ErpFinancialsTransactionRunner = {
 };
 
 export type ErpFinancialsPostgresTransactionClient = PostgresQueryClient & {
-  release(): void;
+  /** A failed connection must not be returned to the pool for reuse. */
+  release(error?: Error | boolean): void;
+  /** Optional for custom clients; standard node-postgres clients expose both. */
+  on?(event: "error", listener: (error: Error) => void): unknown;
+  off?(event: "error", listener: (error: Error) => void): unknown;
 };
 
 export type ErpFinancialsPostgresPool = {
@@ -66,6 +76,7 @@ export type ErpFinancialsPostgresPool = {
 export type ErpFinancialsDatabase = ErpFinancialsTransactionRunner | ErpFinancialsPostgresPool;
 
 export type CreateErpFinancialsInput = {
+  readonly invoiceAccountPolicy?: InvoiceAccountPolicy;
   readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly customerPaymentCorrectionGuard?: CustomerPaymentCorrectionGuard;
   readonly database: ErpFinancialsDatabase;
@@ -132,12 +143,18 @@ export type PostJournalEntryLineInput = JournalEntryLineCommon &
     | { readonly credit: DecimalString; readonly debit?: never }
   );
 
+export type JournalEntryOrigin = {
+  readonly module: string;
+  readonly reference?: string;
+};
+
 export type PostJournalEntryInput = {
   readonly operation: FinancialOperationContext;
   readonly idempotencyKey: string;
   readonly date: IsoDate;
   readonly transactionNumber?: string;
   readonly memo?: string;
+  readonly origin?: JournalEntryOrigin;
   readonly postedAt?: IsoDateTime;
   readonly currencyCode?: IsoCurrencyCode;
   readonly accountingBasis?: AccountingBasis;
@@ -201,7 +218,7 @@ export type SubledgerDocumentType =
   | "purchase"
   | "vendor_credit";
 
-export type SubledgerAmountLine = ErpFinancialsAccountReference & CommercialDocumentLineInput;
+export type SubledgerAmountLine = ErpFinancialsAccountReference & CommercialDocumentLineInput & InvoicePostingComponents;
 
 type SubledgerDocumentInputCommon = {
   readonly operation: FinancialOperationContext;
@@ -213,19 +230,124 @@ type SubledgerDocumentInputCommon = {
 };
 
 export type CreateInvoiceInput = SubledgerDocumentInputCommon & {
+  /** Accrual recognition date. Defaults to the contractual date for existing callers. */
+  readonly recognitionDate?: IsoDate;
   readonly customerId: string;
   readonly dueDate: IsoDate;
   readonly receivableAccount: ErpFinancialsAccountReference;
   readonly revenueLines: readonly SubledgerAmountLine[];
 };
 
+/** Restates native invoice recognition while retaining its identity and applications. */
+export type CorrectInvoiceDatesInput = {
+  /** Defaults to documentDate for one-date invoices. Required once dates differ. */
+  readonly recognitionDate?: IsoDate;
+  readonly operation: FinancialOperationContext;
+  readonly invoiceId: string;
+  readonly expectedVersion: number;
+  readonly idempotencyKey: string;
+  readonly documentDate: IsoDate;
+  readonly dueDate: IsoDate;
+};
+export type CorrectInvoiceDatesResult = {
+  /** Present when recognition differs from the contractual document date. */
+  readonly recognitionDate?: IsoDate;
+  readonly invoiceId: string;
+  readonly version: number;
+  readonly documentDate: IsoDate;
+  readonly dueDate: IsoDate;
+  readonly originalTransactionId: string;
+  readonly reversalTransactionId?: string;
+  readonly replacementTransactionId?: string;
+  readonly lifecycleEventId: string;
+};
+
 export type RecordCustomerPaymentInput = SubledgerDocumentInputCommon & {
+  /** Immutable host collection identity (for example an order); never a balance. */
+  readonly collectionRef?: string;
+  /** Explicit economic purpose of this cash receipt, independent of invoicing.
+   * Retained for cash-flow reporting and inherited by native cash returns. */
+  readonly cashFlowActivity?: "operating" | "investing" | "financing";
   readonly customerId: string;
   readonly amount: DecimalString;
   readonly cashAccount: ErpFinancialsAccountReference;
   readonly receivableAccount: ErpFinancialsAccountReference;
   /** Bounded external reconciliation references; never raw provider payloads or credentials. */
   readonly provenance?: CustomerPaymentProvenance;
+};
+
+/** Record new cash and allocate it to one invoice in a single atomic command. */
+export type RecordAndApplyCustomerPaymentInput = RecordCustomerPaymentInput & {
+  readonly invoiceId: string;
+  readonly expectedInvoiceVersion: number;
+  /** Defaults to the entire receipt. Any excess remains unapplied receipt credit. */
+  readonly applicationAmount?: DecimalString;
+  /** Defaults to the receipt date. Explicit allocation date must not precede cash receipt or invoice recognition. */
+  readonly applicationDate?: IsoDate;
+};
+/** Immutable command receipt; query current balances separately after replay. */
+export type RecordAndApplyCustomerPaymentResult = {
+  readonly status: "recorded_and_applied" | "already_recorded_and_applied";
+  readonly paymentId: string;
+  readonly invoiceId: string;
+  readonly applicationId: string;
+  readonly paymentTransactionId: string;
+  readonly amount: DecimalString;
+  readonly lifecycleEventId: string;
+};
+
+/** Resolve an uncertain collection without reversing cash. If collection has not
+ * committed, permanently retire its exact key/payload so delayed dispatch cannot post.
+ * The original actor must authorize retirement; book/source ownership is enforced. */
+export type RetireCustomerPaymentCollectionInput = {
+  readonly command: RecordAndApplyCustomerPaymentInput;
+  readonly operation: FinancialOperationContext;
+};
+export type RetireCustomerPaymentCollectionResult = RecordAndApplyCustomerPaymentResult | {
+  readonly status: "retired" | "already_retired";
+  readonly invoiceId: string;
+  readonly idempotencyKey: string;
+  readonly lifecycleEventId: string;
+};
+
+export type ReturnCustomerPaymentCashInput = {
+  readonly operation: FinancialOperationContext;
+  readonly idempotencyKey: string;
+  readonly paymentId: string;
+  readonly customerId: string;
+  readonly expectedVersion: number;
+  readonly date: IsoDate;
+  readonly amount: DecimalString;
+  /** A captured cash void, never an authorization release. */
+  readonly returnKind: "refund" | "void";
+  readonly externalReturnRef: string;
+  readonly memo?: string;
+  /** Use unused receipt credit first; release only the additional refunded amount. */
+  readonly releases: readonly { readonly applicationId: string; readonly expectedVersion: number; readonly amount: DecimalString }[];
+};
+/** Read-only accounting plan validation. This is neither approval nor a reservation. */
+export type PreviewCustomerPaymentCashReturnInput = Pick<ReturnCustomerPaymentCashInput,
+  "paymentId" | "customerId" | "expectedVersion" | "date" | "amount" | "returnKind" | "releases">;
+export type PreviewCustomerPaymentCashReturnResult = {
+  readonly paymentId: string;
+  readonly paymentVersion: number;
+  readonly amount: DecimalString;
+  readonly unappliedAmount: DecimalString;
+  readonly releasedAmount: DecimalString;
+  readonly remainingReturnableAmount: DecimalString;
+  readonly releases: PreviewCustomerPaymentCashReturnInput["releases"];
+};
+export type ReturnCustomerPaymentCashResult = {
+  readonly status: "returned" | "already_returned";
+  readonly paymentId: string;
+  readonly refundDocumentId: string;
+  readonly refundTransactionId: string;
+  readonly settlementApplicationId: string;
+  readonly amount: DecimalString;
+  readonly releasedAmount: DecimalString;
+  readonly remainingReturnableAmount: DecimalString;
+  readonly paymentVersion: number;
+  readonly lifecycleEventId: string;
 };
 
 export type CustomerPaymentProvenance = {
@@ -327,11 +449,56 @@ export type VendorBillExpenseLine = SubledgerAmountLine & {
   readonly customerId?: string;
 };
 
+export type SetVendorBillPaymentHoldInput = {
+  readonly operation: FinancialOperationContext;
+  readonly vendorBillId: string;
+  readonly expectedVersion: number;
+  readonly idempotencyKey: string;
+  readonly paymentHold: boolean;
+  readonly reason?: string;
+};
+export type VendorBillPaymentHoldResult = {
+  readonly status: "changed" | "already_changed";
+  readonly vendorBillId: string;
+  readonly version: number;
+  readonly paymentHold: boolean;
+  readonly paymentHoldReason: string | null;
+  readonly lifecycleEventId: string;
+};
+
+/** Resolve an uncertain hold/release without reversing any accepted state change. */
+export type RetireVendorBillPaymentHoldInput = {
+  readonly command: SetVendorBillPaymentHoldInput;
+  readonly operation: FinancialOperationContext;
+};
+export type RetireVendorBillPaymentHoldResult = {
+  readonly status: "retired" | "already_retired";
+  readonly vendorBillId: string;
+  readonly idempotencyKey: string;
+  readonly lifecycleEventId: string;
+} | {
+  readonly status: "already_recorded";
+  readonly vendorBillId: string;
+  readonly idempotencyKey: string;
+  /** Immutable original command receipt; current state is deliberately separate. */
+  readonly receipt: VendorBillPaymentHoldResult;
+  readonly current: {
+    readonly version: number;
+    readonly paymentHold: boolean;
+    readonly paymentHoldReason: string | null;
+  };
+};
+
 export type CreateVendorBillInput = SubledgerDocumentInputCommon & {
   readonly vendorId: string;
   readonly dueDate: IsoDate;
   readonly payableAccount: ErpFinancialsAccountReference;
   readonly expenseLines: readonly VendorBillExpenseLine[];
+  /** Optional host accounting policy, enforced against locked canonical accounts before posting. */
+  readonly accountPolicy?: {
+    readonly expenseClassifications: readonly AccountClassification[];
+    readonly payableClassifications: readonly AccountClassification[];
+  };
 };
 
 export type VoidPostedVendorBillInput = {
@@ -345,6 +512,30 @@ export type VoidPostedVendorBillInput = {
 
 export type ReplacePostedVendorBillInput = VoidPostedVendorBillInput & {
   readonly replacement: WithoutFinancialOperation<CreateVendorBillInput>;
+};
+
+/** One approved correction, including an explicit complete application release plan.
+ * Zero reapplyAmount leaves the released funds/credit available. Source versions
+ * are the reviewed versions before any releases, including repeated sources.
+ */
+export type CorrectPostedVendorBillInput = VoidPostedVendorBillInput & {
+  readonly releases: readonly {
+    readonly applicationId: string;
+    readonly expectedVersion: number;
+    readonly expectedSourceVersion: number;
+    readonly reapplyAmount: DecimalString;
+  }[];
+  readonly replacement?: Omit<WithoutFinancialOperation<CreateVendorBillInput>, "idempotencyKey">;
+};
+
+/** Immutable completion receipt, not a query for current balances. */
+export type CorrectPostedVendorBillResult = {
+  readonly status: "corrected" | "already_corrected";
+  readonly correction: PostedVendorBillLifecycleResult;
+  readonly releasedApplications: readonly SubledgerApplicationResult[];
+  readonly applications: readonly SubledgerApplicationResult[];
+  readonly replacementPosition?: Pick<SubledgerDocumentResult, "documentId" | "version" | "openAmount" | "documentStatus">;
+  readonly lifecycleEventId: string;
 };
 
 /** Alias matching issued-document correction terminology used by host applications. */
@@ -391,6 +582,23 @@ export type RecordAndApplyBillPaymentInput = RecordBillPaymentInput & {
   readonly allocations: readonly BillPaymentAllocationInput[];
 };
 
+/** Resolve an uncertain immediate record-and-apply attempt. This does not cancel
+ * scheduled payments, void posted money or authorize any external provider action. */
+export type RetireBillPaymentRecordingInput = {
+  readonly command: RecordAndApplyBillPaymentInput;
+  readonly operation: FinancialOperationContext;
+};
+export type RetireBillPaymentRecordingResult = {
+  readonly billPaymentId: string;
+  readonly idempotencyKey: string;
+  readonly lifecycleEventId: string;
+} & (
+  | { readonly status: "retired" | "already_retired" }
+  | { readonly status: "already_recorded"; readonly paymentStatus: "cleared" | "voided";
+      readonly paymentTransactionId: string; readonly amount: DecimalString; readonly currencyCode: IsoCurrencyCode;
+      readonly applicationIds: readonly string[] }
+);
+
 export type ScheduleBillPaymentInput = RecordAndApplyBillPaymentInput;
 
 export type ClearScheduledBillPaymentInput = {
@@ -402,7 +610,10 @@ export type ClearScheduledBillPaymentInput = {
 
 export type CancelScheduledBillPaymentInput = ClearScheduledBillPaymentInput;
 
-export type VoidAndUnapplyBillPaymentInput = VoidPostedBillPaymentInput;
+export type VoidAndUnapplyBillPaymentInput = VoidPostedBillPaymentInput & {
+  /** Require the current SDK review snapshot when the host uses reviewed approval. */
+  readonly expectedReviewToken?: string;
+};
 
 export type ScheduledBillPaymentResult = {
   readonly status: "scheduled" | "already_scheduled";
@@ -411,6 +622,7 @@ export type ScheduledBillPaymentResult = {
   readonly lifecycleEventId: string;
 };
 
+/** Immutable clear receipt. Use queries for current balances/application state. */
 export type ClearedBillPaymentResult = {
   readonly status: "cleared" | "already_cleared";
   readonly billPaymentId: string;
@@ -552,7 +764,8 @@ export type SubledgerApplicationType =
   | "bill_payment_to_bill"
   | "credit_to_invoice"
   | "vendor_credit_to_bill"
-  | "write_off_to_invoice";
+  | "write_off_to_invoice"
+  | "customer_payment_to_refund";
 
 export type ApplySubledgerPaymentInput = {
   readonly operation: FinancialOperationContext;
@@ -572,6 +785,15 @@ export type ApplySubledgerPaymentInput = {
     readonly evidence?: JsonValue;
   };
 };
+
+/** Retire an uncertain native customer receipt allocation without unapplying it. */
+export type RetireReceiptApplicationInput = {
+  readonly command: ApplySubledgerPaymentInput & { readonly applicationType: "customer_payment_to_invoice" };
+  readonly operation: FinancialOperationContext;
+};
+export type RetireReceiptApplicationResult =
+  | { readonly status: "already_recorded"; readonly application: SubledgerApplicationResult }
+  | { readonly status: "retired" | "already_retired"; readonly sourceDocumentId: string; readonly targetDocumentId: string; readonly idempotencyKey: string; readonly lifecycleEventId: string };
 
 export type EndSubledgerApplicationInput = {
   readonly operation: FinancialOperationContext;
@@ -617,7 +839,20 @@ export type SubledgerApplicationResult = {
   readonly lifecycleEventId: string;
 };
 
+/** Register operational identity once. Existing accounting identity, name and
+ * active state remain SDK-owned; this command cannot reactivate a party. */
+export type EnsureActivePartyInput = {
+  readonly partyId: string;
+  readonly sourcePartyId: string;
+  readonly partyType: "customer" | "vendor";
+  readonly displayName: string;
+  readonly operation: FinancialOperationContext;
+};
+export type EnsureActivePartyResult = { readonly partyId: string };
+
 export type ErpFinancials = {
+  readonly parties: { ensureActive(input: EnsureActivePartyInput): Promise<EnsureActivePartyResult> };
+  readonly cashFlow: { correctPurpose(input: CorrectCashFlowPurposeInput): Promise<CorrectCashFlowPurposeResult> };
   readonly accounts: {
     upsertTree(input: UpsertAccountTreeInput): Promise<UpsertAccountTreeResult>;
   };
@@ -630,8 +865,11 @@ export type ErpFinancials = {
     replace(input: ReplaceJournalEntryInput): Promise<JournalEntryLifecycleResult>;
   };
   readonly fiscalPeriods: FiscalPeriodService;
-  readonly invoices: { create(input: CreateInvoiceInput): Promise<SubledgerDocumentResult> };
-  readonly customerPayments: { record(input: RecordCustomerPaymentInput): Promise<SubledgerDocumentResult> } & ReturnType<typeof createCustomerPaymentCorrectionService>;
+  readonly invoices: {
+    create(input: CreateInvoiceInput): Promise<SubledgerDocumentResult>;
+    correctDates(input: CorrectInvoiceDatesInput): Promise<CorrectInvoiceDatesResult>;
+  };
+  readonly customerPayments: { record(input: RecordCustomerPaymentInput): Promise<SubledgerDocumentResult>; recordAndApply(input: RecordAndApplyCustomerPaymentInput): Promise<RecordAndApplyCustomerPaymentResult>; retireCollectionAttempt(input: RetireCustomerPaymentCollectionInput): Promise<RetireCustomerPaymentCollectionResult>; returnCash(input: ReturnCustomerPaymentCashInput): Promise<ReturnCustomerPaymentCashResult>; previewReturnCash(input: PreviewCustomerPaymentCashReturnInput): Promise<PreviewCustomerPaymentCashReturnResult> } & ReturnType<typeof createCustomerPaymentCorrectionService>;
   readonly adjustments: {
     voidIssued(input: VoidIssuedAdjustmentInput): Promise<IssuedAdjustmentLifecycleResult>;
     replaceIssued(input: ReplaceIssuedAdjustmentInput): Promise<IssuedAdjustmentLifecycleResult>;
@@ -647,6 +885,9 @@ export type ErpFinancials = {
     replaceIssued(input: ReplaceIssuedRefundInput): Promise<IssuedAdjustmentLifecycleResult>;
   };
   readonly vendorBills: {
+    correctPosted(input: CorrectPostedVendorBillInput): Promise<CorrectPostedVendorBillResult>;
+    setPaymentHold(input: SetVendorBillPaymentHoldInput): Promise<VendorBillPaymentHoldResult>;
+    retirePaymentHoldAttempt(input: RetireVendorBillPaymentHoldInput): Promise<RetireVendorBillPaymentHoldResult>;
     create(input: CreateVendorBillInput): Promise<SubledgerDocumentResult>;
     voidIssued(input: VoidIssuedVendorBillInput): Promise<PostedVendorBillLifecycleResult>;
     replaceIssued(input: ReplaceIssuedVendorBillInput): Promise<PostedVendorBillLifecycleResult>;
@@ -656,6 +897,7 @@ export type ErpFinancials = {
   readonly billPayments: {
     record(input: RecordBillPaymentInput): Promise<SubledgerDocumentResult>;
     recordAndApply(input: RecordAndApplyBillPaymentInput): Promise<ClearedBillPaymentResult>;
+    retireRecordingAttempt(input: RetireBillPaymentRecordingInput): Promise<RetireBillPaymentRecordingResult>;
     schedule(input: ScheduleBillPaymentInput): Promise<ScheduledBillPaymentResult>;
     clear(input: ClearScheduledBillPaymentInput): Promise<ClearedBillPaymentResult>;
     cancel(input: CancelScheduledBillPaymentInput): Promise<CancelledScheduledBillPaymentResult>;
@@ -680,6 +922,7 @@ export type ErpFinancials = {
   };
   readonly paymentApplications: {
     apply(input: ApplySubledgerPaymentInput): Promise<SubledgerApplicationResult>;
+    retireReceiptAttempt(input: RetireReceiptApplicationInput): Promise<RetireReceiptApplicationResult>;
     unapply(input: EndSubledgerApplicationInput): Promise<SubledgerApplicationResult>;
     void(input: EndSubledgerApplicationInput): Promise<SubledgerApplicationResult>;
   };
@@ -713,6 +956,7 @@ export class ErpFinancialsIdempotencyConflictError extends ErpFinancialsError {
 }
 
 type ServiceContext = {
+  readonly invoiceAccountPolicy?: InvoiceAccountPolicy;
   readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly customerPaymentCorrectionGuard?: CustomerPaymentCorrectionGuard;
   readonly database: ErpFinancialsTransactionRunner;
@@ -746,6 +990,7 @@ type NormalizedJournalEntry = {
   readonly date: IsoDate;
   readonly transactionNumber?: string;
   readonly memo?: string;
+  readonly origin?: JournalEntryOrigin;
   readonly postedAt?: IsoDateTime;
   readonly currencyCode: IsoCurrencyCode;
   readonly accountingBasis: AccountingBasis;
@@ -777,6 +1022,7 @@ export function createErpFinancials(input: CreateErpFinancialsInput): ErpFinanci
   const context = serviceContext(input);
 
   return {
+    parties: { ensureActive: command => ensureActiveParty(context, command) },
     accounts: {
       upsertTree(treeInput) {
         return upsertAccountTree(context, treeInput);
@@ -803,8 +1049,16 @@ export function createErpFinancials(input: CreateErpFinancialsInput): ErpFinanci
       }
     },
     fiscalPeriods: createFiscalPeriodService(context),
-    invoices: { create: (documentInput) => createInvoice(context, documentInput) },
+    invoices: {
+      create: (documentInput) => createInvoice(context, documentInput),
+      correctDates: (command) => runFinancialAction(context, "invoices.correctDates", command, correctInvoiceDates)
+    },
+    cashFlow: { correctPurpose: command => runFinancialAction(context, "cashFlow.correctPurpose", command, correctCashFlowPurpose) },
     customerPayments: { record: (documentInput) => recordCustomerPayment(context, documentInput),
+      recordAndApply: (command) => resolveCustomerPaymentCollection(context, command),
+      retireCollectionAttempt: ({command, operation}) => resolveCustomerPaymentCollection(context, command, operation),
+      previewReturnCash: (command) => previewCustomerPaymentCashReturn(context, command),
+      returnCash: (command) => runFinancialAction(context, "customerPayments.returnCash", command, returnCustomerPaymentCash),
       ...createCustomerPaymentCorrectionService(context, (client, journal) => {
         // Keep correction compensation out of the generic journal lifecycle API.
         const correctionJournal: InternalPostJournalEntryInput = {
@@ -835,6 +1089,9 @@ export function createErpFinancials(input: CreateErpFinancialsInput): ErpFinanci
       ))
     },
     vendorBills: {
+      correctPosted: command => runFinancialAction(context, "vendorBills.correctPosted", command, correctPostedVendorBill),
+      setPaymentHold: command => setVendorBillPaymentHold(context, command),
+      retirePaymentHoldAttempt: command => retireVendorBillPaymentHoldAttempt(context, command),
       create: (documentInput) => createVendorBill(context, documentInput),
       voidIssued: (workflowInput) => runFinancialAction(context, "vendorBills.voidIssued", workflowInput, (context, workflowInput) => runPostedVendorBillLifecycle(context, "voided", workflowInput)),
       replaceIssued: (workflowInput) => runFinancialAction(context, "vendorBills.replaceIssued", workflowInput, (context, workflowInput) => runPostedVendorBillLifecycle(context, "replaced", workflowInput)),
@@ -844,6 +1101,7 @@ export function createErpFinancials(input: CreateErpFinancialsInput): ErpFinanci
     billPayments: {
       record: (documentInput) => recordBillPayment(context, documentInput),
       recordAndApply: (documentInput) => recordAndApplyBillPayment(context, documentInput),
+      retireRecordingAttempt: (input) => retireBillPaymentRecordingAttempt(context, input),
       schedule: (documentInput) => scheduleBillPayment(context, documentInput),
       clear: (workflowInput) => clearScheduledBillPayment(context, workflowInput),
       cancel: (workflowInput) => runFinancialAction(context, "billPayments.cancel", workflowInput, (context, workflowInput) => cancelScheduledBillPayment(context, workflowInput)),
@@ -872,6 +1130,7 @@ export function createErpFinancials(input: CreateErpFinancialsInput): ErpFinanci
     },
     paymentApplications: {
       apply: (applicationInput) => applySubledgerPayment(context, applicationInput),
+      retireReceiptAttempt: ({ command, operation }) => applySubledgerPayment(context, command, operation),
       unapply: (applicationInput) => runFinancialAction(context, "paymentApplications.unapply", applicationInput, (context, applicationInput) => endSubledgerApplication(context, applicationInput, "unapplied")),
       void: (applicationInput) => runFinancialAction(context, "paymentApplications.void", applicationInput, (context, applicationInput) => endSubledgerApplication(context, applicationInput, "voided"))
     }
@@ -884,24 +1143,80 @@ export function createPostgresTransactionRunner(
   return {
     async transaction<Result>(operation: (client: PostgresQueryClient) => Promise<Result>): Promise<Result> {
       const client = await pool.connect();
-      let transactionStarted = false;
-
+      let transactionStarted = false, discard = false;
+      let connectionFailure: Error | undefined;
+      const onConnectionError = (error: Error) => { connectionFailure ??= error; };
+      const assertConnection = () => { if (connectionFailure) throw connectionFailure; };
+      const observesErrors = typeof client.on === "function" && typeof client.off === "function";
+      if (observesErrors) client.on?.("error", onConnectionError);
       try {
         await client.query("begin");
         transactionStarted = true;
+        assertConnection();
         const result = await operation(client);
+        assertConnection();
         await client.query("commit");
+        assertConnection();
         return result;
       } catch (error) {
         if (transactionStarted) {
-          await client.query("rollback");
-        }
+          try { await client.query("rollback"); } catch { discard = true; }
+        } else discard = true;
+        // Rollback failure must not hide a command/commit error. Callers recover
+        // uncertain commits with their original key; this runner never retries.
         throw error;
       } finally {
-        client.release();
+        try { if (connectionFailure || discard) client.release(connectionFailure ?? true); else client.release(); }
+        finally { if (observesErrors) client.off?.("error", onConnectionError); }
       }
     }
   };
+}
+
+async function ensureActiveParty(context: ServiceContext, command: EnsureActivePartyInput): Promise<EnsureActivePartyResult> {
+  const input = { ...command, operation: copyFinancialOperation(command.operation) };
+  assertFinancialOperationContext(input.operation);
+  for (const value of [input.partyId, input.sourcePartyId, input.displayName]) {
+    if (typeof value !== "string" || !value.trim() || value.length > 512) {
+      throw new ErpFinancialsValidationError("Party identity and display name must be nonempty and at most 512 characters");
+    }
+  }
+  if (!(new Set<string>(["customer", "vendor"])).has(input.partyType)) {
+    throw new ErpFinancialsValidationError("Operational party registration requires customer or vendor");
+  }
+  return context.database.transaction(async client => {
+    await assertCompanySourceScope(client, context);
+    // The unique source identity serializes concurrent first registration.
+    // Never UPDATE on conflict: an importer or accountant may have disabled it.
+    const inserted = await client.query(
+      `insert into erp_financials.parties
+       (party_id,tenant_id,source_id,source_party_id,party_type,display_name,active)
+       values ($1,$2,$3,$4,$5,$6,true)
+       on conflict (tenant_id,source_id,source_party_id) do nothing returning party_id`,
+      [input.partyId, context.tenantId, context.sourceId, input.sourcePartyId, input.partyType, input.displayName]
+    );
+    const stored = (await client.query<{ party_id: string; party_type: string; active: boolean }>(
+      `select party_id,party_type,active from erp_financials.parties
+       where tenant_id=$1 and source_id=$2 and source_party_id=$3 for share`,
+      [context.tenantId, context.sourceId, input.sourcePartyId]
+    )).rows[0];
+    if (!stored || stored.party_id !== input.partyId || stored.party_type !== input.partyType) {
+      throw new ErpFinancialsError("scope_mismatch", "Operational party identity conflicts with existing accounting identity");
+    }
+    if (!stored.active) throw new ErpFinancialsError("missing_party", "Accounting party is inactive");
+    // FOR SHARE blocks non-key active-state updates through the caller's commit.
+    if (inserted.rows.length) {
+      await appendFinancialLifecycleEvent(client, {
+        tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId,
+        aggregateType: "party", aggregateId: input.partyId, eventType: "party.registered",
+        idempotencyKey: `party-registration:${createHash("sha256").update(input.sourcePartyId).digest("hex")}`,
+        operation: input.operation, recordedAt: context.now(),
+        payload: { partyId: input.partyId, sourcePartyId: input.sourcePartyId,
+          partyType: input.partyType, displayName: input.displayName }
+      });
+    }
+    return { partyId: stored.party_id };
+  });
 }
 
 async function upsertAccountTree(
@@ -983,6 +1298,7 @@ async function postJournalEntry(
   const identities = journalIdentities(context, journal);
 
   return context.database.transaction(async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(
       client,
       `journal-entry:${context.tenantId}:${context.sourceId}:${journal.idempotencyKey}`
@@ -1000,7 +1316,9 @@ async function executePostJournalEntryInTransaction(
   context: ServiceContext,
   input: PostJournalEntryInput,
   journal: NormalizedJournalEntry,
-  identities: ReturnType<typeof journalIdentities>
+  identities: ReturnType<typeof journalIdentities>,
+  accountRequirements: readonly { readonly accountId: string; readonly classifications: readonly AccountClassification[] }[] = [],
+  validateNewPosting?: ()=>void
 ): Promise<PostJournalEntryResult> {
     const existing = await loadExistingJournal(
       client,
@@ -1014,11 +1332,26 @@ async function executePostJournalEntryInTransaction(
         existing.status === "posted" &&
         sourceRefChecksum(existing.sourcePayloadRef) === journal.checksum
       ) {
-        const lifecycle = await appendJournalPostedLifecycleEvent(client, context, input.operation, journal, identities);
-        return alreadyPostedResult(identities, lifecycle.eventId);
+        const eventKey = `${journal.lifecycleAggregateType}:${journal.sourceTransactionType}:${journal.idempotencyKey}:posted`;
+        const event = (await client.query(
+          `select "event_id", "aggregate_type", "aggregate_id", "event_type", "actor_ref", "approver_ref", "reason_code", "reason_detail"
+from "erp_financials"."financial_lifecycle_events"
+where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "idempotency_key" = $4
+for key share`,
+          [context.tenantId, context.companyId, context.sourceId, eventKey]
+        )).rows[0];
+        if (!event || event.aggregate_type !== journal.lifecycleAggregateType || event.aggregate_id !== identities.transactionId ||
+            event.event_type !== journal.lifecycleEventType || event.actor_ref !== input.operation.actorRef ||
+            (event.approver_ref ?? null) !== (input.operation.approverRef ?? null) ||
+            event.reason_code !== input.operation.reasonCode || (event.reason_detail ?? null) !== (input.operation.reasonDetail ?? null)) {
+          throw new ErpFinancialsIdempotencyConflictError(journal.idempotencyKey);
+        }
+        return alreadyPostedResult(identities, storedString(event.event_id, "event_id"));
       }
       throw new ErpFinancialsIdempotencyConflictError(journal.idempotencyKey);
     }
+
+    validateNewPosting?.();
 
     if (context.postingPolicy === "enforce_fiscal_periods") {
       await assertPostingDateAllowed(client, context, journal.date, {
@@ -1029,12 +1362,21 @@ async function executePostJournalEntryInTransaction(
     const storage = createPostgresStorageAdapter(client);
     const accountIds = unique(journal.lines.map((line) => line.accountId));
     await assertPostingAccountEligibility(client, context, accountIds);
+    if (accountRequirements.length) await client.query(
+      `select account_id from erp_financials.accounts where tenant_id=$1 and source_id=$2 and account_id=any($3::text[]) order by account_id for share`,
+      [context.tenantId, context.sourceId, [...new Set(accountRequirements.map(item => item.accountId))].sort()]);
     const accounts = await storage.loadAccounts({
       tenantId: context.tenantId,
       sourceId: context.sourceId,
       accountIds
     });
     assertJournalAccounts(accounts, accountIds);
+    for (const requirement of accountRequirements) {
+      const account = accounts.find(candidate => candidate.accountId === requirement.accountId);
+      if (!account || !requirement.classifications.includes(account.classification)) {
+        throw new ErpFinancialsValidationError("Account classification does not satisfy the posting policy", "invalid_input", { accountId: requirement.accountId });
+      }
+    }
 
     const postedAt = journal.postedAt ?? context.now();
     assertIsoDateTime(postedAt, "postedAt");
@@ -1056,19 +1398,25 @@ async function executePostJournalEntryInTransaction(
       accountingBasis: journal.accountingBasis,
       currencyCode: journal.currencyCode
     });
-    const lifecycle = await appendJournalPostedLifecycleEvent(client, context, input.operation, journal, identities);
+    const lifecycle = await appendJournalPostedLifecycleEvent(client, context, input.operation, journal, identities, accountRequirements);
+    const ledgerPayload = {
+      accountingBasis: journal.accountingBasis,
+      currencyCode: journal.currencyCode,
+      postingDate: journal.date,
+      transactionId: identities.transactionId
+    };
+    const inlinePayload = { ...ledgerPayload, postingIds: identities.postingIds };
+    // Preserve existing small-event payloads. Large journals publish a complete
+    // locator plus explicit omission metadata, never a truncated list of facts.
+    const payload = Buffer.byteLength(JSON.stringify(inlinePayload), "utf8") <= FINANCIAL_OUTBOX_MAX_PAYLOAD_BYTES
+      ? inlinePayload
+      : { ...ledgerPayload, postingCount: identities.postingIds.length, postingIdsOmitted: true };
     await appendServiceOutboxEvent(client, context, {
       eventType: "ledger.posted",
       aggregateType: journal.lifecycleAggregateType,
       aggregateId: identities.transactionId,
       idempotencyKey: `ledger-posted:${journal.sourceTransactionType}:${journal.idempotencyKey}`,
-      payload: {
-        accountingBasis: journal.accountingBasis,
-        currencyCode: journal.currencyCode,
-        postingDate: journal.date,
-        postingIds: identities.postingIds,
-        transactionId: identities.transactionId
-      }
+      payload
     });
 
     return {
@@ -1084,6 +1432,7 @@ async function executePostJournalEntryInTransaction(
 }
 
 type SubledgerDocumentWrite = {
+  readonly recognitionDate?: IsoDate;
   readonly documentType: SubledgerDocumentType;
   readonly idempotencyKey: string;
   readonly date: IsoDate;
@@ -1098,25 +1447,137 @@ type SubledgerDocumentWrite = {
   readonly documentLines?: readonly NormalizedSubledgerAmountLine[];
   readonly memo?: string;
   readonly operation: FinancialOperationContext;
+  readonly accountRequirements?: readonly { readonly accountId: string; readonly classifications: readonly AccountClassification[] }[];
+  readonly validateNewPosting?: ()=>void;
 };
 
+async function correctInvoiceDates(context: ServiceContext, input: CorrectInvoiceDatesInput): Promise<CorrectInvoiceDatesResult> {
+  assertFinancialApproval(context, input.operation);
+  assertNonEmpty(input.invoiceId, "invoiceId");
+  assertNonEmpty(input.idempotencyKey, "idempotencyKey");
+  assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
+  assertIsoDate(input.documentDate, "documentDate");
+  if (input.recognitionDate !== undefined) assertIsoDate(input.recognitionDate, "recognitionDate");
+  assertIsoDate(input.dueDate, "dueDate");
+  const explicitRecognitionDate = input.recognitionDate !== undefined;
+  const command = { invoiceId: input.invoiceId, expectedVersion: input.expectedVersion,
+    idempotencyKey: input.idempotencyKey, documentDate: input.documentDate, dueDate: input.dueDate,
+    ...(input.recognitionDate !== undefined && input.recognitionDate !== input.documentDate ? { recognitionDate: input.recognitionDate } : {}),
+    operation: copyFinancialOperation(input.operation) };
+  const { operation, ...business } = command;
+  const checksum = createHash("sha256").update(stableJson(JSON.parse(JSON.stringify({ ...business,
+    actorRef: operation.actorRef, approverRef: operation.approverRef,
+    reasonCode: operation.reasonCode, reasonDetail: operation.reasonDetail
+  })) as JsonValue)).digest("hex");
+  const eventKey = `invoice-date-correction:${command.idempotencyKey}:completed`;
+  return context.database.transaction(async client => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    await acquireTransactionLock(client, `invoice-date-correction:${context.tenantId}:${context.companyId}:${context.sourceId}:${command.idempotencyKey}`);
+    await assertCompanySourceScope(client, context);
+    const replay = (await client.query(
+      `select "event_id", "aggregate_id", "payload" from "erp_financials"."financial_lifecycle_events"
+where "tenant_id"=$1 and "company_id"=$2 and "source_id"=$3 and "idempotency_key"=$4`,
+      [context.tenantId, context.companyId, context.sourceId, eventKey]
+    )).rows[0];
+    if (replay) {
+      const payload = storedJson(replay.payload) as { commandChecksum?: string; result?: Omit<CorrectInvoiceDatesResult, "lifecycleEventId"> } | null;
+      if (replay.aggregate_id !== command.invoiceId || payload?.commandChecksum !== checksum || !payload.result) {
+        throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+      }
+      return { ...payload.result, lifecycleEventId: storedString(replay.event_id, "event_id") };
+    }
+    const invoice = (await client.query(
+      `select *, "document_date"::text as "document_date", "due_date"::text as "due_date", "recognition_date"::text as "recognition_date" from "erp_financials"."subledger_documents"
+where "tenant_id"=$1 and "company_id"=$2 and "source_id"=$3 and "subledger_document_id"=$4 for update`,
+      [context.tenantId, context.companyId, context.sourceId, command.invoiceId]
+    )).rows[0];
+    if (!invoice || invoice.document_type !== "invoice") throw new ErpFinancialsError("missing_document", "Invoice is not in this write source");
+    if (invoice.status === "voided" || (await client.query(
+      `select 1 from "erp_financials"."invoice_voids" where "tenant_id"=$1 and "company_id"=$2 and "source_id"=$3 and "invoice_document_id"=$4 limit 1`,
+      [context.tenantId, context.companyId, context.sourceId, command.invoiceId]
+    )).rows.length) throw new ErpFinancialsError("terminal_state_conflict", "A voided invoice cannot be date-corrected");
+    const version = storedInteger(invoice.version, "version");
+    if (version !== command.expectedVersion) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Invoice changed before correction", { retryable: true });
+    const previousDate = storedDate(invoice.document_date, "document_date");
+    const previousRecognitionDate = storedDate(invoice.recognition_date ?? invoice.document_date, "recognition_date");
+    if (previousRecognitionDate !== previousDate && !explicitRecognitionDate) throw new ErpFinancialsValidationError("An invoice with distinct dates requires an explicit recognitionDate for correction");
+    const recognitionDate = command.recognitionDate ?? command.documentDate;
+    const previousDueDate = storedOptionalDate(invoice.due_date, "due_date") ?? null;
+    const earlierApplication = await client.query(`select 1 from "erp_financials"."subledger_applications"
+where "tenant_id"=$1 and "company_id"=$2 and "source_id"=$3 and "target_document_id"=$4 and "application_date"<$5::date limit 1`,
+      [context.tenantId,context.companyId,context.sourceId,command.invoiceId,recognitionDate]);
+    if (earlierApplication.rows.length) throw new ErpFinancialsValidationError("Recognition cannot follow historical invoice applications; use an explicit economic correction");
+    // Corrections always honor both periods, including callers using legacy import policy.
+    await assertPostingDateAllowed(client, context, previousRecognitionDate);
+    await assertPostingDateAllowed(client, context, recognitionDate);
+    const original = await loadPostedJournalForLifecycle(client, context, storedString(invoice.transaction_id, "transaction_id"), [subledgerTransactionType("invoice")], "accrual");
+    if (original.accountingBasis !== "accrual" || original.currencyCode !== context.currencyCode) {
+      throw new ErpFinancialsError("unsupported_operation", "Invoice correction requires a native accrual invoice in the scope currency");
+    }
+    let reversalTransactionId: string | undefined;
+    let replacementTransactionId: string | undefined;
+    if (previousRecognitionDate !== recognitionDate) {
+      const nested = { ...nestedServiceContext(context, client), postingPolicy: "enforce_fiscal_periods" as const };
+      const common = { operation, accountingBasis: "accrual" as const, currencyCode: original.currencyCode,
+        nativeTransactionType: "Subledger:invoice_date_correction", nativePartyId: storedString(invoice.party_id, "party_id"),
+        origin: { module: "invoice_date_correction", reference: command.invoiceId } };
+      const reversal = await postJournalEntry(nested, { ...common, idempotencyKey: `${eventKey}:reversal`,
+        date: previousRecognitionDate, memo: `Invoice date correction: reverse ${command.invoiceId}`, lines: original.lines });
+      const replacement = await postJournalEntry(nested, { ...common, idempotencyKey: `${eventKey}:replacement`,
+        date: recognitionDate, memo: `Invoice date correction: restate ${command.invoiceId}`,
+        lines: original.lines.map(line => {
+          const { debit, credit, ...dimensions } = line;
+          return { ...dimensions, ...(credit === undefined ? { credit: debit } : { debit: credit }) };
+        }) });
+      reversalTransactionId = reversal.transactionId;
+      replacementTransactionId = replacement.transactionId;
+    }
+    const result: Omit<CorrectInvoiceDatesResult, "lifecycleEventId"> = {
+      invoiceId: command.invoiceId, version: version + 1, documentDate: command.documentDate, dueDate: command.dueDate,
+      ...(recognitionDate !== command.documentDate ? { recognitionDate } : {}),
+      originalTransactionId: original.transactionId,
+      ...(reversalTransactionId !== undefined && replacementTransactionId !== undefined ? { reversalTransactionId, replacementTransactionId } : {})
+    };
+    const event = await appendFinancialLifecycleEvent(client, {
+      tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId,
+      aggregateType: "subledger_document", aggregateId: command.invoiceId,
+      eventType: "subledger.invoice.dates_corrected", idempotencyKey: eventKey, operation, recordedAt: context.now(),
+      payload: { commandChecksum: checksum, expectedVersion: version, previousDate, previousDueDate,
+        ...(previousRecognitionDate !== previousDate ? { previousRecognitionDate } : {}), result }
+    });
+    const updated = await client.query(
+      `update "erp_financials"."subledger_documents" set "document_date"=$5, "due_date"=$6, "recognition_date"=$9, "version"="version"+1, "updated_at"=$7
+where "tenant_id"=$1 and "company_id"=$2 and "source_id"=$3 and "subledger_document_id"=$4 and "version"=$8 returning "version"`,
+      [context.tenantId, context.companyId, context.sourceId, command.invoiceId, command.documentDate, command.dueDate, context.now(), version, recognitionDate === command.documentDate ? null : recognitionDate]
+    );
+    if (!updated.rows[0]) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Invoice changed before correction", { retryable: true });
+    await appendServiceOutboxEvent(client, context, {
+      eventType: "subledger.invoice.dates_corrected", aggregateType: "subledger_document", aggregateId: command.invoiceId,
+      idempotencyKey: `${eventKey}:outbox`, payload: { ...result, lifecycleEventId: event.eventId }
+    });
+    return { ...result, lifecycleEventId: event.eventId };
+  });
+}
+
 async function createInvoice(context: ServiceContext, input: CreateInvoiceInput): Promise<SubledgerDocumentResult> {
-  const revenueLines = normalizeSubledgerLines(input.revenueLines, "revenueLines");
+  input = structuredClone(input);
+  const policy = context.invoiceAccountPolicy;
+  const revenueLines = normalizeInvoiceLines(input.revenueLines);
   const amount = sumSubledgerLines(revenueLines, "revenueLines");
   return createSubledgerDocument(context, {
     ...commonSubledgerDocument(context, input, "invoice", amount, true),
+    accountRequirements: [
+      ...(policy ? [{accountId:resolveAccountId(context,input.receivableAccount),classifications:policy.receivableClassifications},
+        ...revenueLines.map(line=>({accountId:resolveAccountId(context,line),classifications:policy.revenueClassifications}))] : []),
+      ...revenueLines.flatMap(line=>invoiceComponentRequirements(line,policy,ref=>resolveAccountId(context,ref)))
+    ],
+    validateNewPosting: ()=>{ for(const line of revenueLines) assertInvoiceComponentPolicy(line,policy,resolveAccountId(context,input.receivableAccount),ref=>resolveAccountId(context,ref)); },
+    ...(input.recognitionDate === undefined || input.recognitionDate === input.date ? {} : { recognitionDate: input.recognitionDate }),
     dueDate: input.dueDate,
     partyId: input.customerId,
     journalLines: [
       { ...input.receivableAccount, debit: amount, partyId: input.customerId },
-      ...revenueLines.map((line) => ({
-        ...accountReferenceOnly(line),
-        credit: line.amount,
-        partyId: input.customerId,
-        ...(line.itemId === undefined ? {} : { itemId: line.itemId }),
-        ...(line.description === undefined ? {} : { description: line.description }),
-        dimensionRefs: line.dimensionRefs
-      }))
+      ...revenueLines.flatMap(line=>invoiceComponentJournalLines(line,input.customerId))
     ],
     documentLines: revenueLines
   });
@@ -1128,6 +1589,10 @@ async function recordCustomerPayment(
 ): Promise<SubledgerDocumentResult> {
   const amount = normalizedPositiveMoney(input.amount, "amount");
   const provenance = paymentProvenance(input.provenance);
+  if (input.cashFlowActivity !== undefined && !["operating", "investing", "financing"].includes(input.cashFlowActivity)) {
+    throw new ErpFinancialsValidationError("cashFlowActivity must be operating, investing or financing");
+  }
+  if (input.collectionRef !== undefined && (typeof input.collectionRef !== "string" || !input.collectionRef.trim() || input.collectionRef.length > 512)) throw new ErpFinancialsValidationError("collectionRef must contain 1–512 characters");
   return createSubledgerDocument(context, {
     ...commonSubledgerDocument(
       context,
@@ -1135,13 +1600,317 @@ async function recordCustomerPayment(
       "customer_payment",
       amount,
       true,
-      provenance === undefined ? {} : { customerPaymentProvenance: provenance }
+      { ...(provenance === undefined ? {} : { customerPaymentProvenance: provenance }),
+        ...(input.cashFlowActivity === undefined ? {} : { cashFlowActivity: input.cashFlowActivity }),
+        ...(input.collectionRef === undefined ? {} : { collectionRef: input.collectionRef }) }
     ),
     partyId: input.customerId,
     journalLines: [
       { ...input.cashAccount, debit: amount, partyId: input.customerId },
       { ...input.receivableAccount, credit: amount, partyId: input.customerId }
     ]
+  });
+}
+
+function resolveCustomerPaymentCollection(context: ServiceContext, input: RecordAndApplyCustomerPaymentInput): Promise<RecordAndApplyCustomerPaymentResult>;
+function resolveCustomerPaymentCollection(context: ServiceContext, input: RecordAndApplyCustomerPaymentInput, retirement: FinancialOperationContext): Promise<RetireCustomerPaymentCollectionResult>;
+async function resolveCustomerPaymentCollection(context: ServiceContext, input: RecordAndApplyCustomerPaymentInput, retirementInput?: FinancialOperationContext): Promise<RetireCustomerPaymentCollectionResult> {
+  const retirement = retirementInput === undefined ? undefined : copyFinancialOperation(retirementInput);
+  if (retirement) {
+    assertFinancialOperationContext(retirement);
+    if (retirement.actorRef !== input.operation.actorRef) throw new ErpFinancialsError("authorization_context_invalid", "Only the original collection actor may retire its unrecorded attempt");
+  }
+  assertFinancialOperationContext(input.operation);
+  assertNonEmpty(input.idempotencyKey, "idempotencyKey");
+  assertNonEmpty(input.invoiceId, "invoiceId");
+  assertExpectedSubledgerVersion(input.expectedInvoiceVersion, "expectedInvoiceVersion");
+  const { applicationAmount: requestedApplicationAmount, applicationDate: requestedApplicationDate, ...receiptInput } = structuredClone(input);
+  const applicationDate = requestedApplicationDate ?? receiptInput.date;
+  assertIsoDate(receiptInput.date, "date");
+  assertIsoDate(applicationDate, "applicationDate");
+  if (applicationDate < receiptInput.date) throw new ErpFinancialsValidationError("Application cannot precede cash receipt");
+  const amount = normalizedPositiveMoney(receiptInput.amount, "amount");
+  const applicationAmount = requestedApplicationAmount === undefined ? amount : normalizedPositiveMoney(requestedApplicationAmount, "applicationAmount");
+  if (parsePositiveMoney(applicationAmount, "applicationAmount") > parsePositiveMoney(amount, "amount")) {
+    throw new ErpFinancialsValidationError("applicationAmount cannot exceed the receipt amount");
+  }
+  // Preserve the previous checksum for full-receipt applications, including
+  // retries of commands committed before this optional field was introduced.
+  const command = { ...receiptInput, amount,
+    ...(applicationAmount === amount ? {} : { applicationAmount }),
+    ...(applicationDate === receiptInput.date ? {} : { applicationDate }),
+    operation: copyFinancialOperation(input.operation) };
+  const { operation, ...business } = command;
+  const checksum = createHash("sha256").update(stableJson(JSON.parse(JSON.stringify({ ...business,
+    bookId: context.bookId ?? null, currencyCode: command.currencyCode ?? context.currencyCode,
+    actorRef: operation.actorRef, approverRef: operation.approverRef,
+    reasonCode: operation.reasonCode, reasonDetail: operation.reasonDetail
+  })) as JsonValue)).digest("hex");
+  const retirementChecksum = retirement === undefined ? undefined : createHash("sha256").update(stableJson({
+    actorRef: retirement.actorRef, approverRef: retirement.approverRef ?? null,
+    reasonCode: retirement.reasonCode, reasonDetail: retirement.reasonDetail ?? null
+  })).digest("hex");
+  const eventKey = `customer-payment-collection:${command.idempotencyKey}:completed`;
+  return context.database.transaction(async client => {
+    // Match the application/correction lock order before any cash posting.
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    await acquireTransactionLock(client, `customer-payment-collection:${context.tenantId}:${context.companyId}:${context.sourceId}:${command.idempotencyKey}`);
+    await assertCompanySourceScope(client, context);
+    const replay = (await client.query(
+      `select "event_id", "aggregate_id", "payload" from "erp_financials"."financial_lifecycle_events"
+where "tenant_id"=$1 and "company_id"=$2 and "source_id"=$3 and "idempotency_key"=$4`,
+      [context.tenantId, context.companyId, context.sourceId, eventKey]
+    )).rows[0];
+    if (replay) {
+      const payload = storedJson(replay.payload) as { commandChecksum?: string; retired?: boolean; invoiceId?: string; retirementChecksum?: string; result?: Omit<RecordAndApplyCustomerPaymentResult, "status" | "lifecycleEventId"> } | null;
+      if (payload?.retired === true) {
+        if (!retirement || payload.commandChecksum !== checksum || payload.retirementChecksum !== retirementChecksum
+          || payload.invoiceId !== command.invoiceId || replay.aggregate_id !== `collection-attempt:${checksum}`) throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+        return {status:"already_retired",invoiceId:command.invoiceId,idempotencyKey:command.idempotencyKey,lifecycleEventId:storedString(replay.event_id,"event_id")};
+      }
+      if (payload?.commandChecksum !== checksum || !payload.result || replay.aggregate_id !== payload.result.paymentId) {
+        throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+      }
+      return { ...payload.result, status: "already_recorded_and_applied", lifecycleEventId: storedString(replay.event_id, "event_id") };
+    }
+    if (retirement) {
+      const independent = await client.query(`select subledger_document_id from erp_financials.subledger_documents
+        where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+        [context.tenantId,context.companyId,context.sourceId,command.idempotencyKey]);
+      if (independent.rows.length) throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+      // A source can serve several books. Verify the target's original native
+      // posting provenance; do not infer a book from current caller configuration.
+      const target = (await client.query(`select d.party_id, o.book_id
+        from erp_financials.subledger_documents d join erp_financials.financial_outbox o
+          on o.tenant_id=d.tenant_id and o.company_id=d.company_id and o.source_id=d.source_id
+          and o.aggregate_id=d.transaction_id and o.event_type='ledger.posted'
+        where d.tenant_id=$1 and d.company_id=$2 and d.source_id=$3 and d.subledger_document_id=$4
+          and d.document_type='invoice' for key share of d,o`,
+        [context.tenantId,context.companyId,context.sourceId,command.invoiceId])).rows;
+      const original=target[0];
+      if (target.length!==1 || !original || original.party_id!==command.customerId || storedOptionalString(original.book_id)!==context.bookId) {
+        throw new ErpFinancialsError("scope_mismatch", "Collection retirement requires the original customer's native invoice in this book and source");
+      }
+      if (retirementChecksum===undefined) throw new Error("Collection retirement checksum is missing");
+      const lifecycle=await appendFinancialLifecycleEvent(client,{...context,operation:retirement,
+        aggregateType:"customer_payment_collection",aggregateId:`collection-attempt:${checksum}`,
+        eventType:"customer_payment.collection_retired",idempotencyKey:eventKey,recordedAt:context.now(),
+        payload:{commandChecksum:checksum,retired:true,invoiceId:command.invoiceId,retirementChecksum}});
+      return {status:"retired",invoiceId:command.invoiceId,idempotencyKey:command.idempotencyKey,lifecycleEventId:lifecycle.eventId};
+    }
+    const nested = { ...context, database: { transaction: async <T>(work: (client: PostgresQueryClient) => Promise<T>) => work(client) } };
+    const payment = await recordCustomerPayment(nested, command);
+    // An independently recorded receipt is not a replay of this composite
+    // command. Its allocations must use the explicit application API.
+    if (payment.status === "already_posted") throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+    const application = await applySubledgerPayment(nested, {
+      operation, idempotencyKey: `customer-payment-collection:${command.idempotencyKey}:apply`,
+      applicationType: "customer_payment_to_invoice", sourceDocumentId: payment.documentId,
+      targetDocumentId: command.invoiceId, amount: applicationAmount, applicationDate,
+      expectedSourceVersion: payment.version, expectedTargetVersion: command.expectedInvoiceVersion
+    });
+    const result = { paymentId: payment.documentId, invoiceId: command.invoiceId, applicationId: application.applicationId,
+      paymentTransactionId: payment.journal.transactionId, amount: command.amount };
+    const lifecycle = await appendFinancialLifecycleEvent(client, { ...context, operation,
+      aggregateType: "customer_payment", aggregateId: payment.documentId, eventType: "customer_payment.recorded_and_applied",
+      idempotencyKey: eventKey, recordedAt: context.now(), payload: { commandChecksum: checksum, result } });
+    return { ...result, status: "recorded_and_applied", lifecycleEventId: lifecycle.eventId };
+  });
+}
+
+function normalizeCustomerPaymentCashReturn(input: PreviewCustomerPaymentCashReturnInput): PreviewCustomerPaymentCashReturnInput {
+  const releaseInputs: PreviewCustomerPaymentCashReturnInput["releases"] = input.releases;
+  assertNonEmpty(input.paymentId, "paymentId");
+  assertNonEmpty(input.customerId, "customerId");
+  assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
+  assertIsoDate(input.date, "date");
+  if (!["refund", "void"].includes(input.returnKind) || !Array.isArray(input.releases)) {
+    throw new ErpFinancialsValidationError("Return requires refund/void kind and an explicit application release plan");
+  }
+  const command = { paymentId: input.paymentId, customerId: input.customerId, expectedVersion: input.expectedVersion,
+    date: input.date, amount: normalizedPositiveMoney(input.amount, "amount"), returnKind: input.returnKind,
+    releases: releaseInputs.map(release => {
+      assertNonEmpty(release.applicationId, "applicationId");
+      assertExpectedSubledgerVersion(release.expectedVersion, "release.expectedVersion");
+      return { applicationId: release.applicationId, expectedVersion: release.expectedVersion,
+        amount: normalizedPositiveMoney(release.amount, "release.amount") };
+    }).sort((a,b) => a.applicationId.localeCompare(b.applicationId)) };
+  if (new Set(command.releases.map(release => release.applicationId)).size !== command.releases.length) {
+    throw new ErpFinancialsValidationError("Application release identities must be unique");
+  }
+  return command;
+}
+
+/** Shared by preflight and posting: all amounts and versions come from the same
+ * scoped transaction. Locks are released when the caller's transaction ends. */
+async function prepareCustomerPaymentCashReturn(client: PostgresQueryClient, context: ServiceContext,
+  command: PreviewCustomerPaymentCashReturnInput) {
+    const receipt = (await client.query(
+      `select *, "document_date"::text as "document_date", "due_date"::text as "due_date" from "erp_financials"."subledger_documents"
+where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_document_id" = $4 for update`,
+      [context.tenantId, context.companyId, context.sourceId, command.paymentId]
+    )).rows[0];
+    if (receipt?.document_type !== "customer_payment") throw new ErpFinancialsError("missing_document", "Receipt does not exist in the write source");
+    if (receipt.party_id !== command.customerId || receipt.currency_code !== context.currencyCode) {
+      throw new ErpFinancialsError("scope_mismatch", "Receipt customer or currency does not match the return");
+    }
+    if (receipt.status === "voided") throw new ErpFinancialsError("terminal_state_conflict", "Voided receipt cannot be returned");
+    if (storedInteger(receipt.version, "version") !== command.expectedVersion) {
+      throw new ErpFinancialsError("optimistic_concurrency_conflict", "Receipt changed before cash return", { retryable: true });
+    }
+    if (command.date < storedDate(receipt.document_date, "document_date")) throw new ErpFinancialsValidationError("Return cannot precede receipt date");
+    await assertPostingDateAllowed(client, context, command.date);
+    const amount = parsePositiveMoney(command.amount, "amount");
+    const priorReturns = (await client.query(
+      `select coalesce(sum("applied_amount"), 0)::text as returned from "erp_financials"."subledger_applications"
+where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "source_document_id" = $4
+  and "application_type" = 'customer_payment_to_refund' and "status" = 'applied'`,
+      [context.tenantId, context.companyId, context.sourceId, command.paymentId]
+    )).rows[0];
+    const returned = parsePositiveOrZeroMoney(priorReturns?.returned, "returned");
+    const originalAmount = parsePositiveMoney(storedMoney(receipt.original_amount, "original_amount"), "original_amount");
+    if (amount > originalAmount - returned) throw new ErpFinancialsValidationError("Return exceeds the remaining recorded receipt");
+    if (command.returnKind === "void" && (returned !== 0n || amount !== originalAmount)) {
+      throw new ErpFinancialsValidationError("Cash void must return the entire unrefunded receipt");
+    }
+    const available = parsePositiveOrZeroMoney(receipt.open_amount, "open_amount");
+    const requiredRelease = amount > available ? amount - available : 0n;
+    const requestedRelease = command.releases.reduce((sum, release) => sum + parsePositiveMoney(release.amount, "release.amount"), 0n);
+    if (requestedRelease !== requiredRelease) throw new ErpFinancialsValidationError("Release plan must use available receipt credit first and release exactly the remaining return amount");
+    // Native receipts have one cash debit and one receivable credit. Derive
+    // refund accounts from their immutable journal, never from caller input.
+    const original = await loadPostedJournalForLifecycle(client, context, storedString(receipt.transaction_id, "transaction_id"), [subledgerTransactionType("customer_payment")]);
+    if (original.lines.length !== 2 || original.currencyCode !== context.currencyCode) throw new ErpFinancialsError("unsupported_operation", "Receipt cash return requires a native two-account receipt");
+    const receivable = original.lines.find((line) => line.debit !== undefined);
+    const cash = original.lines.find((line) => line.credit !== undefined);
+    if (!receivable || !cash) throw new ErpFinancialsValidationError("Receipt journal has invalid cash/receivable sides");
+
+    const accountIds = [resolveAccountId(context, receivable), resolveAccountId(context, cash)];
+    await assertPostingAccountEligibility(client, context, accountIds);
+    const accounts = await createPostgresStorageAdapter(client).loadAccounts({ tenantId: context.tenantId, sourceId: context.sourceId, accountIds });
+    assertJournalAccounts(accounts, accountIds);
+    const applications = new Map<string, Record<string, unknown>>();
+    for (const release of command.releases) {
+      const application = (await client.query(
+        `select *, "application_date"::text as "application_date" from "erp_financials"."subledger_applications"
+where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_application_id" = $4 for update`,
+        [context.tenantId, context.companyId, context.sourceId, release.applicationId]
+      )).rows[0];
+      if (application?.source_document_id !== command.paymentId || application.application_type !== "customer_payment_to_invoice" || application.status !== "applied") {
+        throw new ErpFinancialsError("scope_mismatch", "Release must identify an active invoice application of this receipt");
+      }
+      if (command.date < storedDate(application.application_date, "application_date")) throw new ErpFinancialsValidationError("Return cannot precede its application");
+      const applied = parsePositiveMoney(storedMoney(application.applied_amount, "applied_amount"), "applied_amount");
+      const released = parsePositiveMoney(release.amount, "release.amount");
+      if (released > applied) throw new ErpFinancialsValidationError("Release exceeds original application amount");
+
+      if (storedInteger(application.version, "version") !== release.expectedVersion) {
+        throw new ErpFinancialsError("optimistic_concurrency_conflict", "Invoice application changed before cash return", { retryable: true });
+      }
+      // Validate the same cash-basis projection used when ending this allocation,
+      // before an external provider can be asked to return money.
+      const targetTransactionId = await loadSubledgerDocumentTransactionId(client, context,
+        storedString(application.target_document_id, "target_document_id"));
+      const projection = { applicationId: release.applicationId, applicationType: "customer_payment_to_invoice" as const,
+        effectiveDate: command.date, targetTransactionId };
+      await prepareCashBasisApplicationProjection(client, context, { ...projection, action: "reverse",
+        appliedAmount: formatMoney(applied) });
+      if (applied > released) await prepareCashBasisApplicationProjection(client, context, { ...projection,
+        action: "recognize", appliedAmount: formatMoney(applied - released), sourceDocument: receipt, previewReleasedApplicationId: release.applicationId });
+      applications.set(release.applicationId, application);
+    }
+    return { receipt, amount, originalAmount, returned, available, requestedRelease, receivable, cash, applications };
+}
+
+async function previewCustomerPaymentCashReturn(context: ServiceContext, input: PreviewCustomerPaymentCashReturnInput): Promise<PreviewCustomerPaymentCashReturnResult> {
+  // Normalize before awaiting, so the caller cannot mutate a pending plan.
+  const command = normalizeCustomerPaymentCashReturn(input);
+  return context.database.transaction(async client => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    await assertCompanySourceScope(client, context);
+    const plan = await prepareCustomerPaymentCashReturn(client, context, command);
+    return { paymentId: command.paymentId, paymentVersion: storedInteger(plan.receipt.version, "version"),
+      amount: command.amount, unappliedAmount: formatMoney(plan.available), releasedAmount: formatMoney(plan.requestedRelease),
+      remainingReturnableAmount: formatMoney(plan.originalAmount - plan.returned - plan.amount), releases: command.releases };
+  });
+}
+
+/** Return recorded cash without cancelling the underlying sale. */
+async function returnCustomerPaymentCash(context: ServiceContext, input: ReturnCustomerPaymentCashInput): Promise<ReturnCustomerPaymentCashResult> {
+  assertFinancialApproval(context, input.operation);
+  assertNonEmpty(input.idempotencyKey, "idempotencyKey");
+  assertNonEmpty(input.externalReturnRef, "externalReturnRef");
+  const command = { ...normalizeCustomerPaymentCashReturn(input), idempotencyKey: input.idempotencyKey,
+    externalReturnRef: input.externalReturnRef, ...(input.memo === undefined ? {} : { memo: input.memo }),
+    operation: copyFinancialOperation(input.operation) };
+  const { operation, ...business } = command;
+  const checksum = createHash("sha256").update(stableJson(JSON.parse(JSON.stringify({ ...business,
+    actorRef: operation.actorRef, approverRef: operation.approverRef, occurredAt: operation.occurredAt,
+    reasonCode: operation.reasonCode, reasonDetail: operation.reasonDetail
+  })) as JsonValue)).digest("hex");
+  const eventKey = `customer-payment-return:${command.idempotencyKey}:completed`;
+  return context.database.transaction(async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    await acquireTransactionLock(client, `customer-payment-return:${context.tenantId}:${context.companyId}:${context.sourceId}:${command.idempotencyKey}`);
+    await assertCompanySourceScope(client, context);
+    const replay = (await client.query(
+      `select "event_id", "aggregate_id", "payload" from "erp_financials"."financial_lifecycle_events"
+where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "idempotency_key" = $4`,
+      [context.tenantId, context.companyId, context.sourceId, eventKey]
+    )).rows[0];
+    if (replay !== undefined) {
+      const payload = storedJson(replay.payload) as { commandChecksum?: string; result?: Omit<ReturnCustomerPaymentCashResult, "lifecycleEventId"> } | null;
+      if (replay.aggregate_id !== command.paymentId || payload?.commandChecksum !== checksum || !payload.result) {
+        throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+      }
+      return { ...payload.result, status: "already_returned", lifecycleEventId: storedString(replay.event_id, "event_id") };
+    }
+    const { amount, originalAmount, returned, requestedRelease, receivable, cash, applications } =
+      await prepareCustomerPaymentCashReturn(client, context, command);
+    const nested = nestedServiceContext(context, client);
+    for (const release of command.releases) {
+      const application = applications.get(release.applicationId);
+      if (!application) throw new Error("Validated cash-return application is missing");
+      const applied = parsePositiveMoney(storedMoney(application.applied_amount, "applied_amount"), "applied_amount");
+      const released = parsePositiveMoney(release.amount, "release.amount");
+      await endSubledgerApplication(nested, { operation, applicationId: release.applicationId,
+        expectedVersion: release.expectedVersion, effectiveDate: command.date }, "unapplied");
+      if (applied > released) {
+        const invoiceId = storedString(application.target_document_id, "target_document_id");
+        const [source, target] = await loadSubledgerDocumentsForUpdate(client, context, [command.paymentId, invoiceId]);
+        await applySubledgerPayment(nested, { operation, idempotencyKey: `${command.idempotencyKey}:residual:${release.applicationId}`,
+          applicationType: "customer_payment_to_invoice", sourceDocumentId: command.paymentId, targetDocumentId: invoiceId,
+          amount: formatMoney(applied - released), applicationDate: command.date,
+          expectedSourceVersion: storedInteger(source.version, "version"), expectedTargetVersion: storedInteger(target.version, "version") });
+      }
+    }
+    const refund = await createSubledgerDocument(nested, {
+      ...commonSubledgerDocument(context, { ...command, idempotencyKey: `customer-payment-return:${command.externalReturnRef}` }, "refund", command.amount, true, {
+        customerPaymentReturn: { paymentId: command.paymentId, commandChecksum: checksum, returnKind: command.returnKind, externalReturnRef: command.externalReturnRef }
+      }),
+      partyId: command.customerId,
+      journalLines: [
+        { accountId: resolveAccountId(context, receivable), debit: command.amount, partyId: command.customerId },
+        { accountId: resolveAccountId(context, cash), credit: command.amount, partyId: command.customerId }
+      ]
+    });
+    const [source, target] = await loadSubledgerDocumentsForUpdate(client, context, [command.paymentId, refund.documentId]);
+    const settlement = await applySubledgerPayment(nested, { operation, idempotencyKey: `${command.idempotencyKey}:settlement`,
+      applicationType: "customer_payment_to_refund", sourceDocumentId: command.paymentId, targetDocumentId: refund.documentId,
+      amount: command.amount, applicationDate: command.date,
+      expectedSourceVersion: storedInteger(source.version, "version"), expectedTargetVersion: storedInteger(target.version, "version") });
+    const result: Omit<ReturnCustomerPaymentCashResult, "lifecycleEventId"> = {
+      status: "returned", paymentId: command.paymentId, refundDocumentId: refund.documentId,
+      refundTransactionId: refund.journal.transactionId, settlementApplicationId: settlement.applicationId,
+      amount: command.amount, releasedAmount: formatMoney(requestedRelease),
+      remainingReturnableAmount: formatMoney(originalAmount - returned - amount), paymentVersion: storedInteger(source.version, "version") + 1
+    };
+    const lifecycle = await appendFinancialLifecycleEvent(client, { tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId,
+      aggregateType: "customer_payment", aggregateId: command.paymentId, eventType: "customer_payment.returned", idempotencyKey: eventKey,
+      operation, recordedAt: context.now(), payload: { commandChecksum: checksum, result } });
+    await appendServiceOutboxEvent(client, context, { aggregateType: "customer_payment", aggregateId: command.paymentId,
+      eventType: "customer_payment.returned", idempotencyKey: `${eventKey}:outbox`, payload: { ...result, lifecycleEventId: lifecycle.eventId } });
+    return { ...result, lifecycleEventId: lifecycle.eventId };
   });
 }
 
@@ -1154,7 +1923,7 @@ async function issueCreditMemo(
   const legacyRevenueAccount: ErpFinancialsAccountReference | undefined = input.revenueAccount;
   const revenueLines = revenueLineInput === undefined
     ? undefined
-    : normalizeSubledgerLines(revenueLineInput, "revenueLines");
+    : normalizeInvoiceLines(revenueLineInput);
   const amount = revenueLines === undefined && legacyAmount !== undefined
     ? normalizedPositiveMoney(legacyAmount, "amount")
     : revenueLines === undefined
@@ -1164,16 +1933,11 @@ async function issueCreditMemo(
     ? legacyRevenueAccount === undefined
       ? (() => { throw new ErpFinancialsValidationError("Credit memo amount requires revenueAccount"); })()
       : [{ ...legacyRevenueAccount, debit: amount, partyId: input.customerId }]
-    : revenueLines.map((line): PostJournalEntryLineInput => ({
-        ...accountReferenceOnly(line),
-        debit: line.amount,
-        partyId: input.customerId,
-        ...(line.itemId === undefined ? {} : { itemId: line.itemId }),
-        ...(line.description === undefined ? {} : { description: line.description }),
-        dimensionRefs: line.dimensionRefs
-      }));
+    : revenueLines.flatMap(line=>invoiceComponentJournalLines(line,input.customerId,true));
   return createSubledgerDocument(context, {
     ...commonSubledgerDocument(context, input, "credit_memo", amount, true),
+    accountRequirements: revenueLines?.flatMap(line=>invoiceComponentRequirements(line,context.invoiceAccountPolicy,ref=>resolveAccountId(context,ref))) ?? [],
+    validateNewPosting: ()=>{ for(const line of revenueLines ?? []) assertInvoiceComponentPolicy(line,undefined,resolveAccountId(context,input.receivableAccount),ref=>resolveAccountId(context,ref)); },
     partyId: input.customerId,
     journalLines: [
       ...revenueJournalLines,
@@ -1207,14 +1971,157 @@ async function issueRefund(context: ServiceContext, input: IssueRefundInput): Pr
   });
 }
 
+function normalizeVendorBillPaymentHold(context: ServiceContext, input: SetVendorBillPaymentHoldInput) {
+  const command = structuredClone(input);
+  assertFinancialOperationContext(command.operation);
+  assertExpectedSubledgerVersion(command.expectedVersion, "expectedVersion");
+  assertNonEmpty(command.vendorBillId, "vendorBillId");
+  assertNonEmpty(command.idempotencyKey, "idempotencyKey");
+  if (typeof command.paymentHold !== "boolean" || (command.reason !== undefined && typeof command.reason !== "string")) {
+    throw new ErpFinancialsValidationError("Payment hold and reason are invalid");
+  }
+  const reason = command.reason?.trim() ?? null;
+  if ((command.paymentHold && !reason) || (reason !== null && reason.length > 1000)) {
+    throw new ErpFinancialsValidationError("A payment hold requires a reason of at most 1000 characters");
+  }
+  const operation = copyFinancialOperation(command.operation);
+  const checksum = createHash("sha256").update(stableJson({ vendorBillId: command.vendorBillId,
+    bookId: context.bookId ?? null, currencyCode: context.currencyCode, expectedVersion: command.expectedVersion, paymentHold: command.paymentHold, reason,
+    actorRef: operation.actorRef, approverRef: operation.approverRef ?? null,
+    reasonCode: operation.reasonCode, reasonDetail: operation.reasonDetail ?? null })).digest("hex");
+  return { command, reason, operation, checksum };
+}
+
+async function lockNativeVendorBillForHold(client: PostgresQueryClient, context: ServiceContext, vendorBillId: string) {
+  const bill = (await client.query(`select document.*, source.source_system from erp_financials.subledger_documents document
+    join erp_financials.accounting_sources source using(tenant_id,source_id)
+    where document.tenant_id=$1 and document.company_id=$2 and document.source_id=$3 and document.subledger_document_id=$4
+    for update of document`, [context.tenantId, context.companyId, context.sourceId, vendorBillId])).rows[0];
+  if (!bill || bill.document_type !== "vendor_bill") throw new ErpFinancialsError("missing_document", "Vendor bill does not exist in the write source");
+  if (bill.source_system !== "native_erp") throw new ErpFinancialsError("provider_dependency", "Provider-owned bills require provider payment controls");
+  if (bill.currency_code !== context.currencyCode) throw new ErpFinancialsError("scope_mismatch", "Vendor bill currency differs from the command scope");
+  const provenance = await client.query(`select book_id from erp_financials.financial_outbox
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and aggregate_id=$4 and event_type='ledger.posted' for key share`,
+    [context.tenantId, context.companyId, context.sourceId, bill.transaction_id]);
+  if (provenance.rows.length !== 1 || storedOptionalString(provenance.rows[0]?.book_id) !== context.bookId) {
+    throw new ErpFinancialsError("scope_mismatch", "Vendor bill posting book differs from the command scope");
+  }
+  return bill;
+}
+
+async function setVendorBillPaymentHold(context: ServiceContext, input: SetVendorBillPaymentHoldInput): Promise<VendorBillPaymentHoldResult> {
+  const { command, reason, operation, checksum } = normalizeVendorBillPaymentHold(context, input);
+  return context.database.transaction(async client => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    await acquireTransactionLock(client, `vendor-bill-hold:${context.tenantId}:${context.companyId}:${context.sourceId}:${command.idempotencyKey}`);
+    await assertCompanySourceScope(client, context);
+    const eventKey = `vendor-bill-hold:${command.idempotencyKey}`;
+    const prior = (await client.query(`select payload,event_id,event_type,aggregate_id from erp_financials.financial_lifecycle_events
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+      [context.tenantId, context.companyId, context.sourceId, eventKey])).rows[0];
+    if (prior) {
+      const payload = storedJson(prior.payload) as { commandChecksum?: string; result?: Omit<VendorBillPaymentHoldResult, "status" | "lifecycleEventId"> };
+      if (prior.event_type !== "subledger.vendor_bill.payment_hold_changed" || prior.aggregate_id !== command.vendorBillId || payload.commandChecksum !== checksum || !payload.result) throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+      return { ...payload.result, status: "already_changed", lifecycleEventId: storedString(prior.event_id, "event_id") };
+    }
+    const bill = await lockNativeVendorBillForHold(client, context, command.vendorBillId);
+    const version = storedInteger(bill.version, "version");
+    if (version !== command.expectedVersion) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Vendor bill changed before payment hold", { retryable: true });
+    if (!["open", "partially_applied"].includes(String(bill.status)) || parsePositiveOrZeroMoney(bill.open_amount, "open_amount") === 0n) {
+      throw new ErpFinancialsError("terminal_state_conflict", "Only an outstanding bill can change its payment hold");
+    }
+    if (bill.payment_hold === command.paymentHold) throw new ErpFinancialsError("terminal_state_conflict", "Vendor bill already has this payment hold state");
+    const result = { vendorBillId: command.vendorBillId, version: version + 1, paymentHold: command.paymentHold,
+      paymentHoldReason: command.paymentHold ? reason : null };
+    const event = await appendFinancialLifecycleEvent(client, { tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId,
+      aggregateType: "subledger_document", aggregateId: command.vendorBillId, eventType: "subledger.vendor_bill.payment_hold_changed",
+      idempotencyKey: eventKey, operation, recordedAt: context.now(), payload: { commandChecksum: checksum, expectedVersion: version,
+        previousHold: bill.payment_hold === true, reason, result } });
+    await client.query(`update erp_financials.subledger_documents set payment_hold=$5,payment_hold_reason=$6,version=version+1,updated_at=$7
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_document_id=$4`,
+      [context.tenantId, context.companyId, context.sourceId, command.vendorBillId, result.paymentHold, result.paymentHoldReason, context.now()]);
+    await appendFinancialOutboxEvent(client, { tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId, ...(context.bookId === undefined ? {} : { bookId: context.bookId }),
+      eventType: "subledger.vendor_bill.payment_hold_changed", aggregateType: "subledger_document", aggregateId: command.vendorBillId,
+      idempotencyKey: eventKey, availableAt: context.now(), payload: { lifecycleEventId: event.eventId, ...result } });
+    return { ...result, status: "changed", lifecycleEventId: event.eventId };
+  });
+}
+
+async function retireVendorBillPaymentHoldAttempt(context: ServiceContext, input: RetireVendorBillPaymentHoldInput): Promise<RetireVendorBillPaymentHoldResult> {
+  input = structuredClone(input);
+  const { command, checksum } = normalizeVendorBillPaymentHold(context, input.command);
+  assertFinancialOperationContext(input.operation);
+  const operation = copyFinancialOperation(input.operation);
+  if (operation.actorRef !== command.operation.actorRef) throw new ErpFinancialsError("authorization_context_invalid", "Only the original actor may retire a payment hold attempt");
+  const retirementChecksum = createHash("sha256").update(stableJson({ actorRef: operation.actorRef, approverRef: operation.approverRef ?? null,
+    reasonCode: operation.reasonCode, reasonDetail: operation.reasonDetail ?? null })).digest("hex");
+  return context.database.transaction(client => withBillPaymentSavepoint(client, async () => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    await acquireTransactionLock(client, `vendor-bill-hold:${context.tenantId}:${context.companyId}:${context.sourceId}:${command.idempotencyKey}`);
+    await assertCompanySourceScope(client, context);
+    // Use the original event key. Even earlier setPaymentHold implementations
+    // reject a retirement (no result), so delayed writers cannot bypass it.
+    const eventKey = `vendor-bill-hold:${command.idempotencyKey}`;
+    const prior = (await client.query(`select aggregate_type,aggregate_id,event_type,event_id,payload from erp_financials.financial_lifecycle_events
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+      [context.tenantId, context.companyId, context.sourceId, eventKey])).rows[0];
+    if (prior) {
+      const payload = storedJson(prior.payload) as { commandChecksum?: string; retirementChecksum?: string; result?: Omit<VendorBillPaymentHoldResult, "status" | "lifecycleEventId"> };
+      if (prior.aggregate_type !== "subledger_document" || prior.aggregate_id !== command.vendorBillId || payload.commandChecksum !== checksum) throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+      if (prior.event_type === "subledger.vendor_bill.payment_hold_retired") {
+        if (payload.retirementChecksum !== retirementChecksum || payload.result) throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+        return { status: "already_retired", vendorBillId: command.vendorBillId, idempotencyKey: command.idempotencyKey, lifecycleEventId: storedString(prior.event_id, "event_id") };
+      }
+      if (prior.event_type !== "subledger.vendor_bill.payment_hold_changed" || !payload.result) throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+      const bill = await lockNativeVendorBillForHold(client, context, command.vendorBillId);
+      return { status: "already_recorded", vendorBillId: command.vendorBillId, idempotencyKey: command.idempotencyKey,
+        receipt: { ...payload.result, status: "already_changed", lifecycleEventId: storedString(prior.event_id, "event_id") },
+        current: { version: storedInteger(bill.version, "version"), paymentHold: bill.payment_hold === true, paymentHoldReason: storedOptionalString(bill.payment_hold_reason) ?? null } };
+    }
+    // Immutable provenance is required. A later hold, settlement, correction or
+    // fiscal close is not grounds to leave the uncertain command executable.
+    await lockNativeVendorBillForHold(client, context, command.vendorBillId);
+    const event = await appendFinancialLifecycleEvent(client, { ...context, operation, aggregateType: "subledger_document", aggregateId: command.vendorBillId,
+      eventType: "subledger.vendor_bill.payment_hold_retired", idempotencyKey: eventKey, recordedAt: context.now(),
+      payload: { commandChecksum: checksum, retirementChecksum } });
+    return { status: "retired", vendorBillId: command.vendorBillId, idempotencyKey: command.idempotencyKey, lifecycleEventId: event.eventId };
+  }));
+}
+
+
 async function createVendorBill(
   context: ServiceContext,
   input: CreateVendorBillInput
 ): Promise<SubledgerDocumentResult> {
+  input = structuredClone(input);
   const expenseLines = normalizeSubledgerLines(input.expenseLines, "expenseLines");
   const amount = sumSubledgerLines(expenseLines, "expenseLines");
+  const policyValue: unknown = input.accountPolicy;
+  if (policyValue !== undefined && (policyValue === null || typeof policyValue !== "object")) {
+    throw new ErpFinancialsValidationError("Vendor bill account policy must be an object");
+  }
+  const policy = policyValue as { readonly expenseClassifications?: unknown; readonly payableClassifications?: unknown } | undefined;
+  const normalizeClasses = (values: unknown): AccountClassification[] => {
+    if (!Array.isArray(values) || !values.length) {
+      throw new ErpFinancialsValidationError("Vendor bill account policy requires nonempty supported classifications");
+    }
+    const entries: readonly unknown[] = values;
+    if (entries.some(value => typeof value !== "string" || !ACCOUNT_CLASSIFICATIONS.has(value))) {
+      throw new ErpFinancialsValidationError("Vendor bill account policy requires nonempty supported classifications");
+    }
+    return [...new Set(entries as readonly AccountClassification[])].sort();
+  };
+  const normalizedPolicy = policy === undefined ? undefined : {
+    expenseClassifications: normalizeClasses(policy.expenseClassifications),
+    payableClassifications: normalizeClasses(policy.payableClassifications)
+  };
   return createSubledgerDocument(context, {
-    ...commonSubledgerDocument(context, input, "vendor_bill", amount, true),
+    ...commonSubledgerDocument(context, input, "vendor_bill", amount, true,
+      normalizedPolicy === undefined ? {} : { accountPolicy: normalizedPolicy }),
+    ...(normalizedPolicy === undefined ? {} : { accountRequirements: [
+      ...expenseLines.map(line => ({ accountId: resolveAccountId(context, line), classifications: normalizedPolicy.expenseClassifications })),
+      { accountId: resolveAccountId(context, input.payableAccount), classifications: normalizedPolicy.payableClassifications }
+    ] }),
     dueDate: input.dueDate,
     partyId: input.vendorId,
     journalLines: [
@@ -1244,12 +2151,23 @@ async function recordBillPayment(
   context: ServiceContext,
   input: RecordBillPaymentInput
 ): Promise<SubledgerDocumentResult> {
+  input = structuredClone(input);
+  const write = billPaymentDocumentWrite(context, input);
+  return context.database.transaction(client => withBillPaymentSavepoint(client, async () => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    await acquireTransactionLock(client, billPaymentInstructionLock(context, input.idempotencyKey));
+    await assertBillPaymentRecordingNotRetired(client, context, input.idempotencyKey);
+    return createSubledgerDocument(nestedServiceContext(context, client), write);
+  }));
+}
+
+function billPaymentDocumentWrite(context: ServiceContext, input: RecordBillPaymentInput): SubledgerDocumentWrite {
   const amount = normalizedPositiveMoney(input.amount, "amount");
   const fundingAccountId = resolveAccountId(context, input.cashAccount);
   const payableAccountId = resolveAccountId(context, input.payableAccount);
   if (input.paymentMethod !== undefined) assertBillPaymentMethod(input.paymentMethod);
   optionalNonEmpty(input.reference, "reference");
-  return createSubledgerDocument(context, {
+  return {
     ...commonSubledgerDocument(context, input, "bill_payment", amount, true, {
       billPaymentProvenance: {
         fundingAccountId,
@@ -1263,7 +2181,7 @@ async function recordBillPayment(
       { ...input.payableAccount, debit: amount, partyId: input.vendorId },
       { ...input.cashAccount, credit: amount, partyId: input.vendorId }
     ]
-  });
+  };
 }
 
 type NormalizedBillPaymentInstruction = {
@@ -1283,12 +2201,30 @@ type NormalizedBillPaymentInstruction = {
   readonly payloadChecksum: string;
 };
 
+/** Preserve SDK atomicity even when a host catches a command error inside its
+ * own transaction. Nested payment steps use PostgreSQL savepoint shadowing;
+ * earlier host work survives, while partial accounting and audit writes do not. */
+async function withBillPaymentSavepoint<Result>(client: PostgresQueryClient, work: () => Promise<Result>): Promise<Result> {
+  await client.query("savepoint erp_bill_payment_command");
+  try {
+    const result = await work();
+    await client.query("release savepoint erp_bill_payment_command");
+    return result;
+  } catch (error) {
+    await client.query("rollback to savepoint erp_bill_payment_command");
+    await client.query("release savepoint erp_bill_payment_command");
+    throw error;
+  }
+}
+
 async function scheduleBillPayment(
   context: ServiceContext,
   input: ScheduleBillPaymentInput
 ): Promise<ScheduledBillPaymentResult> {
+  input = structuredClone(input);
   const instruction = normalizeBillPaymentInstruction(context, input);
-  return context.database.transaction(async (client) => {
+  return context.database.transaction(client => withBillPaymentSavepoint(client, async () => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(client, billPaymentInstructionLock(context, instruction.idempotencyKey));
     await assertCompanySourceScope(client, context);
     const row = await createOrLoadBillPaymentInstruction(client, context, instruction, input.operation);
@@ -1298,15 +2234,17 @@ async function scheduleBillPayment(
       version: storedInteger(row.value.version, "bill payment version"),
       lifecycleEventId: storedString(row.value.scheduled_event_id, "scheduled_event_id")
     };
-  });
+  }));
 }
 
 async function recordAndApplyBillPayment(
   context: ServiceContext,
   input: RecordAndApplyBillPaymentInput
 ): Promise<ClearedBillPaymentResult> {
+  input = structuredClone(input);
   const instruction = normalizeBillPaymentInstruction(context, input);
-  return context.database.transaction(async (client) => {
+  return context.database.transaction(client => withBillPaymentSavepoint(client, async () => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(client, billPaymentInstructionLock(context, instruction.idempotencyKey));
     await assertCompanySourceScope(client, context);
     const scheduled = await createOrLoadBillPaymentInstruction(client, context, instruction, input.operation);
@@ -1316,7 +2254,7 @@ async function recordAndApplyBillPayment(
     }
     const nestedContext = nestedServiceContext(context, client);
     if (currentStatus === "cleared") {
-      await assertLifecycleReplayKey(
+      const originalOperation = await billPaymentReplayOperation(
         client,
         context,
         scheduled.value.cleared_event_id,
@@ -1326,7 +2264,7 @@ async function recordAndApplyBillPayment(
       return materializeClearedBillPayment(
         nestedContext,
         instruction,
-        input.operation,
+        originalOperation,
         "already_cleared",
         storedInteger(scheduled.value.version, "bill payment version"),
         storedString(scheduled.value.cleared_event_id, "cleared_event_id")
@@ -1341,18 +2279,99 @@ async function recordAndApplyBillPayment(
       storedInteger(scheduled.value.version, "bill payment version"),
       input.idempotencyKey
     );
-  });
+  }));
+}
+
+function billPaymentRecordingRetirementKey(idempotencyKey: string): string {
+  return `bill-payment:${idempotencyKey}:recording-retired`;
+}
+
+async function assertBillPaymentRecordingNotRetired(client: PostgresQueryClient, context: ServiceContext, key: string): Promise<void> {
+  const result = await client.query(`select 1 from erp_financials.financial_lifecycle_events
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+  [context.tenantId, context.companyId, context.sourceId, billPaymentRecordingRetirementKey(key)]);
+  if (result.rows.length) throw new ErpFinancialsIdempotencyConflictError(key);
+}
+
+async function retireBillPaymentRecordingAttempt(context: ServiceContext, input: RetireBillPaymentRecordingInput): Promise<RetireBillPaymentRecordingResult> {
+  input = structuredClone(input);
+  const { command, operation } = input, instruction = normalizeBillPaymentInstruction(context, command);
+  assertFinancialOperationContext(operation);
+  if (command.operation.actorRef !== operation.actorRef) throw new ErpFinancialsError("authorization_context_invalid", "Only the original payment actor may retire its recording attempt");
+  const audit = (value: FinancialOperationContext) => ({ actorRef: value.actorRef, approverRef: value.approverRef ?? null,
+    reasonCode: value.reasonCode, reasonDetail: value.reasonDetail ?? null });
+  const checksum = createHash("sha256").update(stableJson({ instructionChecksum: instruction.payloadChecksum, bookId: context.bookId ?? null, ...audit(command.operation) })).digest("hex");
+  const retirementChecksum = createHash("sha256").update(stableJson(audit(operation))).digest("hex");
+  const key = billPaymentRecordingRetirementKey(command.idempotencyKey);
+  return context.database.transaction(client => withBillPaymentSavepoint(client, async () => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    await acquireTransactionLock(client, billPaymentInstructionLock(context, instruction.idempotencyKey));
+    await assertCompanySourceScope(client, context);
+    const retired = (await client.query(`select aggregate_type,aggregate_id,event_type,event_id,payload from erp_financials.financial_lifecycle_events
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+    [context.tenantId, context.companyId, context.sourceId, key])).rows[0];
+    if (retired) {
+      const payload = storedJson(retired.payload) as { commandChecksum?: string; retirementChecksum?: string } | null;
+      if (retired.aggregate_type !== "bill_payment" || retired.aggregate_id !== instruction.billPaymentId
+        || retired.event_type !== "bill_payment.recording_retired" || payload?.commandChecksum !== checksum || payload.retirementChecksum !== retirementChecksum) {
+        throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+      }
+      return { status: "already_retired", billPaymentId: instruction.billPaymentId, idempotencyKey: command.idempotencyKey, lifecycleEventId: storedString(retired.event_id, "event_id") };
+    }
+    const existing = await loadBillPaymentInstructionByIdempotencyKey(client, context, instruction.idempotencyKey);
+    if (existing) {
+      if (existing.bill_payment_id !== instruction.billPaymentId || existing.payload_checksum !== instruction.payloadChecksum) throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+      await billPaymentReplayOperation(client, context, existing.scheduled_event_id, `bill-payment:${command.idempotencyKey}:scheduled`, command.operation);
+      const status = storedString(existing.status, "bill payment status");
+      // A separate schedule/clear uses its own command identity. It must be
+      // resolved by that lifecycle, never silently cancelled by this API.
+      if ((status !== "cleared" && status !== "voided") || !existing.cleared_event_id) throw new ErpFinancialsError("unsupported_operation", "Resolve the scheduled payment through its scheduling lifecycle");
+      const originalOperation = await billPaymentReplayOperation(client, context, existing.cleared_event_id,
+        `bill-payment:${command.idempotencyKey}:cleared`, command.operation);
+      const receipt = await materializeClearedBillPayment(nestedServiceContext(context, client), instruction, originalOperation,
+        "already_cleared", storedInteger(existing.version, "version"), storedString(existing.cleared_event_id, "cleared_event_id"));
+      const currentPayment = await loadPostedBillPaymentForVoid(client, context, instruction.billPaymentId);
+      if (status === "voided" && currentPayment.status !== "voided") throw new ErpFinancialsError("terminal_state_conflict", "Voided instruction disagrees with the payment document");
+      // Return the historical identity and current payment state separately.
+      // Older direct voids may retain a cleared instruction: never repair history
+      // during recovery, and never describe voided money as a new clear.
+      return { status: "already_recorded", billPaymentId: instruction.billPaymentId, idempotencyKey: command.idempotencyKey,
+        lifecycleEventId: receipt.lifecycleEventId, paymentStatus: currentPayment.status === "voided" ? "voided" : "cleared", paymentTransactionId: receipt.payment.journal.transactionId,
+        amount: instruction.amount, currencyCode: instruction.currencyCode, applicationIds: receipt.applications.map(application => application.applicationId) };
+    }
+    if ((await client.query(`select 1 from erp_financials.subledger_documents where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+      [context.tenantId, context.companyId, context.sourceId, command.idempotencyKey])).rows.length) throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+    // Original native bill provenance is sufficient for retirement. Current
+    // open amount, hold, revision and fiscal period must not prevent resolution.
+    const bills = (await client.query(`select d.subledger_document_id,d.party_id,d.currency_code,o.book_id
+      from erp_financials.subledger_documents d join erp_financials.financial_outbox o
+        on o.tenant_id=d.tenant_id and o.company_id=d.company_id and o.source_id=d.source_id
+        and o.aggregate_id=d.transaction_id and o.event_type='ledger.posted'
+      where d.tenant_id=$1 and d.company_id=$2 and d.source_id=$3 and d.subledger_document_id=any($4::text[])
+        and d.document_type='vendor_bill' for key share of d,o`,
+    [context.tenantId, context.companyId, context.sourceId, instruction.allocations.map(allocation => allocation.billId)])).rows;
+    if (bills.length !== instruction.allocations.length || new Set(bills.map(bill => bill.subledger_document_id)).size !== bills.length
+      || bills.some(bill => bill.party_id !== instruction.vendorId || bill.currency_code !== instruction.currencyCode || storedOptionalString(bill.book_id) !== context.bookId)) {
+      throw new ErpFinancialsError("scope_mismatch", "Payment retirement requires original native bills for this vendor, currency, book and source");
+    }
+    const lifecycle = await appendFinancialLifecycleEvent(client, { ...context, operation, aggregateType: "bill_payment", aggregateId: instruction.billPaymentId,
+      eventType: "bill_payment.recording_retired", idempotencyKey: key, recordedAt: context.now(),
+      payload: { commandChecksum: checksum, retirementChecksum } });
+    return { status: "retired", billPaymentId: instruction.billPaymentId, idempotencyKey: command.idempotencyKey, lifecycleEventId: lifecycle.eventId };
+  }));
 }
 
 async function clearScheduledBillPayment(
   context: ServiceContext,
   input: ClearScheduledBillPaymentInput
 ): Promise<ClearedBillPaymentResult> {
+  input = structuredClone(input);
   assertFinancialOperationContext(input.operation);
   assertNonEmpty(input.billPaymentId, "billPaymentId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
-  return context.database.transaction(async (client) => {
+  return context.database.transaction(client => withBillPaymentSavepoint(client, async () => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(client, billPaymentLifecycleLock(context, input.billPaymentId));
     await assertCompanySourceScope(client, context);
     const row = await loadBillPaymentInstructionForUpdate(client, context, input.billPaymentId);
@@ -1364,7 +2383,7 @@ async function clearScheduledBillPayment(
       if (currentVersion !== input.expectedVersion + 1) {
         throw optimisticBillPaymentConflict(input.billPaymentId, input.expectedVersion, currentVersion - 1);
       }
-      await assertLifecycleReplayKey(
+      const originalOperation = await billPaymentReplayOperation(
         client,
         context,
         row.cleared_event_id,
@@ -1374,7 +2393,7 @@ async function clearScheduledBillPayment(
       return materializeClearedBillPayment(
         nestedContext,
         instruction,
-        input.operation,
+        originalOperation,
         "already_cleared",
         storedInteger(row.version, "bill payment version"),
         storedString(row.cleared_event_id, "cleared_event_id")
@@ -1396,18 +2415,20 @@ async function clearScheduledBillPayment(
       version,
       input.idempotencyKey
     );
-  });
+  }));
 }
 
 async function cancelScheduledBillPayment(
   context: ServiceContext,
   input: CancelScheduledBillPaymentInput
 ): Promise<CancelledScheduledBillPaymentResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.billPaymentId, "billPaymentId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
-  return context.database.transaction(async (client) => {
+  return context.database.transaction(client => withBillPaymentSavepoint(client, async () => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(client, billPaymentLifecycleLock(context, input.billPaymentId));
     await assertCompanySourceScope(client, context);
     const row = await loadBillPaymentInstructionForUpdate(client, context, input.billPaymentId);
@@ -1417,7 +2438,7 @@ async function cancelScheduledBillPayment(
       if (currentVersion !== input.expectedVersion + 1) {
         throw optimisticBillPaymentConflict(input.billPaymentId, input.expectedVersion, currentVersion - 1);
       }
-      await assertLifecycleReplayKey(
+      await billPaymentReplayOperation(
         client,
         context,
         row.voided_event_id,
@@ -1474,7 +2495,7 @@ returning "version"`,
       version: storedInteger(updatedRow.version, "bill payment version"),
       lifecycleEventId: lifecycle.eventId
     };
-  });
+  }));
 }
 
 async function clearBillPaymentInstruction(
@@ -1559,7 +2580,7 @@ async function materializeClearedBillPayment(
   version: number,
   lifecycleEventId: string
 ): Promise<ClearedBillPaymentResult> {
-  const payment = await recordBillPayment(context, {
+  const input: RecordBillPaymentInput = {
     operation,
     idempotencyKey: instruction.idempotencyKey,
     date: instruction.date,
@@ -1572,7 +2593,11 @@ async function materializeClearedBillPayment(
     ...(instruction.reference === undefined ? {} : { reference: instruction.reference }),
     payableAccount: { accountId: instruction.payableAccountId },
     cashAccount: { accountId: instruction.fundingAccountId }
-  });
+  };
+  if (status === "already_cleared") {
+    return replayClearedBillPayment(context, instruction, input, version, lifecycleEventId);
+  }
+  const payment = await recordBillPayment(context, input);
   const applications: SubledgerApplicationResult[] = [];
   for (const [index, allocation] of instruction.allocations.entries()) {
     applications.push(await applySubledgerPayment(context, {
@@ -1589,7 +2614,7 @@ async function materializeClearedBillPayment(
   }
   const currentPayment = await context.database.transaction(async (client) => {
     const result = await client.query(
-      `select * from "erp_financials"."subledger_documents"
+      `select *, "document_date"::text as "document_date", "due_date"::text as "due_date" from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_document_id" = $4
 for key share`,
       [context.tenantId, context.companyId, context.sourceId, instruction.billPaymentId]
@@ -1608,12 +2633,120 @@ for key share`,
   };
 }
 
+function billPaymentReceiptPayload(value: unknown): Record<string, unknown> {
+  const payload = storedJson(value);
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new ErpFinancialsValidationError("Bill payment receipt payload is invalid");
+  }
+  const result: Record<string, unknown> = Object.fromEntries(Object.entries(payload));
+  // Authorization audit is checked by the command policy/replay operation;
+  // business evidence is identical under independent and administrator policies.
+  delete result.financialApproval;
+  return result;
+}
+
+/** A successful clear is an immutable receipt, even after applications are released.
+ * Reconstruct it only from retained native evidence. Never call posting/application
+ * commands here: missing evidence must fail closed, not recreate accounting facts.
+ */
+async function replayClearedBillPayment(
+  context: ServiceContext, instruction: NormalizedBillPaymentInstruction,
+  input: RecordBillPaymentInput, version: number, lifecycleEventId: string
+): Promise<ClearedBillPaymentResult> {
+  return context.database.transaction(async client => {
+    const journalInput = subledgerJournalInput(billPaymentDocumentWrite(context, input));
+    const journal = normalizeJournalEntry(context, journalInput);
+    const identities = journalIdentities(context, journal);
+    // Cash movement creates both bases atomically. Neither mirror may be
+    // silently recreated by a historical completion lookup.
+    for (const retained of [journal, normalizeJournalEntry(context, { ...journalInput,
+      idempotencyKey: `${input.idempotencyKey}:accounting-basis:cash`, accountingBasis: "cash" })]) {
+      const retainedIds = journalIdentities(context, retained);
+      const existing = await loadExistingJournal(client, context, retained.idempotencyKey, retained.sourceTransactionType);
+      if (!existing || existing.transactionId !== retainedIds.transactionId || existing.status !== "posted"
+        || sourceRefChecksum(existing.sourcePayloadRef) !== retained.checksum) {
+        throw new ErpFinancialsIdempotencyConflictError(instruction.idempotencyKey);
+      }
+      const provenance = (await client.query(`select book_id from erp_financials.financial_outbox
+        where tenant_id=$1 and company_id=$2 and source_id=$3 and aggregate_id=$4
+          and event_type='ledger.posted' and idempotency_key=$5`,
+      [context.tenantId, context.companyId, context.sourceId, retainedIds.transactionId,
+        `ledger-posted:${retained.sourceTransactionType}:${retained.idempotencyKey}`])).rows;
+      if (provenance.length !== 1 || storedOptionalString(provenance[0]?.book_id) !== context.bookId) {
+        throw new ErpFinancialsError("scope_mismatch", "Bill payment receipt requires native posting evidence in this book");
+      }
+    }
+    const payment = (await client.query(`select *, document_date::text as document_date from erp_financials.subledger_documents
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_document_id=$4`,
+    [context.tenantId, context.companyId, context.sourceId, instruction.billPaymentId])).rows[0];
+    if (!payment || payment.document_type !== "bill_payment" || payment.transaction_id !== identities.transactionId
+      || payment.party_id !== instruction.vendorId || payment.currency_code !== instruction.currencyCode
+      || payment.idempotency_key !== instruction.idempotencyKey || storedDate(payment.document_date, "document_date") !== instruction.date
+      || storedMoney(payment.original_amount, "original_amount") !== instruction.amount) {
+      throw new ErpFinancialsIdempotencyConflictError(instruction.idempotencyKey);
+    }
+    const events = (await client.query(`select * from erp_financials.financial_lifecycle_events
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and event_id=any($4::text[])`,
+    [context.tenantId, context.companyId, context.sourceId, [lifecycleEventId, payment.lifecycle_event_id]])).rows;
+    const posted = events.find(event => event.event_id === payment.lifecycle_event_id);
+    const cleared = events.find(event => event.event_id === lifecycleEventId);
+    if (!posted || posted.aggregate_type !== "subledger_document" || posted.aggregate_id !== identities.transactionId
+      || posted.event_type !== "subledger.bill_payment.posted" || posted.actor_ref !== input.operation.actorRef
+      || (posted.approver_ref ?? null) !== (input.operation.approverRef ?? null)
+      || posted.reason_code !== input.operation.reasonCode || (posted.reason_detail ?? null) !== (input.operation.reasonDetail ?? null)
+      || !cleared || cleared.event_type !== "bill_payment.cleared" || cleared.aggregate_id !== instruction.billPaymentId
+      || stableJson(billPaymentReceiptPayload(cleared.payload)) !== stableJson({ allocations: instruction.allocations, amount: instruction.amount,
+        billPaymentId: instruction.billPaymentId, transactionId: identities.transactionId })) {
+      throw new ErpFinancialsIdempotencyConflictError(instruction.idempotencyKey);
+    }
+    const applications: SubledgerApplicationResult[] = [];
+    for (const [index, allocation] of instruction.allocations.entries()) {
+      const key = billPaymentAllocationIdempotencyKey(instruction, allocation, index);
+      const applicationId = scopedRecordId(context, "subledger_application", key);
+      const row = await loadSubledgerApplicationByIdempotencyKey(client, context, key);
+      if (!row || row.currency_code !== instruction.currencyCode) throw new ErpFinancialsIdempotencyConflictError(key);
+      const appliedInput: ApplySubledgerPaymentInput = { operation: input.operation, idempotencyKey: key,
+        applicationType: "bill_payment_to_bill", sourceDocumentId: instruction.billPaymentId, targetDocumentId: allocation.billId,
+        amount: allocation.amount, applicationDate: instruction.date, expectedSourceVersion: index + 1, expectedTargetVersion: allocation.expectedBillVersion };
+      assertSameSubledgerApplication(row, appliedInput, allocation.amount, applicationId);
+      const event = (await client.query(`select aggregate_type,aggregate_id,event_type,actor_ref,approver_ref,reason_code,reason_detail,payload from erp_financials.financial_lifecycle_events
+        where tenant_id=$1 and company_id=$2 and source_id=$3 and event_id=$4`,
+      [context.tenantId, context.companyId, context.sourceId, row.applied_event_id])).rows[0];
+      let evidence = event ? billPaymentReceiptPayload(event.payload) : {};
+      if (evidence.commandVersion === 1 && event) {
+        await assertSubledgerApplicationCommandReplay(client, context, row, appliedInput, applicationId,
+          subledgerApplicationCommandChecksum(context, appliedInput, allocation.amount), event);
+        const { commandVersion, commandChecksum, expectedSourceVersion, expectedTargetVersion, ...businessEvidence } = evidence;
+        void commandVersion; void commandChecksum; void expectedSourceVersion; void expectedTargetVersion;
+        evidence = businessEvidence;
+      }
+      // Earlier child events are still provable here: the immutable parent
+      // instruction retained the ordered allocations and original bill versions.
+      if (!event || event.aggregate_type !== "subledger_application" || event.aggregate_id !== applicationId
+        || event.event_type !== "subledger_application.applied" || event.actor_ref !== input.operation.actorRef
+        || (event.approver_ref ?? null) !== (input.operation.approverRef ?? null)
+        || event.reason_code !== input.operation.reasonCode || (event.reason_detail ?? null) !== (input.operation.reasonDetail ?? null)
+        || stableJson(evidence) !== stableJson({ applicationDate: instruction.date, applicationType: "bill_payment_to_bill",
+          appliedAmount: allocation.amount, sourceDocumentId: instruction.billPaymentId, targetDocumentId: allocation.billId })) {
+        throw new ErpFinancialsIdempotencyConflictError(key);
+      }
+      applications.push(applicationResult({ ...row, version: 1, ended_event_id: null }, "already_applied"));
+    }
+    // The instruction requires full allocation in a single transaction. These are
+    // the original completion values; current balances belong to query APIs.
+    return { status: "already_cleared", billPaymentId: instruction.billPaymentId, version, lifecycleEventId, applications,
+      payment: documentResult({ ...payment, version: instruction.allocations.length + 1, open_amount: "0.00", status: "settled" },
+        alreadyPostedResult(identities, storedString(posted.event_id, "event_id"))) };
+  });
+}
+
 async function createOrLoadBillPaymentInstruction(
   client: PostgresQueryClient,
   context: ServiceContext,
   instruction: NormalizedBillPaymentInstruction,
   operation: FinancialOperationContext
 ): Promise<{ readonly created: boolean; readonly value: Record<string, unknown> }> {
+  await assertBillPaymentRecordingNotRetired(client, context, instruction.idempotencyKey);
   const existing = await loadBillPaymentInstructionByIdempotencyKey(client, context, instruction.idempotencyKey);
   if (existing !== undefined) {
     if (
@@ -1622,6 +2755,8 @@ async function createOrLoadBillPaymentInstruction(
     ) {
       throw new ErpFinancialsIdempotencyConflictError(instruction.idempotencyKey);
     }
+    await billPaymentReplayOperation(client, context, existing.scheduled_event_id,
+      `bill-payment:${instruction.idempotencyKey}:scheduled`, operation);
     return { created: false, value: existing };
   }
   await assertBillPaymentInstructionScope(client, context, instruction);
@@ -1788,13 +2923,21 @@ async function assertBillPaymentBillsForInstruction(
 ): Promise<void> {
   const billIds = instruction.allocations.map((allocation) => allocation.billId);
   const result = await client.query(
-    `select * from "erp_financials"."subledger_documents"
+    `select *, "document_date"::text as "document_date", "due_date"::text as "due_date" from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   and "subledger_document_id" = any($4::text[])
 order by "subledger_document_id"
 for update`,
     [context.tenantId, context.companyId, context.sourceId, [...billIds].sort()]
   );
+  const postingEvidence = await client.query(`select aggregate_id,book_id,idempotency_key from erp_financials.financial_outbox
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and event_type='ledger.posted' and aggregate_id=any($4::text[]) for key share`,
+  [context.tenantId, context.companyId, context.sourceId, result.rows.map(row => storedString(row.transaction_id, "transaction_id"))]);
+  const postings = new Map<string, Record<string, unknown>[]>();
+  for (const evidence of postingEvidence.rows) {
+    const key = storedString(evidence.aggregate_id, "aggregate_id"), existing = postings.get(key) ?? [];
+    existing.push(evidence); postings.set(key, existing);
+  }
   const byId = new Map(result.rows.map((row) => [storedString(row.subledger_document_id, "bill id"), row]));
   for (const allocation of instruction.allocations) {
     const bill = byId.get(allocation.billId);
@@ -1808,6 +2951,12 @@ for update`,
     if (bill.document_type !== "vendor_bill") {
       throw new ErpFinancialsValidationError(`Allocation target ${allocation.billId} is not a vendor bill`);
     }
+    const provenance = (postings.get(storedString(bill.transaction_id, "transaction_id")) ?? []).filter(event =>
+      event.idempotency_key === `ledger-posted:${subledgerTransactionType("vendor_bill")}:${storedString(bill.idempotency_key, "idempotency_key")}`);
+    if (provenance.length !== 1 || storedOptionalString(provenance[0]?.book_id) !== context.bookId) {
+      throw new ErpFinancialsError("scope_mismatch", "Bill payment allocations require native bill posting evidence in this book");
+    }
+    if (bill.payment_hold === true) throw new ErpFinancialsError("terminal_state_conflict", "Vendor bill is on payment hold");
     if (bill.party_id !== instruction.vendorId) {
       throw new ErpFinancialsValidationError("Every allocation must target the payment vendor", "scope_mismatch", {
         billId: allocation.billId,
@@ -1867,18 +3016,34 @@ function billPaymentAllocationIdempotencyKey(
   return `${instruction.idempotencyKey}:allocation:${String(index + 1)}:${allocation.billId}`;
 }
 
+// A source may participate in several books. Scheduling emits durable book
+// provenance before there is a posted payment document; require it on every
+// lifecycle path, including retries, instead of inferring ownership from caller scope.
+async function assertBillPaymentInstructionBook(client: PostgresQueryClient, context: ServiceContext, row: Record<string, unknown>): Promise<void> {
+  const evidence = await client.query(`select book_id from erp_financials.financial_outbox
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and aggregate_id=$4
+      and event_type='bill_payment.scheduled' and idempotency_key=$5 for key share`,
+  [context.tenantId, context.companyId, context.sourceId, storedString(row.bill_payment_id, "bill_payment_id"),
+    `bill-payment:${storedString(row.idempotency_key, "idempotency_key")}:outbox:scheduled`]);
+  if (evidence.rows.length !== 1 || storedOptionalString(evidence.rows[0]?.book_id) !== context.bookId) {
+    throw new ErpFinancialsError("scope_mismatch", "Bill payment instruction book differs from the command scope");
+  }
+}
+
 async function loadBillPaymentInstructionByIdempotencyKey(
   client: PostgresQueryClient,
   context: ServiceContext,
   idempotencyKey: string
 ): Promise<Record<string, unknown> | undefined> {
   const result = await client.query(
-    `select * from "erp_financials"."bill_payment_disbursements"
+    `select *, "payment_date"::text as "payment_date" from "erp_financials"."bill_payment_disbursements"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "idempotency_key" = $4
 for update`,
     [context.tenantId, context.companyId, context.sourceId, idempotencyKey]
   );
-  return result.rows[0];
+  const row = result.rows[0];
+  if (row !== undefined) await assertBillPaymentInstructionBook(client, context, row);
+  return row;
 }
 
 async function loadBillPaymentInstructionForUpdate(
@@ -1887,7 +3052,7 @@ async function loadBillPaymentInstructionForUpdate(
   billPaymentId: string
 ): Promise<Record<string, unknown>> {
   const result = await client.query(
-    `select * from "erp_financials"."bill_payment_disbursements"
+    `select *, "payment_date"::text as "payment_date" from "erp_financials"."bill_payment_disbursements"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "bill_payment_id" = $4
 for update`,
     [context.tenantId, context.companyId, context.sourceId, billPaymentId]
@@ -1896,6 +3061,7 @@ for update`,
   if (row === undefined) {
     throw new ErpFinancialsError("missing_document", `Bill payment ${billPaymentId} does not exist in the write source`);
   }
+  await assertBillPaymentInstructionBook(client, context, row);
   return row;
 }
 
@@ -1945,38 +3111,25 @@ async function scheduledLifecycleEventId(
   return storedString(row.scheduled_event_id, "scheduled_event_id");
 }
 
-async function assertLifecycleReplayKey(
-  client: PostgresQueryClient,
-  context: ServiceContext,
-  eventIdValue: unknown,
-  expectedIdempotencyKey: string,
-  operation: FinancialOperationContext
-): Promise<void> {
-  const eventId = storedString(eventIdValue, "lifecycle event id");
-  const result = await client.query(
-    `select "idempotency_key", "actor_ref", "approver_ref", "request_id", "correlation_id", "reason_code",
-  "reason_detail", "occurred_at"
-from "erp_financials"."financial_lifecycle_events"
-where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "event_id" = $4`,
-    [context.tenantId, context.companyId, context.sourceId, eventId]
-  );
-  const row = result.rows[0];
-  const occurredAt = row?.occurred_at instanceof Date
-    ? row.occurred_at.toISOString()
-    : row === undefined ? undefined : storedString(row.occurred_at, "occurred_at");
-  if (
-    row === undefined ||
-    storedString(row.idempotency_key, "idempotency_key") !== expectedIdempotencyKey ||
-    storedString(row.actor_ref, "actor_ref") !== operation.actorRef ||
-    storedOptionalString(row.approver_ref) !== operation.approverRef ||
-    storedString(row.request_id, "request_id") !== operation.requestId ||
-    storedString(row.correlation_id, "correlation_id") !== operation.correlationId ||
-    storedString(row.reason_code, "reason_code") !== operation.reasonCode ||
-    storedOptionalString(row.reason_detail) !== operation.reasonDetail ||
-    occurredAt !== operation.occurredAt
-  ) {
-    throw new ErpFinancialsError("terminal_state_conflict", "Bill payment lifecycle already advanced under another command");
+/** A transport retry may carry fresh request metadata; immutable authorization and business payload must agree. */
+async function billPaymentReplayOperation(
+  client: PostgresQueryClient, context: ServiceContext, eventId: unknown,
+  expectedKey: string, operation: FinancialOperationContext
+): Promise<FinancialOperationContext> {
+  const row = (await client.query(`select idempotency_key,actor_ref,approver_ref,request_id,correlation_id,reason_code,reason_detail,occurred_at
+    from erp_financials.financial_lifecycle_events where tenant_id=$1 and company_id=$2 and source_id=$3 and event_id=$4`,
+    [context.tenantId, context.companyId, context.sourceId, storedString(eventId, "lifecycle event id")])).rows[0];
+  if (!row || row.idempotency_key !== expectedKey || row.actor_ref !== operation.actorRef
+    || storedOptionalString(row.approver_ref) !== operation.approverRef || row.reason_code !== operation.reasonCode
+    || storedOptionalString(row.reason_detail) !== operation.reasonDetail) {
+    throw new ErpFinancialsIdempotencyConflictError(expectedKey);
   }
+  const approverRef = storedOptionalString(row.approver_ref);
+  const reasonDetail = storedOptionalString(row.reason_detail);
+  return { actorRef: storedString(row.actor_ref, "actor_ref"), ...(approverRef === undefined ? {} : { approverRef }),
+    requestId: storedString(row.request_id, "request_id"), correlationId: storedString(row.correlation_id, "correlation_id"),
+    reasonCode: storedString(row.reason_code, "reason_code"), ...(reasonDetail === undefined ? {} : { reasonDetail }),
+    occurredAt: row.occurred_at instanceof Date ? row.occurred_at.toISOString() : storedString(row.occurred_at, "occurred_at") };
 }
 
 function optimisticBillPaymentConflict(
@@ -2302,23 +3455,11 @@ function commonSubledgerDocument(
   };
 }
 
-async function createSubledgerDocument(
-  context: ServiceContext,
-  input: SubledgerDocumentWrite
-): Promise<SubledgerDocumentResult> {
-  assertFinancialOperationContext(input.operation);
-  assertIsoDate(input.date, "date");
-  if (input.dueDate !== undefined) {
-    assertIsoDate(input.dueDate, "dueDate");
-    if (input.dueDate < input.date) {
-      throw new ErpFinancialsValidationError("dueDate must be on or after date");
-    }
-  }
-  const documentId = scopedRecordId(context, "subledger_document", `${input.documentType}:${input.idempotencyKey}`);
-  const journalInput: InternalPostJournalEntryInput = {
+function subledgerJournalInput(input: SubledgerDocumentWrite): InternalPostJournalEntryInput {
+  return {
     operation: input.operation,
     idempotencyKey: input.idempotencyKey,
-    date: input.date,
+    date: input.recognitionDate ?? input.date,
     ...(input.documentNumber === undefined ? {} : { transactionNumber: input.documentNumber }),
     ...(input.memo === undefined ? {} : { memo: input.memo }),
     currencyCode: input.currencyCode,
@@ -2329,15 +3470,46 @@ async function createSubledgerDocument(
     lifecycleEventType: `subledger.${input.documentType}.posted`,
     ...(input.partyId === undefined ? {} : { nativePartyId: input.partyId })
   };
+}
+
+async function createSubledgerDocument(
+  context: ServiceContext,
+  input: SubledgerDocumentWrite
+): Promise<SubledgerDocumentResult> {
+  assertFinancialOperationContext(input.operation);
+  assertIsoDate(input.date, "date");
+  if (input.recognitionDate !== undefined) assertIsoDate(input.recognitionDate, "recognitionDate");
+  if (input.dueDate !== undefined) {
+    assertIsoDate(input.dueDate, "dueDate");
+    // An invoice or supplier obligation can already be overdue when recognized or corrected.
+    // Its contractual due date must not be extended to the posting date.
+    if (input.documentType !== "vendor_bill" && input.documentType !== "invoice" && input.dueDate < input.date) {
+      throw new ErpFinancialsValidationError("dueDate must be on or after date");
+    }
+  }
+  const documentId = scopedRecordId(context, "subledger_document", `${input.documentType}:${input.idempotencyKey}`);
+  const journalInput = subledgerJournalInput(input);
   const journal = normalizeJournalEntry(context, journalInput);
   const identities = journalIdentities(context, journal);
 
   return context.database.transaction(async (client) => {
+    // Collection guards and application/correction commands take this lock
+    // before document/fiscal locks. Include new receipts to prevent phantoms.
+    if (input.documentType === "invoice" || input.documentType === "customer_payment") {
+      await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    }
     await acquireTransactionLock(
       client,
       `subledger-document:${context.tenantId}:${context.companyId}:${context.sourceId}:${input.idempotencyKey}`
     );
     await assertCompanySourceScope(client, context);
+    if (input.documentType === "customer_payment") {
+      const retired = await client.query(`select event_id from erp_financials.financial_lifecycle_events
+        where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4
+          and payload->>'retired'='true'`,
+        [context.tenantId,context.companyId,context.sourceId,`customer-payment-collection:${input.idempotencyKey}:completed`]);
+      if (retired.rows.length) throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+    }
     await assertSubledgerParty(client, context, input.partyId, input.documentType);
     for (const customerId of unique((input.documentLines ?? []).flatMap((line) =>
       line.customerId === undefined ? [] : [line.customerId]
@@ -2345,7 +3517,7 @@ async function createSubledgerDocument(
       await assertActiveSubledgerParty(client, context, customerId, "customer", "Bill-line customerId");
     }
     await assertRelatedInvoiceReference(client, context, input.partyId, input.metadata);
-    const posted = await executePostJournalEntryInTransaction(client, context, journalInput, journal, identities);
+    const posted = await executePostJournalEntryInTransaction(client, context, journalInput, journal, identities, input.accountRequirements,input.validateNewPosting);
     if (isDualBasisCashMovement(input.documentType)) {
       const cashInput: InternalPostJournalEntryInput = {
         ...journalInput,
@@ -2367,8 +3539,8 @@ async function createSubledgerDocument(
       `insert into "erp_financials"."subledger_documents" (
   "subledger_document_id", "tenant_id", "company_id", "source_id", "document_type", "transaction_id",
   "party_id", "document_number", "document_date", "due_date", "currency_code", "original_amount", "open_amount",
-  "status", "version", "idempotency_key", "lifecycle_event_id", "metadata", "created_at", "updated_at"
-) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 1, $15, $16, $17, $18, $18)
+  "status", "version", "idempotency_key", "lifecycle_event_id", "metadata", "created_at", "updated_at"${input.recognitionDate === undefined ? "" : ', "recognition_date"'}
+) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 1, $15, $16, $17, $18, $18${input.recognitionDate === undefined ? "" : ", $19"})
 on conflict ("tenant_id", "company_id", "source_id", "idempotency_key") do nothing
 returning *`,
       [
@@ -2389,7 +3561,8 @@ returning *`,
         input.idempotencyKey,
         posted.lifecycleEventId,
         JSON.stringify(input.metadata),
-        context.now()
+        context.now(),
+        ...(input.recognitionDate === undefined ? [] : [input.recognitionDate])
       ]
     );
     const inserted = insert.rows[0];
@@ -2402,13 +3575,22 @@ returning *`,
       return documentResult(inserted, posted);
     }
     const existing = await loadSubledgerDocumentByIdempotencyKey(client, context, input.idempotencyKey);
+    // Exact issuance replay compares the original dated facts, even after an
+    // explicit restatement. The response still describes the current document.
+    const firstCorrection = input.documentType === "invoice" ? (await client.query(
+      `select "payload"->>'previousDate' as "original_date", "payload"->>'previousDueDate' as "original_due_date"
+from "erp_financials"."financial_lifecycle_events"
+where "tenant_id"=$1 and "company_id"=$2 and "source_id"=$3 and "aggregate_id"=$4 and "event_type"='subledger.invoice.dates_corrected'
+order by ("payload"->>'expectedVersion')::integer limit 1`,
+      [context.tenantId, context.companyId, context.sourceId, documentId]
+    )).rows[0] : undefined;
     if (
       storedString(existing.subledger_document_id, "subledger_document_id") !== documentId ||
       storedString(existing.document_type, "document_type") !== input.documentType ||
       storedString(existing.transaction_id, "transaction_id") !== posted.transactionId ||
       storedMoney(existing.original_amount, "original_amount") !== input.amount ||
-      storedDate(existing.document_date, "document_date") !== input.date ||
-      storedOptionalDate(existing.due_date, "due_date") !== input.dueDate ||
+      storedDate(firstCorrection?.original_date ?? existing.document_date, "document_date") !== input.date ||
+      storedOptionalDate(firstCorrection ? firstCorrection.original_due_date : existing.due_date, "due_date") !== input.dueDate ||
       storedOptionalString(existing.document_number) !== input.documentNumber ||
       storedOptionalString(existing.party_id) !== input.partyId ||
       storedString(existing.currency_code, "currency_code") !== input.currencyCode ||
@@ -2419,6 +3601,7 @@ returning *`,
     if (input.documentType === "vendor_bill") {
       await assertSameBillLineCustomers(client, context, documentId, input);
     }
+    if (input.documentType === "invoice" || input.documentType === "credit_memo") await assertSameInvoiceComponents(client,context,documentId,input);
     // The original atomic write already persisted refund cash projections; replay adds no postings.
     await appendSubledgerDocumentOutboxEvent(client, context, input, documentId, posted.transactionId);
     return documentResult(existing, { ...posted, status: "already_posted" });
@@ -2495,7 +3678,7 @@ async function appendSubledgerDocumentOutboxEvent(
 }
 
 type NormalizedSubledgerAmountLine = ErpFinancialsAccountReference & NormalizedCommercialDocumentLine &
-  Pick<VendorBillExpenseLine, "customerId">;
+  Pick<VendorBillExpenseLine, "customerId"> & InvoicePostingComponents;
 
 async function assertSameBillLineCustomers(
   client: PostgresQueryClient,
@@ -2524,6 +3707,17 @@ for key share`,
   }
 }
 
+async function assertSameInvoiceComponents(client: PostgresQueryClient,context:ServiceContext,documentId:string,input:SubledgerDocumentWrite):Promise<void>{
+  const stored=await client.query(`select line_number,tax_account_id,discount_account_id from erp_financials.subledger_document_lines
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_document_id=$4
+    and (tax_account_id is not null or discount_account_id is not null) order by line_number for key share`,
+    [context.tenantId,context.companyId,context.sourceId,documentId]);
+  const actual=stored.rows.map(row=>({lineNumber:storedInteger(row.line_number,"line_number"),tax:row.tax_account_id??null,discount:row.discount_account_id??null}));
+  const expected=(input.documentLines??[]).flatMap((line,index)=>line.taxAccount||line.discountAccount ? [{lineNumber:index+1,
+    tax:line.taxAccount?resolveAccountId(context,line.taxAccount):null,discount:line.discountAccount?resolveAccountId(context,line.discountAccount):null}] : []);
+  if(stableJson(actual)!==stableJson(expected))throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+}
+
 async function writeSubledgerDocumentLines(
   client: PostgresQueryClient,
   context: ServiceContext,
@@ -2536,8 +3730,8 @@ async function writeSubledgerDocumentLines(
       `insert into "erp_financials"."subledger_document_lines" (
   "subledger_document_line_id", "tenant_id", "company_id", "source_id", "subledger_document_id", "line_number",
   "account_id", "item_id", "description", "quantity", "unit_amount", "unit_cost", "discount_amount", "tax_code", "tax_amount",
-  "service_period_start", "service_period_end", "dimension_refs", "line_amount", "customer_party_id"
-) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
+  "service_period_start", "service_period_end", "dimension_refs", "line_amount", "customer_party_id", "tax_account_id", "discount_account_id"
+) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`,
       [
         scopedRecordId(context, "subledger_document_line", `${documentId}:${String(lineNumber)}`),
         context.tenantId,
@@ -2558,16 +3752,23 @@ async function writeSubledgerDocumentLines(
         line.servicePeriodEnd,
         JSON.stringify(line.dimensionRefs),
         line.amount,
-        line.customerId
+        line.customerId,
+        line.taxAccount ? resolveAccountId(context,line.taxAccount) : undefined,
+        line.discountAccount ? resolveAccountId(context,line.discountAccount) : undefined
       ]
     );
   }
 }
 
+function applySubledgerPayment(context: ServiceContext, input: ApplySubledgerPaymentInput): Promise<SubledgerApplicationResult>;
+function applySubledgerPayment(context: ServiceContext, input: ApplySubledgerPaymentInput, retirement: FinancialOperationContext): Promise<RetireReceiptApplicationResult>;
 async function applySubledgerPayment(
   context: ServiceContext,
-  input: ApplySubledgerPaymentInput
-): Promise<SubledgerApplicationResult> {
+  input: ApplySubledgerPaymentInput,
+  retirementInput?: FinancialOperationContext
+): Promise<SubledgerApplicationResult | RetireReceiptApplicationResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
+  assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertFinancialOperationContext(input.operation);
   assertExpectedSubledgerVersion(input.expectedSourceVersion, "expectedSourceVersion");
   assertExpectedSubledgerVersion(input.expectedTargetVersion, "expectedTargetVersion");
@@ -2575,7 +3776,17 @@ async function applySubledgerPayment(
   const amount = normalizedPositiveMoney(input.amount, "amount");
   assertIsoDate(input.applicationDate, "applicationDate");
   assertSubledgerMatchInput(input.match);
+  const commandChecksum = subledgerApplicationCommandChecksum(context, input, amount);
   const applicationId = scopedRecordId(context, "subledger_application", input.idempotencyKey);
+  const retirement = retirementInput === undefined ? undefined : copyFinancialOperation(retirementInput);
+  if (retirement) {
+    assertFinancialOperationContext(retirement);
+    if (retirement.actorRef !== input.operation.actorRef) throw new ErpFinancialsError("authorization_context_invalid", "Only the original application actor may retire its unrecorded attempt");
+    if (input.applicationType !== "customer_payment_to_invoice") throw new ErpFinancialsError("unsupported_operation", "Retirement supports native customer receipt allocations only");
+  }
+  const retirementChecksum = retirement === undefined ? undefined : createHash("sha256").update(stableJson({ actorRef: retirement.actorRef,
+    approverRef: retirement.approverRef ?? null, reasonCode: retirement.reasonCode, reasonDetail: retirement.reasonDetail ?? null })).digest("hex");
+  const eventKey = `subledger-application:${input.idempotencyKey}:applied`;
   return context.database.transaction(async (client) => {
     await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(
@@ -2583,16 +3794,47 @@ async function applySubledgerPayment(
       `subledger-application:${context.tenantId}:${context.companyId}:${context.sourceId}:${input.sourceDocumentId}:${input.targetDocumentId}`
     );
     await assertCompanySourceScope(client, context);
+    const terminal = (await client.query(`select event_id,aggregate_id,event_type,payload from erp_financials.financial_lifecycle_events
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+      [context.tenantId, context.companyId, context.sourceId, eventKey])).rows[0];
+    if (terminal?.event_type === "subledger_application.receipt_attempt_retired") {
+      const payload = storedJson(terminal.payload) as { commandChecksum?: string; retirementChecksum?: string } | null;
+      if (!retirement || terminal.aggregate_id !== applicationId || payload?.commandChecksum !== commandChecksum || payload.retirementChecksum !== retirementChecksum) throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+      return { status: "already_retired", sourceDocumentId: input.sourceDocumentId, targetDocumentId: input.targetDocumentId,
+        idempotencyKey: input.idempotencyKey, lifecycleEventId: storedString(terminal.event_id, "event_id") };
+    }
     const existing = await loadSubledgerApplicationByIdempotencyKey(client, context, input.idempotencyKey);
     if (existing !== undefined) {
       assertSameSubledgerApplication(existing, input, amount, applicationId);
       const existingStatus = storedString(existing.status, "status");
+      if (retirement) {
+        await assertSubledgerApplicationCommandReplay(client, context, existing, input, applicationId, commandChecksum);
+        if (existingStatus !== "applied" && existingStatus !== "unapplied" && existingStatus !== "voided") throw new ErpFinancialsError("terminal_state_conflict", "Application has an unsupported recorded state");
+        return { status: "already_recorded", application: applicationResult(existing, existingStatus === "applied" ? "already_applied" : existingStatus) };
+      }
       if (existingStatus !== "applied") {
         throw new ErpFinancialsValidationError(
           `Subledger application ${applicationId} is ${existingStatus} and cannot be replayed as applied; use a new idempotency key`
         );
       }
+      await assertSubledgerApplicationCommandReplay(client, context, existing, input, applicationId, commandChecksum);
       return applicationResult(existing, "already_applied");
+    }
+    if (retirement) {
+      const [source, target] = await loadSubledgerDocumentsForUpdate(client, context, [input.sourceDocumentId, input.targetDocumentId]);
+      if (source.document_type !== "customer_payment" || target.document_type !== "invoice" || source.party_id == null || source.party_id !== target.party_id
+        || source.currency_code !== target.currency_code || source.currency_code !== context.currencyCode) throw new ErpFinancialsError("scope_mismatch", "Retirement requires a native receipt and invoice for the same customer and currency");
+      for (const document of [source, target]) {
+        const provenance = (await client.query(`select book_id from erp_financials.financial_outbox
+          where tenant_id=$1 and company_id=$2 and source_id=$3 and aggregate_id=$4 and event_type='ledger.posted' for key share`,
+          [context.tenantId, context.companyId, context.sourceId, document.transaction_id])).rows;
+        if (provenance.length !== 1 || storedOptionalString(provenance[0]?.book_id) !== context.bookId) throw new ErpFinancialsError("scope_mismatch", "Receipt application retirement requires original posting evidence in this book");
+      }
+      if (retirementChecksum === undefined) throw Error("Missing application retirement checksum");
+      const lifecycle = await appendFinancialLifecycleEvent(client, { ...context, operation: retirement, aggregateType: "subledger_application",
+        aggregateId: applicationId, eventType: "subledger_application.receipt_attempt_retired", idempotencyKey: eventKey, recordedAt: context.now(),
+        payload: { commandChecksum, retirementChecksum, sourceDocumentId: input.sourceDocumentId, targetDocumentId: input.targetDocumentId } });
+      return { status: "retired", sourceDocumentId: input.sourceDocumentId, targetDocumentId: input.targetDocumentId, idempotencyKey: input.idempotencyKey, lifecycleEventId: lifecycle.eventId };
     }
     if (context.postingPolicy === "enforce_fiscal_periods") {
       await assertPostingDateAllowed(client, context, input.applicationDate);
@@ -2601,6 +3843,7 @@ async function applySubledgerPayment(
       input.sourceDocumentId,
       input.targetDocumentId
     ]);
+    if (input.applicationType === "bill_payment_to_bill" && target.payment_hold === true) throw new ErpFinancialsError("terminal_state_conflict", "Vendor bill is on payment hold");
     assertSubledgerApplicationDocuments(input, source, target, amount);
     if (input.match !== undefined) {
       await assertAcceptedSubledgerMatch(client, context, { ...input, match: input.match }, source, target);
@@ -2616,6 +3859,10 @@ async function applySubledgerPayment(
       operation: input.operation,
       recordedAt: context.now(),
       payload: {
+        commandVersion: 1,
+        commandChecksum,
+        expectedSourceVersion: input.expectedSourceVersion,
+        expectedTargetVersion: input.expectedTargetVersion,
         applicationDate: input.applicationDate,
         applicationType: input.applicationType,
         appliedAmount: amount,
@@ -2706,7 +3953,7 @@ async function endSubledgerApplication(
       `subledger-application:${context.tenantId}:${context.companyId}:${context.sourceId}:${input.applicationId}`
     );
     const currentResult = await client.query(
-      `select * from "erp_financials"."subledger_applications"
+      `select *, "application_date"::text as "application_date" from "erp_financials"."subledger_applications"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_application_id" = $4
 for update`,
       [context.tenantId, context.companyId, context.sourceId, input.applicationId]
@@ -2719,8 +3966,36 @@ for update`,
         { applicationId: input.applicationId }
       );
     }
+    if (current.application_type === "customer_payment_to_refund") {
+      throw new ErpFinancialsError("terminal_state_conflict", "Cash return settlements cannot be detached from their refund");
+    }
+    const cancellation = await client.query(
+      `select invoice_void_id from erp_financials.invoice_voids
+       where tenant_id=$1 and company_id=$2 and source_id=$3 and application_id=$4 limit 1`,
+      [context.tenantId, context.companyId, context.sourceId, input.applicationId]
+    );
+    if (cancellation.rows.length) throw new ErpFinancialsError("terminal_state_conflict",
+      "Invoice cancellation credit cannot be detached; record a separately reviewed replacement invoice instead");
     const currentStatus = storedString(current.status, "status");
     if (currentStatus === status) {
+      // A retry may use a new transport request, but cannot silently change
+      // the accounting date or the version on which the original end acted.
+      const event = await client.query(
+        `select "idempotency_key", "payload", "aggregate_id", "event_type"
+from "erp_financials"."financial_lifecycle_events"
+where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "event_id" = $4`,
+        [context.tenantId, context.companyId, context.sourceId, current.ended_event_id]
+      );
+      const ended = event.rows[0];
+      const payload = storedJson(ended?.payload);
+      const evidence = payload !== null && typeof payload === "object" && !Array.isArray(payload)
+        ? payload as Readonly<Record<string, JsonValue>> : undefined;
+      if (ended === undefined || evidence === undefined
+        || ended.aggregate_id !== input.applicationId || ended.event_type !== `subledger_application.${status}`
+        || evidence.effectiveDate !== input.effectiveDate || evidence.priorVersion !== input.expectedVersion
+        || evidence.status !== status || storedInteger(current.version, "version") !== input.expectedVersion + 1) {
+        throw new ErpFinancialsIdempotencyConflictError(`subledger-application:${input.applicationId}:${status}`);
+      }
       return applicationResult(current, status);
     }
     if (currentStatus !== "applied") {
@@ -2797,22 +4072,24 @@ returning *`,
   });
 }
 
-async function persistCashBasisApplicationProjection(
-  client: PostgresQueryClient,
-  context: ServiceContext,
-  input: {
+type CashBasisApplicationProjectionInput = {
     readonly action: "recognize" | "reverse";
     readonly applicationId: string;
     readonly applicationType: SubledgerApplicationType | "customer_refund_against_invoice";
     readonly appliedAmount: DecimalString;
     readonly effectiveDate: IsoDate;
     readonly targetTransactionId: string;
+    /** Read-only cash-return preflight models the pending full unapplication. */
+    readonly previewReleasedApplicationId?: string;
     readonly sourceDocument?: Record<string, unknown>;
-  }
-): Promise<readonly string[]> {
-  if (!["customer_payment_to_invoice", "bill_payment_to_bill", "customer_refund_against_invoice"].includes(input.applicationType)) return [];
+  };
+
+async function prepareCashBasisApplicationProjection(
+  client: PostgresQueryClient, context: ServiceContext, input: CashBasisApplicationProjectionInput
+) {
+  if (!["customer_payment_to_invoice", "bill_payment_to_bill", "customer_refund_against_invoice"].includes(input.applicationType)) return null;
   const result = await client.query(
-    `select * from "erp_financials"."ledger_postings"
+    `select *, "posting_date"::text as "posting_date" from "erp_financials"."ledger_postings"
 where "tenant_id" = $1 and "source_id" = $2 and "transaction_id" = $3 and "accounting_basis" = 'accrual'
 order by "posting_id"
 for key share`,
@@ -2823,10 +4100,62 @@ for key share`,
     "import_batch",
     `cash-basis-application:${input.applicationId}:${input.action}`
   );
-  const accrualPostings = (result.rows.length ? result.rows :
+  let accrualPostings = (result.rows.length ? result.rows :
     await loadImportedDocumentAccrualPostings(client, context, input.targetTransactionId)).map(storedLedgerPosting);
   if (!result.rows.length && input.sourceDocument !== undefined && input.applicationType === 'customer_payment_to_invoice') {
     await assertImportedPaymentCashCredit(client, context, input.sourceDocument);
+  }
+  let controlAccountId: string | undefined;
+  if(input.applicationType !== "bill_payment_to_bill") {
+    const components=(await client.query(`select distinct d.subledger_document_id,d.original_amount::text,l.discount_account_id
+      from erp_financials.subledger_documents d join erp_financials.subledger_document_lines l
+      on l.tenant_id=d.tenant_id and l.company_id=d.company_id and l.source_id=d.source_id and l.subledger_document_id=d.subledger_document_id
+      where d.tenant_id=$1 and d.company_id=$2 and d.source_id=$3 and d.transaction_id=$4 and d.document_type='invoice'
+      and (l.discount_account_id is not null or l.tax_account_id is not null)`,[context.tenantId,context.companyId,context.sourceId,input.targetTransactionId])).rows;
+    if(components.length){
+      if(input.applicationType==="customer_refund_against_invoice")throw new ErpFinancialsError("unsupported_operation",
+        "Component invoices require receipt returnCash for cash refunds and explicit credits for sale adjustments");
+      const document=components[0];
+      if(!document)throw new ErpFinancialsValidationError("Missing component document");
+      const discountAccounts=new Set(components.filter(row=>row.discount_account_id!==null).map(row=>storedString(row.discount_account_id,"discount_account_id")));
+      const controls=accrualPostings.filter(posting=>!discountAccounts.has(posting.accountId)&&parsePositiveOrZeroMoney(posting.debitAmount,"debit")>0n);
+      if(controls.length!==1 || components.some(row=>row.subledger_document_id!==document.subledger_document_id)
+        || controls[0]?.debitAmount!==storedMoney(document.original_amount,"original_amount"))throw new ErpFinancialsValidationError("Invoice component control posting is ambiguous");
+      const control=controls[0];
+      controlAccountId=control.accountId;
+      const identities=accrualPostings.map(posting=>posting.sourcePostingId);
+      if(input.action==="recognize"){
+        // Subtract actual prior allocations and reversals, not independently
+        // rounded application percentages. The last collection consumes the
+        // exact remaining journal; unapply makes its exact components available.
+        const recognized=(await client.query(`with origins as (select jsonb_array_elements_text($5::jsonb) id)
+          select o.id,trunc(coalesce(sum(p.debit_amount-p.credit_amount),0)*100)::text as net_minor
+          from origins o left join erp_financials.subledger_applications a
+            on a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3 and a.target_document_id=$4
+            and a.application_type='customer_payment_to_invoice'
+            and ($7::text is null or a.subledger_application_id<>$7)
+          left join erp_financials.ledger_postings p on p.tenant_id=$1 and p.source_id=$3 and p.accounting_basis='cash'
+            and p.transaction_id=$6 and p.source_posting_id in ('cash-application:'||a.subledger_application_id||':recognize:'||o.id,'cash-application:'||a.subledger_application_id||':reverse:'||o.id)
+          group by o.id`,[context.tenantId,context.companyId,context.sourceId,document.subledger_document_id,JSON.stringify(identities),input.targetTransactionId,input.previewReleasedApplicationId??null])).rows;
+        const used=new Map(recognized.map(row=>[storedString(row.id,"id"),BigInt(storedString(row.net_minor,"net_minor"))]));
+        accrualPostings=accrualPostings.map(posting=>{
+          const debit=parsePositiveOrZeroMoney(posting.debitAmount,"debit"),credit=parsePositiveOrZeroMoney(posting.creditAmount,"credit"),net=used.get(posting.sourcePostingId)??0n;
+          const remainingDebit=debit>0n?debit-net:0n,remainingCredit=credit>0n?credit+net:0n;
+          if(remainingDebit<0n||remainingCredit<0n)throw new ErpFinancialsValidationError("Invoice component allocations exceed their original journal");
+          return {...posting,debitAmount:formatMoney(remainingDebit),creditAmount:formatMoney(remainingCredit),netAmount:formatMoney(remainingDebit-remainingCredit)};
+        });
+      }else{
+        const prefix=`cash-application:${input.applicationId}:recognize:`;
+        const allocated=(await client.query(`select source_posting_id,debit_amount::text,credit_amount::text from erp_financials.ledger_postings
+          where tenant_id=$1 and source_id=$2 and transaction_id=$3 and accounting_basis='cash' and source_posting_id=any($4::text[])`,
+          [context.tenantId,context.sourceId,input.targetTransactionId,identities.map(id=>prefix+id)])).rows;
+        const byOrigin=new Map(allocated.map(row=>[storedString(row.source_posting_id,"source_posting_id").slice(prefix.length),row]));
+        accrualPostings=accrualPostings.map(posting=>{
+          const prior=byOrigin.get(posting.sourcePostingId),debit=prior?storedMoney(prior.debit_amount,"debit_amount"):"0.00",credit=prior?storedMoney(prior.credit_amount,"credit_amount"):"0.00";
+          return {...posting,debitAmount:debit,creditAmount:credit,netAmount:formatMoney(parsePositiveOrZeroMoney(debit,"debit")-parsePositiveOrZeroMoney(credit,"credit"))};
+        });
+      }
+    }
   }
   const postings = projectCashBasisApplication({
     applicationId: input.applicationId,
@@ -2835,7 +4164,8 @@ for key share`,
     appliedAmount: input.appliedAmount,
     effectiveDate: input.effectiveDate,
     importBatchId,
-    accrualPostings
+    accrualPostings,
+    ...(controlAccountId===undefined?{}:{controlAccountId})
   });
   const now = context.now();
   const storage = createPostgresStorageAdapter(client);
@@ -2843,6 +4173,15 @@ for key share`,
   await assertPostingAccountEligibility(client, context, accountIds);
   const accounts = await storage.loadAccounts({ tenantId: context.tenantId, sourceId: context.sourceId, accountIds });
   assertJournalAccounts(accounts, accountIds);
+  return { postings, storage, importBatchId, now };
+}
+
+async function persistCashBasisApplicationProjection(
+  client: PostgresQueryClient, context: ServiceContext, input: CashBasisApplicationProjectionInput
+): Promise<readonly string[]> {
+  const plan = await prepareCashBasisApplicationProjection(client, context, input);
+  if (!plan) return [];
+  const { postings, storage, importBatchId, now } = plan;
   await storage.upsertImportBatch({
     tenantId: context.tenantId,
     sourceId: context.sourceId,
@@ -2887,7 +4226,7 @@ async function assertImportedPaymentCashCredit(
       ((source_transaction_type='Payment' and source_transaction_id=$3) or
        (source_payload_ref->>'sourceObjectType'='Payment' and source_payload_ref->>'sourceObjectId'=$3))
     order by transaction_id for share`, [context.tenantId,context.sourceId,metadata.sourceTransactionId])).rows;
-  const postings = (await client.query(`select p.*,a.type as account_type from erp_financials.ledger_postings p
+  const postings = (await client.query(`select p.*,p.posting_date::text as posting_date,a.type as account_type from erp_financials.ledger_postings p
     join erp_financials.accounts a using(tenant_id,source_id,account_id)
     where p.tenant_id=$1 and p.source_id=$2 and p.transaction_id=any($3::text[]) order by posting_id for share of p,a`,
     [context.tenantId,context.sourceId,transactions.map(t=>t.transaction_id)])).rows;
@@ -2936,7 +4275,7 @@ async function loadImportedDocumentAccrualPostings(
     where tenant_id=$1 and source_id=$2 and transaction_id<>$3
       and source_payload_ref->>'sourceObjectType'=$4 and source_payload_ref->>'sourceObjectId'=$5
     order by transaction_id for share`, [context.tenantId,context.sourceId,headerTransactionId,header.source_transaction_type,header.source_transaction_id])).rows;
-  const rows = (await client.query(`select * from erp_financials.ledger_postings
+  const rows = (await client.query(`select *, "posting_date"::text as "posting_date" from erp_financials.ledger_postings
     where tenant_id=$1 and source_id=$2 and transaction_id=any($3::text[]) and accounting_basis='accrual'
     order by posting_id for share`, [context.tenantId,context.sourceId,transactions.map(t=>t.transaction_id)])).rows;
   const ids = unique(rows.map(r=>String(r.transaction_id)));
@@ -3024,7 +4363,7 @@ async function assertActiveSubledgerParty(
   const result = await client.query(
     `select "party_type", "active" from "erp_financials"."parties"
 where "tenant_id" = $1 and "source_id" = $2 and "party_id" = $3
-for key share`,
+for share`,
     [context.tenantId, context.sourceId, partyId]
   );
   const party = result.rows[0];
@@ -3043,7 +4382,7 @@ async function loadSubledgerDocumentByIdempotencyKey(
   idempotencyKey: string
 ): Promise<Record<string, unknown>> {
   const result = await client.query(
-    `select * from "erp_financials"."subledger_documents"
+    `select *, document_date::text as document_date, due_date::text as due_date from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "idempotency_key" = $4
 for key share`,
     [context.tenantId, context.companyId, context.sourceId, idempotencyKey]
@@ -3061,7 +4400,7 @@ async function loadSubledgerApplicationByIdempotencyKey(
   idempotencyKey: string
 ): Promise<Record<string, unknown> | undefined> {
   const result = await client.query(
-    `select * from "erp_financials"."subledger_applications"
+    `select *, application_date::text as application_date from "erp_financials"."subledger_applications"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "idempotency_key" = $4
 for key share`,
     [context.tenantId, context.companyId, context.sourceId, idempotencyKey]
@@ -3078,7 +4417,7 @@ async function loadSubledgerDocumentsForUpdate(
     throw new ErpFinancialsValidationError("Subledger application source and target documents must differ");
   }
   const result = await client.query(
-    `select * from "erp_financials"."subledger_documents"
+    `select *, "document_date"::text as "document_date", "due_date"::text as "due_date", (to_jsonb("subledger_documents")->>'recognition_date') as "recognition_date" from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_document_id" = any($4::text[])
 order by "subledger_document_id"
 for update`,
@@ -3107,7 +4446,8 @@ function assertSubledgerApplicationDocuments(
     bill_payment_to_bill: [["bill_payment"], "vendor_bill"],
     credit_to_invoice: [["credit_memo", "deposit"], "invoice"],
     vendor_credit_to_bill: [["vendor_credit"], "vendor_bill"],
-    write_off_to_invoice: [["write_off"], "invoice"]
+    write_off_to_invoice: [["write_off"], "invoice"],
+    customer_payment_to_refund: [["customer_payment"], "refund"]
   };
   const types = expectedTypes[input.applicationType];
   if (!types[0].includes(source.document_type as SubledgerDocumentType) || target.document_type !== types[1]) {
@@ -3130,6 +4470,12 @@ function assertSubledgerApplicationDocuments(
       retryable: true,
       details: { documentId: input.targetDocumentId, expectedVersion: input.expectedTargetVersion }
     });
+  }
+  if (source.document_type === "customer_payment" && input.applicationDate < storedDate(source.document_date, "document_date")) {
+    throw new ErpFinancialsValidationError("Application cannot precede cash receipt");
+  }
+  if (target.document_type === "invoice" && input.applicationDate < storedDate(target.recognition_date ?? target.document_date, "recognition_date")) {
+    throw new ErpFinancialsValidationError("Invoice application cannot precede recognition; retain the receipt unapplied until recognition");
   }
   const amountMinor = parsePositiveMoney(amount, "amount");
   if (
@@ -3273,6 +4619,42 @@ where "tenant_id" = $1 and "source_id" = $2 and "match_candidate_id" = $3 and "s
   );
 }
 
+function subledgerApplicationCommandChecksum(context: ServiceContext, input: ApplySubledgerPaymentInput, amount: string): string {
+  return createHash("sha256").update(stableJson({
+    commandVersion: 1, tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId,
+    bookId: context.bookId ?? null, currencyCode: context.currencyCode, accountingBasis: context.accountingBasis,
+    idempotencyKey: input.idempotencyKey, applicationType: input.applicationType,
+    sourceDocumentId: input.sourceDocumentId, targetDocumentId: input.targetDocumentId,
+    applicationDate: input.applicationDate, amount,
+    expectedSourceVersion: input.expectedSourceVersion, expectedTargetVersion: input.expectedTargetVersion,
+    match: input.match ?? null, actorRef: input.operation.actorRef, approverRef: input.operation.approverRef ?? null,
+    reasonCode: input.operation.reasonCode, reasonDetail: input.operation.reasonDetail ?? null
+  })).digest("hex");
+}
+
+async function assertSubledgerApplicationCommandReplay(client: PostgresQueryClient, context: ServiceContext,
+  existing: Record<string, unknown>, input: ApplySubledgerPaymentInput, applicationId: string, checksum: string, retainedEvent?: Record<string, unknown>): Promise<void> {
+  const event = retainedEvent ?? (await client.query(
+    `select aggregate_type,aggregate_id,event_type,actor_ref,approver_ref,reason_code,reason_detail,payload
+from erp_financials.financial_lifecycle_events
+where tenant_id=$1 and company_id=$2 and source_id=$3 and event_id=$4 for key share`,
+    [context.tenantId, context.companyId, context.sourceId, existing.applied_event_id]
+  )).rows[0];
+  const rawPayload = storedJson(event?.payload);
+  const payload = rawPayload !== null && typeof rawPayload === "object" && !Array.isArray(rawPayload)
+    ? rawPayload as Readonly<Record<string, JsonValue>> : undefined;
+  if (!payload || payload.commandVersion !== 1 ||
+    typeof payload.commandChecksum !== "string" || typeof payload.expectedSourceVersion !== "number" || typeof payload.expectedTargetVersion !== "number") {
+    throw new ErpFinancialsError("unsupported_operation", "Historical application lacks immutable command evidence; reconcile its retained application and lifecycle records instead of resubmitting or choosing a new key");
+  }
+  if (!event || event.aggregate_type !== "subledger_application" || event.aggregate_id !== applicationId || event.event_type !== "subledger_application.applied" ||
+    event.actor_ref !== input.operation.actorRef || (event.approver_ref ?? null) !== (input.operation.approverRef ?? null) ||
+    event.reason_code !== input.operation.reasonCode || (event.reason_detail ?? null) !== (input.operation.reasonDetail ?? null) ||
+    payload.commandChecksum !== checksum || payload.expectedSourceVersion !== input.expectedSourceVersion || payload.expectedTargetVersion !== input.expectedTargetVersion) {
+    throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+  }
+}
+
 function assertSameSubledgerApplication(
   existing: Record<string, unknown>,
   input: ApplySubledgerPaymentInput,
@@ -3402,6 +4784,12 @@ function sumSubledgerLines(lines: readonly SubledgerAmountLine[], field: string)
   );
 }
 
+function normalizeInvoiceLines(lines: readonly SubledgerAmountLine[]): readonly NormalizedSubledgerAmountLine[] {
+  if (!lines.length) throw new ErpFinancialsValidationError("revenueLines must contain at least one line");
+  return lines.map((line,index)=>({ ...accountReferenceOnly(line),
+    ...normalizeCommercialDocumentLine(line,`revenueLines[${String(index)}]`),...normalizeInvoiceComponents(line) }));
+}
+
 function normalizeSubledgerLines(
   lines: readonly SubledgerAmountLine[],
   field: string
@@ -3409,10 +4797,10 @@ function normalizeSubledgerLines(
   if (lines.length === 0) {
     throw new ErpFinancialsValidationError(`${field} must contain at least one line`);
   }
-  return lines.map((line, index) => ({
-    ...accountReferenceOnly(line),
-    ...normalizeCommercialDocumentLine(line, `${field}[${String(index)}]`)
-  }));
+  return lines.map((line, index) => {
+    if (line.taxAccount !== undefined || line.discountAccount !== undefined) throw new ErpFinancialsValidationError("Invoice component accounts are unsupported for this document type");
+    return {...accountReferenceOnly(line),...normalizeCommercialDocumentLine(line, `${field}[${String(index)}]`)};
+  });
 }
 
 function accountReferenceOnly(line: SubledgerAmountLine): ErpFinancialsAccountReference {
@@ -3440,7 +4828,8 @@ function assertSubledgerApplicationType(value: SubledgerApplicationType): void {
     "bill_payment_to_bill",
     "credit_to_invoice",
     "vendor_credit_to_bill",
-    "write_off_to_invoice"
+    "write_off_to_invoice",
+    "customer_payment_to_refund"
   ].includes(value)) {
     throw new ErpFinancialsValidationError(`Unsupported subledger application type ${value}`);
   }
@@ -3489,13 +4878,126 @@ type LoadedPostedVendorBill = {
   readonly status: SubledgerDocumentResult["documentStatus"];
   readonly version: number;
   readonly journal: LoadedPostedJournal;
+  readonly paymentHold: boolean;
+  readonly paymentHoldReason: string | null;
 };
+
+async function correctPostedVendorBill(context: ServiceContext, input: CorrectPostedVendorBillInput): Promise<CorrectPostedVendorBillResult> {
+  const command = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
+  assertFinancialApproval(context, command.operation);
+  assertNonEmpty(command.vendorBillId, "vendorBillId");
+  assertNonEmpty(command.idempotencyKey, "idempotencyKey");
+  assertExpectedSubledgerVersion(command.expectedVersion, "expectedVersion");
+  assertIsoDate(command.date, "date");
+  const rawReleases: unknown = command.releases;
+  if (!Array.isArray(rawReleases)) throw new ErpFinancialsValidationError("Correction requires an explicit application release plan");
+  const releases = command.releases.map(release => {
+    assertNonEmpty(release.applicationId, "applicationId");
+    assertExpectedSubledgerVersion(release.expectedVersion, "application.expectedVersion");
+    assertExpectedSubledgerVersion(release.expectedSourceVersion, "application.expectedSourceVersion");
+    const reapplyAmount = formatMoney(parsePositiveOrZeroMoney(release.reapplyAmount, "reapplyAmount"));
+    if (!command.replacement && reapplyAmount !== "0.00") throw new ErpFinancialsValidationError("A void cannot reapply funds without a replacement bill");
+    return { ...release, reapplyAmount };
+  }).sort((a, b) => a.applicationId.localeCompare(b.applicationId));
+  if (new Set(releases.map(release => release.applicationId)).size !== releases.length) throw new ErpFinancialsValidationError("Application release IDs must be unique");
+  if (command.replacement && command.replacement.date > command.date) throw new ErpFinancialsValidationError("Replacement date cannot follow the correction date");
+  const { operation, ...business } = command;
+  const checksum = createHash("sha256").update(stableJson({ ...business, releases,
+    bookId: context.bookId ?? null, currencyCode: context.currencyCode, accountingBasis: context.accountingBasis, postingPolicy: context.postingPolicy,
+    actorRef: operation.actorRef, approverRef: operation.approverRef,
+    reasonCode: operation.reasonCode, reasonDetail: operation.reasonDetail })).digest("hex");
+  const key = `vendor-bill-correction:${command.idempotencyKey}`;
+  return context.database.transaction(client => withVendorBillCorrectionSavepoint(client, async () => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    await acquireTransactionLock(client, `${key}:${context.tenantId}:${context.companyId}:${context.sourceId}`);
+    await assertCompanySourceScope(client, context);
+    const original = await loadPostedVendorBillForLifecycle(client, context, command.vendorBillId);
+    if (original.currencyCode !== context.currencyCode) throw new ErpFinancialsError("scope_mismatch", "Correction currency differs from the bill");
+    const prior = (await client.query(
+      `select event_id,aggregate_id,payload from erp_financials.financial_lifecycle_events
+where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+      [context.tenantId, context.companyId, context.sourceId, `${key}:completed`])).rows[0];
+    if (prior) {
+      const payload = storedJson(prior.payload) as { commandChecksum?: string; result?: Omit<CorrectPostedVendorBillResult, "lifecycleEventId" | "status"> } | null;
+      if (prior.aggregate_id !== original.documentId || payload?.commandChecksum !== checksum || !payload.result) throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+      return { ...payload.result, status: "already_corrected", lifecycleEventId: storedString(prior.event_id, "event_id") };
+    }
+    if (original.version !== command.expectedVersion) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Bill changed before correction", { retryable: true });
+    if (original.status === "voided") throw new ErpFinancialsError("terminal_state_conflict", "Bill is already voided");
+    if (original.paymentHold && releases.some(release => release.reapplyAmount !== "0.00")) throw new ErpFinancialsError("terminal_state_conflict", "A held bill correction cannot authorize a new application; release the hold separately");
+    // Query only active applications for this bill; never collect its full history.
+    const active = (await client.query(
+      `select *,application_date::text as application_date from erp_financials.subledger_applications
+where tenant_id=$1 and company_id=$2 and source_id=$3 and target_document_id=$4 and status='applied'
+order by subledger_application_id for update`, [context.tenantId, context.companyId, context.sourceId, original.documentId])).rows;
+    const byId = new Map(active.map(row => [storedString(row.subledger_application_id, "application_id"), row]));
+    if (active.length !== releases.length || releases.some(release => !byId.has(release.applicationId))) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Reviewed release plan must contain every active bill application", { retryable: true });
+    const nested = nestedServiceContext(context, client);
+    for (const release of releases) {
+      const row = byId.get(release.applicationId);
+      if (!row) throw new ErpFinancialsValidationError("Missing reviewed application");
+      if (row.application_type !== "bill_payment_to_bill" && row.application_type !== "vendor_credit_to_bill") throw new ErpFinancialsError("unsupported_operation", "Bill correction cannot release this application type");
+      if (storedInteger(row.version, "application.version") !== release.expectedVersion) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Application changed before correction", { retryable: true });
+      if (storedDate(row.application_date, "application_date") > command.date) throw new ErpFinancialsValidationError("Correction cannot precede the released application date");
+      const [source] = await loadSubledgerDocumentsForUpdate(client, context, [storedString(row.source_document_id, "source_document_id"), original.documentId]);
+      if (storedInteger(source.version, "source.version") !== release.expectedSourceVersion) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Payment or credit changed before correction", { retryable: true });
+      if (source.party_id !== original.vendorId || source.currency_code !== original.currencyCode) throw new ErpFinancialsError("scope_mismatch", "Application source differs from the bill vendor or currency");
+      const provenance = (await client.query(
+        `select book_id from erp_financials.financial_outbox where tenant_id=$1 and company_id=$2 and source_id=$3
+and aggregate_id=$4 and event_type='ledger.posted' and idempotency_key=$5 for key share`,
+        [context.tenantId, context.companyId, context.sourceId, source.transaction_id,
+          `ledger-posted:Subledger:${storedString(source.document_type, "document_type")}:${storedString(source.idempotency_key, "idempotency_key")}`])).rows;
+      if (provenance.length !== 1 || storedOptionalString(provenance[0]?.book_id) !== context.bookId) throw new ErpFinancialsError("scope_mismatch", "Application source requires native posting evidence in the correction book");
+    }
+    if (command.replacement && (await client.query(
+      `select 1 from erp_financials.subledger_documents where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+      [context.tenantId, context.companyId, context.sourceId, `${key}:replacement`])).rows.length) throw new ErpFinancialsIdempotencyConflictError(command.idempotencyKey);
+    const releasedApplications: SubledgerApplicationResult[] = [];
+    for (const release of releases) releasedApplications.push(await endSubledgerApplication(nested, {
+      operation, applicationId: release.applicationId, expectedVersion: release.expectedVersion, effectiveDate: command.date
+    }, "unapplied"));
+    const correction = await runPostedVendorBillLifecycle(nested, command.replacement ? "replaced" : "voided", {
+      operation, vendorBillId: command.vendorBillId, expectedVersion: command.expectedVersion + releases.length,
+      idempotencyKey: `${key}:document`, date: command.date, ...(command.memo === undefined ? {} : { memo: command.memo }),
+      ...(command.replacement ? { replacement: { ...command.replacement, idempotencyKey: `${key}:replacement` } } : {})
+    });
+    const applications: SubledgerApplicationResult[] = [];
+    let replacementPosition: CorrectPostedVendorBillResult["replacementPosition"];
+    if (correction.replacement) {
+      const replacementId = correction.replacement.documentId;
+      if (original.paymentHold) await setVendorBillPaymentHold(nested, { operation, vendorBillId: replacementId,
+        expectedVersion: 1, idempotencyKey: `${key}:hold`, paymentHold: true, reason: original.paymentHoldReason ?? "Retained original bill hold" });
+      for (const release of releases) {
+        if (release.reapplyAmount === "0.00") continue;
+        const row = byId.get(release.applicationId);
+        if (!row) throw new ErpFinancialsValidationError("Missing released application");
+        const sourceId = storedString(row.source_document_id, "source_document_id");
+        const [source, target] = await loadSubledgerDocumentsForUpdate(client, context, [sourceId, replacementId]);
+        applications.push(await applySubledgerPayment(nested, { operation, idempotencyKey: `${key}:apply:${release.applicationId}`,
+          applicationType: row.application_type as "bill_payment_to_bill" | "vendor_credit_to_bill",
+          sourceDocumentId: sourceId, targetDocumentId: replacementId, amount: release.reapplyAmount, applicationDate: command.date,
+          expectedSourceVersion: storedInteger(source.version, "source.version"), expectedTargetVersion: storedInteger(target.version, "target.version") }));
+      }
+      const current = await loadSubledgerDocumentByIdempotencyKey(client, context, `${key}:replacement`);
+      replacementPosition = { documentId: replacementId, version: storedInteger(current.version, "version"),
+        openAmount: storedMoney(current.open_amount, "open_amount"), documentStatus: storedString(current.status, "status") as SubledgerDocumentResult["documentStatus"] };
+    }
+    const result = { correction, releasedApplications, applications, ...(replacementPosition ? { replacementPosition } : {}) };
+    const completion = await appendFinancialLifecycleEvent(client, { tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId,
+      aggregateType: "vendor_bill", aggregateId: original.documentId, eventType: "vendor_bill.corrected", idempotencyKey: `${key}:completed`,
+      operation, recordedAt: context.now(), payload: JSON.parse(JSON.stringify({ commandChecksum: checksum, result })) as JsonValue });
+    await appendServiceOutboxEvent(client, context, { eventType: "vendor_bill.corrected", aggregateType: "vendor_bill", aggregateId: original.documentId,
+      idempotencyKey: `${key}:outbox`, payload: { lifecycleEventId: completion.eventId, replacementVendorBillId: correction.replacement?.documentId ?? null } });
+    return { ...result, status: "corrected", lifecycleEventId: completion.eventId };
+  }));
+}
 
 async function runPostedVendorBillLifecycle(
   context: ServiceContext,
   outcome: "voided" | "replaced",
   input: VoidPostedVendorBillInput | ReplacePostedVendorBillInput
 ): Promise<PostedVendorBillLifecycleResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.vendorBillId, "vendorBillId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
@@ -3505,7 +5007,10 @@ async function runPostedVendorBillLifecycle(
     throw new ErpFinancialsValidationError("Replacing a posted vendor bill requires a replacement bill");
   }
 
-  return context.database.transaction(async (client) => {
+  return context.database.transaction(client => withVendorBillCorrectionSavepoint(client, async () => {
+    // Applications and database write guards take the source lock before rows.
+    // Taking a bill row first can deadlock against an in-flight application.
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(
       client,
       `posted-vendor-bill:${context.tenantId}:${context.companyId}:${context.sourceId}:${input.vendorBillId}`
@@ -3551,6 +5056,7 @@ async function runPostedVendorBillLifecycle(
       eventType: outcome === "voided" ? "vendor_bill.voided" : "vendor_bill.reversed",
       idempotencyKey: `${input.idempotencyKey}:${reversalLinkType}`,
       operation: input.operation,
+      allowTransportReplay: true,
       ...(original.journal.postedLifecycleEventId === undefined
         ? {}
         : { priorEventId: original.journal.postedLifecycleEventId })
@@ -3585,6 +5091,7 @@ async function runPostedVendorBillLifecycle(
         eventType: "vendor_bill.replaced",
         idempotencyKey: `${input.idempotencyKey}:replacement`,
         operation: input.operation,
+        allowTransportReplay: true,
         priorEventId: reversalLink.eventId
       });
     }
@@ -3599,6 +5106,7 @@ async function runPostedVendorBillLifecycle(
       idempotencyKey: `vendor-bill:${input.idempotencyKey}:${outcome}`,
       operation: input.operation,
       recordedAt: context.now(),
+      allowTransportReplay: true,
       priorEventId: replacementLink?.eventId ?? reversalLink.eventId,
       payload: {
         originalVendorBillId: original.documentId,
@@ -3638,7 +5146,28 @@ async function runPostedVendorBillLifecycle(
         lifecycle.eventId
       ]
     };
-  });
+  }));
+}
+
+/** A host may bind the SDK to its existing transaction and catch a command error.
+ * Roll back the entire correction in that case, including its reversal, original
+ * bill transition, replacement and audit/outbox, while preserving prior host work.
+ * SAVEPOINT also fails closed if a host accidentally supplies an autocommit client.
+ */
+async function withVendorBillCorrectionSavepoint<Result>(
+  client: PostgresQueryClient,
+  work: () => Promise<Result>
+): Promise<Result> {
+  await client.query("savepoint erp_vendor_bill_correction");
+  try {
+    const result = await work();
+    await client.query("release savepoint erp_vendor_bill_correction");
+    return result;
+  } catch (error) {
+    await client.query("rollback to savepoint erp_vendor_bill_correction");
+    await client.query("release savepoint erp_vendor_bill_correction");
+    throw error;
+  }
 }
 
 async function loadPostedVendorBillForLifecycle(
@@ -3647,7 +5176,7 @@ async function loadPostedVendorBillForLifecycle(
   documentId: string
 ): Promise<LoadedPostedVendorBill> {
   const result = await client.query(
-    `select * from "erp_financials"."subledger_documents"
+    `select *, "document_date"::text as "document_date", "due_date"::text as "due_date" from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_document_id" = $4
 for update`,
     [context.tenantId, context.companyId, context.sourceId, documentId]
@@ -3661,6 +5190,20 @@ for update`,
     );
   }
   const transactionId = storedString(row.transaction_id, "transaction_id");
+  // Company/source membership does not establish the posting book. A source
+  // can participate in several books; corrections must retain original scope,
+  // including replay and legacy callers with no configured book.
+  const provenance = await client.query(
+    `select "book_id" from "erp_financials"."financial_outbox"
+where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
+  and "aggregate_id" = $4 and "event_type" = 'ledger.posted' and "idempotency_key" = $5
+for key share`,
+    [context.tenantId, context.companyId, context.sourceId, transactionId,
+      `ledger-posted:${subledgerTransactionType("vendor_bill")}:${storedString(row.idempotency_key, "idempotency_key")}`]
+  );
+  if (provenance.rows.length !== 1 || storedOptionalString(provenance.rows[0]?.book_id) !== context.bookId) {
+    throw new ErpFinancialsError("scope_mismatch", "Vendor bill posting book differs from the correction scope");
+  }
   const status = storedString(row.status, "status");
   if (!["open", "partially_applied", "settled", "voided"].includes(status)) {
     throw new Error(`Posted vendor bill ${documentId} has invalid status ${status}`);
@@ -3675,11 +5218,16 @@ for update`,
     openAmount: formatMoney(parsePositiveOrZeroMoney(row.open_amount, "open_amount")),
     status: status as LoadedPostedVendorBill["status"],
     version: storedInteger(row.version, "version"),
+    paymentHold: row.payment_hold === true,
+    paymentHoldReason: storedOptionalString(row.payment_hold_reason) ?? null,
     journal: await loadPostedJournalForLifecycle(
       client,
       context,
       transactionId,
-      [subledgerTransactionType("vendor_bill")]
+      [subledgerTransactionType("vendor_bill")],
+      // Native bill liability is accrual. Cash-recognition postings added by
+      // applications are reversed by unapply, never by correcting the bill.
+      "accrual"
     )
   };
 }
@@ -3695,6 +5243,12 @@ function assertPostedVendorBillLifecycleState(
         "terminal_state_conflict",
         `Vendor bill ${bill.documentId} has lifecycle links but is not voided`
       );
+    }
+    // Voiding increments once and is terminal: no hold or application command
+    // may advance the original bill afterward. The pre-transition version is
+    // part of the original command, including retries of older stored events.
+    if (bill.version - 1 !== expectedVersion) {
+      throw new ErpFinancialsIdempotencyConflictError(`vendor-bill:${bill.documentId}:expected-version`);
     }
     return;
   }
@@ -3777,19 +5331,67 @@ type LoadedPostedBillPayment = {
   readonly journal: LoadedPostedJournal;
 };
 
+/** Completion evidence binds the outer reviewed command, including its original
+ * version. Inner unapplication steps may advance the payment version, so that
+ * version cannot be reconstructed from the terminal row on a later retry. */
+async function withBillPaymentCompletion<Result extends PostedBillPaymentLifecycleResult>(
+  client: PostgresQueryClient, context: ServiceContext, input: VoidPostedBillPaymentInput,
+  action: "void" | "compensate", work: () => Promise<Result>
+): Promise<Result> {
+  const { operation, ...business } = input;
+  const checksum = createHash("sha256").update(stableJson({ ...business, action,
+    bookId: context.bookId ?? null, currencyCode: context.currencyCode, accountingBasis: context.accountingBasis,
+    postingPolicy: context.postingPolicy, actorRef: operation.actorRef, approverRef: operation.approverRef,
+    reasonCode: operation.reasonCode, reasonDetail: operation.reasonDetail })).digest("hex");
+  const key = `bill-payment-completion:${action}:${input.idempotencyKey}`;
+  const prior = (await client.query(`select event_id,aggregate_id,payload from erp_financials.financial_lifecycle_events
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+  [context.tenantId, context.companyId, context.sourceId, key])).rows[0];
+  if (prior) {
+    const payload = storedJson(prior.payload) as { commandChecksum?: string; result?: Result } | null;
+    if (prior.aggregate_id !== input.billPaymentId || payload?.commandChecksum !== checksum || !payload.result) {
+      throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+    }
+    return { ...payload.result, status: "already_voided", reversal: { ...payload.result.reversal,
+      status: "already_posted", snapshotsMarkedStale: 0,
+      writeCounts: { importBatches: 0, transactions: 0, transactionLines: 0, postings: 0 } } };
+  }
+  const result = await work();
+  // Do not manufacture a full command receipt for older terminal history whose
+  // original outer version and authorization cannot be proven from that history.
+  if (result.status === "voided") await appendFinancialLifecycleEvent(client, {
+    tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId,
+    aggregateType: "bill_payment", aggregateId: input.billPaymentId, eventType: `bill_payment.${action}_completed`,
+    idempotencyKey: key, operation, recordedAt: context.now(),
+    payload: JSON.parse(JSON.stringify({ commandChecksum: checksum, result })) as JsonValue
+  });
+  return result;
+}
+
 async function voidAndUnapplyBillPayment(
   context: ServiceContext,
   input: VoidAndUnapplyBillPaymentInput
 ): Promise<VoidAndUnapplyBillPaymentResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.billPaymentId, "billPaymentId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
   assertIsoDate(input.date, "date");
-  return context.database.transaction(async (client) => {
+  return context.database.transaction(client => withBillPaymentSavepoint(client, async () => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(client, billPaymentLifecycleLock(context, input.billPaymentId));
     await assertCompanySourceScope(client, context);
     const disbursement = await loadOptionalBillPaymentInstructionForUpdate(client, context, input.billPaymentId);
+    if (disbursement === undefined) await loadPostedBillPaymentForVoid(client, context, input.billPaymentId);
+    return withBillPaymentCompletion(client, context, input, "compensate", async () => {
+    if (input.expectedReviewToken !== undefined) {
+      if (!/^[a-f0-9]{64}$/u.test(input.expectedReviewToken)) throw new ErpFinancialsValidationError("expectedReviewToken must be an SDK review token");
+      if (!context.bookId) throw new ErpFinancialsError("scope_mismatch", "Reviewed compensation requires a reporting book");
+      const review = await getBillPaymentCorrectionReview({database:{transaction:work=>work(client)},tenantId:context.tenantId,companyId:context.companyId,bookId:context.bookId},
+        {sourceId:context.sourceId,paymentId:input.billPaymentId,limit:1});
+      if (review.reviewToken !== input.expectedReviewToken) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Payment correction review changed; review the current applications", {retryable:true});
+    }
     if (disbursement !== undefined) {
       const status = storedString(disbursement.status, "bill payment status");
       const version = storedInteger(disbursement.version, "bill payment version");
@@ -3803,14 +5405,15 @@ async function voidAndUnapplyBillPayment(
         if (version !== input.expectedVersion + 1) {
           throw optimisticBillPaymentConflict(input.billPaymentId, input.expectedVersion, version - 1);
         }
-        await assertLifecycleReplayKey(
+        await billPaymentReplayOperation(
           client,
           context,
           disbursement.voided_event_id,
           `bill-payment:${input.idempotencyKey}:compensated`,
           input.operation
         );
-        const replay = await runPostedBillPaymentVoid(nestedServiceContext(context, client), input);
+        const terminal = await loadPostedBillPaymentForVoid(client, context, input.billPaymentId);
+        const replay = await runPostedBillPaymentVoid(nestedServiceContext(context, client), { ...input, expectedVersion: terminal.version - 1 }, true);
         const replayRows = await loadBillPaymentApplicationsForUpdate(client, context, input.billPaymentId);
         const endedApplications = replayRows.map((row) => {
           const applicationStatus = storedString(row.status, "application status");
@@ -3830,19 +5433,7 @@ async function voidAndUnapplyBillPayment(
     } else {
       const payment = await loadPostedBillPaymentForVoid(client, context, input.billPaymentId);
       if (payment.status === "voided") {
-        const replay = await runPostedBillPaymentVoid(nestedServiceContext(context, client), input);
-        const replayRows = await loadBillPaymentApplicationsForUpdate(client, context, input.billPaymentId);
-        const endedApplications = replayRows.map((row) => {
-          const applicationStatus = storedString(row.status, "application status");
-          if (applicationStatus !== "unapplied" && applicationStatus !== "voided") {
-            throw new ErpFinancialsError(
-              "terminal_state_conflict",
-              `Compensated bill payment has an application in status ${applicationStatus}`
-            );
-          }
-          return applicationResult(row, applicationStatus);
-        });
-        return { ...replay, endedApplications };
+        throw new ErpFinancialsError("terminal_state_conflict", "Legacy compensated payment lacks a provable outer command receipt; reconcile retained evidence before recovery");
       }
       if (payment.version !== input.expectedVersion) {
         throw optimisticBillPaymentConflict(input.billPaymentId, input.expectedVersion, payment.version);
@@ -3871,7 +5462,7 @@ async function voidAndUnapplyBillPayment(
     const voided = await runPostedBillPaymentVoid(nestedContext, {
       ...input,
       expectedVersion: openPayment.version
-    });
+    }, true);
     if (disbursement === undefined) return { ...voided, endedApplications };
 
     const disbursementVersion = storedInteger(disbursement.version, "bill payment version");
@@ -3928,7 +5519,8 @@ returning "version"`,
       endedApplications,
       disbursementVersion: storedInteger(row.version, "bill payment version")
     };
-  });
+    });
+  }));
 }
 
 async function loadOptionalBillPaymentInstructionForUpdate(
@@ -3937,12 +5529,14 @@ async function loadOptionalBillPaymentInstructionForUpdate(
   billPaymentId: string
 ): Promise<Record<string, unknown> | undefined> {
   const result = await client.query(
-    `select * from "erp_financials"."bill_payment_disbursements"
+    `select *, "payment_date"::text as "payment_date" from "erp_financials"."bill_payment_disbursements"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "bill_payment_id" = $4
 for update`,
     [context.tenantId, context.companyId, context.sourceId, billPaymentId]
   );
-  return result.rows[0];
+  const row = result.rows[0];
+  if (row !== undefined) await assertBillPaymentInstructionBook(client, context, row);
+  return row;
 }
 
 async function loadBillPaymentApplicationsForUpdate(
@@ -3951,10 +5545,10 @@ async function loadBillPaymentApplicationsForUpdate(
   billPaymentId: string
 ): Promise<readonly Record<string, unknown>[]> {
   const result = await client.query(
-    `select * from "erp_financials"."subledger_applications"
+    `select *, "application_date"::text as "application_date" from "erp_financials"."subledger_applications"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   and "source_document_id" = $4 and "application_type" = 'bill_payment_to_bill'
-order by "application_date", "subledger_application_id"
+order by "subledger_applications"."application_date", "subledger_application_id"
 for update`,
     [context.tenantId, context.companyId, context.sourceId, billPaymentId]
   );
@@ -3963,21 +5557,26 @@ for update`,
 
 async function runPostedBillPaymentVoid(
   context: ServiceContext,
-  input: VoidPostedBillPaymentInput
+  input: VoidPostedBillPaymentInput,
+  compensationOwnsInstruction = false
 ): Promise<PostedBillPaymentLifecycleResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialApproval(context, input.operation);
   assertNonEmpty(input.billPaymentId, "billPaymentId");
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
   assertIsoDate(input.date, "date");
 
-  return context.database.transaction(async (client) => {
+  return context.database.transaction(client => withBillPaymentSavepoint(client, async () => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(
       client,
       `posted-bill-payment:${context.tenantId}:${context.companyId}:${context.sourceId}:${input.billPaymentId}`
     );
     await assertCompanySourceScope(client, context);
+    const disbursement = compensationOwnsInstruction ? undefined : await loadOptionalBillPaymentInstructionForUpdate(client, context, input.billPaymentId);
     const original = await loadPostedBillPaymentForVoid(client, context, input.billPaymentId);
+    return withBillPaymentCompletion(client, context, input, "void", async () => {
     const reversalInput: PostJournalEntryInput = {
       operation: input.operation,
       idempotencyKey: `${input.idempotencyKey}:reversal`,
@@ -3998,6 +5597,7 @@ async function runPostedBillPaymentVoid(
       competingLinkTypes: ["reversal", "void"]
     });
     assertPostedBillPaymentVoidState(original, input.expectedVersion, replay);
+    if (replay) return replayLegacyPostedBillPaymentVoid(client, context, input, original, reversalInput);
 
     await acquireTransactionLock(
       client,
@@ -4023,9 +5623,7 @@ async function runPostedBillPaymentVoid(
         ? {}
         : { priorEventId: original.journal.postedLifecycleEventId })
     });
-    const originalVersion = replay
-      ? original.version
-      : await markPostedBillPaymentVoided(client, context, original, input.expectedVersion);
+    const originalVersion = await markPostedBillPaymentVoided(client, context, original, input.expectedVersion);
     const lifecycle = await appendFinancialLifecycleEvent(client, {
       tenantId: context.tenantId,
       companyId: context.companyId,
@@ -4043,6 +5641,20 @@ async function runPostedBillPaymentVoid(
         reversalTransactionId: reversal.transactionId
       }
     });
+    // Direct void is also valid after explicit unapplication. Keep its optional
+    // instruction in the same terminal state, atomically with the document and
+    // reversal. The composite compensation path owns its own instruction event.
+    if (disbursement) {
+      const version = storedInteger(disbursement.version, "bill payment version");
+      if (disbursement.status !== "cleared" || disbursement.subledger_document_id !== original.documentId || !disbursement.cleared_event_id) {
+        throw new ErpFinancialsError("terminal_state_conflict", "A posted payment requires its cleared instruction before direct void");
+      }
+      const updated = await client.query(`update "erp_financials"."bill_payment_disbursements"
+        set status='voided',version=version+1,voided_event_id=$5,updated_at=$6
+        where tenant_id=$1 and company_id=$2 and source_id=$3 and bill_payment_id=$4 and status='cleared' and version=$7 returning version`,
+      [context.tenantId, context.companyId, context.sourceId, original.documentId, lifecycle.eventId, context.now(), version]);
+      if (!updated.rows.length) throw optimisticBillPaymentConflict(original.documentId, version, version + 1);
+    }
     await appendServiceOutboxEvent(client, context, {
       eventType: "bill_payment.voided",
       aggregateType: "bill_payment",
@@ -4055,7 +5667,7 @@ async function runPostedBillPaymentVoid(
     });
 
     return {
-      status: replay ? "already_voided" : "voided",
+      status: "voided",
       originalBillPaymentId: original.documentId,
       originalTransactionId: original.transactionId,
       originalVersion,
@@ -4067,7 +5679,60 @@ async function runPostedBillPaymentVoid(
         lifecycle.eventId
       ]
     };
-  });
+    });
+  }));
+}
+
+/** Pre-receipt raw voids retain enough immutable journal/link evidence for a
+ * read-only replay. Never repair missing mirrors or audit facts during retry. */
+async function replayLegacyPostedBillPaymentVoid(
+  client: PostgresQueryClient, context: ServiceContext, input: VoidPostedBillPaymentInput,
+  original: LoadedPostedBillPayment, reversalInput: PostJournalEntryInput
+): Promise<PostedBillPaymentLifecycleResult> {
+  const primary = normalizeJournalEntry(context, reversalInput);
+  if (primary.accountingBasis === "modified_cash") throw new ErpFinancialsValidationError("Payment reversal requires cash and accrual evidence");
+  const mirror = normalizeJournalEntry(context, { ...reversalInput,
+    idempotencyKey: `${reversalInput.idempotencyKey}:accounting-basis:${oppositeAccountingMethod(primary.accountingBasis)}`,
+    accountingBasis: oppositeAccountingMethod(primary.accountingBasis), accountingPolicy: "configured_basis_only" });
+  const results: PostJournalEntryResult[] = [];
+  for (const journal of [primary, mirror]) {
+    const identities = journalIdentities(context, journal);
+    const existing = await loadExistingJournal(client, context, journal.idempotencyKey, journal.sourceTransactionType);
+    if (!existing || existing.status !== "posted" || existing.transactionId !== identities.transactionId
+      || sourceRefChecksum(existing.sourcePayloadRef) !== journal.checksum) throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+    const eventKey = `${journal.lifecycleAggregateType}:${journal.sourceTransactionType}:${journal.idempotencyKey}:posted`;
+    const event = (await client.query(`select event_id from erp_financials.financial_lifecycle_events
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4 and aggregate_id=$5 and event_type=$6`,
+    [context.tenantId, context.companyId, context.sourceId, eventKey, identities.transactionId, journal.lifecycleEventType])).rows[0];
+    if (!event) throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+    await billPaymentReplayOperation(client, context, event.event_id, eventKey, input.operation);
+    const provenance = (await client.query(`select book_id from erp_financials.financial_outbox
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and aggregate_id=$4 and event_type='ledger.posted' and idempotency_key=$5`,
+    [context.tenantId, context.companyId, context.sourceId, identities.transactionId,
+      `ledger-posted:${journal.sourceTransactionType}:${journal.idempotencyKey}`])).rows;
+    if (provenance.length !== 1 || storedOptionalString(provenance[0]?.book_id) !== context.bookId) {
+      throw new ErpFinancialsError("scope_mismatch", "Payment reversal requires retained posting book evidence");
+    }
+    results.push(alreadyPostedResult(identities, storedString(event.event_id, "event_id")));
+  }
+  const [first, second] = results;
+  if (!first || !second) throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+  const reversal = combineJournalResults(first, second);
+  const link = (await client.query(`select journal_entry_link_id,lifecycle_event_id from erp_financials.journal_entry_links
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and original_transaction_id=$4 and related_transaction_id=$5 and link_type='void'`,
+  [context.tenantId, context.companyId, context.sourceId, original.transactionId, reversal.transactionId])).rows[0];
+  const terminalKey = `bill-payment:${input.idempotencyKey}:voided`;
+  const terminal = (await client.query(`select event_id,payload from erp_financials.financial_lifecycle_events
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4 and aggregate_id=$5 and event_type='bill_payment.voided'`,
+  [context.tenantId, context.companyId, context.sourceId, terminalKey, original.documentId])).rows[0];
+  if (!link || !terminal || stableJson(billPaymentReceiptPayload(terminal.payload)) !== stableJson({
+    originalBillPaymentId: original.documentId, originalTransactionId: original.transactionId, reversalTransactionId: reversal.transactionId
+  })) throw new ErpFinancialsIdempotencyConflictError(input.idempotencyKey);
+  await billPaymentReplayOperation(client, context, link.lifecycle_event_id, `journal-lifecycle:${input.idempotencyKey}:void`, input.operation);
+  await billPaymentReplayOperation(client, context, terminal.event_id, terminalKey, input.operation);
+  return { status: "already_voided", originalBillPaymentId: original.documentId, originalTransactionId: original.transactionId,
+    originalVersion: original.version, reversal, journalEntryLinkIds: [storedString(link.journal_entry_link_id, "link_id")],
+    lifecycleEventIds: [reversal.lifecycleEventId, storedString(link.lifecycle_event_id, "event_id"), storedString(terminal.event_id, "event_id")] };
 }
 
 async function loadPostedBillPaymentForVoid(
@@ -4076,7 +5741,7 @@ async function loadPostedBillPaymentForVoid(
   documentId: string
 ): Promise<LoadedPostedBillPayment> {
   const result = await client.query(
-    `select * from "erp_financials"."subledger_documents"
+    `select *, "document_date"::text as "document_date", "due_date"::text as "due_date" from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_document_id" = $4
 for update`,
     [context.tenantId, context.companyId, context.sourceId, documentId]
@@ -4090,6 +5755,14 @@ for update`,
     );
   }
   const transactionId = storedString(row.transaction_id, "transaction_id");
+  const evidence = await client.query(`select book_id from erp_financials.financial_outbox
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and aggregate_id=$4
+      and event_type='ledger.posted' and idempotency_key=$5 for key share`,
+  [context.tenantId, context.companyId, context.sourceId, transactionId,
+    `ledger-posted:${subledgerTransactionType("bill_payment")}:${storedString(row.idempotency_key, "idempotency_key")}`]);
+  if (evidence.rows.length !== 1 || storedOptionalString(evidence.rows[0]?.book_id) !== context.bookId) {
+    throw new ErpFinancialsError("scope_mismatch", "Bill payment posting book differs from the command scope");
+  }
   const status = storedString(row.status, "status");
   if (!["open", "partially_applied", "settled", "voided"].includes(status)) {
     throw new Error(`Posted bill payment ${documentId} has invalid status ${status}`);
@@ -4123,6 +5796,7 @@ function assertPostedBillPaymentVoidState(
         `Bill payment ${payment.documentId} has lifecycle links but is not voided`
       );
     }
+    if (payment.version !== expectedVersion + 1) throw optimisticBillPaymentConflict(payment.documentId, expectedVersion, payment.version - 1);
     return;
   }
   if (payment.version !== expectedVersion) {
@@ -4374,7 +6048,7 @@ async function loadIssuedAdjustmentForLifecycle(
   documentId: string
 ): Promise<LoadedIssuedAdjustment> {
   const result = await client.query(
-    `select * from "erp_financials"."subledger_documents"
+    `select *, "document_date"::text as "document_date", "due_date"::text as "due_date" from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_document_id" = $4
 for update`,
     [context.tenantId, context.companyId, context.sourceId, documentId]
@@ -4400,6 +6074,9 @@ for update`,
     throw new Error(`Issued adjustment ${documentId} has invalid status ${status}`);
   }
   const metadata = storedJson(row.metadata);
+  if (metadata !== null && typeof metadata === "object" && "customerPaymentReturn" in metadata) {
+    throw new ErpFinancialsError("terminal_state_conflict", "A receipt cash return requires an explicit compensating cash fact; generic adjustment void/replace is not allowed");
+  }
   const refundProvenance = metadata !== null && typeof metadata === "object" && !Array.isArray(metadata)
     ? (metadata as Readonly<Record<string, JsonValue>>).refundProvenance
     : undefined;
@@ -4528,6 +6205,7 @@ async function runJournalLifecycleWorkflow(
   }
 
   return context.database.transaction(async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(
       client,
       `journal-lifecycle:${context.tenantId}:${context.sourceId}:${input.originalTransactionId}`
@@ -4683,7 +6361,8 @@ async function loadPostedJournalForLifecycle(
   client: PostgresQueryClient,
   context: ServiceContext,
   transactionId: string,
-  allowedSourceTypes: readonly string[] = ["JournalEntry", "JournalEntryAdjustment"]
+  allowedSourceTypes: readonly string[] = ["JournalEntry", "JournalEntryAdjustment"],
+  accountingBasisFilter?: AccountingBasis
 ): Promise<LoadedPostedJournal> {
   const result = await client.query(
     `select transactions."transaction_id", transactions."source_transaction_type", transactions."status", transactions."memo", transactions."source_payload_ref",
@@ -4695,9 +6374,10 @@ join "erp_financials"."ledger_postings" postings
  and postings."source_id" = transactions."source_id"
  and postings."transaction_id" = transactions."transaction_id"
 where transactions."tenant_id" = $1 and transactions."source_id" = $2 and transactions."transaction_id" = $3
+  and ($4::text is null or postings."accounting_basis" = $4)
 order by postings."posting_id"
 for update of transactions, postings`,
-    [context.tenantId, context.sourceId, transactionId]
+    [context.tenantId, context.sourceId, transactionId, accountingBasisFilter ?? null]
   );
   if (result.rows.length < 2) {
     throw new ErpFinancialsValidationError(`Posted journal ${transactionId} does not exist or has insufficient postings`);
@@ -4785,6 +6465,7 @@ async function appendJournalEntryLink(
     readonly idempotencyKey: string;
     readonly operation: FinancialOperationContext;
     readonly priorEventId?: string;
+    readonly allowTransportReplay?: boolean;
   }
 ): Promise<{ readonly linkId: string; readonly eventId: string }> {
   const linkId = scopedRecordId(
@@ -4802,6 +6483,7 @@ async function appendJournalEntryLink(
     idempotencyKey: `journal-lifecycle:${input.idempotencyKey}`,
     operation: input.operation,
     recordedAt: context.now(),
+    ...(input.allowTransportReplay === true ? { allowTransportReplay: true } : {}),
     ...(input.priorEventId === undefined ? {} : { priorEventId: input.priorEventId }),
     payload: {
       linkType: input.linkType,
@@ -4897,6 +6579,7 @@ function isStoredDimensionRef(value: unknown): value is DimensionRef {
 }
 
 function serviceContext(input: CreateErpFinancialsInput): ServiceContext {
+  const invoiceAccountPolicy = normalizeInvoiceAccountPolicy(input.invoiceAccountPolicy);
   assertNonEmpty(input.tenantId, "tenantId");
   assertNonEmpty(input.companyId, "companyId");
   assertNonEmpty(input.sourceId, "sourceId");
@@ -4924,6 +6607,7 @@ function serviceContext(input: CreateErpFinancialsInput): ServiceContext {
     ...(input.bookId === undefined ? {} : { bookId: input.bookId }),
     currencyCode: input.currencyCode,
     currencyPolicy: input.currencyPolicy ?? "single_currency",
+    ...(invoiceAccountPolicy === undefined ? {} : { invoiceAccountPolicy }),
     accountingBasis,
     now: input.now ?? (() => new Date().toISOString()),
     postingPolicy: input.postingPolicy ?? "enforce_fiscal_periods",
@@ -5015,6 +6699,20 @@ function assertAccountIdentitiesAreStable(existingAccounts: readonly Account[], 
   }
 }
 
+function normalizeJournalOrigin(origin: JournalEntryOrigin): JournalEntryOrigin {
+  const candidate: unknown = origin;
+  if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
+    throw new ErpFinancialsValidationError("Journal origin must be an object");
+  }
+  assertNonEmpty(origin.module, "origin.module");
+  if (origin.module.length > 80) throw new ErpFinancialsValidationError("Journal origin.module exceeds 80 characters");
+  if (origin.reference !== undefined) {
+    assertNonEmpty(origin.reference, "origin.reference");
+    if (origin.reference.length > 256) throw new ErpFinancialsValidationError("Journal origin.reference exceeds 256 characters");
+  }
+  return { module: origin.module, ...(origin.reference === undefined ? {} : { reference: origin.reference }) };
+}
+
 function normalizeJournalEntry(context: ServiceContext, input: InternalPostJournalEntryInput): NormalizedJournalEntry {
   assertNonEmpty(input.idempotencyKey, "idempotencyKey");
   assertIsoDate(input.date, "date");
@@ -5025,6 +6723,7 @@ function normalizeJournalEntry(context: ServiceContext, input: InternalPostJourn
     throw new ErpFinancialsValidationError("A journal entry requires at least two lines");
   }
 
+  const origin = input.origin === undefined ? undefined : normalizeJournalOrigin(input.origin);
   const lineIds = new Set<string>();
   const lines = input.lines.map((line, index): NormalizedJournalLine => {
     const accountId = resolveAccountId(context, line);
@@ -5106,6 +6805,7 @@ function normalizeJournalEntry(context: ServiceContext, input: InternalPostJourn
           partyId: line.partyId ?? null
         })),
         memo: input.memo ?? null,
+        ...(origin === undefined ? {} : { origin }),
         postedAt: input.postedAt ?? null,
         transactionNumber: input.transactionNumber ?? null
         ,
@@ -5120,6 +6820,7 @@ function normalizeJournalEntry(context: ServiceContext, input: InternalPostJourn
     date: input.date,
     ...(input.transactionNumber === undefined ? {} : { transactionNumber: input.transactionNumber }),
     ...(input.memo === undefined ? {} : { memo: input.memo }),
+    ...(origin === undefined ? {} : { origin }),
     ...(input.postedAt === undefined ? {} : { postedAt: input.postedAt }),
     currencyCode,
     accountingBasis,
@@ -5232,7 +6933,8 @@ function journalFacts(
         accountingPolicy: journal.accountingPolicy,
       currencyCode: journal.currencyCode,
       lineCount: journal.lines.length,
-      transactionDate: journal.date
+      transactionDate: journal.date,
+      ...(journal.origin === undefined ? {} : { journalOrigin: { ...journal.origin } })
     }
   };
   assertNoCredentialKeys(transactionRef);
@@ -5440,8 +7142,24 @@ async function appendJournalPostedLifecycleEvent(
   context: ServiceContext,
   operation: FinancialOperationContext,
   journal: NormalizedJournalEntry,
-  identities: ReturnType<typeof journalIdentities>
+  identities: ReturnType<typeof journalIdentities>,
+  accountRequirements: readonly { readonly accountId: string; readonly classifications: readonly AccountClassification[] }[] = []
 ) {
+  const evidence = {
+    ...await retainJournalAccountPolicy(client,{tenantId:context.tenantId,companyId:context.companyId,sourceId:context.sourceId,transactionId:identities.transactionId,operation,recordedAt:context.now(),requirements:accountRequirements}),
+    accountingBasis: journal.accountingBasis,
+    adjustment: journal.adjustment,
+    currencyCode: journal.currencyCode,
+    importBatchId: identities.importBatchId,
+    transactionDate: journal.date,
+    transactionId: identities.transactionId
+  };
+  const inline = { ...evidence, postingIds: identities.postingIds };
+  // Use the smaller outbox budget, leaving room for JSONB formatting and any
+  // approval audit. Canonical posting pages retain the complete set of IDs.
+  const payload = Buffer.byteLength(JSON.stringify(inline), "utf8") <= FINANCIAL_OUTBOX_MAX_PAYLOAD_BYTES
+    ? inline
+    : { ...evidence, postingCount: identities.postingIds.length, postingIdsOmitted: true };
   return appendFinancialLifecycleEvent(client, {
     tenantId: context.tenantId,
     companyId: context.companyId,
@@ -5452,15 +7170,7 @@ async function appendJournalPostedLifecycleEvent(
     idempotencyKey: `${journal.lifecycleAggregateType}:${journal.sourceTransactionType}:${journal.idempotencyKey}:posted`,
     operation,
     recordedAt: context.now(),
-    payload: {
-      accountingBasis: journal.accountingBasis,
-      adjustment: journal.adjustment,
-      currencyCode: journal.currencyCode,
-      importBatchId: identities.importBatchId,
-      postingIds: identities.postingIds,
-      transactionDate: journal.date,
-      transactionId: identities.transactionId
-    }
+    payload
   });
 }
 
@@ -5564,13 +7274,6 @@ function formatMoney(value: bigint): DecimalString {
   return `${sign}${(absolute / 100n).toString()}.${(absolute % 100n).toString().padStart(2, "0")}`;
 }
 
-function scopedRecordId(context: Pick<ServiceContext, "tenantId" | "sourceId">, kind: string, key: string): string {
-  const digest = createHash("sha256")
-    .update([context.tenantId, context.sourceId, kind, key].join("\u0000"))
-    .digest("hex")
-    .slice(0, 16);
-  return `${kind}_${digest}`;
-}
 
 function assertIsoDate(value: string, field: string): void {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);

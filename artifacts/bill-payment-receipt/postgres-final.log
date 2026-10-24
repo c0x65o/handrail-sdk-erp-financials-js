@@ -1,0 +1,64 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-e81zlw/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (364 tests | 312 skipped) 80780ms
+   ✓ ERP Financials real PostgreSQL > cleared payment immediate retry is a historical receipt after bill correction  978ms
+   ✓ ERP Financials real PostgreSQL > cleared payment scheduled retry is a historical receipt after bill correction  953ms
+   ✓ ERP Financials real PostgreSQL > cleared payment retry fails closed for missing application evidence  842ms
+   ✓ ERP Financials real PostgreSQL > cleared payment retry fails closed for changed application evidence  800ms
+   ✓ ERP Financials real PostgreSQL > scheduled bill payment retries preserve original evidence with fresh transport metadata  932ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections require the originating book and currency before writes or replay: voided  841ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections require the originating book and currency before writes or replay: replaced  867ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject active applications and preserve unapplied cash: 20.00  864ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject active applications and preserve unapplied cash: 100.00  871ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'voided', 'correction' first  872ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'voided', 'payment' first  972ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'replaced', 'correction' first  972ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'replaced', 'payment' first  963ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections avoid a payment lock inversion: voided  970ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections avoid a payment lock inversion: replaced  795ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections respect an in-flight hold writer  924ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections respect an in-flight payment writer  790ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections roll back a rejected replacement even when the host catches it  882ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught reversal-link failure  1034ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught original failure  1053ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught replacement failure  1108ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught lifecycle failure  1197ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught outbox failure  1229ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught sql-error failure  1274ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases 20.00 and explicitly reapplies 10.00  1337ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases 100.00 and explicitly reapplies 80.00  1445ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction void preserves funds and replaces held bills without releasing their hold  1387ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rejects stale, incomplete, changed and unauthorized plans without writes  1655ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught release interruption  1370ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught replacement interruption  1514ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught reapply interruption  1546ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught receipt interruption  1542ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught outbox interruption  1523ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases repeated payment sources and serializes identical retries  1699ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back an actual lost PostgreSQL connection and retries cleanly  878ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction honors a closed fiscal period and can replay after close  1864ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction snapshots approval and rejects independently created replacement keys  1945ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rejects a payment from another book before releasing it  1924ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction respects committed correction winner  2118ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction respects committed application winner  2183ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction preserves administrator confirmation across nested releases and replacement  2156ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction is available through the built public SDK facade  2967ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review pages active evidence beyond 200 without collecting ended history  4147ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review is scoped, read-only and provides a complete public command plan  2189ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review returns an empty plan and detects bill hold changes between pages  2084ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review uses one bounded SQL snapshot during a concurrent unapplication  2302ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review snapshots requests before awaiting and exports its built public API  2460ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject changed replay versions and preserve original commands  2483ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill correction snapshots preserve a scoped administrator grant and its audit  2411ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections snapshot independent commands before waiting for a transaction  2486ms
+   ✓ ERP Financials real PostgreSQL > voids and reloads a canonical bill payment through real PostgreSQL  2566ms
+   ✓ ERP Financials real PostgreSQL > atomically clears ordered vendor bills, exposes provenance and summary, and compensates applications  2766ms
+
+ Test Files  1 passed (1)
+      Tests  52 passed | 312 skipped (364)
+   Start at  17:19:10
+   Duration  83.28s (transform 2.36s, setup 0ms, collect 2.22s, tests 80.78s, environment 0ms, prepare 60ms)
+
+EPHEMERAL POSTGRES REMOVED

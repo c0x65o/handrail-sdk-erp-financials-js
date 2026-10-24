@@ -1,0 +1,71 @@
+{
+  "checkpoint": "Bounded public vendor bill correction review",
+  "sdkBaseCommit": "b52bd8fb5cb47dad61d3d01a99a497b7ef9a04d4",
+  "sdkVersion": "0.3.111",
+  "schemaVersion": 38,
+  "status": "locally verified SDK; unpublished; full goal incomplete",
+  "publicAPI": [
+    "queries.getVendorBillCorrectionReview",
+    "VendorBillCorrectionReviewRequest",
+    "VendorBillCorrectionReviewPage",
+    "VendorBillCorrectionReviewApplication"
+  ],
+  "behavior": [
+    "One SQL statement snapshot returns bill, hold, active application controls and bounded page with source versions/balances.",
+    "Default50/max200 keyset pages; no ended-history collection, no per-row query fanout and no ledger-posting reads. Active plan digest is computed in PostgreSQL, with only limit+1 items returned.",
+    "Cursor binds full tenant/company/book/source/bill scope and complete active-plan freshness. Bill/hold or active source changes invalidate the next page; unrelated postings do not.",
+    "Native book/vendor/currency evidence required for bill and active sources. Voided bills and unsupported source provenance fail closed.",
+    "Review is not approval or an as-of report; command independently validates explicit reviewed plan and all versions."
+  ],
+  "executed": {
+    "postgres": {
+      "passed": 6,
+      "unselected": 354,
+      "total": 360,
+      "newReviewCases": 5,
+      "log": "postgres.log",
+      "engine": "PostgreSQL15.19",
+      "isolation": "Verified disposable Unix-socket-only cluster; removed after execution"
+    },
+    "reportReadModels": {
+      "passed": 43,
+      "log": "read-models.log"
+    },
+    "typecheck": {
+      "result": "full SDK source/tests passed",
+      "log": "typecheck-final.log"
+    },
+    "lint": {
+      "result": "all changed typed files passed",
+      "log": "lint.log"
+    },
+    "build": {
+      "result": "passed",
+      "log": "build.log"
+    },
+    "consumerImports": {
+      "result": "BLU/CoreERP/FutureERP public import fixtures passed; BLU includes new review types",
+      "logs": [
+        "blu-imports.log",
+        "core-imports.log",
+        "future-imports.log"
+      ]
+    }
+  },
+  "proof": [
+    "205 active applications page200+5 with exact controls and stable ordering; ended application excluded.",
+    "Payment change on another bill invalidates old cursor even though reviewed bill version is unchanged; unrelated new bill does not.",
+    "Hold change invalidates cursor; wrong-scope/malformed cursors, foreign project scopes and foreign posting book evidence rejected.",
+    "All SDK financial/audit tables unchanged by review and failed reads.",
+    "Review fields form a successful complete correctPosted command without private-table access.",
+    "A read held after its SQL snapshot remains internally consistent across concurrent unapply; subsequent read reflects new state. Instrumented read executes exactly1 SQL query and passes limit+1.",
+    "Request mutation cannot change awaited query; built public SDK facade returns the same review."
+  ],
+  "limitations": [
+    "205 active-application test is not million-entry or sustained-load performance proof; digest cost scales with active applications on this bill.",
+    "Only selected SDK tests and consumer import fixtures ran; not complete affected-consumer application regressions.",
+    "BLU independent correction approval, intent persistence, canonical replacement links, routes and UI remain unfinished.",
+    "No production SQL/schema migration, publication, dependency upgrade, push, deployment or live verification.",
+    "Earlier broad goal requirements remain outstanding, including reports, migration/recovery, all-writer concurrency and scale acceptance."
+  ]
+}

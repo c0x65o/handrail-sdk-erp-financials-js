@@ -63,6 +63,20 @@ describe("financial authorization and lifecycle context", () => {
     ).rejects.toBeInstanceOf(FinancialLifecycleIdempotencyConflictError);
   });
 
+  it("explicit transport replay preserves original audit metadata and never relaxes business or authorization identity", async () => {
+    const client = new LifecycleClient(), input = lifecycleInput();
+    const first = await appendFinancialLifecycleEvent(client, input);
+    const transport = { ...input.operation, requestId: "retry-request", correlationId: "retry-correlation", occurredAt: "2026-09-01T12:00:00.000Z" };
+    await expect(appendFinancialLifecycleEvent(client, { ...input, operation: transport })).rejects.toBeInstanceOf(FinancialLifecycleIdempotencyConflictError);
+    const before = structuredClone(client.events);
+    await expect(appendFinancialLifecycleEvent(client, { ...input, operation: transport, allowTransportReplay: true })).resolves.toEqual({ ...first, status: "already_recorded" });
+    for (const changed of [{ actorRef: "other" }, { approverRef: "other" }, { reasonCode: "changed" }, { reasonDetail: "changed" }]) {
+      await expect(appendFinancialLifecycleEvent(client, { ...input, operation: { ...transport, ...changed }, allowTransportReplay: true })).rejects.toBeInstanceOf(FinancialLifecycleIdempotencyConflictError);
+    }
+    await expect(appendFinancialLifecycleEvent(client, { ...input, operation: transport, payload: { changed: true }, allowTransportReplay: true })).rejects.toBeInstanceOf(FinancialLifecycleIdempotencyConflictError);
+    expect(client.events).toEqual(before);
+  });
+
   it("rejects credential-shaped lifecycle payloads before querying Postgres", async () => {
     const client = new LifecycleClient();
 

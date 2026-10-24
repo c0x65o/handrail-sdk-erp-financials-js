@@ -1,7 +1,12 @@
+import {readPostgresAccountingAccess,changePostgresAccountingAccess,withPostgresAccountingAccess,installPostgresAccountingHostGuards,verifyPostgresAccountingHostGuards} from '../src/accounting-access.js';
+import { createHash } from "node:crypto";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { Pool } from "pg";
+import { appendFinancialOutboxEvent, createFinancialOutboxService } from "../src/financial-outbox.js";
 
 import {
+  withPostgresAccountingMaintenance,
+  appendFinancialLifecycleEvent,
   persistImportedCustomerPaymentEvidence,
   persistCanonicalFacts,
   createPostgresStorageAdapter,
@@ -10,7 +15,10 @@ import {
   POSTGRES_CANONICAL_SCHEMA_MANIFEST,
   createErpFinancials,
   createTransferReversalApprovalChecksum,
+  createFinancialActionCommandChecksum,
   createErpFinancialsSdk,
+  createPostgresTransactionRunner,
+  createFinancialReadModels,
   createFiscalCloseEvidenceChecksum,
   migratePostgresSchema,
   persistQuickBooksSubledgerResources,
@@ -20,12 +28,18 @@ import {
 } from "../src/index.js";
 
 import type {
+  BankStatementCommandAttempt,
+  ErpFinancialsPostgresPool,
   CustomerPaymentCorrectionGuard,
+  ErpFinancialsSdk,
+  ErpFinancialsTransactionRunner,
   CanonicalAccountingFactSet,
   CreateVendorBillInput,
   CreateErpFinancialsInput,
+  FinancialOperationContext,
   ReverseDepositInput,
   ReverseTransferInput,
+  VoidPostedBillPaymentInput,
   HandrailQuickBooksSdkResourceSet,
   PostgresMigrationTransactionRunner,
   PostgresQueryClient,
@@ -43,12 +57,4772 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
   const runner = new PgTransactionRunner(pool);
 
   beforeEach(async () => {
-    await pool.query('drop schema if exists "erp_financials" cascade');
+    await pool.query<Record<string, unknown>>('drop schema if exists "erp_financials" cascade');
   });
 
   afterAll(async () => {
-    await pool.query('drop schema if exists "erp_financials" cascade');
+    await pool.query<Record<string, unknown>>('drop schema if exists "erp_financials" cascade');
     await pool.end();
+  });
+
+  it("host accounting guards persist across transactions and reject drift, busy writes and stale snapshots",async()=>{
+    await migratePostgresSchema(runner,{appliedByRef:'host-guards'});
+    await pool.query('create schema host_access_fixture');
+    await pool.query('create table host_access_fixture.orders(id integer primary key,amount integer not null);create table host_access_fixture.receipts(id integer primary key)');
+    const request={acknowledgeDatabaseWideMaintenance:true as const,relations:[{schema:'host_access_fixture',table:'orders'},{schema:'host_access_fixture',table:'receipts'}]};
+    try{
+      await expect(verifyPostgresAccountingHostGuards(pool,request)).rejects.toThrow('missing');
+      const writer=await pool.connect();
+      try{
+        await writer.query('begin');await writer.query('insert into host_access_fixture.orders values(1,100)');
+        await expect(runner.transaction(c=>installPostgresAccountingHostGuards(c,request))).rejects.toMatchObject({code:'55P03'});
+        await writer.query('commit');
+      }finally{await writer.query('rollback');writer.release();}
+      await expect(runner.transaction(async c=>{await installPostgresAccountingHostGuards(c,request);throw Error('host rollback');})).rejects.toThrow('host rollback');
+      await expect(verifyPostgresAccountingHostGuards(pool,request)).rejects.toThrow('missing');
+      expect((await runner.transaction(c=>installPostgresAccountingHostGuards(c,request))).installedCount).toBe(2);
+      expect((await runner.transaction(c=>installPostgresAccountingHostGuards(c,request))).installedCount).toBe(0);
+      expect((await verifyPostgresAccountingHostGuards(pool,request)).relations).toEqual(request.relations);
+      const stale=await pool.connect();
+      try{
+        await stale.query('begin isolation level repeatable read');await stale.query('select * from host_access_fixture.orders');
+        const paused=await runner.transaction(c=>changePostgresAccountingAccess(c,{acknowledgeDatabaseWideMaintenance:true,action:'pause',commandKey:'host:pause',expectedRevision:0,operation:sdkOperation()}));
+        if(!paused.activeSessionId)throw Error('Missing pause identity');
+        const sessionId=paused.activeSessionId;
+        await expect(stale.query('update host_access_fixture.orders set amount=200')).rejects.toMatchObject({code:'40001'});
+        await stale.query('rollback');
+        // The control and guards were committed on previous connections. Old
+        // host code has no SDK wrapper and still cannot mutate the source.
+        for(const sql of ['insert into host_access_fixture.receipts values(1)','update host_access_fixture.orders set amount=200','delete from host_access_fixture.orders','truncate host_access_fixture.orders']) {
+          await expect(pool.query(sql)).rejects.toThrow('accounting_maintenance_access_denied');
+        }
+        const authorized=withPostgresAccountingAccess(runner,{sessionId:paused.activeSessionId});
+        await authorized.transaction(c=>c.query('insert into host_access_fixture.receipts values(2)'));
+        expect((await pool.query('select * from host_access_fixture.orders')).rows).toEqual([{id:1,amount:100}]);
+        expect((await verifyPostgresAccountingHostGuards(pool,request)).relations).toEqual(request.relations);
+        await runner.transaction(c=>changePostgresAccountingAccess(c,{acknowledgeDatabaseWideMaintenance:true,action:'resume',sessionId,commandKey:'host:resume',expectedRevision:1,operation:sdkOperation()}));
+        await pool.query('update host_access_fixture.orders set amount=150');
+        await expect(authorized.transaction(c=>c.query('insert into host_access_fixture.receipts values(3)'))).rejects.toThrow('accounting_maintenance_access_denied');
+      }finally{await stale.query('rollback');stale.release();}
+      await pool.query('alter table host_access_fixture.orders disable trigger erp_financials_host_access_guard');
+      await expect(verifyPostgresAccountingHostGuards(pool,request)).rejects.toThrow('drifted');
+      await expect(runner.transaction(c=>installPostgresAccountingHostGuards(c,request))).rejects.toThrow('drifted');
+      await pool.query('alter table host_access_fixture.orders enable trigger erp_financials_host_access_guard');
+      await pool.query('create table host_access_fixture.child(extra text) inherits(host_access_fixture.orders)');
+      await expect(verifyPostgresAccountingHostGuards(pool,request)).rejects.toThrow('non-inherited');
+      await expect(runner.transaction(c=>installPostgresAccountingHostGuards(c,{...request,relations:[{schema:'pg_catalog',table:'pg_class'}]}))).rejects.toThrow('invalid');
+      await expect(runner.transaction(c=>installPostgresAccountingHostGuards(c,{...request,relations:[...request.relations,...request.relations]}))).rejects.toThrow('distinct');
+    }finally{await pool.query('drop schema host_access_fixture cascade');}
+  });
+
+  it("durable accounting access fences old writers, read snapshots, rollback and explicit session resume",async()=>{
+    await depositFixture('access-control',48);
+    await migratePostgresSchema(runner,{appliedByRef:'access:upgrade'});
+    expect((await validatePostgresSchema(pool)).compatible).toBe(true);
+    const pause={acknowledgeDatabaseWideMaintenance:true as const,action:'pause' as const,commandKey:'access:pause',expectedRevision:0,operation:sdkOperation()};
+    const writer=await pool.connect();
+    try{
+      await writer.query('begin');await writer.query("update erp_financials.reporting_books set name='Busy' where book_id='access-control'");
+      await expect(runner.transaction(c=>changePostgresAccountingAccess(c,pause))).rejects.toThrow('busy');
+      await writer.query('rollback');
+    }finally{writer.release();}
+    const stale=await pool.connect(),oldReader=await pool.connect();
+    try{
+      await stale.query('begin isolation level repeatable read');await stale.query('select revision from erp_financials.accounting_access_control');
+      await oldReader.query('begin isolation level repeatable read read only');await oldReader.query('select revision from erp_financials.accounting_access_control');
+      const paused=await runner.transaction(c=>changePostgresAccountingAccess(c,pause));expect(paused.revision).toBe(1);expect(paused.activeSessionId).toBeTypeOf('string');
+      const sessionId=paused.activeSessionId;if(!sessionId)throw Error('Missing maintenance session');
+      expect(await runner.transaction(c=>changePostgresAccountingAccess(c,{...pause,operation:{...pause.operation,requestId:'transport-retry'}}))).toEqual({...paused,replayed:true});
+      await expect(pool.query("update erp_financials.reporting_books set name='Must not write' where book_id='access-control'")).rejects.toThrow('accounting_maintenance_access_denied');
+      await expect(pool.query('truncate erp_financials.financial_outbox')).rejects.toThrow('accounting_maintenance_access_denied');
+      await expect(stale.query("update erp_financials.reporting_books set name='Stale writer' where book_id='access-control'")).rejects.toMatchObject({code:'40001'});
+      await stale.query('rollback');
+      // A host RR snapshot that predates admission may finish consistently;
+      // an ordinary new report may not read a partially migrated store.
+      const prior=withPostgresAccountingAccess({transaction:work=>work(oldReader)});
+      expect((await prior.transaction(c=>c.query("select name from erp_financials.reporting_books where book_id='access-control'"))).rows[0]?.name).toBe('Deposit book');
+      await oldReader.query('commit');
+      let read=false;
+      await expect(withPostgresAccountingAccess(runner).transaction(()=>{read=true;return Promise.resolve();})).rejects.toThrow('accounting_maintenance_access_denied');expect(read).toBe(false);
+      await expect(withPostgresAccountingAccess(runner,{sessionId:'wrong-session'}).transaction(c=>c.query('select 1'))).rejects.toThrow('accounting_maintenance_access_denied');
+      const authorized=withPostgresAccountingAccess(runner,{sessionId});
+      await expect(authorized.transaction(async c=>{await c.query("update erp_financials.reporting_books set name='Rolled back' where book_id='access-control'");throw Error('migration failed');})).rejects.toThrow('migration failed');
+      expect((await authorized.transaction(c=>c.query("select name from erp_financials.reporting_books where book_id='access-control'"))).rows[0]?.name).toBe('Deposit book');
+      await authorized.transaction(c=>c.query("update erp_financials.reporting_books set name='Migrated book' where book_id='access-control'"));
+      const resume={acknowledgeDatabaseWideMaintenance:true as const,action:'resume' as const,sessionId,commandKey:'access:resume',expectedRevision:1,operation:sdkOperation()};
+      await expect(runner.transaction(c=>changePostgresAccountingAccess(c,{...resume,sessionId:'wrong-session'}))).rejects.toThrow('does not match');
+      expect(await runner.transaction(c=>changePostgresAccountingAccess(c,resume))).toMatchObject({revision:2,activeSessionId:null});
+      await expect(authorized.transaction(c=>c.query('select 1'))).rejects.toThrow('accounting_maintenance_access_denied');
+      expect((await withPostgresAccountingAccess(runner).transaction(c=>c.query("select name from erp_financials.reporting_books where book_id='access-control'"))).rows[0]?.name).toBe('Migrated book');
+      await expect(pool.query("update erp_financials.accounting_access_control set revision=3")).rejects.toThrow('control_command_required');
+      await expect(pool.query('delete from erp_financials.accounting_access_commands')).rejects.toThrow('evidence_immutable');
+      await expect(pool.query('truncate erp_financials.accounting_access_control')).rejects.toThrow('evidence_immutable');
+    }finally{await stale.query('rollback');stale.release();await oldReader.query('rollback');oldReader.release();}
+  });
+
+  it("durable accounting access control is atomic, payload-bound and excludes admitted readers",async()=>{
+    await depositFixture('access-atomic');
+    const pause={acknowledgeDatabaseWideMaintenance:true as const,action:'pause' as const,commandKey:'atomic:pause',expectedRevision:0,operation:sdkOperation()};
+    // A reader admitted before a pause must finish before the control can change.
+    const reader=await pool.connect();
+    try{
+      await reader.query('begin read only');
+      await withPostgresAccountingAccess({transaction:work=>work(reader)}).transaction(c=>c.query('select 1'));
+      await expect(runner.transaction(c=>changePostgresAccountingAccess(c,pause))).rejects.toThrow('busy');
+      expect(await readPostgresAccountingAccess(pool)).toEqual({revision:0,activeSessionId:null});
+      await reader.query('commit');
+    }finally{await reader.query('rollback');reader.release();}
+    // A later host failure rolls back both the state and the durable receipt.
+    await expect(runner.transaction(async c=>{await changePostgresAccountingAccess(c,pause);throw Error('host rollback');})).rejects.toThrow('host rollback');
+    expect(await readPostgresAccountingAccess(pool)).toEqual({revision:0,activeSessionId:null});
+    expect((await pool.query<{count:string}>('select count(*) from erp_financials.accounting_access_commands')).rows[0]?.count).toBe('0');
+    const paused=await runner.transaction(c=>changePostgresAccountingAccess(c,pause));
+    const sessionId=paused.activeSessionId;if(!sessionId)throw Error('Missing maintenance session');
+    expect(await readPostgresAccountingAccess(pool)).toEqual({revision:1,activeSessionId:paused.activeSessionId});
+    await expect(runner.transaction(c=>changePostgresAccountingAccess(c,{...pause,operation:{...pause.operation,reasonDetail:'changed intent'}}))).rejects.toMatchObject({code:'idempotency_conflict'});
+    // The same-session outer caller is not authority for an ordinary nested facade.
+    await expect(withPostgresAccountingAccess(runner,{sessionId}).transaction(c=>
+      withPostgresAccountingAccess({transaction:work=>work(c)}).transaction(x=>x.query('select 1')))).rejects.toThrow('accounting_maintenance_access_denied');
+    await runner.transaction(c=>changePostgresAccountingAccess(c,{...pause,action:'resume',commandKey:'atomic:resume',expectedRevision:1,sessionId}));
+    const receipt=await runner.transaction(c=>changePostgresAccountingAccess(c,pause));
+    expect(receipt).toEqual({...paused,replayed:true});
+    expect(await readPostgresAccountingAccess(pool)).toEqual({revision:2,activeSessionId:null});
+    await expect(changePostgresAccountingAccess(pool,{...pause,commandKey:'outside-tx',expectedRevision:2})).rejects.toThrow('control_command_required');
+    expect(await readPostgresAccountingAccess(pool)).toEqual({revision:2,activeSessionId:null});
+  });
+
+  const maintenancePool={connect:()=>pool.connect()};
+  const maintenanceRequest={acknowledgeDatabaseWideLock:true as const,sources:[{tenantId:"tenant_1",sourceId:"source_1"}],timeoutMs:5000};
+
+  it("accounting maintenance supports savepoint recovery without surrendering transaction ownership",async()=>{
+    await depositFixture("maintenance-savepoint");
+    await pool.query("create table public.maintenance_savepoint_fact(id integer primary key)");
+    const request={...maintenanceRequest,additionalRelations:[{schema:"public",table:"maintenance_savepoint_fact"}]};
+    await withPostgresAccountingMaintenance(maintenancePool,request,async({client})=>{
+      await client.query("insert into maintenance_savepoint_fact values(1)");
+      await client.query("savepoint host_command");
+      await client.query("insert into maintenance_savepoint_fact values(2)");
+      await expect(client.query("insert into maintenance_savepoint_fact values(1)")).rejects.toMatchObject({code:"23505"});
+      await client.query("ROLLBACK TO SAVEPOINT host_command");
+      await client.query("release savepoint host_command");
+      expect((await client.query("select id from maintenance_savepoint_fact order by id")).rows).toEqual([{id:1}]);
+      await client.query("savepoint second_command");
+      await client.query("insert into maintenance_savepoint_fact values(3)");
+      for(const sql of ["rollback", "rollback work", "commit", "rollback to second_command;commit", "begin", "end"]){
+        await expect(client.query(sql)).rejects.toThrow("owns transaction control");
+      }
+      await client.query("rollback to second_command;");
+      await client.query("release savepoint second_command");
+      await client.query("insert into maintenance_savepoint_fact values(4)");
+    });
+    expect((await pool.query("select id from maintenance_savepoint_fact order by id")).rows).toEqual([{id:1},{id:4}]);
+    await expect(withPostgresAccountingMaintenance(maintenancePool,request,async({client})=>{
+      await client.query("savepoint command");await client.query("insert into maintenance_savepoint_fact values(5)");
+      await client.query("release savepoint command");throw Error("outer failure");
+    })).rejects.toThrow("outer failure");
+    expect((await pool.query("select id from maintenance_savepoint_fact order by id")).rows).toEqual([{id:1},{id:4}]);
+  });
+
+  it("accounting maintenance rejects busy writers and starts a fresh snapshot after their commit",async()=>{
+    await depositFixture("maintenance");
+    const writer=await pool.connect();let entered=false;
+    try{
+      await writer.query("begin");
+      await writer.query("select pg_advisory_xact_lock(hashtextextended($1,0))",["payment-correction:tenant_1:source_1"]);
+      await expect(withPostgresAccountingMaintenance(maintenancePool,maintenanceRequest,()=>{entered=true;return Promise.resolve();})).rejects.toThrow("source is busy");
+      expect(entered).toBe(false);
+      await writer.query("update erp_financials.reporting_books set name='Fresh committed name' where book_id='maintenance'");
+      await writer.query("commit");
+      await withPostgresAccountingMaintenance(maintenancePool,maintenanceRequest,async({client})=>{
+        expect((await client.query<{name:string}>("select name from erp_financials.reporting_books where book_id='maintenance'")).rows[0]?.name).toBe("Fresh committed name");
+      });
+      // A configuration writer need not hold the source advisory lock.
+      await writer.query("begin");await writer.query("update erp_financials.reporting_books set name='Other' where book_id='maintenance'");
+      await expect(withPostgresAccountingMaintenance(maintenancePool,maintenanceRequest,()=>{entered=true;return Promise.resolve();})).rejects.toMatchObject({code:"55P03"});
+      expect(entered).toBe(false);await writer.query("rollback");
+      await withPostgresAccountingMaintenance(maintenancePool,maintenanceRequest,()=>Promise.resolve(undefined));
+    }finally{await writer.query("rollback");writer.release();}
+  });
+
+  it("accounting maintenance freezes SDK and host writers while public fiscal proof uses the same snapshot",async()=>{
+    const {sdk,scope,command}=await canonicalCloseFixture();
+    const closed=await sdk.commands.fiscalPeriods.closeCanonical(command);
+    await sdk.commands.fiscalPeriods.define({operation:command.operation,fiscalYear:2026,periodNumber:9,periodStart:"2026-09-01",periodEnd:"2026-09-30"});
+    await pool.query("create table public.maintenance_host_fact(id integer primary key)");
+    let enter!:(pid:number)=>void,release!:()=>void;
+    const entered=new Promise<number>(resolve=>{enter=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+    const fence=Promise.allSettled([withPostgresAccountingMaintenance(maintenancePool,{...maintenanceRequest,additionalRelations:[{schema:"public",table:"maintenance_host_fact"}]},async guard=>{
+      const bound=createErpFinancialsSdk({...scope,database:{transaction:work=>work(guard.client)}});
+      expect(await bound.fiscalCloseCertificates.verifyClosedState(closed.certificateId)).toMatchObject({matches:true});
+      expect(guard.lockedRelationCount).toBe(POSTGRES_CANONICAL_SCHEMA_MANIFEST.tables.length+1);
+      expect(guard.scope).toBe("database");
+      const configResult=await guard.client.query({text:"select pg_backend_pid() pid",rowMode:"array"});
+      enter(Number(configResult.rows[0]?.[0]));
+      await gate;
+      expect((await guard.client.query<{count:string}>("select count(*)::text count from public.maintenance_host_fact")).rows[0]?.count).toBe("0");
+      await guard.client.query("insert into public.maintenance_host_fact values(1)");
+    })]);
+    let writes:Promise<PromiseSettledResult<unknown>[]>|undefined;
+    try{
+      const pid=await Promise.race([entered,fence.then(()=>{throw Error("Fence ended before barrier");})]);
+      writes=Promise.allSettled([
+        sdk.commands.journalEntries.post({operation:command.operation,idempotencyKey:"maintenance:journal",date:"2026-09-12",lines:[{accountId:"account_cash",debit:"1.00"},{accountId:"account_income",credit:"1.00"}]}),
+        pool.query("insert into public.maintenance_host_fact values(2)")
+      ]);
+      await expect.poll(async()=>(await pool.query<{count:string}>("select count(*)::text count from pg_stat_activity where $1=any(pg_blocking_pids(pid))",[pid])).rows[0]?.count).toBe("2");
+      release();expect((await fence)[0]).toMatchObject({status:"fulfilled"});
+      expect((await writes).map(result=>result.status)).toEqual(["fulfilled","fulfilled"]);
+      expect((await pool.query<{count:string}>("select count(*)::text count from public.maintenance_host_fact")).rows[0]?.count).toBe("2");
+    }finally{release();await fence;await writes;await pool.query("drop table public.maintenance_host_fact");}
+  },15000);
+
+  it("accounting maintenance rolls back failures, owns transaction control and expires escaped clients",async()=>{
+    await depositFixture("maintenance");
+    let escaped:PoolClient|undefined;
+    const original=(await pool.query<{name:string}>("select name from erp_financials.reporting_books where book_id='maintenance'")).rows[0]?.name;
+    await expect(withPostgresAccountingMaintenance(maintenancePool,maintenanceRequest,async({client})=>{
+      escaped=client;await client.query("update erp_financials.reporting_books set name='Must roll back' where book_id='maintenance'");
+      await expect(client.query("/* accidental */ commit")).rejects.toThrow("owns transaction control");
+      expect(()=>{client.release();}).toThrow("owns the connection lifecycle");
+      throw Error("host proof failed");
+    })).rejects.toThrow("host proof failed");
+    expect((await pool.query<{name:string}>("select name from erp_financials.reporting_books where book_id='maintenance'")).rows[0]?.name).toBe(original);
+    await expect(escaped?.query("select 1")).rejects.toThrow("scope has ended");
+    await expect(withPostgresAccountingMaintenance(maintenancePool,{...maintenanceRequest,timeoutMs:100},async({client})=>{
+      escaped=client;await new Promise(resolve=>setTimeout(resolve,180));
+      await client.query("select 1");
+    })).rejects.toThrow(/deadline exceeded|idle-in-transaction/);
+    await expect(escaped?.query("select 1")).rejects.toThrow("scope has ended");
+    await withPostgresAccountingMaintenance(maintenancePool,maintenanceRequest,async({client})=>{
+      expect((await client.query<{value:number}>("select 1 value")).rows[0]?.value).toBe(1);
+    });
+  });
+
+  it("explicit invoice components preserve tax and discount postings through receipts, unapply, and cancellation",async()=>{
+    const bookId="invoice-components";await depositFixture(bookId);
+    const sdk=createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",bookId,writeSourceId:"source_1",currencyCode:"USD",
+      invoiceAccountPolicy:{revenueClassifications:["income"],receivableClassifications:["asset"],taxClassifications:["liability"],discountClassifications:["income"]}});
+    const operation=sdkOperation();
+    const accounts:Record<string,string>={};
+    for(const [key,number,classification] of [["tax","2200","liability"],["discount","4900","income"],["shipping","4100","income"]] as const){
+      accounts[key]=(await sdk.commands.accounts.upsertTree({operation:{...operation,requestId:`components:${key}`},parent:{accountKey:key,sourceAccountId:key,accountNumber:number,name:key,classification,type:classification,active:true}})).accounts[0]?.accountId ?? (()=>{throw Error("Missing component account");})();
+    }
+    const create={operation,idempotencyKey:"components:draft",customerId:"customer_1",documentDate:"2026-08-12",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},
+      revenueLines:[{accountId:"account_income",quantity:"12",unitAmount:"15.00",discountAmount:"12.00",taxAmount:"10.08",amount:"178.08",taxAccount:{accountId:requiredComponentFixture(accounts.tax)},discountAccount:{accountId:requiredComponentFixture(accounts.discount)}},
+        {accountId:requiredComponentFixture(accounts.shipping),amount:"9.95"}]};
+    const draft=await sdk.invoices.createDraft(create);
+    expect(draft.originalAmount).toBe("188.03");expect(draft.lines[0]).toMatchObject({taxAccountId:accounts.tax,discountAccountId:accounts.discount});
+    expect((await sdk.invoices.createDraft(create)).invoiceDraftId).toBe(draft.invoiceDraftId);
+    await expect(sdk.invoices.createDraft({...create,revenueLines:[{...requiredComponentFixture(create.revenueLines[0]),taxAccount:{accountId:"account_income"}},requiredComponentFixture(create.revenueLines[1])]})).rejects.toMatchObject({code:"idempotency_conflict"});
+    const issued=await sdk.invoices.issue({operation,invoiceDraftId:draft.invoiceDraftId,expectedVersion:1,idempotencyKey:"components:issue"});
+    expect((await sdk.queries.getInvoice(issued.invoiceDocumentId)).lines[0]).toMatchObject({taxAccountId:accounts.tax,discountAccountId:accounts.discount});
+    const totals=async(basis:string,transactions:string[])=>Object.fromEntries((await pool.query<{account_id:string;net:string}>(`select account_id,trunc(sum(debit_amount-credit_amount)*100)::text as net from erp_financials.ledger_postings where tenant_id='tenant_1' and source_id='source_1' and accounting_basis=$1 and transaction_id=any($2::text[]) group by account_id order by account_id`,[basis,transactions])).rows.map(row=>[row.account_id,row.net]));
+    const expected={account_ar:"18803",account_income:"-18000",[requiredComponentFixture(accounts.tax)]:"-1008",[requiredComponentFixture(accounts.discount)]:"1200",[requiredComponentFixture(accounts.shipping)]:"-995"};
+    expect(await totals("accrual",[issued.transactionId])).toEqual(expected);
+    const applications:{applicationId:string;paymentId:string}[]=[];
+    for(const [index,amount] of ["60.01","60.01","68.01"].entries()){
+      const invoice=await sdk.queries.getInvoice(issued.invoiceDocumentId);
+      const result=await sdk.commands.customerPayments.recordAndApply({operation,idempotencyKey:`components:receipt:${String(index)}`,invoiceId:issued.invoiceDocumentId,expectedInvoiceVersion:invoice.version,customerId:"customer_1",date:"2026-08-12",amount,cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+      applications.push(result);
+    }
+    expect(await totals("cash",[issued.transactionId])).toEqual(expected);
+    const middle=requiredComponentFixture(applications[1]);
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:middle.applicationId,expectedVersion:1,effectiveDate:"2026-08-12"});
+    const invoice=await sdk.queries.getInvoice(issued.invoiceDocumentId),payment=await sdk.queries.getCustomerPayment(middle.paymentId);
+    const reapplied=await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"components:reapply",applicationType:"customer_payment_to_invoice",sourceDocumentId:middle.paymentId,targetDocumentId:issued.invoiceDocumentId,amount:"60.01",applicationDate:"2026-08-12",expectedSourceVersion:payment.version,expectedTargetVersion:invoice.version});
+    expect(await totals("cash",[issued.transactionId])).toEqual(expected);
+    for(const applicationId of [requiredComponentFixture(applications[0]).applicationId,requiredComponentFixture(applications[2]).applicationId,reapplied.applicationId])await sdk.commands.paymentApplications.unapply({operation,applicationId,expectedVersion:1,effectiveDate:"2026-08-12"});
+    expect(Object.values(await totals("cash",[issued.transactionId])).every(value=>value==="0")).toBe(true);
+    const current=await sdk.queries.getInvoice(issued.invoiceDocumentId);
+    const cancelled=await sdk.invoices.voidIssued({operation,invoiceDocumentId:issued.invoiceDocumentId,expectedVersion:current.version,idempotencyKey:"components:void",date:"2026-08-12"});
+    const credit=requiredComponentFixture((await pool.query<{transaction_id:string}>("select transaction_id from erp_financials.subledger_documents where subledger_document_id=$1",[cancelled.creditDocumentId])).rows[0]);
+    expect(Object.values(await totals("accrual",[issued.transactionId,credit.transaction_id])).every(value=>value==="0")).toBe(true);
+    expect(await sdk.queries.getInvoice(issued.invoiceDocumentId)).toMatchObject({status:"voided",openAmount:"0.00"});
+  });
+
+  async function componentFixture() {
+    const bookId="component-guards";await depositFixture(bookId);
+    const options={database:runner,tenantId:"tenant_1",companyId:"company_1",bookId,writeSourceId:"source_1",currencyCode:"USD"};
+    const operation=sdkOperation(),sdk=createErpFinancialsSdk({...options,invoiceAccountPolicy:{revenueClassifications:["income"],receivableClassifications:["asset"],taxClassifications:["liability"],discountClassifications:["income"]}});
+    const tax=(await sdk.commands.accounts.upsertTree({operation:{...operation,requestId:"component:tax"},parent:{accountKey:"tax",sourceAccountId:"tax",accountNumber:"2200",name:"Tax",classification:"liability",type:"liability",active:true}})).accounts[0]?.accountId ?? (()=>{throw Error("Missing component account");})();
+    const discount=(await sdk.commands.accounts.upsertTree({operation:{...operation,requestId:"component:discount"},parent:{accountKey:"discount",sourceAccountId:"discount",accountNumber:"4900",name:"Discount",classification:"income",type:"income",active:true}})).accounts[0]?.accountId ?? (()=>{throw Error("Missing component account");})();
+    const line={accountId:"account_income",quantity:"1",unitAmount:"100.00",discountAmount:"10.00",taxAmount:"5.00",amount:"95.00",taxAccount:{accountId:tax},discountAccount:{accountId:discount}};
+    const input={operation,idempotencyKey:"component:invoice",customerId:"customer_1",date:"2026-08-12",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[line]};
+    return {sdk,options,operation,tax,discount,line,input};
+  }
+
+  it("invoice component policies reject missing, inactive, wrong-role and foreign accounts atomically and retain exact historical replay",async()=>{
+    const {sdk,options,input,line,tax}=await componentFixture();
+    await pool.query(`insert into erp_financials.accounts(account_id,tenant_id,source_id,source_account_id,name,type,classification,active)
+      values('foreign_component','tenant_1','source_2','foreign-component','Other source tax','liability','liability',true)`);
+    const before=await depositDatabaseState(pool);
+    for(const change of [{taxAccount:undefined},{discountAccount:undefined},{taxAccount:{accountId:"account_income"}},
+      {discountAccount:{accountId:"account_ap"}},{taxAccount:{accountId:"account_ar"}},{taxAccount:{accountId:"foreign_component"}}]){
+      await expect(sdk.commands.invoices.create({...input,revenueLines:[JSON.parse(JSON.stringify({...line,...change}))]})).rejects.toThrow();
+      await expect(sdk.invoices.createDraft({...input,documentDate:input.date,revenueLines:[JSON.parse(JSON.stringify({...line,...change}))]})).rejects.toThrow();
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+    await pool.query("update erp_financials.accounts set active=false where account_id=$1",[tax]);
+    const inactive=await depositDatabaseState(pool);
+    await expect(sdk.commands.invoices.create(input)).rejects.toThrow();expect(await depositDatabaseState(pool)).toEqual(inactive);
+    await pool.query("update erp_financials.accounts set active=true where account_id=$1",[tax]);
+    const created=await sdk.commands.invoices.create(input),posted=await depositDatabaseState(pool);
+    await expect(sdk.commands.invoices.create({...input,revenueLines:[{...line,taxAccount:{accountId:"account_ap"}}]})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(posted);
+    const generic=createErpFinancialsSdk(options),legacy={...input,idempotencyKey:"component:legacy",revenueLines:[JSON.parse(JSON.stringify({...line,taxAccount:undefined,discountAccount:undefined}))]};
+    const historical=await generic.commands.invoices.create(legacy);
+    const beforeReplay=await depositDatabaseState(pool);
+    expect((await sdk.commands.invoices.create(legacy)).documentId).toBe(historical.documentId);
+    expect((await sdk.commands.invoices.create(input)).documentId).toBe(created.documentId);
+    expect(await depositDatabaseState(pool)).toEqual(beforeReplay);
+  });
+
+  it("explicit invoice component partial cash return previews and posts without cancelling the sale or duplicating a retry",async()=>{
+    const {sdk,operation,input}=await componentFixture();
+    const invoice=await sdk.commands.invoices.create(input);
+    const receipt=await sdk.commands.customerPayments.recordAndApply({operation,idempotencyKey:"component:paid",invoiceId:invoice.documentId,expectedInvoiceVersion:1,customerId:"customer_1",date:"2026-08-12",amount:"95.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    const payment=await sdk.queries.getCustomerPayment(receipt.paymentId);
+    const command={operation,idempotencyKey:"component:return",externalReturnRef:"component:provider:return",paymentId:receipt.paymentId,customerId:"customer_1",expectedVersion:payment.version,date:"2026-08-12",amount:"20.01",returnKind:"refund" as const,releases:[{applicationId:receipt.applicationId,expectedVersion:1,amount:"20.01"}]};
+    const before=await depositDatabaseState(pool);
+    expect(await sdk.commands.customerPayments.previewReturnCash(command)).toMatchObject({amount:"20.01",releasedAmount:"20.01"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const returned=await sdk.commands.customerPayments.returnCash(command);
+    expect(returned).toMatchObject({amount:"20.01",releasedAmount:"20.01",remainingReturnableAmount:"74.99"});
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({originalAmount:"95.00",openAmount:"20.01"});
+    const totals=(await pool.query<{accounting_basis:string;debit:string;credit:string}>("select accounting_basis,trunc(sum(debit_amount)*100)::text debit,trunc(sum(credit_amount)*100)::text credit from erp_financials.ledger_postings where transaction_id=$1 group by accounting_basis",[invoice.journal.transactionId])).rows;
+    expect(totals.every(row=>row.debit===row.credit)).toBe(true);
+    const ar=requiredComponentFixture((await pool.query<{net:string}>("select trunc(sum(debit_amount-credit_amount)*100)::text net from erp_financials.ledger_postings where transaction_id=$1 and accounting_basis='cash' and account_id='account_ar'",[invoice.journal.transactionId])).rows[0]);
+    expect(ar.net).toBe("7499");
+    const after=await depositDatabaseState(pool);
+    expect(await sdk.commands.customerPayments.returnCash(command)).toMatchObject({...returned,status:"already_returned"});
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("invoice component posting rolls back after journal persistence and serializes concurrent identical retries",async()=>{
+    const {sdk,options,input}=await componentFixture();
+    const before=await depositDatabaseState(pool);
+    const failing=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work(new FailingMigrationClient(client,'insert into "erp_financials"."subledger_document_lines"')))}});
+    await expect(failing.commands.invoices.create(input)).rejects.toThrow("injected real migration failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const [first,second]=await Promise.all([sdk.commands.invoices.create(input),sdk.commands.invoices.create(input)]);
+    expect(first.documentId).toBe(second.documentId);
+    const rows=await pool.query<{count:number}>("select count(*)::integer count from erp_financials.subledger_documents where document_type='invoice'");
+    expect(rows.rows[0]?.count).toBe(1);
+    const postings=await pool.query<{count:number;net:string}>("select count(*)::integer count,sum(debit_amount-credit_amount)::text net from erp_financials.ledger_postings where transaction_id=$1 and accounting_basis='accrual'",[first.journal.transactionId]);
+    expect(postings.rows[0]).toEqual({count:4,net:"0.00"});
+  });
+
+  it("invoice component correction releases and reapplies cash while reversing exact original components",async()=>{
+    const {sdk,operation,input,line}=await componentFixture();
+    const draft=await sdk.invoices.createDraft({...input,documentDate:input.date});
+    const issued=await sdk.invoices.issue({operation,invoiceDraftId:draft.invoiceDraftId,expectedVersion:1,idempotencyKey:"component:issue"});
+    const receipt=await sdk.commands.customerPayments.recordAndApply({operation,idempotencyKey:"component:paid",invoiceId:issued.invoiceDocumentId,expectedInvoiceVersion:1,customerId:"customer_1",date:"2026-08-12",amount:"95.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    const payment=await sdk.queries.getCustomerPayment(receipt.paymentId);
+    const command={operation,invoiceDocumentId:issued.invoiceDocumentId,expectedVersion:2,idempotencyKey:"component:correct",date:"2026-08-12",memo:"Reviewed revised sale",
+      releases:[{applicationId:receipt.applicationId,expectedVersion:1,expectedSourceVersion:payment.version,reapplyAmount:"76.00"}],
+      replacement:{dueDate:input.dueDate,revenueLines:[{...line,unitAmount:"80.00",discountAmount:"8.00",taxAmount:"4.00",amount:"76.00"}]}};
+    const corrected=await sdk.invoices.correctIssued(command);
+    if(!corrected.replacement)throw Error("Missing corrected component invoice");
+    expect(await sdk.queries.getInvoice(issued.invoiceDocumentId)).toMatchObject({status:"voided",openAmount:"0.00"});
+    expect(await sdk.queries.getInvoice(corrected.replacement.invoiceDocumentId)).toMatchObject({originalAmount:"76.00",openAmount:"0.00",lines:[{taxAmount:"4.00",discountAmount:"8.00"}]});
+    expect(await sdk.queries.getCustomerPayment(receipt.paymentId)).toMatchObject({unappliedAmount:"19.00"});
+    const replacement=requiredComponentFixture((await pool.query<{transaction_id:string}>("select transaction_id from erp_financials.subledger_documents where subledger_document_id=$1",[corrected.replacement.invoiceDocumentId])).rows[0]);
+    const rows=await pool.query<{account_id:string;accounting_basis:string;net:string}>("select account_id,accounting_basis,trunc(sum(debit_amount-credit_amount)*100)::text net from erp_financials.ledger_postings where transaction_id=$1 group by account_id,accounting_basis order by account_id,accounting_basis",[replacement.transaction_id]);
+    for(const id of new Set(rows.rows.map(row=>row.account_id))){const pair=rows.rows.filter(row=>row.account_id===id);expect(pair).toHaveLength(2);expect(requiredComponentFixture(pair[0]).net).toBe(requiredComponentFixture(pair[1]).net);}
+    const after=await depositDatabaseState(pool);expect(await sdk.invoices.correctIssued(command)).toEqual({...corrected,status:"already_corrected"});expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("tax-only invoice allocations consume the final cent exactly across tiny receipts",async()=>{
+    const {sdk,operation,input,tax}=await componentFixture();
+    const invoice=await sdk.commands.invoices.create({...input,revenueLines:[{accountId:"account_income",quantity:"1",unitAmount:"0.02",taxAmount:"0.01",amount:"0.03",taxAccount:{accountId:tax}}]});
+    for(let index=0;index<3;index++){
+      const current=await sdk.queries.getInvoice(invoice.documentId);
+      await sdk.commands.customerPayments.recordAndApply({operation,idempotencyKey:`tiny:${String(index)}`,invoiceId:invoice.documentId,expectedInvoiceVersion:current.version,customerId:"customer_1",date:"2026-08-12",amount:"0.01",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    }
+    const rows=await pool.query<{account_id:string;net:string}>("select account_id,trunc(sum(debit_amount-credit_amount)*100)::text net from erp_financials.ledger_postings where transaction_id=$1 and accounting_basis='cash' group by account_id",[invoice.journal.transactionId]);
+    expect(Object.fromEntries(rows.rows.map(row=>[row.account_id,row.net]))).toEqual({account_ar:"3",account_income:"-2",[tax]:"-1"});
+    const before=await depositDatabaseState(pool);
+    await expect(sdk.commands.refunds.issue({operation,idempotencyKey:"tiny:ambiguous-refund",date:"2026-08-12",customerId:"customer_1",relatedInvoiceId:invoice.documentId,amount:"0.01",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}})).rejects.toMatchObject({code:"unsupported_operation"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("reporting account references resolve one scoped chart identity without reading financial facts", async () => {
+    const bookId = "reporting-account-reference"; await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    await sdk.books.defineAccount({ operation, bookId, bookAccountKey: "treasury", accountNumber: "101", name: "Treasury", classification: "asset", accountRole: "posting", expectedVersion: 0, active: false });
+    await sdk.books.mapAccount({ operation, bookId, sourceId: "source_1", accountId: "account_cash", bookAccountKey: "treasury" });
+    await pool.query("update erp_financials.accounts set account_number='401',active=false where account_id='account_income' and tenant_id='tenant_1'");
+    let queries = 0;
+    const measured = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(client => work({ query: async (sql, values) => {
+      if (/erp_financials\.(ledger_postings|transactions|subledger_documents|fiscal_periods)\b/u.test(sql)) throw Error("Reference lookup must not access financial facts");
+      queries++; return client.query(sql, values);
+    } })) } });
+    const request = { referenceType: "account_number" as const, reference: "101", asOfDate: "2026-08-12" };
+    const byNumber = await measured.queries.resolveReportingAccount(request); expect(queries).toBe(1);
+    expect(byNumber).toMatchObject({ bookAccountKey: "treasury", accountNumber: "101", name: "Treasury", active: false });
+    expect(await measured.queries.resolveReportingAccount({ ...request, referenceType: "book_key", reference: "treasury" })).toEqual(byNumber);
+    expect(queries).toBe(2); expect(Object.keys(byNumber).some(key => /balance|amount|direct|inclusive/iu.test(key))).toBe(false);
+    const chart = await sdk.queries.getAccountChart({ periodStart: "2026-08-01", periodEnd: request.asOfDate });
+    const { direct: _direct, inclusive: _inclusive, ...chartDefinition } = registerValue(chart.items.find(item => item.bookAccountKey === "treasury"));
+    void _direct; void _inclusive; expect(byNumber).toEqual(chartDefinition);
+    expect(await measured.queries.resolveReportingAccount({ ...request, reference: "401" })).toMatchObject({ bookAccountKey: "source_1:account_income", active: false });
+    await expect(measured.queries.resolveReportingAccount({ ...request, reference: "account_cash", referenceType: "book_key" })).rejects.toMatchObject({ code: "missing_account" });
+    await expect(measured.queries.resolveReportingAccount({ ...request, reference: "source_1:account_cash", referenceType: "book_key" })).rejects.toMatchObject({ code: "missing_account" });
+    await expect(measured.queries.resolveReportingAccount({ ...request, reference: "401", asOfDate: "2025-12-31" })).rejects.toMatchObject({ code: "missing_account" });
+    // Ended bindings still identify historical chart rows, unlike command selectors.
+    await pool.query("update erp_financials.reporting_book_sources set effective_through='2026-08-01' where book_id=$1", [bookId]);
+    expect(await measured.queries.resolveReportingAccount({ ...request, reference: "401" })).toMatchObject({ bookAccountKey: "source_1:account_income" });
+    for (const foreign of [{ companyId: "foreign" }, { tenantId: "foreign" }, { bookId: "foreign" }]) {
+      await expect(createErpFinancialsSdk({ ...scope, ...foreign, database: runner }).queries.resolveReportingAccount(request)).rejects.toMatchObject({ code: "missing_book" });
+    }
+    await pool.query("update erp_financials.reporting_books set status='archived' where book_id=$1", [bookId]);
+    await expect(measured.queries.resolveReportingAccount(request)).rejects.toMatchObject({ code: "missing_book" });
+  });
+
+  it("reporting account references reject ambiguity and malformed requests and capture inputs before awaiting", async () => {
+    const bookId = "reporting-reference-ambiguity"; await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner });
+    await pool.query("update erp_financials.accounts set account_number='100' where tenant_id='tenant_1' and account_id in ('account_cash','account_ar')");
+    const request = { referenceType: "account_number" as const, reference: "100", asOfDate: "2026-08-12" };
+    await expect(sdk.queries.resolveReportingAccount(request)).rejects.toMatchObject({ code: "invalid_input", message: "Reporting account reference is ambiguous; use a unique book account key" });
+    expect(await sdk.queries.resolveReportingAccount({ ...request, referenceType: "book_key", reference: "source_1:account_cash" })).toMatchObject({ name: "Cash" });
+    await sdk.books.defineAccount({ operation: sdkOperation(), bookId, bookAccountKey: "source_1:account_cash", name: "Collision", classification: "asset", accountRole: "posting", expectedVersion: 0 });
+    await expect(sdk.queries.resolveReportingAccount({ ...request, referenceType: "book_key", reference: "source_1:account_cash" })).rejects.toMatchObject({ code: "invalid_input" });
+    let queries = 0;
+    const measured = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(client => work({ query: async (sql, values) => { queries++; return client.query(sql, values); } })) } });
+    for (const change of [{ reference: "" }, { reference: "x".repeat(513) }, { referenceType: "guess" }, { asOfDate: "2026-02-30" }]) {
+      await expect(measured.queries.resolveReportingAccount({ ...request, ...change } as never)).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    expect(queries).toBe(0);
+    const mutable = { referenceType: "book_key" as const, reference: "source_1:account_income", asOfDate: "2026-08-12" };
+    const pending = measured.queries.resolveReportingAccount(mutable); mutable.reference = "foreign"; mutable.asOfDate = "2025-01-01";
+    expect(await pending).toMatchObject({ bookAccountKey: "source_1:account_income" }); expect(queries).toBe(1);
+    // The lookup remains one metadata query even beyond the former10000-item ceiling.
+    await pool.query(`insert into erp_financials.accounts(tenant_id,source_id,account_id,source_account_id,account_number,name,type,classification,active)
+      select 'tenant_1','source_1','reference-'||n,'reference-'||n,'R-'||n,'Reference '||n,'asset','asset',true from generate_series(1,10005) n`);
+    expect(await measured.queries.resolveReportingAccount({ ...request, reference: "R-10005" })).toMatchObject({ bookAccountKey: "source_1:reference-10005", accountNumber: "R-10005" }); expect(queries).toBe(2);
+  });
+
+  it("operational account selector pages source IDs and mapped labels without financial reads", async () => {
+    const bookId = "account-selector"; await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    await sdk.books.defineAccount({ operation, bookId, bookAccountKey: "treasury", accountNumber: "101", name: "Treasury 100%", classification: "asset", accountRole: "posting", expectedVersion: 0 });
+    await sdk.books.mapAccount({ operation, bookId, sourceId: "source_1", accountId: "account_cash", bookAccountKey: "treasury" });
+    let queries = 0;
+    const measured = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(client => work({ query: async (sql, values) => {
+      if (/erp_financials\.(ledger_postings|transactions|subledger_documents|fiscal_periods)\b/u.test(sql)) throw Error("Selector must not access financial facts");
+      queries++; return client.query(sql, values);
+    } })) } });
+    const request = { sourceId: "source_1", asOfDate: "2026-08-12", limit: 1 };
+    const first = await measured.queries.listOperationalAccounts(request); expect(queries).toBe(1);
+    const items = [...first.items]; let cursor = first.nextCursor;
+    while (cursor) { if (items.length > 4) throw Error("Nonterminating selector"); const page = await measured.queries.listOperationalAccounts({ ...request, cursor }); expect(page.items).toHaveLength(1); items.push(...page.items); cursor = page.nextCursor; }
+    expect(new Set(items.map(item => item.accountId)).size).toBe(4); expect(queries).toBe(4);
+    const cash = registerValue(items.find(item => item.accountId === "account_cash"));
+    expect(cash).toMatchObject({ sourceId: "source_1", bookAccountKey: "treasury", bookAccountName: "Treasury 100%", bookAccountNumber: "101", accountEnabled: true });
+    expect(Object.keys(cash).some(key => /balance|debit|credit|amount/iu.test(key))).toBe(false);
+    expect((await sdk.queries.listOperationalAccounts({ ...request, search: "%" })).items).toEqual([cash]);
+    expect((await sdk.queries.listOperationalAccounts({ ...request, search: "not found" })).items).toEqual([]);
+    await sdk.books.defineAccount({ operation: { ...operation, requestId: "selector:disable" }, bookId, bookAccountKey: "treasury", accountNumber: "101", name: "Treasury 100%", classification: "asset", accountRole: "posting", expectedVersion: 1, active: false });
+    expect((await sdk.queries.listOperationalAccounts({ ...request, search: "101" })).items).toEqual([]);
+    expect((await sdk.queries.listOperationalAccounts({ ...request, search: "101", includeUnavailable: true })).items[0]).toMatchObject({ accountId: cash.accountId, active: true, accountEnabled: false });
+    const count = async () => registerValue((await pool.query<{ n: string }>("select count(*)::text n from erp_financials.ledger_postings")).rows[0]).n;
+    const before = await count();
+    const command = { operation: { ...operation, requestId: "selector:post" }, idempotencyKey: "selector:post", date: request.asOfDate, lines: [{ accountId: cash.accountId, debit: "1.00" }, { accountId: "account_income", credit: "1.00" }] };
+    await expect(sdk.commands.journalEntries.post(command)).rejects.toMatchObject({ code: "invalid_input" });
+    expect(await count()).toBe(before); // A prior selection never grants posting eligibility.
+    await sdk.books.defineAccount({ operation: { ...operation, requestId: "selector:enable" }, bookId, bookAccountKey: "treasury", accountNumber: "101", name: "Treasury 100%", classification: "asset", accountRole: "posting", expectedVersion: 2, active: true });
+    await expect(sdk.commands.journalEntries.post(command)).resolves.toMatchObject({ status: "posted" });
+    await pool.query("update erp_financials.accounts set active=false where tenant_id='tenant_1' and source_id='source_1' and account_id='account_cash'");
+    expect((await sdk.queries.listOperationalAccounts({ ...request, search: "101", includeUnavailable: true })).items[0]).toMatchObject({ active: false, accountEnabled: false });
+  });
+
+  it("operational account selector binds cursors, captures inputs and rechecks dated source and book scope", async () => {
+    const bookId = "account-selector-scope"; await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), request = { sourceId: "source_1", asOfDate: "2026-08-12", limit: 1 };
+    const first = await sdk.queries.listOperationalAccounts(request), cursor = registerValue(first.nextCursor);
+    for (const change of [{ sourceId: "source_2" }, { asOfDate: "2026-08-13" }, { search: "Cash" }, { includeUnavailable: true }]) {
+      await expect(sdk.queries.listOperationalAccounts({ ...request, ...change, cursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const change of [{ tenantId: "other" }, { companyId: "other" }, { bookId: "other" }]) {
+      await expect(createErpFinancialsSdk({ ...scope, ...change, database: runner }).queries.listOperationalAccounts({ ...request, cursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const change of [{ sourceId: "" }, { sourceId: 1 as unknown as string }, { asOfDate: "2026-02-30" }, { search: " " }, { limit: 201 }, { includeUnavailable: "yes" as unknown as boolean }, { cursor: "bad" }]) {
+      await expect(sdk.queries.listOperationalAccounts({ ...request, ...change })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const change of [{ sourceId: "source_2" }, { asOfDate: "2025-12-31" }]) {
+      await expect(sdk.queries.listOperationalAccounts({ ...request, ...change })).rejects.toMatchObject({ code: "scope_mismatch" });
+    }
+    const mutable = { ...request };
+    const database: ErpFinancialsTransactionRunner = { transaction: work => { mutable.sourceId = "other"; mutable.asOfDate = "2030-01-01"; mutable.limit = 200; return runner.transaction(work); } };
+    expect((await createErpFinancialsSdk({ ...scope, database }).queries.listOperationalAccounts(mutable)).items).toEqual(first.items);
+    await pool.query("update erp_financials.reporting_books set status='archived' where book_id=$1", [bookId]);
+    await expect(sdk.queries.listOperationalAccounts({ ...request, cursor })).rejects.toMatchObject({ code: "scope_mismatch" });
+  });
+
+  it("operational account selector traverses more than ten thousand definitions in bounded pages", async () => {
+    const bookId = "account-selector-many"; await depositFixture(bookId);
+    await pool.query(`insert into erp_financials.accounts (account_id,tenant_id,source_id,source_account_id,account_number,name,type,classification,active)
+      select 'picker_'||n,'tenant_1','source_1','picker_'||n,lpad(n::text,6,'0'),'Many selector '||n,'asset','asset',true from generate_series(1,10005) n`);
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" });
+    const request = { sourceId: "source_1", asOfDate: "2026-08-12", search: "Many selector", limit: 200 };
+    let count = 0, cursor: string | undefined, last: string | undefined;
+    do {
+      const page = await sdk.queries.listOperationalAccounts({ ...request, ...(cursor ? { cursor } : {}) });
+      expect(page.items.length).toBeLessThanOrEqual(200); count += page.items.length;
+      if (count > 10005) throw Error("Duplicate or nonterminating selector pagination");
+      last = page.items.at(-1)?.accountNumber; cursor = page.nextCursor;
+    } while (cursor);
+    expect(count).toBe(10005); expect(last).toBe("010005");
+  });
+
+  it("journal register includes imported facts without native events or transaction lines and uses posting dates", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:journal-import" });
+    const base = quickBooksSubledgerFacts();
+    const facts: CanonicalAccountingFactSet = { ...base,
+      transactions: base.transactions.map(t => ({ ...t, memo: "Literal 100% source", status: "void", sourcePayloadRef: { sourceObjectType: t.sourceTransactionType, sourceObjectId: t.sourceTransactionId } })),
+      postings: base.transactions.flatMap(t => (["debit", "credit"] as const).map(side => ({ tenantId: "tenant_qbo", sourceId: "source_qbo",
+        postingId: `${t.transactionId}:${side}`, sourcePostingId: `${t.transactionId}:${side}`, transactionId: t.transactionId,
+        accountId: side === "debit" ? "account_cash_qbo" : "account_revenue_qbo", postingDate: side === "debit" ? "2026-08-10" : "2026-08-11",
+        accountingBasis: "accrual", debitAmount: side === "debit" ? "90071992547409.93" : "0.00", creditAmount: side === "credit" ? "90071992547409.93" : "0.00",
+        netAmount: side === "debit" ? "90071992547409.93" : "-90071992547409.93", currencyCode: "USD", dimensionHash: "a".repeat(64), dimensionRefs: [], importBatchId: "batch_qbo" }))) };
+    await runner.transaction(client => persistCanonicalFacts(createPostgresStorageAdapter(client), facts));
+    const scope = { tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "journal-import", writeSourceId: "source_qbo", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner });
+    await sdk.books.define({ operation: sdkOperation(), bookId: scope.bookId, name: "Import", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation: sdkOperation(), bookId: scope.bookId, sourceId: scope.writeSourceId, sourceRole: "historical", effectiveFrom: "2026-08-05", effectiveThrough: "2026-08-31" });
+    const request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", limit: 1 };
+    expect((await sdk.queries.listJournalEntries()).items).toEqual([]); // Native-only API retained for compatibility.
+    let queries = 0;
+    const measured = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(client => work({ query: async (sql, values) => { queries++; return client.query(sql, values); } })) } });
+    const first = await measured.queries.getJournalRegister(request);
+    expect(queries).toBe(2);
+    expect(first.summary).toEqual({ journalCount: "2", postingCount: "4", debitAmount: "180143985094819.86", creditAmount: "180143985094819.86" });
+    expect(first.matched).toEqual(first.summary);
+    const second = await sdk.queries.getJournalRegister({ ...request, cursor: registerValue(first.nextCursor) });
+    expect(second.nextCursor).toBeUndefined(); expect(second.summary).toEqual(first.summary);
+    expect(new Set([...first.items, ...second.items].map(item => item.transactionId)).size).toBe(2);
+    const invoice = registerValue([...first.items, ...second.items].find(item => item.transactionId === "transaction_invoice_qbo"));
+    expect(invoice).toMatchObject({ transactionDate: "2026-08-01", firstPostingDate: "2026-08-10", lastPostingDate: "2026-08-11", documentStatus: "void",
+      postingCount: "2", debitAmount: "90071992547409.93", creditAmount: "90071992547409.93", sourceProvenance: { sourceSystem: "quickbooks", sourceTransactionType: "Invoice", sourceObjectId: "invoice_600" } });
+    expect(invoice.preparerProvenance).toBeUndefined(); expect(invoice.nativeStatus).toBeUndefined();
+    for (const filter of [{ transactionType: "Invoice" }, { search: "INV-600" }]) {
+      const filtered = await sdk.queries.getJournalRegister({ ...request, ...filter });
+      expect(filtered.summary).toEqual(first.summary); expect(filtered.matched).toMatchObject({ journalCount: "1", postingCount: "2" });
+    }
+    expect((await sdk.queries.getJournalRegister({ ...request, search: "%" })).matched).toEqual(first.summary);
+    expect((await sdk.queries.getJournalRegister({ ...request, search: "missing" })).matched).toMatchObject({ journalCount: "0", debitAmount: "0.00" });
+    const detailRequest = { ...request, sourceId: "source_qbo", transactionId: invoice.transactionId };
+    const detail = await sdk.queries.getJournalPostingPage(detailRequest);
+    const next = await sdk.queries.getJournalPostingPage({ ...detailRequest, cursor: registerValue(detail.nextCursor) });
+    expect(detail.journal).toEqual(invoice); expect(next.journal).toEqual(invoice); expect(next.nextCursor).toBeUndefined();
+    expect([detail.items[0]?.creditAmount, next.items[0]?.debitAmount]).toEqual(["90071992547409.93", "90071992547409.93"]);
+    expect(detail.items[0]?.description).toBeUndefined();
+    const oneDay = await sdk.queries.getJournalPostingPage({ ...detailRequest, periodEnd: "2026-08-10" });
+    expect(oneDay.journal).toMatchObject({ postingCount: "1", debitAmount: "90071992547409.93", creditAmount: "0.00", lastPostingDate: "2026-08-10" });
+    const chart = await sdk.queries.getAccountChart(request);
+    expect(chart.summary).toMatchObject({ debitAmount: first.summary.debitAmount, creditAmount: first.summary.creditAmount, postingCount: "4" });
+    await expect(sdk.queries.getJournalPostingPage({ ...detailRequest, sourceId: "other-source" })).rejects.toMatchObject({ code: "missing_document" });
+    await expect(sdk.queries.getJournalPostingPage({ ...detailRequest, periodEnd: "2026-08-09" })).rejects.toMatchObject({ code: "missing_document" });
+    await sdk.books.define({ operation: sdkOperation(), bookId: "journal-empty", name: "Empty", baseCurrencyCode: "USD" });
+    expect(await createErpFinancialsSdk({ ...scope, bookId: "journal-empty", database: runner }).queries.getJournalRegister(request)).toMatchObject({ items: [], summary: { journalCount: "0", postingCount: "0", debitAmount: "0.00", creditAmount: "0.00" } });
+  });
+
+  it("journal register aggregates dated sources independently without leaking other books, bases or currencies", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:journal-source-plans" });
+    const makeFacts = (sourceId: string, amount: string): CanonicalAccountingFactSet => {
+      const base = quickBooksSubledgerFacts();
+      const transactionId = `${sourceId}-journal`;
+      return { ...base,
+        source: { ...base.source, sourceId, connectionRef: sourceId, importBatchId: `${sourceId}-batch`, checkpointId: `${sourceId}-checkpoint` },
+        importBatch: { ...base.importBatch, sourceId, importBatchId: `${sourceId}-batch` },
+        checkpoint: { ...base.checkpoint, sourceId, checkpointId: `${sourceId}-checkpoint` },
+        accounts: base.accounts.map(account => ({ ...account, sourceId, accountId: `${sourceId}-${account.sourceAccountId}` })),
+        parties: [], transactions: [{ transactionId, tenantId: "tenant_qbo", sourceId, sourceTransactionId: "same-external-reference", sourceTransactionType: "Invoice", transactionNumber: "SAME-NUMBER", transactionDate: "2026-08-01", currencyCode: "USD", status: "posted" }],
+        postings: (["debit", "credit"] as const).map(side => ({ tenantId: "tenant_qbo", sourceId,
+          postingId: `${sourceId}-${side}`, sourcePostingId: side, transactionId, accountId: `${sourceId}-${side === "debit" ? "cash" : "revenue"}`,
+          postingDate: side === "debit" ? "2026-08-10" : "2026-08-20", accountingBasis: "accrual", currencyCode: "USD",
+          debitAmount: side === "debit" ? amount : "0.00", creditAmount: side === "credit" ? amount : "0.00", netAmount: side === "debit" ? amount : `-${amount}`,
+          dimensionHash: "a".repeat(64), dimensionRefs: [{ dimensionKind: "blu_order", sourceDimensionId: "same-order" }], importBatchId: `${sourceId}-batch` })) };
+    };
+    for (const [sourceId, amount] of [["historical", "1.00"], ["current", "2.00"], ["unbound", "99.00"]] as const) {
+      await runner.transaction(client => persistCanonicalFacts(createPostgresStorageAdapter(client), makeFacts(sourceId, amount)));
+    }
+    const scope = { database: runner, tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "dated-journal", writeSourceId: "current", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(scope), operation = sdkOperation();
+    await sdk.books.define({ operation, bookId: scope.bookId, name: "Dated", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: scope.bookId, sourceId: "historical", sourceRole: "historical", effectiveThrough: "2026-08-15" });
+    await sdk.books.bindSource({ operation, bookId: scope.bookId, sourceId: "current", sourceRole: "active", effectiveFrom: "2026-08-16" });
+    await pool.query(`insert into erp_financials.ledger_postings
+      (posting_id,tenant_id,source_id,source_posting_id,transaction_id,account_id,posting_date,accounting_basis,debit_amount,credit_amount,net_amount,currency_code,dimension_hash,dimension_refs,import_batch_id)
+      select posting_id||'-excluded-'||variant,tenant_id,source_id,source_posting_id||'-excluded-'||variant,transaction_id,account_id,posting_date,
+        case when variant='basis' then 'cash' else accounting_basis end,debit_amount,credit_amount,net_amount,
+        case when variant='currency' then 'EUR' else currency_code end,dimension_hash,dimension_refs,import_batch_id
+      from erp_financials.ledger_postings cross join (values ('basis'),('currency')) as variants(variant) where source_id='historical' and posting_date='2026-08-10'`);
+    const request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", originGroups: [{ id: "invoices", originModules: [], transactionTypeContains: ["invoice"] }], limit: 1 };
+    const first = await sdk.queries.getJournalRegister(request);
+    expect(first.summary).toEqual({ journalCount: "2", postingCount: "2", debitAmount: "1.00", creditAmount: "2.00" });
+    expect(first.matched).toEqual(first.summary);
+    expect(first.originGroups?.find(group => group.id === "invoices")).toEqual({ id: "invoices", ...first.summary });
+    const next = await sdk.queries.getJournalRegister({ ...request, cursor: registerValue(first.nextCursor) });
+    expect(next.nextCursor).toBeUndefined(); expect(next.summary).toEqual(first.summary);
+    expect([...first.items, ...next.items].map(item => [item.sourceId, item.firstPostingDate, item.lastPostingDate, item.postingCount])).toEqual([
+      ["current", "2026-08-20", "2026-08-20", "1"], ["historical", "2026-08-10", "2026-08-10", "1"]]);
+    const filtered = await sdk.queries.getJournalRegister({ ...request, sourceId: "historical", reference: "SAME-NUMBER" });
+    expect(filtered.summary).toEqual(first.summary); expect(filtered.matched).toEqual({ journalCount: "1", postingCount: "1", debitAmount: "1.00", creditAmount: "0.00" });
+    expect((await sdk.queries.getJournalRegister({ ...request, reference: "SAME-NUMBER", limit: 2 })).matched.journalCount).toBe("2");
+    const detail = await sdk.queries.getJournalPostingPage({ ...request, sourceId: "current", transactionId: "current-journal" });
+    expect(detail.items).toHaveLength(1); expect(detail.items[0]?.creditAmount).toBe("2.00");
+    const cash = await sdk.queries.getJournalRegister({ ...request, accountingMethod: "cash" });
+    expect(cash.summary).toEqual({ journalCount: "1", postingCount: "1", debitAmount: "1.00", creditAmount: "0.00" });
+    await sdk.books.define({ operation, bookId: "other-journal-book", name: "Other", baseCurrencyCode: "USD" });
+    expect((await createErpFinancialsSdk({ ...scope, bookId: "other-journal-book" }).queries.getJournalRegister(request)).summary.journalCount).toBe("0");
+    const attributionRequest = { periodStart: request.periodStart, periodEnd: request.periodEnd, dimensionKind: "blu_order", limit: 1 };
+    expect(await sdk.queries.getIncomeAttribution(attributionRequest)).toMatchObject({ groupCount: "1", summary: { income: "2.00" }, items: [{ sourceId: "current", sourceDimensionId: "same-order" }] });
+    expect((await sdk.queries.getIncomeAttribution({ ...attributionRequest, sourceId: "historical" })).summary.income).toBe("0.00");
+    expect((await createErpFinancialsSdk({ ...scope, bookId: "other-journal-book" }).queries.getIncomeAttribution(attributionRequest)).groupCount).toBe("0");
+    await sdk.books.bindSource({ operation, bookId: scope.bookId, sourceId: "historical", sourceRole: "adjustment", effectiveThrough: "2026-08-31" });
+    await pool.query(`insert into erp_financials.ledger_postings
+      (posting_id,tenant_id,source_id,source_posting_id,transaction_id,account_id,posting_date,accounting_basis,debit_amount,credit_amount,net_amount,currency_code,dimension_hash,dimension_refs,import_batch_id)
+      select posting_id||'-euro-income',tenant_id,source_id,source_posting_id||'-euro-income',transaction_id,account_id,posting_date,accounting_basis,debit_amount,credit_amount,net_amount,'EUR',dimension_hash,dimension_refs,import_batch_id
+      from erp_financials.ledger_postings where source_id='historical' and posting_date='2026-08-20'`);
+    const attributed = await sdk.queries.getIncomeAttribution(attributionRequest);
+    const attributedNext = await sdk.queries.getIncomeAttribution({ ...attributionRequest, cursor: registerValue(attributed.nextCursor) });
+    expect(attributed.summary.income).toBe("3.00"); expect(attributedNext.summary).toEqual(attributed.summary);
+    expect([...attributed.items, ...attributedNext.items].map(item => [item.sourceId, item.sourceDimensionId, item.income])).toEqual([
+      ["current", "same-order", "2.00"], ["historical", "same-order", "1.00"],
+    ]);
+    expect(attributed.items[0]?.key).not.toBe(attributedNext.items[0]?.key);
+
+  });
+
+  it("income attribution partitions exact P&L facts once and reconciles every page to statement controls", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:income-attribution" });
+    const base = quickBooksSubledgerFacts(), template = registerValue(base.transactions[0]);
+    const a = { dimensionKind: "blu_order", sourceDimensionId: "order:a" };
+    const b = { dimensionKind: "blu_order", sourceDimensionId: "order:b" };
+    const examples = [
+      { id: "sale-a", classification: "income", side: "credit", amount: "100.00", dimensions: [a] },
+      { id: "cost-a", classification: "cost_of_goods_sold", side: "debit", amount: "30.00", dimensions: [a, { ...a, name: "duplicate label" }] },
+      { id: "expense-a", classification: "expense", side: "debit", amount: "10.00", dimensions: [a] },
+      { id: "sale-b", classification: "income", side: "credit", amount: "50.00", dimensions: [b] },
+      { id: "other-b", classification: "other_income", side: "credit", amount: "5.00", dimensions: [b] },
+      { id: "unassigned", classification: "cost_of_goods_sold", side: "debit", amount: "7.00", dimensions: [] },
+      { id: "ambiguous", classification: "cost_of_goods_sold", side: "debit", amount: "11.00", dimensions: [a, b] },
+      { id: "refund-a", classification: "income", side: "debit", amount: "3.00", dimensions: [a] },
+      { id: "large", classification: "income", side: "credit", amount: "90071992547409.93", dimensions: [{ dimensionKind: "blu_order", sourceDimensionId: "order:large" }] },
+      { id: "canonical", classification: "income", side: "credit", amount: "2.00", dimensions: [{ dimensionKind: "blu_order", dimensionId: "canonical:a", sourceDimensionId: a.sourceDimensionId }] },
+    ] as const;
+    const classifications = ["asset", "income", "other_income", "expense", "cost_of_goods_sold"] as const;
+    const facts: CanonicalAccountingFactSet = { ...base,
+      accounts: classifications.map(classification => ({ ...registerValue(base.accounts[0]), accountId: `attribution-${classification}`, sourceAccountId: classification, name: classification, type: classification, classification })),
+      transactions: examples.map(example => ({ ...template, transactionId: example.id, sourceTransactionId: example.id })),
+      postings: examples.flatMap(example => [true, false].map(financial => {
+        const debit = financial ? example.side === "debit" : example.side !== "debit";
+        return { tenantId: "tenant_qbo", sourceId: "source_qbo", postingId: `${example.id}-${financial ? "pnl" : "cash"}`, sourcePostingId: `${example.id}-${financial ? "pnl" : "cash"}`, transactionId: example.id,
+          accountId: `attribution-${financial ? example.classification : "asset"}`, postingDate: example.id === "large" ? "2026-08-20" : "2026-08-10", accountingBasis: "accrual", currencyCode: "USD",
+          debitAmount: debit ? example.amount : "0.00", creditAmount: debit ? "0.00" : example.amount, netAmount: debit ? example.amount : `-${example.amount}`,
+          dimensionHash: "a".repeat(64), dimensionRefs: financial ? example.dimensions : [], importBatchId: "batch_qbo" };
+      })) };
+    await runner.transaction(client => persistCanonicalFacts(createPostgresStorageAdapter(client), facts));
+    const scope = { database: runner, tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "attribution", writeSourceId: "source_qbo", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(scope), operation = sdkOperation();
+    await sdk.books.define({ operation, bookId: scope.bookId, name: "Attribution", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: scope.bookId, sourceId: scope.writeSourceId, sourceRole: "active" });
+    const request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", dimensionKind: "blu_order", limit: 2 };
+    const first = await sdk.queries.getIncomeAttribution(request);
+    expect(first).toMatchObject({ groupCount: "6", summary: { postingCount: "10", income: "90071992547563.93", costOfGoodsSold: "48.00", expenses: "10.00", netIncome: "90071992547505.93" },
+      coverage: { assigned: { postingCount: "8" }, unassigned: { postingCount: "1", costOfGoodsSold: "7.00" }, ambiguous: { postingCount: "1", costOfGoodsSold: "11.00" } } });
+    const statement = await sdk.queries.getFinancialStatement({ ...request, reportName: "profit_and_loss" });
+    const { postingCount: _count, ...totals } = first.summary; void _count;
+    expect(totals).toEqual(statement.totals);
+    const items = [...first.items]; let cursor = first.nextCursor;
+    while (cursor) {
+      const page = await sdk.queries.getIncomeAttribution({ ...request, cursor });
+      expect(page.items.length).toBeLessThanOrEqual(2); expect(page.summary).toEqual(first.summary); expect(page.coverage).toEqual(first.coverage);
+      items.push(...page.items); cursor = page.nextCursor;
+    }
+    expect(items).toHaveLength(6); expect(new Set(items.map(item => item.key)).size).toBe(6);
+    expect(items.find(item => item.sourceDimensionId === a.sourceDimensionId && item.dimensionId === undefined)).toMatchObject({ postingCount: "4", income: "97.00", costOfGoodsSold: "30.00", expenses: "10.00", netIncome: "57.00" });
+    expect(items.reduce((sum, item) => sum + BigInt(item.netIncome.replace(".", "")), 0n)).toBe(BigInt(first.summary.netIncome.replace(".", "")));
+    expect(first.matched).toEqual({ ...first.summary, groupCount: "6" });
+    expect(first.selection).toEqual({ sort: "identity" });
+    for (const attributionStatus of ["assigned", "unassigned", "ambiguous"] as const) {
+      const filtered = await sdk.queries.getIncomeAttribution({ ...request, attributionStatus });
+      expect(filtered.summary).toEqual(first.summary); expect(filtered.coverage).toEqual(first.coverage);
+      expect(filtered.matched).toEqual({ ...first.coverage[attributionStatus], groupCount: attributionStatus === "assigned" ? "4" : "1" });
+      expect(filtered.items.every(item => item.status === attributionStatus)).toBe(true);
+    }
+    const sourceReference = await sdk.queries.getIncomeAttribution({ ...request, reference: { kind: "source_dimension", id: "order:a" } });
+    expect(sourceReference.matched).toMatchObject({ groupCount: "2", income: "99.00", costOfGoodsSold: "30.00", expenses: "10.00" });
+    expect(sourceReference.summary).toEqual(first.summary); expect(sourceReference.items).toHaveLength(2);
+    const canonicalReference = await sdk.queries.getIncomeAttribution({ ...request, reference: { kind: "dimension", id: "canonical:a" } });
+    expect(canonicalReference.matched).toMatchObject({ groupCount: "1", income: "2.00" });
+    const missingReference = await sdk.queries.getIncomeAttribution({ ...request, reference: { kind: "source_dimension", id: "order:%' OR true --" } });
+    expect(missingReference.items).toEqual([]); expect(missingReference.matched).toMatchObject({ groupCount: "0", income: "0.00" }); expect(missingReference.summary).toEqual(first.summary);
+    for (const sort of ["cost_desc", "income_desc"] as const) {
+      const field = sort === "cost_desc" ? "costOfGoodsSold" : "income";
+      const expected = [...items].sort((a, b) => { const av = BigInt(a[field].replace(".", "")), bv = BigInt(b[field].replace(".", "")); return av > bv ? -1 : av < bv ? 1 : a.key < b.key ? -1 : a.key > b.key ? 1 : 0; });
+      const sorted = await sdk.queries.getIncomeAttribution({ ...request, sort, limit: 1 });
+      const actual = [...sorted.items]; let continuation = sorted.nextCursor;
+      while (continuation) { const page = await sdk.queries.getIncomeAttribution({ ...request, sort, limit: 1, cursor: continuation }); actual.push(...page.items); expect(page.matched).toEqual(first.matched); continuation = page.nextCursor; }
+      expect(actual).toEqual(expected);
+      const invalidCursor = JSON.parse(Buffer.from(registerValue(sorted.nextCursor), "base64url").toString("utf8")) as Record<string, unknown>; invalidCursor.amount = "1e3";
+      await expect(sdk.queries.getIncomeAttribution({ ...request, sort, cursor: Buffer.from(JSON.stringify(invalidCursor)).toString("base64url") })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const changed of [{ attributionStatus: "assigned" as const }, { reference: { kind: "source_dimension" as const, id: "order:a" } }, { sort: "cost_desc" as const }]) {
+      await expect(sdk.queries.getIncomeAttribution({ ...request, ...changed, cursor: registerValue(first.nextCursor) })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const invalid of [{ sort: "other" }, { attributionStatus: "other" }, { reference: {} }, { reference: { kind: "other", id: "x" } }, { reference: { kind: "dimension", id: " " } }, { reference: { kind: "dimension", id: "x".repeat(501) } }]) {
+      await expect(sdk.queries.getIncomeAttribution({ ...request, ...invalid } as Parameters<typeof sdk.queries.getIncomeAttribution>[0])).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    // Two smaller values sort above 100 lexically; even limit+1 must not hide
+    // the true numeric maximum. This reproduces the million-entry sort defect.
+    await pool.query("update erp_financials.ledger_postings set debit_amount=case when debit_amount>0 then 100 else 0 end,credit_amount=case when credit_amount>0 then 100 else 0 end,net_amount=case when net_amount>0 then 100 else -100 end where transaction_id='large'");
+    const numericFirst = await sdk.queries.getIncomeAttribution({ ...request, sort: "income_desc", limit: 1 });
+    expect(numericFirst.items[0]?.income).toBe("100.00");
+    expect((await sdk.queries.getIncomeAttribution({ ...request, sort: "income_desc", limit: 1, cursor: registerValue(numericFirst.nextCursor) })).items[0]?.income).toBe("97.00");
+    await pool.query("update erp_financials.ledger_postings set debit_amount=case when debit_amount>0 then 90071992547409.93 else 0 end,credit_amount=case when credit_amount>0 then 90071992547409.93 else 0 end,net_amount=case when net_amount>0 then 90071992547409.93 else -90071992547409.93 end where transaction_id='large'");
+    // Imported refunds can produce negative net group amounts. Monetary cursor
+    // boundaries must remain exact and order these after zero-valued groups.
+    await pool.query("update erp_financials.ledger_postings set debit_amount=credit_amount,credit_amount=debit_amount,net_amount=-net_amount where transaction_id in ('large','ambiguous')");
+    for (const sort of ["cost_desc", "income_desc"] as const) {
+      const field = sort === "cost_desc" ? "costOfGoodsSold" : "income";
+      const page = await sdk.queries.getIncomeAttribution({ ...request, sort, limit: 1 });
+      let cursor = page.nextCursor, previous = BigInt(registerValue(page.items[0])[field].replace(".", "")), count = 1;
+      while (cursor) { const next = await sdk.queries.getIncomeAttribution({ ...request, sort, limit: 1, cursor }); const amount = BigInt(registerValue(next.items[0])[field].replace(".", "")); expect(amount <= previous).toBe(true); previous = amount; cursor = next.nextCursor; count++; }
+      expect(count).toBe(6); expect(previous).toBe(sort === "cost_desc" ? -1100n : -9007199254740993n);
+    }
+    await pool.query("update erp_financials.ledger_postings set debit_amount=credit_amount,credit_amount=debit_amount,net_amount=-net_amount where transaction_id in ('large','ambiguous')");
+    expect((await sdk.queries.getIncomeAttribution({ ...request, sourceId: "unbound" })).summary.netIncome).toBe("0.00");
+    expect((await sdk.queries.getIncomeAttribution({ ...request, accountingMethod: "cash" })).groupCount).toBe("0");
+    expect((await sdk.queries.getIncomeAttribution({ ...request, periodEnd: "2026-08-15" })).summary.netIncome).toBe("96.00");
+    for (const changes of [{ dimensionKind: "other" }, { sourceId: scope.writeSourceId }, { periodEnd: "2026-08-15" }, { accountingMethod: "cash" as const }]) {
+      await expect(sdk.queries.getIncomeAttribution({ ...request, ...changes, cursor: registerValue(first.nextCursor) })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    await sdk.books.defineAccount({ operation, bookId: scope.bookId, bookAccountKey: "cost-parent", name: "COGS header", classification: "cost_of_goods_sold", accountRole: "header", expectedVersion: 0 });
+    await sdk.books.defineAccount({ operation, bookId: scope.bookId, bookAccountKey: "cost", parentBookAccountKey: "cost-parent", name: "Mapped COGS", classification: "cost_of_goods_sold", accountRole: "posting", expectedVersion: 0 });
+    await sdk.books.mapAccount({ operation, bookId: scope.bookId, sourceId: scope.writeSourceId, accountId: "attribution-cost_of_goods_sold", bookAccountKey: "cost" });
+    await expect(sdk.queries.getIncomeAttribution({ ...request, cursor: registerValue(first.nextCursor) })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    const mapped = await sdk.queries.getIncomeAttribution(request);
+    expect(mapped.summary).toEqual(first.summary);
+    expect((await sdk.queries.getFinancialStatement({ ...request, reportName: "profit_and_loss" })).totals).toEqual(totals);
+    for (const invalid of [[{}], {}, [{dimensionKind:"blu_order",sourceDimensionId:null}], [{dimensionKind:"blu_order",sourceDimensionId:"x".repeat(501)}]]) {
+      await pool.query("update erp_financials.ledger_postings set dimension_refs=$1::jsonb where posting_id='unassigned-pnl'",[JSON.stringify(invalid)]);
+      expect((await sdk.queries.getIncomeAttribution(request)).coverage).toMatchObject({ unassigned: { postingCount: "0" }, ambiguous: { postingCount: "2", costOfGoodsSold: "18.00" } });
+    }
+    await expect(sdk.queries.getIncomeAttribution({ ...request, cursor: registerValue(mapped.nextCursor) })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    // Identical reference buckets sum to exact cents, but their underlying
+    // sub-cent facts must still fail precision validation before aggregation.
+    await pool.query("update erp_financials.ledger_postings set debit_amount=7.001,net_amount=7.001,dimension_refs=(select dimension_refs from erp_financials.ledger_postings where posting_id='cost-a-pnl') where posting_id='unassigned-pnl'");
+    await pool.query("update erp_financials.ledger_postings set debit_amount=30.009,net_amount=30.009 where posting_id='cost-a-pnl'");
+    await expect(sdk.queries.getIncomeAttribution(request)).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  it("income attribution snapshots inputs and controls while concurrent posts invalidate subsequent pages", async () => {
+    const bookId = "attribution-snapshot", { financials } = await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const post = (id: string) => financials.journalEntries.post({ operation: { ...sdkOperation(), requestId: id }, idempotencyKey: id,
+      date: "2026-08-12", lines: [{ accountId: "account_cash", debit: "1.00" }, { accountId: "account_income", credit: "1.00", dimensionRefs: [{ dimensionKind: "blu_order", sourceDimensionId: id }] }] });
+    await post("order:initial");
+    let count = 0;
+    const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]) => {
+      const result = await client.query<Row>(sql, values); count++;
+      if (count === 1) await post("order:before"); else if (count === 2) await post("order:after");
+      return result;
+    } })) };
+    const request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", dimensionKind: "blu_order", limit: 1 };
+    const first = await createErpFinancialsSdk({ ...scope, database }).queries.getIncomeAttribution(request);
+    expect(count).toBe(2); expect(first).toMatchObject({ groupCount: "2", summary: { income: "2.00", postingCount: "2" }, coverage: { assigned: { income: "2.00" } } });
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner });
+    expect((await sdk.queries.getIncomeAttribution(request)).summary.income).toBe("3.00");
+    await expect(sdk.queries.getIncomeAttribution({ ...request, cursor: registerValue(first.nextCursor) })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    const mutable = { ...request, sourceId: "source_1", reference: { kind: "source_dimension" as const, id: "order:initial" }, attributionStatus: "assigned" as const, sort: "cost_desc" as const }; let captured = false;
+    const capturing: ErpFinancialsTransactionRunner = { transaction: work => {
+      if (!captured) { captured = true; mutable.periodStart = "2030-01-01"; mutable.dimensionKind = "different"; mutable.sourceId = "other"; mutable.limit = 99; mutable.reference.id = "other"; }
+      return runner.transaction(work);
+    } };
+    const capturedPage = await createErpFinancialsSdk({ ...scope, database: capturing }).queries.getIncomeAttribution(mutable);
+    expect(capturedPage.items).toHaveLength(1); expect(capturedPage).toMatchObject({ dimensionKind: "blu_order", summary: { income: "3.00" }, coverage: { assigned: { income: "3.00" } } });
+    expect(capturedPage.matched).toMatchObject({ groupCount: "1", income: "1.00" }); expect(capturedPage.selection?.reference?.id).toBe("order:initial");
+    for (const changes of [{ dimensionKind: "" }, { dimensionKind: "x".repeat(101) }, { sourceId: "x".repeat(501) }, { limit: 0 }, { cursor: "garbage" }]) {
+      await expect(sdk.queries.getIncomeAttribution({ ...request, ...changes })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    let changed = false;
+    const archiving: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]) => {
+      const result = await client.query<Row>(sql, values);
+      if (!changed) { changed = true; await pool.query("update erp_financials.reporting_books set status='archived' where book_id=$1", [bookId]); }
+      return result;
+    } })) };
+    await expect(createErpFinancialsSdk({ ...scope, database: archiving }).queries.getIncomeAttribution(request)).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+  });
+
+  it("journal income effects reconcile to SDK statements across classifications, groups and posting windows", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:journal-income-effects" });
+    const base = quickBooksSubledgerFacts(), template = registerValue(base.transactions[0]);
+    const classifications = ["asset", "liability", "equity", "income", "other_income", "cost_of_goods_sold", "expense", "other_expense"] as const;
+    type Line = readonly [typeof classifications[number], "debit" | "credit", string];
+    const examples: readonly { id: string; effect: string; lines: readonly Line[] }[] = [
+      { id: "sale", effect: "120.00", lines: [["asset", "debit", "120.00"], ["income", "credit", "100.00"], ["other_income", "credit", "20.00"]] },
+      { id: "cost", effect: "-80.00", lines: [["expense", "debit", "40.00"], ["cost_of_goods_sold", "debit", "30.00"], ["other_expense", "debit", "10.00"], ["asset", "credit", "80.00"]] },
+      { id: "balance", effect: "0.00", lines: [["asset", "debit", "5.00"], ["liability", "credit", "5.00"], ["equity", "debit", "3.00"], ["asset", "credit", "3.00"]] },
+      { id: "refund", effect: "10.00", lines: [["asset", "debit", "10.00"], ["expense", "credit", "10.00"]] },
+      { id: "large", effect: "90071992547409.93", lines: [["asset", "debit", "90071992547409.93"], ["income", "credit", "90071992547409.93"]] },
+    ];
+    const facts: CanonicalAccountingFactSet = { ...base,
+      accounts: classifications.map(classification => ({ ...registerValue(base.accounts[0]), accountId: `income-${classification}`, sourceAccountId: classification, name: classification, type: classification, classification })),
+      transactions: examples.map(({ id }) => ({ ...template, transactionId: id, sourceTransactionId: id, sourceTransactionType: id, transactionNumber: id })),
+      postings: examples.flatMap(({ id, lines }) => lines.map(([classification, side, amount], index) => ({
+        tenantId: "tenant_qbo", sourceId: "source_qbo", postingId: `${id}-${String(index)}`, sourcePostingId: `${id}-${String(index)}`, transactionId: id, accountId: `income-${classification}`,
+        postingDate: id === "cost" && side === "debit" ? "2026-08-20" : "2026-08-10", accountingBasis: "accrual", currencyCode: "USD",
+        debitAmount: side === "debit" ? amount : "0.00", creditAmount: side === "credit" ? amount : "0.00", netAmount: side === "debit" ? amount : `-${amount}`,
+        dimensionHash: "a".repeat(64), dimensionRefs: [], importBatchId: "batch_qbo",
+      }))) };
+    await runner.transaction(client => persistCanonicalFacts(createPostgresStorageAdapter(client), facts));
+    const scope = { database: runner, tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "income-trace", writeSourceId: "source_qbo", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(scope), operation = sdkOperation();
+    await sdk.books.define({ operation, bookId: scope.bookId, name: "Income trace", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: scope.bookId, sourceId: scope.writeSourceId, sourceRole: "historical" });
+    await sdk.books.defineAccount({ operation, bookId: scope.bookId, bookAccountKey: "revenue-header", name: "Revenue header", classification: "income", accountRole: "header", expectedVersion: 0 });
+    await sdk.books.defineAccount({ operation, bookId: scope.bookId, bookAccountKey: "revenue-leaf", parentBookAccountKey: "revenue-header", name: "Revenue leaf", classification: "income", accountRole: "posting", expectedVersion: 0 });
+    await sdk.books.mapAccount({ operation, bookId: scope.bookId, sourceId: scope.writeSourceId, accountId: "income-income", bookAccountKey: "revenue-leaf" });
+    const request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", includeIncomeEffect: true, limit: 2 };
+    const first = await sdk.queries.getJournalRegister(request);
+    const statement = await sdk.queries.getFinancialStatement({ ...request, reportName: "profit_and_loss" });
+    expect(first.summary.netIncomeEffect).toBe("90071992547459.93"); expect(first.summary.netIncomeEffect).toBe(statement.totals.netIncome);
+    expect(first.matched).toEqual(first.summary);
+    const ordinary = await sdk.queries.getJournalRegister({ ...request, includeIncomeEffect: false });
+    expect(ordinary.summary.netIncomeEffect).toBeUndefined(); expect(ordinary.items[0]?.netIncomeEffect).toBeUndefined();
+    await expect(sdk.queries.getJournalRegister({ ...request, includeIncomeEffect: false, cursor: registerValue(first.nextCursor) })).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(sdk.queries.getJournalRegister({ ...request, includeIncomeEffect: "yes" as unknown as boolean })).rejects.toMatchObject({ code: "invalid_input" });
+    for (const example of examples) {
+      const filtered = await sdk.queries.getJournalRegister({ ...request, reference: example.id });
+      expect(filtered.items[0]?.netIncomeEffect).toBe(example.effect); expect(filtered.matched.netIncomeEffect).toBe(example.effect); expect(filtered.summary).toEqual(first.summary);
+      const detailRequest = { ...request, sourceId: scope.writeSourceId, transactionId: example.id, limit: 1 };
+      const detail = await sdk.queries.getJournalPostingPage(detailRequest);
+      expect(detail.journal.netIncomeEffect).toBe(example.effect); expect(detail.items).toHaveLength(1);
+      expect(detail.items[0]?.accountClassification).toBeDefined(); expect(detail.items[0]?.netIncomeEffect).toBeDefined();
+      const next = await sdk.queries.getJournalPostingPage({ ...detailRequest, cursor: registerValue(detail.nextCursor) });
+      expect(next.journal).toEqual(detail.journal);
+      const lines = [...detail.items, ...next.items]; let cursor = next.nextCursor;
+      while (cursor) {
+        if (lines.length >= example.lines.length) throw Error("Income detail cursor repeated");
+        const page = await sdk.queries.getJournalPostingPage({ ...detailRequest, cursor });
+        expect(page.journal).toEqual(detail.journal); lines.push(...page.items); cursor = page.nextCursor;
+      }
+      expect(lines).toHaveLength(example.lines.length);
+      expect(lines.reduce((sum, line) => sum + BigInt(registerValue(line.netIncomeEffect).replace(".", "")), 0n)).toBe(BigInt(example.effect.replace(".", "")));
+      for (const line of lines) expect(line.accountId).toBe(`income-${registerValue(line.accountClassification)}`);
+      if (example.id === "sale") expect(lines.find(line => line.accountClassification === "income")?.bookAccountKey).toBe("revenue-leaf");
+      await expect(sdk.queries.getJournalPostingPage({ ...detailRequest, includeIncomeEffect: false, cursor: registerValue(detail.nextCursor) })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    const groups = [{ id: "sales", originModules: [], transactionTypeContains: ["sale", "large"] }, { id: "unused", originModules: ["unused"], transactionTypeContains: [] }];
+    const grouped = await sdk.queries.getJournalRegister({ ...request, originGroups: groups });
+    expect(grouped.matched).toEqual(first.summary);
+    expect(grouped.originGroups).toMatchObject([{ id: "sales", netIncomeEffect: "90071992547529.93" }, { id: "unused", netIncomeEffect: "0.00" }, { id: "unclassified", netIncomeEffect: "-70.00" }]);
+    expect((await sdk.queries.getJournalRegister({ ...request, originGroups: groups, originGroupId: "unclassified" })).matched.netIncomeEffect).toBe("-70.00");
+    const early = await sdk.queries.getJournalRegister({ ...request, periodEnd: "2026-08-15" });
+    expect(early.summary.netIncomeEffect).toBe("90071992547539.93");
+    expect(early.summary.netIncomeEffect).toBe((await sdk.queries.getFinancialStatement({ ...request, periodEnd: "2026-08-15", reportName: "profit_and_loss" })).totals.netIncome);
+    expect((await sdk.queries.getJournalRegister({ ...request, sourceId: "unbound" })).matched.netIncomeEffect).toBe("0.00");
+    expect((await sdk.queries.getJournalRegister({ ...request, accountingMethod: "cash" })).summary.netIncomeEffect).toBe("0.00");
+  });
+
+  it("journal pages and detail round-trip long canonical source, transaction and posting identities", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:journal-long-identities" });
+    const sourceId = `source-${"s".repeat(493)}`;
+    const base = JSON.parse(JSON.stringify(quickBooksSubledgerFacts()).replaceAll("source_qbo", sourceId)) as CanonicalAccountingFactSet;
+    const transactions = base.transactions.map((transaction, index) => ({ ...transaction, transactionId: `transaction-${"t".repeat(479)}-${String(index)}` }));
+    const facts: CanonicalAccountingFactSet = { ...base, transactions,
+      postings: transactions.flatMap(transaction => (["debit", "credit"] as const).map(side => ({
+        tenantId: "tenant_qbo", sourceId, postingId: `${transaction.transactionId}-${side}`, sourcePostingId: `${transaction.sourceTransactionId}-${side}`,
+        transactionId: transaction.transactionId, accountId: side === "debit" ? "account_cash_qbo" : "account_revenue_qbo",
+        postingDate: "2026-08-10", accountingBasis: "accrual", debitAmount: side === "debit" ? "1.00" : "0.00",
+        creditAmount: side === "credit" ? "1.00" : "0.00", netAmount: side === "debit" ? "1.00" : "-1.00",
+        currencyCode: "USD", dimensionHash: "a".repeat(64), dimensionRefs: [], importBatchId: "batch_qbo",
+      }))) };
+    await runner.transaction(client => persistCanonicalFacts(createPostgresStorageAdapter(client), facts));
+    const scope = { tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "long-identities", writeSourceId: sourceId, currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner });
+    await sdk.books.define({ operation: sdkOperation(), bookId: scope.bookId, name: "Long identities", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation: sdkOperation(), bookId: scope.bookId, sourceId, sourceRole: "historical", effectiveFrom: "2026-08-01" });
+    const request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", limit: 1 };
+    const first = await sdk.queries.getJournalRegister(request);
+    expect(first.items).toHaveLength(1); expect(first.items[0]?.sourceId).toBe(sourceId);
+    const second = await sdk.queries.getJournalRegister({ ...request, cursor: registerValue(first.nextCursor) });
+    expect(second.items).toHaveLength(1); expect(second.nextCursor).toBeUndefined();
+    expect(second.items[0]?.transactionId).not.toBe(first.items[0]?.transactionId); expect(second.summary).toEqual(first.summary);
+    expect((await sdk.queries.getJournalRegister({ ...request, sourceId })).items).toEqual(first.items);
+    const detailRequest = { ...request, sourceId, transactionId: registerValue(first.items[0]).transactionId };
+    const detail = await sdk.queries.getJournalPostingPage(detailRequest);
+    const next = await sdk.queries.getJournalPostingPage({ ...detailRequest, cursor: registerValue(detail.nextCursor) });
+    expect(next.items).toHaveLength(1); expect(next.nextCursor).toBeUndefined();
+    expect(next.items[0]?.postingId).not.toBe(detail.items[0]?.postingId); expect(next.journal).toEqual(detail.journal);
+    await expect(sdk.queries.getJournalRegister({ ...request, sourceId: "s".repeat(501) })).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(sdk.queries.getJournalPostingPage({ ...detailRequest, transactionId: "t".repeat(501) })).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  it("journal origin groups and exact references preserve whole-book controls and unknown provenance", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:journal-origin-groups" });
+    const base = quickBooksSubledgerFacts(), template = registerValue(base.transactions[0]);
+    const cases = [
+      { type: "Invoice" }, { type: "Payment" }, { type: "bill_payment" }, { type: "Invoice", origin: "Manual" },
+      { type: "Invoice", origin: "Custom" }, { type: "Unknown" }, { type: "Invoice", origin: "Payroll" }, { type: "100%adjustment" },
+    ];
+    const transactions = cases.map((item, index) => ({ ...template, transactionId: `group-tx-${String(index)}`, sourceTransactionId: `group-source-${String(index)}`,
+      sourceTransactionType: item.type, transactionNumber: index < 2 ? "DUP" : `GROUP-${String(index)}`,
+      ...(item.origin ? { sourcePayloadRef: { sourceObjectType: item.type, sourceObjectId: `group-source-${String(index)}`, preview: { journalOrigin: { module: item.origin } } } } : {}) }));
+    const facts: CanonicalAccountingFactSet = { ...base, transactions,
+      postings: transactions.flatMap(transaction => (["debit", "credit"] as const).map(side => ({
+        tenantId: "tenant_qbo", sourceId: "source_qbo", postingId: `${transaction.transactionId}-${side}`, sourcePostingId: `${transaction.sourceTransactionId}-${side}`,
+        transactionId: transaction.transactionId, accountId: side === "debit" ? "account_cash_qbo" : "account_revenue_qbo", postingDate: "2026-08-10", accountingBasis: "accrual",
+        debitAmount: side === "debit" ? "1.23" : "0.00", creditAmount: side === "credit" ? "1.23" : "0.00", netAmount: side === "debit" ? "1.23" : "-1.23",
+        currencyCode: "USD", dimensionHash: "a".repeat(64), dimensionRefs: [], importBatchId: "batch_qbo",
+      }))) };
+    await runner.transaction(client => persistCanonicalFacts(createPostgresStorageAdapter(client), facts));
+    const scope = { tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "origin-groups", writeSourceId: "source_qbo", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner });
+    await sdk.books.define({ operation: sdkOperation(), bookId: scope.bookId, name: "Origin groups", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation: sdkOperation(), bookId: scope.bookId, sourceId: scope.writeSourceId, sourceRole: "historical", effectiveFrom: "2026-08-01" });
+    const originGroups = [
+      { id: "invoices", originModules: ["Invoicing"], transactionTypeContains: ["invoice"] },
+      { id: "payments", originModules: ["Payments"], transactionTypeContains: ["payment"] },
+      { id: "ap", originModules: ["AP"], transactionTypeContains: ["bill"] },
+      { id: "manual", originModules: ["Manual"], transactionTypeContains: [] },
+      { id: "payroll", originModules: ["Payroll"], transactionTypeContains: [] },
+      { id: "percent", originModules: [], transactionTypeContains: ["%"] },
+    ];
+    const request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", limit: 1, originGroups };
+    const first = await sdk.queries.getJournalRegister(request);
+    expect(first.summary).toEqual({ journalCount: "8", postingCount: "16", debitAmount: "9.84", creditAmount: "9.84" });
+    expect(first.matched).toEqual(first.summary);
+    expect(first.originGroups?.map(group => [group.id, group.journalCount])).toEqual([["invoices", "1"], ["payments", "2"], ["ap", "0"], ["manual", "1"], ["payroll", "1"], ["percent", "1"], ["unclassified", "2"]]);
+    const second = await sdk.queries.getJournalRegister({ ...request, cursor: registerValue(first.nextCursor) });
+    expect(second.originGroups).toEqual(first.originGroups); expect(second.items[0]?.transactionId).not.toBe(first.items[0]?.transactionId);
+    for (const group of registerValue(first.originGroups)) {
+      const filtered = await sdk.queries.getJournalRegister({ ...request, originGroupId: group.id, limit: 200 });
+      expect(filtered.summary).toEqual(first.summary); expect(filtered.originGroups).toEqual(first.originGroups);
+      expect(filtered.matched).toEqual({ journalCount: group.journalCount, postingCount: group.postingCount, debitAmount: group.debitAmount, creditAmount: group.creditAmount });
+      expect(filtered.items.every(item => item.originGroupId === group.id && item.preparerProvenance === undefined)).toBe(true);
+    }
+    const exact = await sdk.queries.getJournalRegister({ ...request, reference: "DUP", limit: 2 });
+    expect(exact.matched.journalCount).toBe("2"); expect(exact.summary).toEqual(first.summary); expect(exact.items).toHaveLength(2);
+    for (const reference of ["group-tx-3", "group-source-3", "GROUP-3"]) {
+      expect((await sdk.queries.getJournalRegister({ ...request, reference })).items[0]).toMatchObject({ transactionId: "group-tx-3", originGroupId: "manual" });
+    }
+    expect((await sdk.queries.getJournalRegister({ ...request, reference: "GROUP-" })).matched.journalCount).toBe("0");
+    expect((await sdk.queries.getJournalRegister({ ...request, originGroups: [{ id: "literal", originModules: [], transactionTypeContains: ["' OR 1=1 --"] }] })).originGroups).toMatchObject([{ id: "literal", journalCount: "0" }, { id: "unclassified", journalCount: "8" }]);
+    const cursor = registerValue(first.nextCursor);
+    for (const changed of [{ originGroups: [...originGroups].reverse() }, { originGroupId: "manual" }, { reference: "DUP" }]) {
+      await expect(sdk.queries.getJournalRegister({ ...request, ...changed, cursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const invalid of [{ originGroups: [] }, { originGroups: [...originGroups, originGroups[0]] }, { originGroups: Array.from({ length: 21 }, (_, index) => ({ id: String(index), originModules: ["Manual"], transactionTypeContains: [] })) },
+      { originGroups: [{ id: "unclassified", originModules: ["Manual"], transactionTypeContains: [] }] }, { originGroups: [{ id: "empty", originModules: [], transactionTypeContains: [] }] },
+      { originGroups: [{ id: "bad", originModules: [42], transactionTypeContains: [] }] }, { originGroupId: "missing" }, { reference: "r".repeat(513) }]) {
+      await expect(sdk.queries.getJournalRegister({ ...request, ...invalid } as never)).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    await expect(sdk.queries.getJournalRegister({ periodStart: request.periodStart, periodEnd: request.periodEnd, originGroupId: "manual" })).rejects.toMatchObject({ code: "invalid_input" });
+    const mutable = structuredClone(request), pending = sdk.queries.getJournalRegister(mutable);
+    mutable.originGroups[0]?.originModules.push("Custom"); mutable.originGroups.reverse();
+    expect((await pending).originGroups).toEqual(first.originGroups);
+  });
+
+  it("journal register preserves native preparer and reversal facts with filter-bound stale cursors", async () => {
+    const bookId = "journal-native", { financials, deposit, input } = await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", limit: 1 };
+    const before = await sdk.queries.getJournalPostingPage({ ...request, sourceId: "source_1", transactionId: deposit.journal.transactionId });
+    expect(before.journal.preparerProvenance).toBeUndefined(); // Native subledger posts have their own document event, not a manual-journal preparer.
+    expect(before.journal.nativeStatus).toBeUndefined();
+    await financials.deposits.reverse(input);
+    const page = await sdk.queries.getJournalRegister(request);
+    expect(page.summary).toMatchObject({ journalCount: "2", postingCount: "4", debitAmount: "246.90", creditAmount: "246.90" });
+    const cursor = registerValue(page.nextCursor);
+    const original = await sdk.queries.getJournalPostingPage({ ...request, sourceId: "source_1", transactionId: deposit.journal.transactionId });
+    expect(original.journal.nativeStatus).toBe("reversed");
+    expect(original.journal.preparerProvenance).toBeUndefined();
+    await expect(sdk.queries.getJournalPostingPage({ ...request, sourceId: "source_1", transactionId: deposit.journal.transactionId, cursor: registerValue(before.nextCursor) })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    for (const change of [{ sourceId: "source_2" }, { transactionType: "Invoice" }, { originModule: "Manual" }, { search: "x" }, { periodStart: "2026-08-10" }, { accountingMethod: "cash" as const }]) {
+      await expect(sdk.queries.getJournalRegister({ ...request, ...change, cursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const foreign of [{ tenantId: "other" }, { companyId: "other" }, { bookId: "other" }]) {
+      await expect(createErpFinancialsSdk({ ...scope, ...foreign, database: runner }).queries.getJournalRegister({ ...request, cursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const invalid of [{ limit: 0 }, { limit: 201 }, { search: " " }, { sourceId: 1 as unknown as string }, { periodEnd: "2026-02-30" }, { cursor: "x" }]) {
+      await expect(sdk.queries.getJournalRegister({ ...request, ...invalid })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    const manual = await sdk.commands.journalEntries.post({ operation: { ...sdkOperation(), actorRef: "journal:actual-preparer", requestId: "journal:manual" }, idempotencyKey: "journal:manual", date: "2026-08-15", origin: { module: "Manual", reference: "manual-reference" }, lines: [{ accountId: "account_ar", debit: "2.00" }, { accountId: "account_income", credit: "2.00" }] });
+    const manualPage = await sdk.queries.getJournalRegister({ ...request, originModule: "Manual" });
+    expect(manualPage.matched).toMatchObject({ journalCount: "1", postingCount: "2", debitAmount: "2.00" });
+    expect(manualPage.items[0]).toMatchObject({ transactionId: manual.transactionId, nativeStatus: "posted", preparerProvenance: { actorRef: "journal:actual-preparer" }, sourceProvenance: { origin: { module: "Manual", reference: "manual-reference" } } });
+    await financials.deposits.record({ operation: { ...sdkOperation(), requestId: "journal:backdated" }, idempotencyKey: "journal:backdated", date: "2026-08-11", amount: "0.01", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+    const income = await sdk.queries.getJournalRegister({ ...request, includeIncomeEffect: true });
+    expect(income.summary.netIncomeEffect).toBe("2.00");
+    // The manual receivable remains unpaid: accrual revenue is not cash income.
+    const cashIncome = await sdk.queries.getJournalRegister({ ...request, includeIncomeEffect: true, accountingMethod: "cash" });
+    expect(cashIncome.summary.netIncomeEffect).toBe("0.00");
+    expect(cashIncome.summary.netIncomeEffect).toBe((await sdk.queries.getFinancialStatement({ ...request, accountingMethod: "cash", reportName: "profit_and_loss" })).totals.netIncome);
+    const reversedDetail = await sdk.queries.getJournalPostingPage({ ...request, includeIncomeEffect: true, sourceId: "source_1", transactionId: deposit.journal.transactionId });
+    expect(reversedDetail.journal).toMatchObject({ nativeStatus: "reversed", netIncomeEffect: "0.00" });
+    await expect(sdk.queries.getJournalRegister({ ...request, cursor })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+  });
+
+  it("journal register keeps controls and detail in one snapshot during concurrent posting and book changes", async () => {
+    const bookId = "journal-snapshot", { financials, deposit } = await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", limit: 1, includeIncomeEffect: true, originGroups: [{ id: "deposits", originModules: [], transactionTypeContains: ["deposit"] }] };
+    const post = (id: string) => financials.journalEntries.post({ operation: { ...sdkOperation(), requestId: id }, idempotencyKey: id, date: "2026-08-12", lines: [{ accountId: "account_cash", debit: "1.00" }, { accountId: "account_income", credit: "1.00" }] });
+    let count = 0;
+    const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]) => {
+      const result = await client.query<Row>(sql, values); count++;
+      if (count === 1) await post("journal:before"); else if (count === 2) await post("journal:after");
+      return result;
+    } })) };
+    const first = await createErpFinancialsSdk({ ...scope, database }).queries.getJournalRegister(request);
+    expect(count).toBe(2); expect(first.originGroups?.find(group => group.id === "deposits")?.journalCount).toBe("1"); expect(first.summary).toMatchObject({ journalCount: "2", postingCount: "4", debitAmount: "124.45", netIncomeEffect: "1.00" });
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner });
+    expect((await sdk.queries.getJournalRegister(request)).summary).toMatchObject({ journalCount: "3", debitAmount: "125.45", netIncomeEffect: "2.00" });
+    await expect(sdk.queries.getJournalRegister({ ...request, cursor: registerValue(first.nextCursor) })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    const mutable = { ...request, sourceId: "source_1", transactionId: deposit.journal.transactionId };
+    let captured = false;
+    const capturing: ErpFinancialsTransactionRunner = { transaction: async work => { if (!captured) { mutable.includeIncomeEffect = false; mutable.sourceId = "other"; mutable.periodStart = "2030-01-01"; captured = true; } return runner.transaction(work); } };
+    expect((await createErpFinancialsSdk({ ...scope, database: capturing }).queries.getJournalPostingPage(mutable)).journal).toMatchObject({ transactionId: deposit.journal.transactionId, netIncomeEffect: "0.00" });
+    let changed = false;
+    const archiving: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]) => {
+      const result = await client.query<Row>(sql, values);
+      if (!changed) { changed = true; await pool.query("update erp_financials.reporting_books set status='archived' where book_id=$1", [bookId]); }
+      return result;
+    } })) };
+    await expect(createErpFinancialsSdk({ ...scope, database: archiving }).queries.getJournalRegister(request)).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+  });
+
+  it("account chart pages exact direct and inclusive totals without counting parents twice", async () => {
+    const bookId = "account-chart", { financials } = await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    let queries = 0;
+    const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async (sql, values) => { queries++; return client.query(sql, values); } })) };
+    const sdk = createErpFinancialsSdk({ ...scope, database }), operation = sdkOperation();
+    await sdk.books.defineAccount({ operation, bookId, expectedVersion: 0, bookAccountKey: "cash-group", accountNumber: "100", name: "Cash group", classification: "asset", accountRole: "header" });
+    await sdk.books.defineAccount({ operation, bookId, expectedVersion: 0, bookAccountKey: "cash", accountNumber: "101", name: "Cash 100%", classification: "asset", accountRole: "posting", parentBookAccountKey: "cash-group" });
+    await sdk.books.mapAccount({ operation, bookId, sourceId: "source_1", accountId: "account_cash", bookAccountKey: "cash" });
+    await financials.deposits.record({ operation: { ...operation, requestId: "chart:second" }, idempotencyKey: "chart:second", date: "2026-08-12", amount: "1.00", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+    const request = { periodStart: "2026-08-11", periodEnd: "2026-08-31", limit: 1 };
+    queries = 0;
+    const first = await sdk.queries.getAccountChart(request);
+    expect(queries).toBe(2);
+    expect(first.summary).toMatchObject({ accountCount: "5", openingNet: "0.00", debitAmount: "1.00", creditAmount: "1.00", closingNet: "0.00", postingCount: "2", trialDebit: "124.45", trialCredit: "124.45" });
+    expect(first.matchedAccountCount).toBe("5");
+    const items = [...first.items]; let cursor = first.nextCursor;
+    while (cursor !== undefined) {
+      if (items.length > 5) throw new Error("Chart page loop did not terminate");
+      const page = await sdk.queries.getAccountChart({ ...request, cursor });
+      expect(page.items).toHaveLength(1); expect(page.summary).toEqual(first.summary);
+      items.push(...page.items); cursor = page.nextCursor;
+    }
+    expect(new Set(items.map(item => item.bookAccountKey)).size).toBe(5);
+    const cash = registerValue(items.find(item => item.bookAccountKey === "cash"));
+    expect(cash).toMatchObject({ accountNumber: "101", version: 1, parentBookAccountKey: "cash-group", accountRole: "posting",
+      direct: { openingNet: "123.45", debitAmount: "1.00", creditAmount: "0.00", closingNet: "124.45", postingCount: "1" } });
+    expect(cash.inclusive).toEqual(cash.direct);
+    expect(items.find(item => item.bookAccountKey === "cash-group")).toMatchObject({ direct: { closingNet: "0.00", postingCount: "0" }, inclusive: cash.direct });
+    expect(items.find(item => item.bookAccountKey === "source_1:account_ar")).toMatchObject({ direct: { openingNet: "-123.45", closingNet: "-124.45" } });
+    for (const filter of [{ search: "%" }, { classification: "liability" as const }]) {
+      const filtered = await sdk.queries.getAccountChart({ ...request, ...filter });
+      expect(filtered.matchedAccountCount).toBe("1"); expect(filtered.summary).toEqual(first.summary);
+    }
+    expect(await sdk.queries.getAccountChart({ ...request, search: "does-not-exist" })).toMatchObject({ matchedAccountCount: "0", items: [], summary: first.summary });
+    await pool.query("update erp_financials.accounts set active=false where tenant_id='tenant_1' and source_id='source_1' and account_id='account_ap'");
+    await sdk.books.defineAccount({ operation: { ...operation, requestId: "chart:inactive" }, bookId, expectedVersion: 1, bookAccountKey: "cash", accountNumber: "101", name: "Cash 100%", classification: "asset", accountRole: "posting", parentBookAccountKey: "cash-group", active: false });
+    const active = await sdk.queries.getAccountChart({ ...request, limit: 200, includeInactive: false });
+    expect(active.matchedAccountCount).toBe("4"); expect(active.summary).toEqual(first.summary);
+    expect(active.items.find(item => item.bookAccountKey === "cash")).toMatchObject({ active: false, direct: cash.direct });
+    await expect(sdk.queries.getAccountChart({ ...request, cursor: registerValue(first.nextCursor) })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    await sdk.books.defineAccount({ operation: { ...operation, requestId: "chart:root" }, bookId, expectedVersion: 0, bookAccountKey: "root", accountNumber: "099", name: "Root", classification: "asset", accountRole: "header" });
+    await sdk.books.defineAccount({ operation: { ...operation, requestId: "chart:parent" }, bookId, expectedVersion: 1, bookAccountKey: "cash-group", accountNumber: "100", name: "Cash group", classification: "asset", accountRole: "header", parentBookAccountKey: "root" });
+    const nested = await sdk.queries.getAccountChart({ ...request, limit: 200 });
+    expect(nested.summary).toMatchObject({ accountCount: "6", trialDebit: "124.45", trialCredit: "124.45", postingCount: "2" });
+    expect(nested.items.find(item => item.bookAccountKey === "root")).toMatchObject({ direct: { closingNet: "0.00" }, inclusive: cash.direct });
+  });
+
+  it("account chart scopes cursors, captures inputs and invalidates backdated changes", async () => {
+    const bookId = "account-chart-cursors", { financials } = await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", limit: 1 };
+    const first = await sdk.queries.getAccountChart(request), cursor = registerValue(first.nextCursor);
+    for (const change of [{ periodStart: "2026-08-02" }, { search: "Cash" }, { classification: "asset" as const }, { includeInactive: false }, { accountingMethod: "cash" as const }]) {
+      await expect(sdk.queries.getAccountChart({ ...request, ...change, cursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const foreign of [{ tenantId: "foreign" }, { companyId: "foreign" }, { bookId: "foreign" }]) {
+      await expect(createErpFinancialsSdk({ ...scope, ...foreign, database: runner }).queries.getAccountChart({ ...request, cursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const bad of [{ periodStart: "2026-02-30" }, { limit: 201 }, { cursor: "bad" }]) {
+      await expect(sdk.queries.getAccountChart({ ...request, ...bad })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    let intercepted = false;
+    const mutable = { ...request };
+    const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]) => {
+      const result = await client.query<Row>(sql, values);
+      if (!intercepted) { intercepted = true; mutable.periodStart = "1900-01-01"; mutable.limit = 200; }
+      return result;
+    } })) };
+    const captured = await createErpFinancialsSdk({ ...scope, database }).queries.getAccountChart(mutable);
+    expect(captured.periodStart).toBe(request.periodStart); expect(captured.items).toHaveLength(1);
+    await financials.deposits.record({ operation: { ...sdkOperation(), requestId: "chart:backdated" }, idempotencyKey: "chart:backdated", date: "2026-08-12", amount: "0.01", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+    await expect(sdk.queries.getAccountChart({ ...request, cursor })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    expect((await sdk.queries.getAccountChart(request)).summary).toMatchObject({ trialDebit: "123.46", trialCredit: "123.46", postingCount: "4" });
+    await sdk.books.define({ operation: sdkOperation(), bookId: "empty-chart", name: "Empty", baseCurrencyCode: "USD" });
+    expect(await createErpFinancialsSdk({ ...scope, bookId: "empty-chart", database: runner }).queries.getAccountChart(request)).toMatchObject({ items: [], matchedAccountCount: "0", summary: { accountCount: "0", closingNet: "0.00", groups: [] } });
+  });
+
+  it("account chart rejects cyclic source hierarchies and colliding fallback identities", async () => {
+    const bookId = "account-chart-invalid";
+    await depositFixture(bookId);
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" });
+    const request = { periodStart: "2026-08-01", periodEnd: "2026-08-31" };
+    await pool.query("update erp_financials.accounts set parent_account_id=case account_id when 'account_cash' then 'account_ar' else 'account_cash' end where tenant_id='tenant_1' and source_id='source_1' and account_id in ('account_cash','account_ar')");
+    await expect(sdk.queries.getAccountChart(request)).rejects.toMatchObject({ code: "invalid_input", message: "Account chart contains a hierarchy cycle" });
+    await pool.query("update erp_financials.accounts set parent_account_id=null where tenant_id='tenant_1' and source_id='source_1'");
+    await sdk.books.defineAccount({ operation: sdkOperation(), bookId, bookAccountKey: "source_1:account_cash", name: "Colliding definition", classification: "asset", accountRole: "posting", expectedVersion: 0 });
+    await expect(sdk.queries.getAccountChart(request)).rejects.toMatchObject({ code: "invalid_input", message: "Account chart contains ambiguous book account identities" });
+  });
+
+  it("account chart returns one financial snapshot during concurrent posting", async () => {
+    const bookId = "account-chart-snapshot", { financials } = await depositFixture(bookId);
+    const post = (id: string) => financials.deposits.record({ operation: { ...sdkOperation(), requestId: id }, idempotencyKey: id,
+      date: "2026-08-12", amount: "1.00", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+    let count = 0;
+    const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]) => {
+      const result = await client.query<Row>(sql, values); count++;
+      if (count === 1) await post("chart:before-snapshot");
+      else if (count === 2) await post("chart:after-snapshot");
+      return result;
+    } })) };
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const request = { periodStart: "2026-08-01", periodEnd: "2026-08-31", limit: 2 };
+    const page = await createErpFinancialsSdk({ ...scope, database }).queries.getAccountChart(request);
+    expect(count).toBe(2);
+    expect(page.summary).toMatchObject({ trialDebit: "124.45", trialCredit: "124.45", postingCount: "4" });
+    expect(page.items.find(item => item.bookAccountKey === "source_1:account_cash")).toMatchObject({ direct: { closingNet: "124.45" } });
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner });
+    await expect(sdk.queries.getAccountChart({ ...request, cursor: registerValue(page.nextCursor) })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    expect((await sdk.queries.getAccountChart(request)).summary).toMatchObject({ trialDebit: "125.45", trialCredit: "125.45", postingCount: "6" });
+  });
+
+  it("account register returns exact bounded pages and one-snapshot opening, closing and running balances", async () => {
+    const bookId = "account-register", { financials, input: reversal } = await depositFixture(bookId);
+    const operation = sdkOperation();
+    const post = (id: string, amount: string, date = "2026-08-12") => financials.deposits.record({ operation: { ...operation, requestId: id }, idempotencyKey: id,
+      date, documentNumber: id, memo: `Register ${id}`, amount, bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+    await post("register:huge", "90071992547409.93"); await post("register:cent", "0.01");
+    await financials.deposits.reverse({ ...reversal, date: "2026-08-13" });
+    let queries = 0;
+    const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async (sql, values) => { queries++; return client.query(sql, values); } })) };
+    const scope = { database, tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(scope), request = { accountKey: "source_1:account_cash", periodStart: "2026-08-11", periodEnd: "2026-08-31", limit: 1 };
+    const first = await sdk.queries.getAccountRegister(request);
+    expect(queries).toBe(2); // One book read, then one snapshot for every financial fact.
+    expect(first).toMatchObject({ account: { bookAccountKey: request.accountKey, classification: "asset" },
+      openingNet: "123.45", debitAmount: "90071992547409.94", creditAmount: "123.45", closingNet: "90071992547409.94", postingCount: "3" });
+    expect(first.items).toHaveLength(1); expect(first.nextCursor).toBeTypeOf("string");
+    const second = await sdk.queries.getAccountRegister({ ...request, cursor: registerValue(first.nextCursor) });
+    const third = await sdk.queries.getAccountRegister({ ...request, cursor: registerValue(second.nextCursor) });
+    expect(third.nextCursor).toBeUndefined();
+    const rows = [...first.items, ...second.items, ...third.items];
+    expect(new Set(rows.map(row => row.postingId)).size).toBe(3);
+    expect(rows.map(row => row.postingDate)).toEqual(["2026-08-12", "2026-08-12", "2026-08-13"]);
+    expect(registerValue(rows[0]).postingId < registerValue(rows[1]).postingId).toBe(true);
+    let cents = 12345n;
+    for (const row of rows) {
+      const minor = (value: string) => BigInt(value.replace(".", ""));
+      cents += minor(row.debitAmount) - minor(row.creditAmount);
+      expect(minor(row.runningNet)).toBe(cents);
+      expect(row.currencyCode).toBe("USD"); expect(row.accountingBasis).toBe("accrual");
+    }
+    expect(registerValue(third.items[0]).runningNet).toBe(third.closingNet);
+    expect((await sdk.queries.getAccountRegister({ ...request, accountingMethod: "cash", limit: 200 })).closingNet).toBe(first.closingNet);
+    expect(await sdk.queries.getAccountRegister({ ...request, accountKey: "source_1:account_income" })).toMatchObject({ openingNet: "0.00", closingNet: "0.00", postingCount: "0", items: [] });
+    await expect(sdk.queries.getAccountRegister({ ...request, accountKey: "missing" })).rejects.toMatchObject({ code: "missing_document" });
+    for (const patch of [{ accountKey: "source_1:account_ar" }, { periodStart: "2026-08-12" }, { accountingMethod: "cash" as const }, { includeDescendants: true }, { sourceId: "other" }]) {
+      await expect(sdk.queries.getAccountRegister({ ...request, ...patch, cursor: registerValue(first.nextCursor) })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const patch of [{ tenantId: "other" }, { companyId: "other" }, { bookId: "other" }]) {
+      await expect(createErpFinancialsSdk({ ...scope, ...patch }).queries.getAccountRegister({ ...request, cursor: registerValue(first.nextCursor) })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const patch of [{ limit: 201 }, { limit: 0 }, { cursor: "bad" }, { periodStart: "2026-02-30" }]) {
+      await expect(sdk.queries.getAccountRegister({ ...request, ...patch })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    const tampered = JSON.parse(Buffer.from(registerValue(first.nextCursor), "base64url").toString("utf8")) as Record<string, unknown>;
+    tampered.runningNet = "999999999999999999.99";
+    expect((await sdk.queries.getAccountRegister({ ...request, cursor: Buffer.from(JSON.stringify(tampered)).toString("base64url") })).items).toEqual(second.items);
+    await financials.fiscalPeriods.define({ operation: { ...operation, requestId: "September" }, fiscalYear: 2026, periodNumber: 9, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    await post("register:future", "10.00", "2026-09-01");
+    expect((await sdk.queries.getAccountRegister({ ...request, cursor: registerValue(first.nextCursor) })).revision).toBe(first.revision);
+    await post("register:backdated", "0.01");
+    await expect(sdk.queries.getAccountRegister({ ...request, cursor: registerValue(first.nextCursor) })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    expect((await sdk.queries.getAccountRegister(request)).closingNet).toBe("90071992547409.95");
+  });
+
+  it("account register isolates direct and descendant activity, effective sources and mapping revisions", async () => {
+    const bookId = "account-register-tree", { financials } = await depositFixture(bookId);
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" });
+    const operation = sdkOperation();
+    await sdk.books.defineAccount({ operation, bookId, expectedVersion: 0, bookAccountKey: "assets", name: "Assets", classification: "asset", accountRole: "header" });
+    await sdk.books.defineAccount({ operation, bookId, expectedVersion: 0, bookAccountKey: "cash", name: "Cash", classification: "asset", accountRole: "posting", parentBookAccountKey: "assets" });
+    await sdk.books.mapAccount({ operation, bookId, sourceId: "source_1", accountId: "account_cash", bookAccountKey: "cash" });
+    await financials.deposits.record({ operation: { ...operation, requestId: "tree:second" }, idempotencyKey: "tree:second", date: "2026-08-11", amount: "1.00", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+    const request = { accountKey: "assets", periodStart: "2026-08-01", periodEnd: "2026-08-31", limit: 1 };
+    expect(await sdk.queries.getAccountRegister(request)).toMatchObject({ postingCount: "0", closingNet: "0.00", items: [] });
+    const hierarchy = await sdk.queries.getAccountRegister({ ...request, includeDescendants: true });
+    expect(hierarchy).toMatchObject({ postingCount: "2", closingNet: "124.45", account: { name: "Assets" } });
+    expect(registerValue(hierarchy.items[0]).bookAccountKey).toBe("cash");
+    expect(await sdk.queries.getAccountRegister({ ...request, accountKey: "cash" })).toMatchObject({ postingCount: "2", closingNet: "124.45" });
+    await sdk.books.defineAccount({ operation: { ...operation, requestId: "tree:rename" }, bookId, expectedVersion: 1, bookAccountKey: "cash", name: "Renamed cash", classification: "asset", accountRole: "posting", parentBookAccountKey: "assets" });
+    await expect(sdk.queries.getAccountRegister({ ...request, includeDescendants: true, cursor: registerValue(hierarchy.nextCursor) })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    await sdk.books.bindSource({ operation: { ...operation, requestId: "tree:cutoff" }, bookId, sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-08-11" });
+    expect(await sdk.queries.getAccountRegister({ ...request, includeDescendants: true })).toMatchObject({ postingCount: "1", openingNet: "0.00", closingNet: "1.00" });
+    expect(await sdk.queries.getAccountRegister({ ...request, includeDescendants: true, sourceId: "not-in-book" })).toMatchObject({ postingCount: "0", closingNet: "0.00" });
+    await sdk.books.defineAccount({ operation: { ...operation, requestId: "tree:receivable" }, bookId, expectedVersion: 0, bookAccountKey: "receivable", name: "Receivable", classification: "asset", accountRole: "posting", parentBookAccountKey: "assets" });
+    await sdk.books.mapAccount({ operation, bookId, sourceId: "source_1", accountId: "account_ar", bookAccountKey: "receivable" });
+    const merged = await sdk.queries.getAccountRegister({ ...request, includeDescendants: true });
+    const mergedNext = await sdk.queries.getAccountRegister({ ...request, includeDescendants: true, cursor: registerValue(merged.nextCursor) });
+    expect(merged).toMatchObject({ postingCount: "2", debitAmount: "1.00", creditAmount: "1.00", closingNet: "0.00" });
+    expect(new Set([...merged.items, ...mergedNext.items].map(item => item.bookAccountKey))).toEqual(new Set(["cash", "receivable"]));
+    expect(registerValue(mergedNext.items[0]).runningNet).toBe("0.00");
+    expect(mergedNext.nextCursor).toBeUndefined();
+  });
+
+  it("account register snapshots caller input and financial facts across concurrent committed writes", async () => {
+    const bookId = "account-register-snapshot", { financials } = await depositFixture(bookId);
+    const request = { accountKey: "source_1:account_cash", periodStart: "2026-08-01", periodEnd: "2026-08-31", limit: 1 };
+    const original = { ...request };
+    const post = (id: string) => financials.deposits.record({ operation: { ...sdkOperation(), requestId: id }, idempotencyKey: id,
+      date: "2026-08-12", amount: "1.00", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+    let queryCount = 0;
+    const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]) => {
+      const result = await client.query<Row>(sql, values);
+      queryCount++;
+      if (queryCount === 1) {
+        // The register must use the caller's original request and include a write
+        // committed before its single financial statement snapshot.
+        Object.assign(request, { accountKey: "missing", periodStart: "1900-01-01", limit: 200 });
+        await post("register:before-snapshot");
+      } else if (queryCount === 2) {
+        // A write after that statement must not leak into just one of the page,
+        // summary or revision. It invalidates the next request's old cursor.
+        await post("register:after-snapshot");
+      }
+      return result;
+    } })) };
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const page = await createErpFinancialsSdk({ ...scope, database }).queries.getAccountRegister(request);
+    expect(page).toMatchObject({ account: { bookAccountKey: original.accountKey }, periodStart: original.periodStart,
+      openingNet: "0.00", closingNet: "124.45", postingCount: "2", items: [{ runningNet: "123.45" }] });
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner });
+    await expect(sdk.queries.getAccountRegister({ ...original, cursor: registerValue(page.nextCursor) })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    expect(await sdk.queries.getAccountRegister(original)).toMatchObject({ closingNet: "125.45", postingCount: "3" });
+  });
+
+  it("account register rejects book archival between metadata and financial snapshots", async () => {
+    const bookId = "account-register-book-race";
+    await depositFixture(bookId);
+    let changed = false;
+    const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]) => {
+      const result = await client.query<Row>(sql, values);
+      if (!changed) {
+        changed = true;
+        await pool.query("update erp_financials.reporting_books set status='archived' where tenant_id='tenant_1' and company_id='company_1' and book_id=$1", [bookId]);
+      }
+      return result;
+    } })) };
+    const sdk = createErpFinancialsSdk({ database, tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" });
+    await expect(sdk.queries.getAccountRegister({ accountKey: "source_1:account_cash", periodStart: "2026-08-01", periodEnd: "2026-08-31" }))
+      .rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+  });
+
+  it("account register preserves credit signs and inactive history without including an unbound source", async () => {
+    const bookId = "account-register-scope";
+    await depositFixture(bookId);
+    await pool.query(`insert into erp_financials.company_sources values ('company_source_2','tenant_1','company_1','source_2',now());
+      insert into erp_financials.accounts (account_id,tenant_id,source_id,source_account_id,name,type,classification,active) values
+        ('other_cash','tenant_1','source_2','cash','Other cash','asset','asset',true),
+        ('other_ar','tenant_1','source_2','ar','Other receivable','asset','asset',true)`);
+    const other = depositService(runner, { sourceId: "source_2" });
+    await other.fiscalPeriods.define({ operation: sdkOperation(), fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    await other.deposits.record({ operation: sdkOperation(), idempotencyKey: "register:unbound", date: "2026-08-12", amount: "1000.00",
+      bankAccount: { accountId: "other_cash" }, clearingAccount: { accountId: "other_ar" } });
+    const scope = { database: runner, tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(scope), request = { accountKey: "source_1:account_ar", periodStart: "2026-08-01", periodEnd: "2026-08-31" };
+    expect(await sdk.queries.getAccountRegister(request)).toMatchObject({ debitAmount: "0.00", creditAmount: "123.45", closingNet: "-123.45", items: [{ runningNet: "-123.45" }] });
+    await sdk.commands.journalEntries.post({ operation: { ...sdkOperation(), requestId: "register:accrual-only" }, idempotencyKey: "register:accrual-only",
+      date: "2026-08-12", lines: [{ accountId: "account_income", debit: "5.00" }, { accountId: "account_ar", credit: "5.00" }] });
+    expect(await sdk.queries.getAccountRegister(request)).toMatchObject({ closingNet: "-128.45", postingCount: "2" });
+    expect(await sdk.queries.getAccountRegister({ ...request, accountingMethod: "cash" })).toMatchObject({ closingNet: "-123.45", postingCount: "1" });
+    await pool.query("update erp_financials.accounts set active=false where tenant_id='tenant_1' and source_id='source_1' and account_id='account_ar'");
+    expect(await sdk.queries.getAccountRegister(request)).toMatchObject({ account: { active: false }, closingNet: "-128.45", postingCount: "2" });
+    await expect(sdk.queries.getAccountRegister({ ...request, accountKey: "source_2:other_cash" })).rejects.toMatchObject({ code: "missing_document" });
+    expect(await sdk.queries.getAccountRegister({ ...request, sourceId: "source_2" })).toMatchObject({ closingNet: "0.00", postingCount: "0", items: [] });
+    for (const foreign of [{ tenantId: "tenant_other" }, { companyId: "company_other" }, { bookId: "book_other" }]) {
+      await expect(createErpFinancialsSdk({ ...scope, ...foreign }).queries.getAccountRegister(request)).rejects.toMatchObject({ code: "missing_book" });
+    }
+  });
+
+  it("account register rejects sub-cent stored facts instead of silently truncating balances", async () => {
+    const bookId = "account-register-precision";
+    await depositFixture(bookId);
+    await pool.query(`insert into erp_financials.ledger_postings
+      (posting_id,tenant_id,source_id,source_posting_id,transaction_id,account_id,posting_date,accounting_basis,
+        debit_amount,credit_amount,net_amount,currency_code,dimension_hash,dimension_refs,import_batch_id)
+      values ('subcent-debit','tenant_1','source_1','subcent-debit','journal_1','account_cash','2026-08-12','accrual',
+        0.001,0,0.001,'USD',repeat('0',64),'[]','batch_1'),
+      ('subcent-credit','tenant_1','source_1','subcent-credit','journal_1','account_ar','2026-08-12','accrual',
+        0,0.001,-0.001,'USD',repeat('0',64),'[]','batch_1'),
+      ('subcent-debit-two','tenant_1','source_1','subcent-debit-two','journal_1','account_cash','2026-08-12','accrual',
+        0.009,0,0.009,'USD',repeat('0',64),'[]','batch_1'),
+      ('subcent-credit-two','tenant_1','source_1','subcent-credit-two','journal_1','account_ar','2026-08-12','accrual',
+        0,0.009,-0.009,'USD',repeat('0',64),'[]','batch_1')`);
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" });
+    await expect(sdk.queries.getAccountChart({ periodStart: "2026-08-01", periodEnd: "2026-08-31" })).rejects.toMatchObject({ code: "invalid_input", message: "Account chart contains unsupported sub-cent accounting amounts" });
+    for (const filter of [{}, { search: "no-match" }]) {
+      await expect(sdk.queries.getJournalRegister({ periodStart: "2026-08-01", periodEnd: "2026-08-31", ...filter })).rejects.toMatchObject({ code: "invalid_input", message: "Journal report contains unsupported sub-cent accounting amounts" });
+    }
+    await expect(sdk.queries.getJournalPostingPage({ sourceId: "source_1", transactionId: "journal_1", periodStart: "2026-08-01", periodEnd: "2026-08-31", limit: 1 })).rejects.toMatchObject({ code: "invalid_input" });
+    for (const periodStart of ["2026-08-01", "2026-08-13"]) {
+      await expect(sdk.queries.getAccountRegister({ accountKey: "source_1:account_cash", periodStart, periodEnd: "2026-08-31", limit: 1 }))
+        .rejects.toMatchObject({ code: "invalid_input", message: "Account register contains unsupported sub-cent accounting amounts" });
+    }
+  });
+
+  async function canonicalCloseFixture() {
+    const { deposit } = await depositFixture("canonical-close");
+    const scope = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "canonical-close", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    const fiscalPeriodId = String((await pool.query<Record<string, unknown>>("select fiscal_period_id from erp_financials.fiscal_periods")).rows[0]?.fiscal_period_id);
+    const postingId = String((await pool.query<Record<string, unknown>>("select posting_id from erp_financials.ledger_postings where transaction_id=$1 and account_id='account_cash' and accounting_basis='accrual'", [deposit.journal.transactionId])).rows[0]?.posting_id);
+    const statement = await sdk.bankStatements.prepare({ operation, idempotencyKey: "cert:statement", expectedVersion: 0, externalStatementId: "August-end", accountId: "account_cash", statementDate: "2026-08-31", closingBalance: "123.45", addPostingIds: [postingId] });
+    const completed = await sdk.bankStatements.complete({ operation: { ...operation, actorRef: "statement-controller" }, idempotencyKey: "cert:statement-complete", expectedVersion: 1, statementId: statement.statementId });
+    const command = { operation, idempotencyKey: "cert:close", expectedVersion: 1, bookId: scope.bookId, bankAccountIds: ["account_cash", "account_income"], fiscalPeriodId };
+    const reviewed = await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", fiscalPeriodId, command.bankAccountIds);
+    return { sdk, scope, command: { ...command, expectedApprovalToken: reviewed.approvalToken }, completed };
+  }
+
+  it("journal posting detail exposes canonical line identities for subledger journals without manual preparer events",async()=>{
+    const {sdk,bill}=await paymentHoldFixture();
+    await expect(sdk.queries.getJournalEntry(bill.journal.transactionId)).rejects.toMatchObject({code:"missing_document"});
+    const request={sourceId:"source_1",transactionId:bill.journal.transactionId,periodStart:"2026-08-01",periodEnd:"2026-08-01",limit:1};
+    const first=await sdk.queries.getJournalPostingPage(request);
+    if(!first.nextCursor)throw Error("Missing journal posting cursor");
+    const second=await sdk.queries.getJournalPostingPage({...request,cursor:first.nextCursor});
+    expect(second.nextCursor).toBeUndefined();
+    const lines=[...first.items,...second.items].sort((a,b)=>(a.transactionLineNumber??-1)-(b.transactionLineNumber??-1));
+    expect(lines.map(line=>line.transactionLineId)).toEqual(bill.journal.transactionLineIds);
+    expect(lines.map(line=>line.transactionLineNumber)).toEqual([1,2]);
+    expect(lines.map(line=>[line.accountId,line.debitAmount,line.creditAmount])).toEqual([["account_cash","100.00","0.00"],["account_ap","0.00","100.00"]]);
+    expect(first.revision).toBe(second.revision);
+    await expect(sdk.queries.getJournalPostingPage({...request,sourceId:"foreign_source"})).rejects.toMatchObject({code:"missing_document"});
+  });
+
+  it("journal posting detail rejects imported line linkage to another transaction",async()=>{
+    await migratePostgresSchema(runner,{appliedByRef:"test:cross-journal-line"});
+    const base=quickBooksSubledgerFacts();
+    const facts:CanonicalAccountingFactSet={...base,
+      transactionLines:[{tenantId:"tenant_qbo",sourceId:"source_qbo",transactionLineId:"wrong-parent-line",transactionId:"transaction_payment_qbo",lineNumber:1,amount:"1.00",dimensionRefs:[]}],
+      postings:[{tenantId:"tenant_qbo",sourceId:"source_qbo",postingId:"wrong-line-posting",sourcePostingId:"wrong-line-posting",transactionId:"transaction_invoice_qbo",transactionLineId:"wrong-parent-line",accountId:"account_cash_qbo",postingDate:"2026-08-01",accountingBasis:"accrual",debitAmount:"1.00",creditAmount:"0.00",netAmount:"1.00",currencyCode:"USD",dimensionHash:"a".repeat(64),dimensionRefs:[],importBatchId:"batch_qbo"}]};
+    await runner.transaction(client=>persistCanonicalFacts(createPostgresStorageAdapter(client),facts));
+    const scope={tenantId:"tenant_qbo",companyId:"company_qbo",bookId:"journal-invalid-line",writeSourceId:"source_qbo",currencyCode:"USD"};
+    const sdk=createErpFinancialsSdk({...scope,database:runner});
+    await sdk.books.define({operation:sdkOperation(),bookId:scope.bookId,name:"Import",baseCurrencyCode:"USD"});
+    await sdk.books.bindSource({operation:sdkOperation(),bookId:scope.bookId,sourceId:scope.writeSourceId,sourceRole:"historical"});
+    await expect(sdk.queries.getJournalPostingPage({sourceId:"source_qbo",transactionId:"transaction_invoice_qbo",periodStart:"2026-08-01",periodEnd:"2026-08-01"})).rejects.toMatchObject({code:"invalid_input",message:"Canonical journal line linkage is incomplete"});
+  });
+
+  async function applicationReplayFixture(){
+    const {sdk,options,operation}=await paymentHoldFixture();
+    const invoice=await sdk.commands.invoices.create({operation,idempotencyKey:"replay:invoice",customerId:"customer_1",date:"2026-08-01",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"10.00"}]});
+    const receipt=await sdk.commands.customerPayments.record({operation,idempotencyKey:"replay:receipt",customerId:"customer_1",date:"2026-08-01",amount:"10.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    const replayOperation: {-readonly [Key in keyof FinancialOperationContext]:FinancialOperationContext[Key]}={...operation};
+    const command={operation:replayOperation,idempotencyKey:"replay:application",applicationType:"customer_payment_to_invoice" as const,sourceDocumentId:receipt.documentId,targetDocumentId:invoice.documentId,amount:"10.00",applicationDate:"2026-08-01",expectedSourceVersion:1,expectedTargetVersion:1};
+    return {sdk,options,command};
+  }
+
+  it.each(["actor","approver","reason","source-version","target-version"] as const)("application replay rejects changed %s while identical retries keep one receipt",async field=>{
+    const {sdk,command}=await applicationReplayFixture();
+    const applied=await sdk.commands.paymentApplications.apply(command);
+    expect((await sdk.commands.paymentApplications.apply({...command,operation:{...command.operation,requestId:"fresh-transport"}})).applicationId).toBe(applied.applicationId);
+    const changed={...command,operation:{...command.operation}};
+    if(field==="actor")changed.operation.actorRef="other:actor";
+    if(field==="approver")changed.operation.approverRef="other:approver";
+    if(field==="reason")changed.operation.reasonCode="other:reason";
+    if(field==="source-version")changed.expectedSourceVersion=2;
+    if(field==="target-version")changed.expectedTargetVersion=2;
+    const before=await depositDatabaseState(pool);
+    await expect(sdk.commands.paymentApplications.apply(changed)).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  async function bankCommandFixture(){
+    const {sdk,options,operation}=await paymentHoldFixture();
+    const journal=await sdk.commands.journalEntries.post({operation,idempotencyKey:"bank-command:journal",date:"2026-08-01",lines:[{accountId:"account_cash",debit:"10.00"},{accountId:"account_income",credit:"10.00"}]});
+    const mutableOperation:{-readonly [Key in keyof FinancialOperationContext]:FinancialOperationContext[Key]}={...operation};
+    const ingestion={operation:mutableOperation,externalLineId:"bank-command:line",bankAccountId:"account_cash",postedDate:"2026-08-01",amount:"10.00",reference:"original-reference"};
+    const line=await sdk.bankReconciliation.ingest(ingestion);
+    const command={operation:mutableOperation,bankStatementLineId:line.bankStatementLineId,transactionId:journal.transactionId,expectedVersion:1,idempotencyKey:"bank-command:match",method:"manual" as const};
+    return {sdk,options,ingestion,command};
+  }
+
+  it.each(["actor","approver","reason","expected-version"] as const)("bank match replay rejects changed %s and retains one command",async field=>{
+    const {sdk,command}=await bankCommandFixture();
+    const first=await sdk.bankReconciliation.match(command);
+    expect((await sdk.bankReconciliation.match({...command,operation:{...command.operation,requestId:"fresh-transport"}})).bankReconciliationMatchId).toBe(first.bankReconciliationMatchId);
+    const changed={...command,operation:{...command.operation}};
+    if(field==="actor")changed.operation.actorRef="changed:actor";
+    if(field==="approver")changed.operation.approverRef="changed:approver";
+    if(field==="reason")changed.operation.reasonCode="changed:reason";
+    if(field==="expected-version")changed.expectedVersion=2;
+    const before=await depositDatabaseState(pool);
+    await expect(sdk.bankReconciliation.match(changed)).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("bank match snapshots caller command before asynchronous transaction entry",async()=>{
+    const {options,command}=await bankCommandFixture(),original=structuredClone(command);
+    const sdk=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>{command.idempotencyKey="mutated:match";command.operation.actorRef="mutated:actor";return work(client);})}});
+    const result=await sdk.bankReconciliation.match(command);
+    const stored=await pool.query(`select match.idempotency_key,event.actor_ref from erp_financials.bank_reconciliation_matches match join erp_financials.financial_lifecycle_events event on event.event_id=match.lifecycle_event_id where match.bank_reconciliation_match_id=$1`,[result.bankReconciliationMatchId]);
+    expect(stored.rows).toEqual([{idempotency_key:original.idempotencyKey,actor_ref:original.operation.actorRef}]);
+  });
+
+  it("bank ingestion snapshots caller reference and actor before asynchronous transaction entry",async()=>{
+    const {options,ingestion}=await bankCommandFixture();
+    ingestion.externalLineId="bank-command:second-line";const original=structuredClone(ingestion);
+    const sdk=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>{ingestion.reference="mutated-reference";ingestion.operation.actorRef="mutated:actor";return work(client);})}});
+    const result=await sdk.bankReconciliation.ingest(ingestion);
+    const stored=await pool.query(`select line.reference,event.actor_ref from erp_financials.bank_statement_lines line join erp_financials.financial_lifecycle_events event on event.aggregate_id=line.bank_statement_line_id and event.event_type='bank_statement_line.ingested' where line.bank_statement_line_id=$1`,[result.bankStatementLineId]);
+    expect(stored.rows).toEqual([{reference:original.reference,actor_ref:original.operation.actorRef}]);
+  });
+
+  it("bank ingestion retry accepts fresh transport metadata and preserves original audit",async()=>{
+    const {sdk,ingestion}=await bankCommandFixture();const before=await depositDatabaseState(pool);
+    await expect(sdk.bankReconciliation.ingest({...ingestion,operation:{...ingestion.operation,requestId:"fresh-ingestion-transport",correlationId:"fresh-correlation"}})).resolves.toMatchObject({externalLineId:ingestion.externalLineId});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["actor","expected-version"] as const)("bank unmatch replay rejects changed %s",async field=>{
+    const {sdk,command}=await bankCommandFixture();const matched=await sdk.bankReconciliation.match(command);
+    const input={operation:{...command.operation},bankReconciliationMatchId:matched.bankReconciliationMatchId,expectedVersion:1};
+    await sdk.bankReconciliation.unmatch(input);
+    const changed={...input,operation:{...input.operation}};
+    if(field==="actor")changed.operation.actorRef="changed:actor";else changed.expectedVersion=2;
+    const before=await depositDatabaseState(pool);
+    await expect(sdk.bankReconciliation.unmatch(changed)).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("bank ignore exact retry preserves its original receipt under fresh transport metadata",async()=>{
+    const {sdk,command}=await bankCommandFixture();
+    const input={operation:command.operation,bankStatementLineId:command.bankStatementLineId,expectedVersion:1};
+    const first=await sdk.bankReconciliation.ignore(input),before=await depositDatabaseState(pool);
+    expect(await sdk.bankReconciliation.ignore({...input,operation:{...input.operation,requestId:"fresh-ignore"}})).toEqual(first);
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(sdk.bankReconciliation.ignore({...input,operation:{...input.operation,actorRef:"changed:actor"}})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["ignore","unmatch","unignore"] as const)("bank disposition %s captures the original actor before asynchronous work",async action=>{
+    const {sdk,options,command}=await bankCommandFixture();
+    const operation:{-readonly [Key in keyof FinancialOperationContext]:FinancialOperationContext[Key]}={...command.operation,reasonDetail:"Reviewed bank disposition"};
+    const original=structuredClone(operation);
+    const target=action==="unmatch"?(await sdk.bankReconciliation.match(command)).bankReconciliationMatchId:command.bankStatementLineId;
+    if(action==="unignore")await sdk.bankReconciliation.ignore({operation,bankStatementLineId:target,expectedVersion:1});
+    const capturing=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>{operation.actorRef="mutated:disposition";return work(client);})}});
+    if(action==="ignore")await capturing.bankReconciliation.ignore({operation,bankStatementLineId:target,expectedVersion:1});
+    else if(action==="unmatch")await capturing.bankReconciliation.unmatch({operation,bankReconciliationMatchId:target,expectedVersion:1});
+    else await capturing.bankReconciliation.unignore({operation,bankStatementLineId:target,expectedVersion:2});
+    const eventType=action==="ignore"?"bank_statement_line.ignored":action==="unignore"?"bank_statement_line.unignored":"bank_reconciliation.unmatched";
+    expect((await pool.query("select actor_ref from erp_financials.financial_lifecycle_events where aggregate_id=$1 and event_type=$2",[target,eventType])).rows).toEqual([{actor_ref:original.actorRef}]);
+  });
+
+  it("bank command failure rolls back its writes even when an ambient host catches the error",async()=>{
+    const {options,ingestion}=await bankCommandFixture();const before=await depositDatabaseState(pool);
+    await runner.transaction(async client=>{
+      const sdk=createErpFinancialsSdk({...options,database:{transaction:work=>work({query:async <Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{
+        const result=await client.query<Row>(sql,values);
+        if(sql.startsWith('insert into "erp_financials"."bank_statement_lines"'))throw Error("after-bank-line failure");
+        return result;
+      }})}});
+      await expect(sdk.bankReconciliation.ingest({...ingestion,externalLineId:"bank-command:crash"})).rejects.toThrow("after-bank-line failure");
+    });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("historical bank matches remain retained but cannot invent their original optimistic version",async()=>{
+    const {sdk,options,command}=await bankCommandFixture();
+    const historical=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({query:async <Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{
+      const parameters=[...(values??[])];
+      if(sql.startsWith('insert into "erp_financials"."financial_lifecycle_events"')&&parameters[6]==="bank_reconciliation.matched"){
+        const payload=JSON.parse(String(parameters[17])) as Record<string,unknown>;
+        const serialized=JSON.stringify(Object.fromEntries(Object.entries(payload).filter(([key])=>!["commandVersion","commandChecksum","expectedVersion"].includes(key)).sort(([a],[b])=>a.localeCompare(b))));
+        parameters[16]=createHash("sha256").update(serialized).digest("hex");parameters[17]=serialized;
+      }
+      return client.query<Row>(sql,parameters);
+    }}))}});
+    const matched=await historical.bankReconciliation.match(command),before=await depositDatabaseState(pool);
+    await expect(sdk.bankReconciliation.match(command)).rejects.toMatchObject({code:"unsupported_operation"});
+    expect(await sdk.queries.findBankMatchCommandByKey({sourceId:"source_1",idempotencyKey:command.idempotencyKey})).toMatchObject({originalExpectedVersion:null,status:"matched"});
+    expect((await sdk.queries.listBankReconciliation({status:"matched"})).items).toContainEqual(expect.objectContaining({bankReconciliationMatchId:matched.bankReconciliationMatchId}));
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("concurrent bank match retries preserve one actor and never reopen an ended match",async()=>{
+    const {sdk,command}=await bankCommandFixture();
+    const outcomes=await Promise.allSettled([sdk.bankReconciliation.match(command),sdk.bankReconciliation.match({...command,operation:{...command.operation,actorRef:"other:actor"}})]);
+    expect(outcomes.filter(result=>result.status==="fulfilled")).toHaveLength(1);
+    const rejected=outcomes.find(result=>result.status==="rejected");expect(rejected?.status==="rejected"?rejected.reason:undefined).toMatchObject({code:"idempotency_conflict"});
+    const winner=outcomes.find(result=>result.status==="fulfilled");if(!winner)throw Error("Missing winning match");
+    const unmatch={operation:command.operation,bankReconciliationMatchId:winner.value.bankReconciliationMatchId,expectedVersion:1};
+    const ended=await sdk.bankReconciliation.unmatch(unmatch),before=await depositDatabaseState(pool);
+    expect(await sdk.bankReconciliation.unmatch({...unmatch,operation:{...unmatch.operation,requestId:"fresh-unmatch"}})).toEqual(ended);
+    await expect(sdk.bankReconciliation.match(command)).rejects.toMatchObject({code:"terminal_state_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["ingest","match","unmatch","ignore","unignore"] as const)("bank %s rolls back late outbox failures caught by an ambient host",async action=>{
+    const {sdk,options,ingestion,command}=await bankCommandFixture();
+    const operation={...command.operation,reasonDetail:"Reviewed disposition"};
+    const target=action==="unmatch"?(await sdk.bankReconciliation.match(command)).bankReconciliationMatchId:command.bankStatementLineId;
+    if(action==="unignore")await sdk.bankReconciliation.ignore({operation,bankStatementLineId:target,expectedVersion:1});
+    const before=await depositDatabaseState(pool);let injected=false;
+    await runner.transaction(async client=>{
+      const local=createErpFinancialsSdk({...options,database:{transaction:work=>work({query:async <Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{
+        const result=await client.query<Row>(sql,values);
+        if(sql.startsWith('insert into "erp_financials"."financial_outbox"')){injected=true;throw Error("late-bank-outbox failure");}
+        return result;
+      }})}});
+      const attempt=action==="ingest"?local.bankReconciliation.ingest({...ingestion,externalLineId:"bank-command:late-failure"}):action==="match"?local.bankReconciliation.match(command):action==="unmatch"?local.bankReconciliation.unmatch({operation,bankReconciliationMatchId:target,expectedVersion:1}):action==="ignore"?local.bankReconciliation.ignore({operation,bankStatementLineId:target,expectedVersion:1}):local.bankReconciliation.unignore({operation,bankStatementLineId:target,expectedVersion:2});
+      await expect(attempt).rejects.toThrow("late-bank-outbox failure");
+      expect((await client.query("select 1 as healthy")).rows).toEqual([{healthy:1}]);
+    });
+    expect(injected).toBe(true);expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["ignore","unmatch","unignore"] as const)("bank %s retains a real administrator capability through input capture and replay",async action=>{
+    const {sdk,options,command}=await bankCommandFixture();
+    const target=action==="unmatch"?(await sdk.bankReconciliation.match(command)).bankReconciliationMatchId:command.bankStatementLineId;
+    if(action==="unignore")await sdk.bankReconciliation.ignore({operation:command.operation,bankStatementLineId:target,expectedVersion:1});
+    const input={operation:{...command.operation,approverRef:command.operation.actorRef,reasonDetail:"Reviewed bank correction"},bankStatementLineId:target,bankReconciliationMatchId:target,expectedVersion:action==="unignore"?2:1};
+    const financialAction=action==="ignore"?"bankReconciliation.ignore":action==="unmatch"?"bankReconciliation.unmatch":"bankReconciliation.unignore";
+    const scope={...options,sourceId:options.writeSourceId,accountingBasis:"accrual" as const,postingPolicy:"enforce_fiscal_periods" as const};
+    const checksum=createFinancialActionCommandChecksum(scope,financialAction,input);
+    const admin=createErpFinancialsSdk({...options,financialApprovalPolicy:{mode:"administrator_direct",actions:[financialAction],guard:request=>Promise.resolve({...scope,action:financialAction,actorRef:input.operation.actorRef,requestId:input.operation.requestId,commandChecksum:checksum,active:true,administrator:true,confirmed:request.commandChecksum===checksum})}});
+    const confirmed={...input,operation:{...input.operation,administratorConfirmation:{confirmationRef:"bank-fixture-confirmation",commandChecksum:checksum}}};
+    const invoke=(target:ErpFinancialsSdk)=>action==="ignore"?target.bankReconciliation.ignore(confirmed):action==="unmatch"?target.bankReconciliation.unmatch(confirmed):target.bankReconciliation.unignore(confirmed);
+    await expect(invoke(sdk)).rejects.toMatchObject({code:"authorization_context_invalid"});
+    const first=await invoke(admin),before=await depositDatabaseState(pool);expect(await invoke(admin)).toEqual(first);expect(await depositDatabaseState(pool)).toEqual(before);
+    const eventType=action==="ignore"?"bank_statement_line.ignored":action==="unmatch"?"bank_reconciliation.unmatched":"bank_statement_line.unignored";
+    expect((await pool.query("select actor_ref,approver_ref,payload->'financialApproval' approval from erp_financials.financial_lifecycle_events where aggregate_id=$1 and event_type=$2",[target,eventType])).rows).toMatchObject([{actor_ref:input.operation.actorRef,approver_ref:input.operation.actorRef,approval:{action:financialAction,policy:"administrator_direct",commandChecksum:checksum}}]);
+  });
+
+  it("bank command lookup is exact scoped bounded and retains original versions after unmatch",async()=>{
+    const {sdk,options,command}=await bankCommandFixture();
+    const literal={...command,idempotencyKey:` literal:${"k".repeat(350)}:%_ `},key={sourceId:"source_1",idempotencyKey:literal.idempotencyKey};
+    expect(await sdk.queries.findBankMatchCommandByKey(key)).toBeNull();
+    const matched=await sdk.bankReconciliation.match(literal);let reads=0;
+    const reader=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({query:async <Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{reads++;return client.query<Row>(sql,values);}}))}});
+    expect(await reader.queries.findBankMatchCommandByKey(key)).toEqual({bankReconciliationMatchId:matched.bankReconciliationMatchId,sourceId:key.sourceId,idempotencyKey:key.idempotencyKey,bankStatementLineId:command.bankStatementLineId,transactionId:command.transactionId,method:"manual",status:"matched",version:1,matchedAmount:"10.00",originalExpectedVersion:1});expect(reads).toBe(1);
+    for(const request of [{...key,sourceId:"foreign"},{...key,idempotencyKey:key.idempotencyKey.trim()},{...key,idempotencyKey:" literal:"}])expect(await sdk.queries.findBankMatchCommandByKey(request)).toBeNull();
+    for(const request of [{...key,sourceId:""},{...key,idempotencyKey:""}])await expect(sdk.queries.findBankMatchCommandByKey(request)).rejects.toMatchObject({code:"invalid_input"});
+    for(const foreign of [{...options,tenantId:"foreign"},{...options,companyId:"foreign"},{...options,bookId:"foreign"}])await expect(createErpFinancialsSdk(foreign).queries.findBankMatchCommandByKey(key)).rejects.toMatchObject({code:"missing_book"});
+    const other=createErpFinancialsSdk({...options,bookId:"bank-other-book"});
+    await other.books.define({operation:command.operation,bookId:"bank-other-book",name:"Other",baseCurrencyCode:"USD"});
+    await other.books.bindSource({operation:command.operation,bookId:"bank-other-book",sourceId:"source_1",sourceRole:"active",effectiveFrom:"2026-01-01"});
+    expect(await other.queries.findBankMatchCommandByKey(key)).toBeNull();
+    const mutable={...key};const capturing=createErpFinancialsSdk({...options,database:{transaction:work=>{mutable.idempotencyKey="changed";return runner.transaction(work);}}});
+    expect((await capturing.queries.findBankMatchCommandByKey(mutable))?.bankReconciliationMatchId).toBe(matched.bankReconciliationMatchId);
+    await sdk.bankReconciliation.unmatch({operation:command.operation,bankReconciliationMatchId:matched.bankReconciliationMatchId,expectedVersion:1});
+    expect(await sdk.queries.findBankMatchCommandByKey(key)).toMatchObject({status:"unmatched",version:2,originalExpectedVersion:1});
+    const inactive=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(async client=>{
+      await client.query("update erp_financials.reporting_books set status='archived' where book_id=$1",[options.bookId]);return work(client);
+    })}});
+    await expect(inactive.queries.findBankMatchCommandByKey(key)).rejects.toMatchObject({code:"terminal_state_conflict"});
+  });
+
+  it("bill payment command lookup retains exact scoped ordered allocation versions after later payments",async()=>{
+    const {sdk,options,operation,payment}=await paymentHoldFixture();
+    const baseAllocation=payment.allocations[0];if(!baseAllocation)throw Error("Missing fixture allocation");
+    const secondBill=await sdk.commands.vendorBills.create({operation,idempotencyKey:"command:second-bill",date:"2026-08-01",dueDate:"2026-08-31",vendorId:"vendor_1",payableAccount:{accountId:"account_ap"},expenseLines:[{accountId:"account_cash",amount:"100.00"}]});
+    const command={...payment,idempotencyKey:` literal:${"k".repeat(350)}:%_ `,allocations:[{...baseAllocation,amount:"12.00"},{billId:secondBill.documentId,amount:"8.00",expectedBillVersion:1}]};
+    const firstAllocation=command.allocations[0],secondAllocation=command.allocations[1];if(!firstAllocation||!secondAllocation)throw Error("Missing fixture allocations");
+    const key={sourceId:"source_1",idempotencyKey:command.idempotencyKey};
+    expect(await sdk.queries.findBillPaymentCommandByKey(key)).toBeNull();
+    const first=await sdk.commands.billPayments.recordAndApply(command);
+    await sdk.commands.billPayments.recordAndApply({...payment,idempotencyKey:"command:later-payment",allocations:[{...baseAllocation,expectedBillVersion:2}]});
+    const before=await depositDatabaseState(pool),queries:string[]=[];
+    const reader=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({query:async <Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{queries.push(sql);return client.query<Row>(sql,values);}}))}});
+    expect(await reader.queries.findBillPaymentCommandByKey(key)).toEqual({paymentId:first.billPaymentId,sourceId:"source_1",idempotencyKey:command.idempotencyKey,status:"cleared",version:2,allocations:command.allocations});
+    expect(queries).toHaveLength(1);
+    expect((await sdk.queries.getVendorBill(baseAllocation.billId,"2026-08-31")).version).toBe(3);
+    expect((await sdk.commands.billPayments.recordAndApply(command)).status).toBe("already_cleared");
+    await expect(sdk.commands.billPayments.recordAndApply({...command,allocations:[{...firstAllocation,expectedBillVersion:3},secondAllocation]})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    for(const request of [{...key,sourceId:"foreign"},{...key,idempotencyKey:key.idempotencyKey.trim()},{...key,idempotencyKey:" literal:"}])expect(await sdk.queries.findBillPaymentCommandByKey(request)).toBeNull();
+    for(const request of [{...key,sourceId:""},{...key,idempotencyKey:""}])await expect(sdk.queries.findBillPaymentCommandByKey(request)).rejects.toMatchObject({code:"invalid_input"});
+    for(const foreign of [{...options,tenantId:"foreign"},{...options,companyId:"foreign"}])await expect(createErpFinancialsSdk(foreign).queries.findBillPaymentCommandByKey(key)).rejects.toMatchObject({code:"missing_book"});
+    const other=createErpFinancialsSdk({...options,bookId:"command-other-book"});
+    await other.books.define({operation,bookId:"command-other-book",name:"Other",baseCurrencyCode:"USD"});
+    await other.books.bindSource({operation,bookId:"command-other-book",sourceId:"source_1",sourceRole:"active",effectiveFrom:"2026-01-01"});
+    expect(await other.queries.findBillPaymentCommandByKey(key)).toBeNull();
+    const mutable={...key};
+    const capturing=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>{mutable.idempotencyKey="changed";return work(client);})}});
+    expect((await capturing.queries.findBillPaymentCommandByKey(mutable))?.paymentId).toBe(first.billPaymentId);
+  });
+
+  it("bill payment command lookup preserves cancelled instructions and checks book state in its one snapshot",async()=>{
+    const {sdk,options,operation,payment}=await paymentHoldFixture();
+    const key={sourceId:"source_1",idempotencyKey:payment.idempotencyKey};
+    const scheduled=await sdk.commands.billPayments.schedule(payment);
+    expect(await sdk.queries.findBillPaymentCommandByKey(key)).toMatchObject({status:"scheduled",version:1,allocations:payment.allocations});
+    await sdk.commands.billPayments.cancel({operation,billPaymentId:scheduled.billPaymentId,expectedVersion:1,idempotencyKey:"command:cancel"});
+    expect(await sdk.queries.findBillPaymentCommandByKey(key)).toMatchObject({status:"voided",version:2,allocations:payment.allocations});
+    let calls=0;
+    const reader=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({query:async <Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{
+      calls++;await pool.query("update erp_financials.reporting_books set status='archived' where tenant_id=$1 and company_id=$2 and book_id=$3",[options.tenantId,options.companyId,options.bookId]);
+      return client.query<Row>(sql,values);
+    }}))}});
+    await expect(reader.queries.findBillPaymentCommandByKey(key)).rejects.toMatchObject({code:"terminal_state_conflict"});
+    expect(calls).toBe(1);
+  });
+
+  it("exact application command lookup retains original versions across later applications and ended state",async()=>{
+    const {sdk,options,command}=await applicationReplayFixture();
+    const original={...command,idempotencyKey:` exact:${"k".repeat(350)}:%_ `,amount:"1.00"};
+    expect(await sdk.queries.findPaymentApplicationByKey({sourceId:"source_1",idempotencyKey:original.idempotencyKey})).toBeNull();
+    const first=await sdk.commands.paymentApplications.apply(original);
+    await sdk.commands.paymentApplications.apply({...original,idempotencyKey:"second",expectedSourceVersion:2,expectedTargetVersion:2});
+    const lookup={sourceId:"source_1",idempotencyKey:original.idempotencyKey};
+    const receipt=await sdk.queries.findPaymentApplicationByKey(lookup);
+    expect(receipt).toMatchObject({application:{applicationId:first.applicationId,status:"applied",amount:"1.00"},idempotencyKey:original.idempotencyKey,originalExpectedVersions:{source:1,target:1}});
+    expect((await sdk.queries.getCustomerPayment(command.sourceDocumentId)).version).toBe(3);
+    for(const other of [{...lookup,sourceId:"foreign"},{...lookup,idempotencyKey:original.idempotencyKey.trim()},{...lookup,idempotencyKey:" exact:"}])expect(await sdk.queries.findPaymentApplicationByKey(other)).toBeNull();
+    for(const invalid of [{...lookup,sourceId:""},{...lookup,idempotencyKey:""}])await expect(sdk.queries.findPaymentApplicationByKey(invalid)).rejects.toMatchObject({code:"invalid_input"});
+    for(const foreign of [{...options,tenantId:"foreign"},{...options,companyId:"foreign"}])await expect(createErpFinancialsSdk(foreign).queries.findPaymentApplicationByKey(lookup)).rejects.toMatchObject({code:"missing_book"});
+    const other=createErpFinancialsSdk({...options,bookId:"application-other-book"});
+    await other.books.define({operation:command.operation,bookId:"application-other-book",name:"Other",baseCurrencyCode:"USD"});
+    expect(await other.queries.findPaymentApplicationByKey(lookup)).toBeNull();
+    await other.books.bindSource({operation:command.operation,bookId:"application-other-book",sourceId:"source_1",sourceRole:"active",effectiveFrom:"2026-09-01"});
+    expect(await other.queries.findPaymentApplicationByKey(lookup)).toBeNull();
+    await sdk.commands.paymentApplications.unapply({operation:command.operation,applicationId:first.applicationId,expectedVersion:1,effectiveDate:"2026-08-02"});
+    expect(await sdk.queries.findPaymentApplicationByKey(lookup)).toMatchObject({application:{status:"unapplied"},originalExpectedVersions:{source:1,target:1}});
+    const before=await depositDatabaseState(pool);
+    await expect(sdk.commands.paymentApplications.apply(original)).rejects.toThrow("cannot be replayed");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const mutated={...lookup};
+    const capturing=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>{mutated.idempotencyKey="other";return work(client);})}});
+    expect((await capturing.queries.findPaymentApplicationByKey(mutated))?.application.applicationId).toBe(first.applicationId);
+  });
+
+  function historicalApplicationSdk(options:Parameters<typeof createErpFinancialsSdk>[0]){
+    return createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({query:async <Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{
+      const parameters=[...(values??[])];
+      if(sql.startsWith('insert into "erp_financials"."financial_lifecycle_events"')&&parameters[6]==="subledger_application.applied"){
+        const payload=JSON.parse(String(parameters[17])) as Record<string,unknown>;
+        const omitted=["commandVersion","commandChecksum","expectedSourceVersion","expectedTargetVersion"];
+        const serialized=JSON.stringify(Object.fromEntries(Object.entries(payload).filter(([key])=>!omitted.includes(key)).sort(([a],[b])=>a.localeCompare(b))));
+        parameters[16]=createHash("sha256").update(serialized).digest("hex");parameters[17]=serialized;
+      }
+      return client.query<Row>(sql,parameters);
+    }}))}});
+  }
+
+  it("application retries without historical command evidence remain readable but cannot invent the original versions",async()=>{
+    const {sdk,options,command}=await applicationReplayFixture();
+    // Seed the prior receipt format at insertion, with a valid payload digest.
+    // Never rewrite immutable stored history or disable database guards.
+    const historical=historicalApplicationSdk(options);
+    const applied=await historical.commands.paymentApplications.apply(command);
+    const before=await depositDatabaseState(pool);
+    expect(await sdk.queries.getPaymentApplication(applied.applicationId)).toMatchObject({status:"applied",amount:"10.00"});
+    expect(await sdk.queries.findPaymentApplicationByKey({sourceId:"source_1",idempotencyKey:command.idempotencyKey})).toMatchObject({application:{applicationId:applied.applicationId},originalExpectedVersions:null});
+    await expect(sdk.commands.paymentApplications.apply(command)).rejects.toMatchObject({code:"unsupported_operation"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("historical bill allocation receipts replay through retained parent instructions without reposting",async()=>{
+    const {sdk,options,payment}=await paymentHoldFixture();
+    const historical=historicalApplicationSdk(options);
+    const first=await historical.commands.billPayments.recordAndApply(payment);
+    const before=await depositDatabaseState(pool);
+    const replay=await sdk.commands.billPayments.recordAndApply(payment);
+    expect(replay).toMatchObject({status:"already_cleared",billPaymentId:first.billPaymentId});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(sdk.commands.billPayments.recordAndApply({...payment,allocations:payment.allocations.map(item=>({...item,expectedBillVersion:2}))})).rejects.toMatchObject({code:"idempotency_conflict"});
+    await expect(sdk.commands.billPayments.recordAndApply({...payment,operation:{...payment.operation,actorRef:"different:actor"}})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("concurrent application commands with one key and different actors retain only the winning identity",async()=>{
+    const {sdk,command}=await applicationReplayFixture();
+    const outcomes=await Promise.allSettled([sdk.commands.paymentApplications.apply(command),sdk.commands.paymentApplications.apply({...command,operation:{...command.operation,actorRef:"other:actor"}})]);
+    expect(outcomes.filter(result=>result.status==="fulfilled")).toHaveLength(1);
+    const failed=outcomes.find(result=>result.status==="rejected");
+    expect(failed?.status==="rejected"?failed.reason:undefined).toMatchObject({code:"idempotency_conflict"});
+    expect((await pool.query("select count(*)::int count from erp_financials.subledger_applications where idempotency_key=$1",[command.idempotencyKey])).rows).toEqual([{count:1}]);
+  });
+
+  it("application command snapshots caller fields before the first asynchronous transaction",async()=>{
+    const {options,command}=await applicationReplayFixture();
+    const original=structuredClone(command);
+    const sdk=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>{
+      command.idempotencyKey="mutated-key";command.operation.actorRef="mutated-actor";
+      return work(client);
+    })}});
+    const result=await sdk.commands.paymentApplications.apply(command);
+    const stored=await pool.query<{idempotency_key:string;actor_ref:string}>(`select application.idempotency_key,event.actor_ref from erp_financials.subledger_applications application
+      join erp_financials.financial_lifecycle_events event on event.event_id=application.applied_event_id where application.subledger_application_id=$1`,[result.applicationId]);
+    expect(stored.rows).toEqual([{idempotency_key:original.idempotencyKey,actor_ref:original.operation.actorRef}]);
+  });
+
+  it("journal command lookup uses exact source identity without date or amount matching",async()=>{
+    const {sdk,operation}=await paymentHoldFixture();
+    const command={operation,idempotencyKey:"exact:journal:%_",date:"2026-08-01",lines:[{accountId:"account_cash",debit:"1.00"},{accountId:"account_income",credit:"1.00"}]};
+    const first=await sdk.commands.journalEntries.post(command);
+    await sdk.commands.journalEntries.post({...command,idempotencyKey:"exact:journal:other"});
+    const request={sourceId:"source_1",transactionType:"JournalEntry",sourceTransactionId:command.idempotencyKey,limit:2};
+    expect((await sdk.queries.listJournalEntries(request)).items.map(row=>row.journalEntryId)).toEqual([first.transactionId]);
+    for(const change of [{sourceId:"foreign"},{sourceTransactionId:"exact:journal:"},{sourceTransactionId:" exact:journal:%_ "},{transactionType:"JournalEntryAdjustment"}])expect((await sdk.queries.listJournalEntries({...request,...change})).items).toEqual([]);
+    for(const bad of [{sourceTransactionId:command.idempotencyKey},{sourceId:"source_1",sourceTransactionId:command.idempotencyKey},{...request,sourceTransactionId:""}])await expect(sdk.queries.listJournalEntries(bad)).rejects.toMatchObject({code:"invalid_input"});
+    // The exact-key filter is part of the cursor fingerprint as well.
+    const all=await sdk.queries.listJournalEntries({sourceId:"source_1",transactionType:"JournalEntry",limit:1});
+    if(!all.nextCursor)throw Error("Missing list cursor");
+    await expect(sdk.queries.listJournalEntries({...request,cursor:all.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+  });
+
+  it("large journal posting retains bounded lifecycle and outbox evidence and complete paginated facts on retry",async()=>{
+    const {sdk,operation,bill}=await paymentHoldFixture();
+    const command={operation,idempotencyKey:"large:journal",date:"2026-08-01",lines:Array.from({length:1002},(_,i)=>i<501?{accountId:"account_cash",debit:"1.00"}:{accountId:"account_income",credit:"1.00"})};
+    const posted=await sdk.commands.journalEntries.post(command);
+    const replay=await sdk.commands.journalEntries.post(command);
+    expect(replay.transactionId).toBe(posted.transactionId);
+    expect(replay.postingIds).toEqual(posted.postingIds);
+    const events=await pool.query<{payload:Record<string,unknown>}>("select payload from erp_financials.financial_outbox where event_type='ledger.posted' and aggregate_id=$1",[posted.transactionId]);
+    expect(events.rows).toHaveLength(1);
+    expect(events.rows[0]?.payload).toEqual({transactionId:posted.transactionId,postingDate:command.date,currencyCode:"USD",accountingBasis:"accrual",postingCount:1002,postingIdsOmitted:true});
+    expect(Buffer.byteLength(JSON.stringify(events.rows[0]?.payload),"utf8")).toBeLessThanOrEqual(4096);
+    const request={sourceId:"source_1",transactionId:posted.transactionId,periodStart:command.date,periodEnd:command.date,limit:200};
+    const lifecycle=await pool.query<{payload:Record<string,unknown>;bytes:number}>("select payload,octet_length(payload::text) bytes from erp_financials.financial_lifecycle_events where event_id=$1",[posted.lifecycleEventId]);
+    expect(lifecycle.rows[0]?.payload).toMatchObject({transactionId:posted.transactionId,postingCount:1002,postingIdsOmitted:true});
+    expect(lifecycle.rows[0]?.payload.postingIds).toBeUndefined();
+    expect(lifecycle.rows[0]?.bytes).toBeLessThanOrEqual(8192);
+    const postingIds:string[]=[];let cursor:string|undefined;
+    do{const page=await sdk.queries.getJournalPostingPage({...request,...(cursor?{cursor}:{})});postingIds.push(...page.items.map(line=>line.postingId));cursor=page.nextCursor;}while(cursor);
+    expect(postingIds.sort()).toEqual([...posted.postingIds].sort());
+    await expect(sdk.commands.journalEntries.post({...command,lines:command.lines.map((line,index)=>index===0?{accountId:line.accountId,debit:"2.00"}:index===501?{accountId:line.accountId,credit:"2.00"}:line)})).rejects.toMatchObject({code:"idempotency_conflict"});
+    const smallLifecycle=await pool.query<{payload:Record<string,unknown>}>("select payload from erp_financials.financial_lifecycle_events where event_id=$1",[bill.journal.lifecycleEventId]);
+    expect(smallLifecycle.rows[0]?.payload.postingIds).toEqual(bill.journal.postingIds);
+    expect(smallLifecycle.rows[0]?.payload.postingIdsOmitted).toBeUndefined();
+    const small=await pool.query<{payload:Record<string,unknown>}>("select payload from erp_financials.financial_outbox where event_type='ledger.posted' and aggregate_id=$1",[bill.journal.transactionId]);
+    expect(small.rows[0]?.payload.postingIds).toEqual(bill.journal.postingIds);
+    expect(small.rows[0]?.payload.postingIdsOmitted).toBeUndefined();
+  });
+
+  it("accounting reference guard detects canonical, draft, dimension and composite references without host links", async () => {
+    const {sdk,operation,bill}=await paymentHoldFixture();
+    const marker="0b50816c-82b3-4cb8-9f7a-9986cd621bee";
+    const guarded=(references:readonly string[])=>sdk.queries.withLockedAccountingReferences({sourceIds:["source_1"]},guard=>guard.hasReferences(references));
+    expect(await guarded([marker])).toBe(false);
+    expect(await guarded([bill.documentId])).toBe(true);
+    await sdk.commands.journalEntries.post({operation,idempotencyKey:"guard:dimension",date:"2026-08-12",lines:[{accountId:"account_cash",debit:"1.00",dimensionRefs:[{dimensionKind:"host_order",sourceDimensionId:marker}]},{accountId:"account_income",credit:"1.00"}]});
+    expect(await guarded([marker])).toBe(true);
+    const draftMarker="385b01f7-21b2-422f-a046-a28795db1c6c";
+    const draft=await sdk.invoices.createDraft({operation,idempotencyKey:"guard:draft",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},documentDate:"2026-08-12",dueDate:"2026-08-31",revenueLines:[{accountId:"account_income",amount:"1.00"}],metadata:{externalOrder:draftMarker}});
+    expect(await guarded([draftMarker])).toBe(true);expect(await guarded([draft.invoiceDraftId])).toBe(true);
+    const receiptMarker="b9ddac4a-8ec9-466d-914e-269ba4b20637";
+    await sdk.commands.customerPayments.record({operation,idempotencyKey:"guard:receipt",customerId:"customer_1",date:"2026-08-12",amount:"1.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"},collectionRef:`host-order:${receiptMarker}`});
+    expect(await guarded([receiptMarker])).toBe(true);
+    expect(await guarded(["' OR true; --", "unrelated-reference"])).toBe(false);
+    let escaped: ((references:readonly string[])=>Promise<boolean>)|undefined;
+    await sdk.queries.withLockedAccountingReferences({sourceIds:["source_1"]},async guard=>{escaped=references=>guard.hasReferences(references);expect(await guard.hasReferences([marker])).toBe(true);});
+    if(!escaped)throw Error("Missing guard");await expect(escaped([marker])).rejects.toMatchObject({code:"invalid_input"});
+    await expect(sdk.queries.withLockedAccountingReferences({sourceIds:["source_2"]},()=>Promise.resolve(true))).rejects.toMatchObject({code:"missing_document"});
+  });
+
+  it("accounting reference guard retains scheduled and cancelled payment instructions without ledger postings",async()=>{
+    const {sdk,payment,operation}=await paymentHoldFixture();
+    const marker="a02f203d-09d7-4672-8615-f088cba01824";
+    const check=()=>sdk.queries.withLockedAccountingReferences({sourceIds:["source_1"]},guard=>guard.hasReferences([marker]));
+    const before=(await pool.query("select count(*)::int count from erp_financials.ledger_postings")).rows;
+    expect(await check()).toBe(false);
+    const scheduled=await sdk.commands.billPayments.schedule({...payment,reference:marker});
+    expect(await check()).toBe(true);
+    expect((await pool.query("select count(*)::int count from erp_financials.ledger_postings")).rows).toEqual(before);
+    await sdk.commands.billPayments.cancel({operation,billPaymentId:scheduled.billPaymentId,expectedVersion:scheduled.version,idempotencyKey:"guard:instruction:cancel"});
+    expect(await check()).toBe(true);
+    expect((await pool.query("select count(*)::int count from erp_financials.ledger_postings")).rows).toEqual(before);
+  });
+
+  it.each([["writer","draft"],["guard","draft"],["writer","journal"],["guard","journal"],["writer","bank"],["guard","bank"],["writer","unrestricted-journal"],["guard","unrestricted-journal"]] as const)("accounting reference guard serializes native writers when %s wins against %s", async (first,kind) => {
+    const {options,operation}=await paymentHoldFixture();
+    const policyOptions={...options,...(kind==="unrestricted-journal"?{postingPolicy:"legacy_unrestricted" as const}:{})};
+    const sdk=createErpFinancialsSdk(policyOptions);
+    const marker="27da5ba1-5baa-48aa-872c-1f9c01e60aa1";
+    const draft={operation,idempotencyKey:"guard:race-draft",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},documentDate:"2026-08-12",dueDate:"2026-08-31",revenueLines:[{accountId:"account_income",amount:"1.00"}],metadata:{externalOrder:marker}};
+    let entered!:()=>void,release!:()=>void;
+    const locked=new Promise<void>(resolve=>{entered=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+    const held=createErpFinancialsSdk({...policyOptions,database:{transaction:work=>runner.transaction(async client=>{const result=await work(client);entered();await gate;return result;})}});
+    const inspect=(reader:typeof sdk)=>reader.queries.withLockedAccountingReferences({sourceIds:["source_1"]},guard=>guard.hasReferences([marker]));
+    const write=(target:typeof sdk)=>kind==="draft"?target.invoices.createDraft(draft):(kind==="journal"||kind==="unrestricted-journal")
+      ?target.commands.journalEntries.post({operation,idempotencyKey:"guard:race-journal",date:"2026-08-12",lines:[{accountId:"account_cash",debit:"1.00",dimensionRefs:[{dimensionKind:"host_order",sourceDimensionId:marker}]},{accountId:"account_income",credit:"1.00"}]})
+      :target.bankReconciliation.ingest({operation,externalLineId:"guard:race-bank",bankAccountId:"account_cash",postedDate:"2026-08-12",amount:"1.00",reference:marker});
+    const firstResult=Promise.allSettled([first==="writer"?write(held):inspect(held)]);
+    await Promise.race([locked,firstResult.then(()=>{throw Error("First operation failed before lock");})]);
+    const secondResult=Promise.allSettled([first==="writer"?inspect(sdk):write(sdk)]);
+    try {
+      let blocked=false;
+      for(let attempt=0;attempt<200&&!blocked;attempt++) {
+        blocked=(await pool.query("select 1 from pg_stat_activity where datname=current_database() and wait_event='advisory' and cardinality(pg_blocking_pids(pid))>0")).rows.length>0;
+        if(!blocked) await new Promise(resolve=>setTimeout(resolve,10));
+      }
+      expect(blocked).toBe(true);
+    } finally {release();}
+    const initial=(await firstResult)[0],following=(await secondResult)[0];
+    expect(initial.status).toBe("fulfilled");expect(following.status).toBe("fulfilled");
+    if(first==="writer")expect(following).toMatchObject({status:"fulfilled",value:true});
+    else expect(initial).toMatchObject({status:"fulfilled",value:false});
+    expect(await inspect(sdk)).toBe(true);
+    await expect(runner.transaction(async client=>{
+      await client.query("set transaction isolation level repeatable read");
+      return createErpFinancialsSdk({...options,database:{transaction:work=>work(client)}}).queries.withLockedAccountingReferences({sourceIds:["source_1"]},()=>Promise.resolve(true));
+    })).rejects.toMatchObject({code:"invalid_input"});
+    const autocommit=createErpFinancialsSdk({...options,database:{transaction:work=>work({query:<Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>pool.query<Row>(sql,[...(values??[])])})}});
+    await expect(inspect(autocommit)).rejects.toMatchObject({code:"invalid_input"});
+  });
+
+  it("dashboard reconstructs historical invoice balances and agrees with statement equity", async () => {
+    const {sdk, operation, command} = await invoiceCorrectionFixture("10.00", "2026-08-01");
+    await sdk.commands.invoices.create({operation,idempotencyKey:"dashboard:future",date:"2026-08-20",dueDate:"2026-08-21",customerId:"customer_1",
+      receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"50.00"}]});
+    for (const [asOfDate, expected] of [["2026-08-01","25.00"],["2026-08-02","15.00"]] as const) {
+      const dashboard=await sdk.queries.getDashboardSummary({periodStart:"2026-01-01",asOfDate});
+      expect(dashboard.accountsReceivable).toBe(expected);
+      expect(dashboard.overdueReceivables).toBe(asOfDate==="2026-08-01"?"0.00":expected);
+      const statement=await sdk.queries.getFinancialStatement({reportName:"balance_sheet",periodStart:"2026-01-01",periodEnd:asOfDate});
+      expect({assets:dashboard.assets,liabilities:dashboard.liabilities,equity:dashboard.equity}).toEqual({assets:statement.totals.assets,liabilities:statement.totals.liabilities,equity:statement.totals.equity});
+    }
+    await sdk.invoices.correctIssued({...command,replacement:{dueDate:"2026-08-01",revenueLines:[{accountId:"account_income",amount:"20.00"}]}});
+    for(const [asOfDate, expected] of [["2026-08-03","15.00"],["2026-08-04","20.00"]] as const) {
+      const dashboard=await sdk.queries.getDashboardSummary({periodStart:"2026-01-01",asOfDate});
+      expect(dashboard.accountsReceivable).toBe(expected);
+      expect(dashboard.overdueReceivables).toBe(expected);
+      // Dashboard keeps gross open invoices; AR aging separately nets unapplied cash.
+      expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate})).totals.outstandingAmount).toBe(expected);
+    }
+  });
+
+  it("outstanding document summary counts historical invoices and excludes released unapplied cash", async () => {
+    const {sdk,command}=await invoiceCorrectionFixture("10.00","2026-08-05");
+    for(const [asOfDate,count,overdue] of [["2026-07-31","0","0"],["2026-08-01","1","0"],["2026-08-05","1","0"],["2026-08-06","1","1"]] as const) {
+      expect(await sdk.queries.getOutstandingDocumentSummary({asOfDate})).toMatchObject({asOfDate,outstandingInvoiceCount:count,overdueInvoiceCount:overdue,outstandingVendorBillCount:"0",overdueVendorBillCount:"0"});
+    }
+    await sdk.invoices.correctIssued(command);
+    expect(await sdk.queries.getOutstandingDocumentSummary({asOfDate:"2026-08-03"})).toMatchObject({outstandingInvoiceCount:"1"});
+    expect(await sdk.queries.getOutstandingDocumentSummary({asOfDate:"2026-08-06"})).toMatchObject({outstandingInvoiceCount:"0",overdueInvoiceCount:"0"});
+    await expect(sdk.queries.getOutstandingDocumentSummary({asOfDate:"2026-02-30"})).rejects.toMatchObject({code:"invalid_input"});
+  });
+
+  it("outstanding document summary includes held bills and enforces active book scope", async () => {
+    const {sdk,options,hold}=await paymentHoldFixture("2026-08-05");
+    await sdk.commands.vendorBills.setPaymentHold(hold);
+    const result=await sdk.queries.getOutstandingDocumentSummary({asOfDate:"2026-08-06"});
+    expect(result).toMatchObject({tenantId:options.tenantId,companyId:options.companyId,bookId:options.bookId,currencyCode:"USD",outstandingVendorBillCount:"1",overdueVendorBillCount:"1",outstandingInvoiceCount:"0"});
+    expect(Number.isFinite(Date.parse(result.observedAt))).toBe(true);
+    expect(await sdk.queries.getOutstandingDocumentSummary({asOfDate:"2026-08-05"})).toMatchObject({outstandingVendorBillCount:"1",overdueVendorBillCount:"0"});
+    for(const patch of [{tenantId:"foreign"},{companyId:"foreign"},{bookId:"foreign"}]) await expect(createErpFinancialsSdk({...options,...patch}).queries.getOutstandingDocumentSummary({asOfDate:"2026-08-06"})).rejects.toMatchObject({code:"missing_book"});
+    await pool.query("update erp_financials.reporting_books set status='archived' where book_id=$1",[options.bookId]);
+    await expect(sdk.queries.getOutstandingDocumentSummary({asOfDate:"2026-08-06"})).rejects.toMatchObject({code:"terminal_state_conflict"});
+  });
+
+  it("outstanding document summary retains one SQL snapshot across a concurrent correction", async () => {
+    const {sdk,options,command}=await invoiceCorrectionFixture("10.00","2026-08-05");
+    let calls=0;
+    const reader=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({query:async<Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{
+      calls++;expect(sql).toContain("outstanding_document_summary");const result=await client.query<Row>(sql,values);
+      await sdk.invoices.correctIssued(command);return result;
+    }}))}});
+    expect(await reader.queries.getOutstandingDocumentSummary({asOfDate:"2026-08-06"})).toMatchObject({outstandingInvoiceCount:"1",overdueInvoiceCount:"1"});expect(calls).toBe(1);
+    expect(await sdk.queries.getOutstandingDocumentSummary({asOfDate:"2026-08-06"})).toMatchObject({outstandingInvoiceCount:"0",overdueInvoiceCount:"0"});
+  });
+
+  it("outstanding document summary respects payable corrections at effective dates", async () => {
+    const {sdk,command}=await appliedBillCorrectionFixture("40.00","30.01","2026-08-05");
+    await sdk.commands.vendorBills.correctPosted(command);
+    for(const [asOfDate,overdue] of [["2026-08-09","1"],["2026-08-11","1"],["2026-08-12","0"]] as const)
+      expect(await sdk.queries.getOutstandingDocumentSummary({asOfDate})).toMatchObject({outstandingVendorBillCount:"1",overdueVendorBillCount:overdue});
+  });
+
+  it("dashboard shares one scoped snapshot and mapped equity with financial statements", async () => {
+    const {sdk, options, operation}=await invoiceCorrectionFixture();
+    await sdk.books.defineAccount({operation,bookId:options.bookId,bookAccountKey:"mapped-income",name:"Mapped income",classification:"income",accountRole:"posting",expectedVersion:0});
+    await sdk.books.mapAccount({operation,bookId:options.bookId,sourceId:"source_1",accountId:"account_income",bookAccountKey:"mapped-income"});
+    const input={periodStart:"2026-01-01",asOfDate:"2026-08-12"};
+    const before=await sdk.queries.getDashboardSummary(input);
+    expect(before.revenue).toBe("25.00");expect(before.equity).toBe("25.00");
+    const cash=await sdk.queries.getDashboardSummary({...input,accountingMethod:"cash"});
+    const cashStatement=await sdk.queries.getFinancialStatement({reportName:"balance_sheet",periodStart:input.periodStart,periodEnd:input.asOfDate,accountingMethod:"cash"});
+    expect(cash.accountingBasis).toBe("cash");expect(cash.assets).toBe(cashStatement.totals.assets);expect(cash.equity).toBe(cashStatement.totals.equity);
+
+    let calls=0;
+    const reader=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({query:async<Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{
+      calls++;const result=await client.query<Row>(sql,values);
+      await sdk.commands.journalEntries.post({operation,idempotencyKey:"dashboard:concurrent",date:"2026-08-12",memo:"Concurrent equity",lines:[{accountId:"account_cash",debit:"90071992547409.93"},{accountId:"account_income",credit:"90071992547409.93"}]});
+      return result;
+    }}))}});
+    expect(await reader.queries.getDashboardSummary(input)).toEqual(before);expect(calls).toBe(1);
+    const after=await sdk.queries.getDashboardSummary(input);
+    expect(after.equity).toBe("90071992547434.93");
+    expect(after.assets).toBe(after.equity);
+    const statement=await sdk.queries.getFinancialStatement({reportName:"balance_sheet",periodStart:input.periodStart,periodEnd:input.asOfDate});
+    expect(after.equity).toBe(statement.totals.equity);
+    for(const patch of [{tenantId:"foreign"},{companyId:"foreign"},{bookId:"foreign"}]) await expect(createErpFinancialsSdk({...options,...patch}).queries.getDashboardSummary(input)).rejects.toMatchObject({code:"missing_book"});
+    await pool.query("update erp_financials.reporting_books set status='archived' where book_id=$1",[options.bookId]);
+    await expect(sdk.queries.getDashboardSummary(input)).rejects.toMatchObject({code:"terminal_state_conflict"});
+  });
+
+  it("dashboard reconstructs payable applications and corrections at their effective dates", async () => {
+    const {sdk, command}=await appliedBillCorrectionFixture("40.00","30.01","2026-08-05");
+    await sdk.commands.vendorBills.correctPosted(command);
+    for(const [asOfDate,expected] of [["2026-08-09","100.00"],["2026-08-11","60.00"],["2026-08-12","59.99"]] as const) {
+      const dashboard=await sdk.queries.getDashboardSummary({periodStart:"2026-01-01",asOfDate});
+      expect(dashboard.accountsPayable).toBe(expected);
+      expect(dashboard.overduePayables).toBe(asOfDate==="2026-08-12"?"0.00":expected);
+      const aging=await sdk.queries.getAging({kind:"payables",asOfDate});
+      expect(dashboard.accountsPayable).toBe(aging.totals.total);
+    }
+  });
+
+  it("statement date bands preserve arbitrary overlapping windows and mixed accounting bases", async () => {
+    await migratePostgresSchema(runner,{appliedByRef:"statement:date-bands"});await seedAccountingScope(pool);
+    const scope={tenantId:"tenant_1",companyId:"company_1",bookId:"date-bands",writeSourceId:"source_1",currencyCode:"USD"};
+    const sdk=createErpFinancialsSdk({...scope,database:runner}),operation=sdkOperation();
+    await sdk.books.define({operation,bookId:scope.bookId,name:"Date bands",baseCurrencyCode:"USD"});
+    await sdk.books.bindSource({operation,bookId:scope.bookId,sourceId:"source_1",sourceRole:"active"});
+    await sdk.commands.fiscalPeriods.define({operation,fiscalYear:2026,periodNumber:8,periodStart:"2026-08-01",periodEnd:"2026-08-31"});
+    const days=[1,2,10,11,20,31];const date=(day:number)=>`2026-08-${String(day).padStart(2,"0")}`;
+    for(const accountingBasis of ["accrual","cash"] as const) for(const day of days) {
+      const amount=(day*(accountingBasis==="cash"?3:1)/100).toFixed(2);
+      await sdk.commands.journalEntries.post({operation,idempotencyKey:`bands:${accountingBasis}:${String(day)}`,date:date(day),accountingBasis,memo:"Date band oracle",lines:[{accountId:"account_cash",debit:amount},{accountId:"account_income",credit:amount}]});
+    }
+    const windows=(["accrual","cash"] as const).flatMap(accountingMethod=>([[1,1],[2,10],[10,20],[11,31],[1,31],[20,31]] as const).flatMap(([first,last])=>(["profit_and_loss","balance_sheet","trial_balance"] as const).map(reportName=>({reportName,periodStart:date(first),periodEnd:date(last),asOfDate:date(last),accountingMethod}))));
+    expect(windows).toHaveLength(36);
+    const reports=await sdk.queries.getFinancialStatements({statements:windows});
+    expect(reports).toHaveLength(36);
+    const firstWindow = windows[0];
+    if (!firstWindow) throw Error("Missing statement window fixture");
+    await expect(sdk.queries.getFinancialStatements({statements:[...windows, firstWindow]})).rejects.toMatchObject({code:"invalid_input"});
+    for(let index=0;index<windows.length;index++) {
+      const request=windows[index],report=reports[index];
+      if(!request || !report) throw Error("Missing statement window");
+      const cents=days.filter(day=>date(day)<=request.asOfDate && (request.reportName!=="profit_and_loss" || date(day)>=request.periodStart)).reduce((total,day)=>total+day*(request.accountingMethod==="cash"?3:1),0);
+      const expected=(cents/100).toFixed(2);
+      if(request.reportName==="profit_and_loss") expect(report.totals.netIncome).toBe(expected);
+      else if(request.reportName==="balance_sheet") expect(report.totals).toEqual({assets:expected,liabilities:"0.00",equity:expected,difference:"0.00"});
+      else expect(report.totals).toEqual({debits:expected,credits:expected,difference:"0.00"});
+      expect(report.accountingBasis).toBe(request.accountingMethod);
+    }
+  });
+
+  it("financial statement snapshot keeps cash and earnings coherent across a concurrent posting", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:statement-snapshot" });
+    await seedAccountingScope(pool);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId: "statement-snapshot", writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    await sdk.books.define({ operation, bookId: scope.bookId, name: "Snapshot", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: scope.bookId, sourceId: "source_1", sourceRole: "active" });
+    await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const post = (idempotencyKey: string, amount: string) => sdk.commands.journalEntries.post({ operation, idempotencyKey, date: "2026-08-12", memo: "Snapshot test", lines: [{ accountId: "account_cash", debit: amount }, { accountId: "account_income", credit: amount }] });
+    await post("statement:initial", "100.00");
+    const request = { reportName: "balance_sheet" as const, periodStart: "2026-01-01", periodEnd: "2026-08-31" };
+    const before = await sdk.queries.getFinancialStatement(request);
+    expect(before.totals).toEqual({ assets: "100.00", liabilities: "0.00", equity: "100.00", difference: "0.00" });
+    let injected = false;
+    const concurrent = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(client => work({ query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]) => {
+      const result = await client.query<Row>(sql, values);
+      if (!injected && sql.includes('coalesce(mapping."book_account_key"')) { injected = true; await post("statement:concurrent", "25.00"); }
+      return result;
+    } })) } });
+    expect(await concurrent.queries.getFinancialStatement(request)).toEqual(before);
+    expect(injected).toBe(true);
+    expect((await sdk.queries.getFinancialStatement(request)).totals).toEqual({ assets: "125.00", liabilities: "0.00", equity: "125.00", difference: "0.00" });
+    let batchCalls = 0;
+    const batchSdk = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(client => work({ query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]) => {
+      batchCalls++; const result = await client.query<Row>(sql, values);
+      await post("statement:batch-concurrent", "25.00"); return result;
+    } })) } });
+    const batch = await batchSdk.queries.getFinancialStatements({ statements: [
+      { reportName: "profit_and_loss", periodStart: "2026-07-01", periodEnd: "2026-07-31" },
+      { reportName: "profit_and_loss", periodStart: "2026-08-01", periodEnd: "2026-08-31" }, request,
+      { ...request, reportName: "trial_balance" },
+    ] });
+    expect(batchCalls).toBe(1);
+    expect(batch.map(statement => statement.totals)).toEqual([
+      { income: "0.00", costOfGoodsSold: "0.00", grossProfit: "0.00", expenses: "0.00", netIncome: "0.00" },
+      { income: "125.00", costOfGoodsSold: "0.00", grossProfit: "125.00", expenses: "0.00", netIncome: "125.00" },
+      { assets: "125.00", liabilities: "0.00", equity: "125.00", difference: "0.00" },
+      { debits: "125.00", credits: "125.00", difference: "0.00" },
+    ]);
+    expect((await sdk.queries.getFinancialStatement(request)).totals.assets).toBe("150.00");
+    await post("statement:exact-large", "90071992547409.93");
+    const exact = await sdk.queries.getFinancialStatements({ statements: [request, { ...request, reportName: "profit_and_loss" }] });
+    expect(exact[0]?.totals.assets).toBe("90071992547559.93");
+    expect(exact[0]?.totals.difference).toBe("0.00");
+    expect(exact[1]?.totals.netIncome).toBe("90071992547559.93");
+    for (const patch of [{tenantId:"foreign"},{companyId:"foreign"},{bookId:"foreign"}]) await expect(createErpFinancialsSdk({...scope,...patch,database:runner}).queries.getFinancialStatements({statements:[request]})).rejects.toMatchObject({code:"missing_book"});
+    await pool.query("update erp_financials.reporting_books set status='archived' where book_id=$1",[scope.bookId]);
+    await expect(sdk.queries.getFinancialStatements({statements:[request]})).rejects.toMatchObject({code:"terminal_state_conflict"});
+
+
+  });
+
+  it("reporting calendar uses canonical close/reopen facts in one scoped read snapshot", async () => {
+    const {sdk,scope,command}=await canonicalCloseFixture();
+    const request={sourceId:scope.writeSourceId,year:2026};
+    const open=await sdk.queries.getReportingCalendar(request);
+    expect(open.months[7]).toMatchObject({month:"2026-08",status:"open",days:{open:31,closing:0,closed:0,unconfigured:0}});
+    expect(open.months[0]?.status).toBe("unconfigured");
+    const closed=await sdk.commands.fiscalPeriods.closeCanonical(command);
+    const afterClose=await sdk.queries.getReportingCalendar(request);
+    expect(afterClose.months[7]?.status).toBe("closed");
+    expect(afterClose.periods).toContainEqual(expect.objectContaining({fiscalPeriodId:command.fiscalPeriodId,version:closed.version,canonicalCloseCertificateId:closed.certificateId}));
+    expect(afterClose.revision).not.toBe(open.revision);
+    const beforeRead=await depositDatabaseState(pool);expect(await sdk.queries.getReportingCalendar(request)).toEqual(afterClose);expect(await depositDatabaseState(pool)).toEqual(beforeRead);
+    let reopened=false,calls=0;
+    const concurrent=createErpFinancialsSdk({...scope,database:{transaction:work=>runner.transaction(client=>work({query:async<Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{
+      calls++;const result=await client.query<Row>(sql,values);
+      if(!reopened){reopened=true;await sdk.commands.fiscalPeriods.reopen({operation:command.operation,fiscalPeriodId:command.fiscalPeriodId,expectedVersion:closed.version});}
+      return result;
+    }}))}});
+    expect(await concurrent.queries.getReportingCalendar(request)).toEqual(afterClose);expect(calls).toBe(1);
+    const afterReopen=await sdk.queries.getReportingCalendar(request);expect(afterReopen.months[7]?.status).toBe("open");expect(afterReopen.revision).not.toBe(afterClose.revision);
+    await sdk.commands.fiscalPeriods.beginClose({operation:command.operation,fiscalPeriodId:command.fiscalPeriodId,expectedVersion:closed.version+1});
+    expect((await sdk.queries.getReportingCalendar(request)).months[7]?.status).toBe("closing");
+    await expect(sdk.queries.getReportingCalendar({sourceId:"source_2",year:2026})).rejects.toMatchObject({code:"missing_document"});
+    for(const patch of [{tenantId:"foreign"},{companyId:"foreign"},{bookId:"foreign"}]) await expect(createErpFinancialsSdk({...scope,...patch,database:runner}).queries.getReportingCalendar(request)).rejects.toMatchObject({code:"missing_book"});
+  });
+
+  it("canonical fiscal review invalidates changed facts while no-op statements and rollback preserve approval", async () => {
+    const { sdk, command: original } = await canonicalCloseFixture();
+    await pool.query("insert into erp_financials.transactions(transaction_id,tenant_id,source_id,source_transaction_id,source_transaction_type,transaction_date,currency_code,status) values('review_imported','tenant_1','source_1','review_imported','Invoice','2026-08-20','USD','posted')");
+    const read = () => sdk.queries.getCanonicalFiscalCloseReadiness("source_1", original.fiscalPeriodId, original.bankAccountIds);
+    const command = { ...original, expectedApprovalToken: (await read()).approvalToken };
+    const before = await read();
+    await pool.query("update erp_financials.transactions set memo=memo");
+    await pool.query("delete from erp_financials.transactions where transaction_id='does-not-exist'");
+    expect(await read()).toEqual(before);
+    await expect(runner.transaction(async client => {
+      await client.query("update erp_financials.transactions set memo='rolled back review change' where transaction_id='review_imported'");
+      throw new Error("abort change");
+    })).rejects.toThrow("abort change");
+    expect(await read()).toEqual(before);
+    await pool.query("update erp_financials.transactions set memo='reviewed facts changed' where transaction_id='review_imported'");
+    const after = await read();
+    expect(BigInt(after.sourceRevision)).toBe(BigInt(before.sourceRevision) + 1n);
+    expect(after.approvalToken).not.toBe(before.approvalToken);
+    expect(after.diagnostics).toEqual(before.diagnostics);
+    await expect(sdk.commands.fiscalPeriods.closeCanonical(command)).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    for (const sql of ["update erp_financials.accounting_source_revisions set revision=revision+1", "delete from erp_financials.accounting_source_revisions"]) {
+      await expect(pool.query(sql)).rejects.toThrow("database managed");
+    }
+    const closed = await sdk.commands.fiscalPeriods.closeCanonical({ ...command, expectedApprovalToken: after.approvalToken });
+    expect(await sdk.fiscalCloseCertificates.get(closed.certificateId)).toMatchObject({ approvalToken: after.approvalToken, sourceRevision: after.sourceRevision });
+  });
+
+  it("canonical fiscal review rejects accounting changes after capture in the same host transaction", async () => {
+    const { sdk: reader, scope, command: original } = await canonicalCloseFixture();
+    await pool.query("insert into erp_financials.transactions(transaction_id,tenant_id,source_id,source_transaction_id,source_transaction_type,transaction_date,currency_code,status) values('review_imported','tenant_1','source_1','review_imported','Invoice','2026-08-20','USD','posted')");
+    const command = { ...original, expectedApprovalToken: (await reader.queries.getCanonicalFiscalCloseReadiness("source_1", original.fiscalPeriodId, original.bankAccountIds)).approvalToken };
+    const before = await depositDatabaseState(pool);
+    await expect(runner.transaction(async client => {
+      const sdk = createErpFinancialsSdk({ ...scope, database: { transaction: work => work(client) } });
+      await sdk.commands.fiscalPeriods.closeCanonical(command);
+      // Metadata mutation leaves every control total identical, but the reviewed
+      // canonical facts changed and the deferred revision guard must reject it.
+      await client.query("update erp_financials.transactions set memo='changed after capture' where transaction_id='review_imported'");
+    })).rejects.toThrow("review revision changed");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("canonical fiscal review remains valid across unrelated future-period posting", async () => {
+    const { sdk, command } = await canonicalCloseFixture();
+    const before = await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", command.fiscalPeriodId, command.bankAccountIds);
+    await sdk.commands.fiscalPeriods.define({ operation: command.operation, fiscalYear: 2026, periodNumber: 9, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    await sdk.commands.deposits.record({ operation: command.operation, idempotencyKey: "review:future", date: "2026-09-12", amount: "1.00", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+    expect(await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", command.fiscalPeriodId, command.bankAccountIds)).toEqual(before);
+    expect((await sdk.commands.fiscalPeriods.closeCanonical(command)).status).toBe("closed");
+  });
+
+  it("canonical fiscal review tracks both sides of date moves without allowing approval resurrection", async () => {
+    const { sdk, command } = await canonicalCloseFixture();
+    const read = () => sdk.queries.getCanonicalFiscalCloseReadiness("source_1", command.fiscalPeriodId, command.bankAccountIds);
+    const initial = await read();
+    await pool.query("insert into erp_financials.transactions(transaction_id,tenant_id,source_id,source_transaction_id,source_transaction_type,transaction_date,currency_code,status) values('review_moved','tenant_1','source_1','review_moved','Invoice','2026-09-20','USD','posted')");
+    expect(await read()).toEqual(initial);
+    await pool.query("update erp_financials.transactions set transaction_date='2026-08-20' where transaction_id='review_moved'");
+    const moved = await read();
+    expect(BigInt(moved.sourceRevision)).toBe(BigInt(initial.sourceRevision) + 1n);
+    await pool.query("update erp_financials.transactions set transaction_date='2026-09-20' where transaction_id='review_moved'");
+    const restored = await read();
+    expect(BigInt(restored.sourceRevision)).toBe(BigInt(initial.sourceRevision) + 2n);
+    expect(restored.approvalToken).not.toBe(initial.approvalToken);
+    await expect(sdk.commands.fiscalPeriods.closeCanonical(command)).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+  });
+
+  it("canonical fiscal review revisions are source isolated and advance per date per statement, not per row", async () => {
+    const { sdk, command } = await canonicalCloseFixture();
+    const read = () => sdk.queries.getCanonicalFiscalCloseReadiness("source_1", command.fiscalPeriodId, command.bankAccountIds);
+    const initial = await read();
+    await pool.query("insert into erp_financials.accounting_sources(source_id,tenant_id,source_system,provider_environment,connection_ref,status) values('revision_other','tenant_1','native_erp','test','revision_other','active')");
+    await pool.query("insert into erp_financials.transactions(transaction_id,tenant_id,source_id,source_transaction_id,source_transaction_type,transaction_date,currency_code,status) select 'bulk_'||n,'tenant_1','revision_other',n::text,'Invoice','2026-08-20','USD','posted' from generate_series(1,100) n");
+    const revision = async () => (await pool.query<{ revision: string }>("select revision::text from erp_financials.accounting_source_revisions where tenant_id='tenant_1' and source_id='revision_other' and effective_date='2026-08-20'")).rows[0]?.revision;
+    expect(await revision()).toBe("1");
+    await pool.query("update erp_financials.transactions set memo='bulk change' where source_id='revision_other'");
+    expect(await revision()).toBe("2");
+    await pool.query("update erp_financials.transactions set memo=memo where source_id='revision_other'");
+    expect(await revision()).toBe("2");
+    await pool.query("delete from erp_financials.transactions where source_id='revision_other'");
+    expect(await revision()).toBe("3");
+    expect(await read()).toEqual(initial);
+  });
+
+  it("canonical close certificates capture exact immutable totals and bank evidence with scoped pagination and durable retries", async () => {
+    const { sdk, scope, command, completed } = await canonicalCloseFixture();
+    const ledgerBefore = (await depositDatabaseState(pool)).ledger_postings;
+    const [closed, retry] = await Promise.all([sdk.commands.fiscalPeriods.closeCanonical(command), sdk.commands.fiscalPeriods.closeCanonical({ ...command, operation: { ...command.operation, requestId: "new-transport" } })]);
+    expect([closed.outcome, retry.outcome].sort()).toEqual(["already_closed", "closed"]);
+    expect(closed.certificateId).toBe(retry.certificateId); expect(closed.version).toBe(2);
+    const current = await sdk.queries.getFiscalPeriod("source_1", command.fiscalPeriodId);
+    expect(current.canonicalCloseCertificateId).toBe(closed.certificateId); expect(current.closeEvidence).toBeUndefined();
+    const certificate = await sdk.fiscalCloseCertificates.get(closed.certificateId);
+    expect(certificate).toMatchObject({ certificateId: closed.certificateId, accountingBasis: "accrual", currencyCode: "USD", diagnostics: { postingCount: "4" }, result: { status: "closed", version: 2 } });
+    const first = await sdk.fiscalCloseCertificates.totals({ certificateId: closed.certificateId, limit: 1 });
+    expect(first.items).toHaveLength(1); expect(first.nextCursor).toBeDefined();
+    const rows = [...first.items]; let cursor = first.nextCursor;
+    while (cursor) { const page = await sdk.fiscalCloseCertificates.totals({ certificateId: closed.certificateId, limit: 1, cursor }); rows.push(...page.items); cursor = page.nextCursor; }
+    expect(rows).toHaveLength(4);
+    expect(rows.find(row => row.accountId === "account_cash" && row.accountingBasis === "accrual")).toEqual({ accountId: "account_cash", accountingBasis: "accrual", currencyCode: "USD", openingNet: "0", debitAmount: "123.45", creditAmount: "0.00", closingNet: "123.45", postingCount: "1", historicalPostingCount: "1" });
+    const bank = await sdk.fiscalCloseCertificates.banks({ certificateId: closed.certificateId, limit: 1 });
+    expect(bank.items).toEqual([{ accountId: "account_cash", hasActivity: true, statementId: completed.statementId, statementVersion: 2, statementEventId: completed.lifecycleEventId }]);
+    if (!bank.nextCursor || !first.nextCursor) throw new Error("Expected certificate continuation");
+    expect((await sdk.fiscalCloseCertificates.banks({ certificateId: closed.certificateId, limit: 1, cursor: bank.nextCursor })).items).toEqual([{ accountId: "account_income", hasActivity: false, statementId: null, statementVersion: null, statementEventId: null }]);
+    await expect(sdk.fiscalCloseCertificates.banks({ certificateId: closed.certificateId, cursor: first.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(createErpFinancialsSdk({ ...scope, database: runner, writeSourceId: "other" }).fiscalCloseCertificates.get(closed.certificateId)).rejects.toMatchObject({ code: "missing_document" });
+    await expect(createErpFinancialsSdk({ ...scope, database: runner, companyId: "other" }).fiscalCloseCertificates.totals({ certificateId: closed.certificateId })).rejects.toMatchObject({ code: "missing_document" });
+    const before = await depositDatabaseState(pool);
+    for (const change of [{ bankAccountIds: [] }, { operation: { ...command.operation, actorRef: "other" } }, { expectedVersion: 2 }]) {
+      await expect(sdk.commands.fiscalPeriods.closeCanonical({ ...command, ...change })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    for (const table of ["fiscal_close_certificates", "fiscal_close_totals", "fiscal_close_banks"]) {
+      await expect(pool.query(`delete from erp_financials.${table} where certificate_id=$1`, [closed.certificateId])).rejects.toThrow("canonical close evidence is immutable");
+    }
+    await expect(pool.query(`insert into erp_financials.fiscal_close_banks select bank_check_id||':late',tenant_id,company_id,source_id,certificate_id,account_id,has_activity,statement_id,statement_version,statement_event_id from erp_financials.fiscal_close_banks where certificate_id=$1 limit 1`, [closed.certificateId])).rejects.toThrow("capture transaction");
+    expect(await depositDatabaseState(pool)).toEqual(before); expect(before.ledger_postings).toEqual(ledgerBefore);
+    await sdk.commands.fiscalPeriods.reopen({ operation: command.operation, fiscalPeriodId: command.fiscalPeriodId, expectedVersion: 2 });
+    await expect(sdk.commands.fiscalPeriods.closeCanonical(command)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await sdk.fiscalCloseCertificates.get(closed.certificateId)).toEqual(certificate);
+    expect((await sdk.fiscalCloseCertificates.totals({ certificateId: closed.certificateId })).items).toEqual(rows);
+  });
+
+  it("bank statement selection pages only scoped selected postings with canonical line ownership",async()=>{
+    const {sdk,options,operation}=await paymentHoldFixture();
+    const journal=await sdk.commands.journalEntries.post({operation,idempotencyKey:"selection:journal",date:"2026-08-01",lines:[{accountId:"account_cash",debit:"6.00"},{accountId:"account_cash",debit:"4.00"},{accountId:"account_income",credit:"10.00"}]});
+    const details=await sdk.queries.getJournalPostingPage({sourceId:"source_1",transactionId:journal.transactionId,periodStart:"2026-08-01",periodEnd:"2026-08-01",limit:10});
+    const selected=details.items.filter(row=>row.accountId==="account_cash");expect(selected).toHaveLength(2);
+    await sdk.commands.journalEntries.post({operation,idempotencyKey:"selection:unselected",date:"2026-08-01",lines:[{accountId:"account_cash",debit:"1.00"},{accountId:"account_income",credit:"1.00"}]});
+    const input={operation,idempotencyKey:"selection:prepare",externalStatementId:"selection:statement",accountId:"account_cash",statementDate:"2026-08-31",closingBalance:"10.00",expectedVersion:0,addPostingIds:selected.map(row=>row.postingId)};
+    const statement=await sdk.bankStatements.prepare(input);
+    const first=await sdk.bankStatements.selection({statementId:statement.statementId,limit:1});if(!first.nextCursor)throw Error("Missing selection cursor");
+    const second=await sdk.bankStatements.selection({statementId:statement.statementId,limit:1,cursor:first.nextCursor});expect(second.nextCursor).toBeUndefined();
+    expect([...first.items,...second.items].map(row=>row.transactionLineId).sort()).toEqual(selected.map(row=>row.transactionLineId).sort());
+    expect([...first.items,...second.items].map(row=>row.transactionId)).toEqual([journal.transactionId,journal.transactionId]);
+    for(const change of [{tenantId:"foreign"},{companyId:"foreign"},{writeSourceId:"foreign"},{bookId:"foreign"}])await expect(createErpFinancialsSdk({...options,...change}).bankStatements.selection({statementId:statement.statementId})).rejects.toMatchObject({code:"missing_document"});
+    await sdk.bankStatements.prepare({...input,idempotencyKey:"selection:edit",expectedVersion:1,addPostingIds:[],removePostingIds:[first.items[0]?.postingId??""]});
+    await expect(sdk.bankStatements.selection({statementId:statement.statementId,cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    expect((await sdk.bankStatements.selection({statementId:statement.statementId})).items).toEqual(second.items);
+  });
+
+  it("closed state verification requires the retained close lifecycle and exact current totals",async()=>{
+    const {sdk,scope,command,completed}=await canonicalCloseFixture();
+    const closed=await sdk.commands.fiscalPeriods.closeCanonical(command);
+    const verify=()=>sdk.fiscalCloseCertificates.verifyClosedState(closed.certificateId);
+    expect(await verify()).toMatchObject({certificateId:closed.certificateId,bankEvidenceRefs:[completed.evidenceRef],closedAtCapturedVersion:true,matches:true,totals:{matches:true}});
+    for(const change of [{tenantId:"foreign"},{companyId:"foreign"},{writeSourceId:"foreign"},{bookId:"foreign"}])await expect(createErpFinancialsSdk({...scope,...change,database:runner}).fiscalCloseCertificates.verifyClosedState(closed.certificateId)).rejects.toMatchObject({code:"missing_document"});
+    await sdk.commands.fiscalPeriods.reopen({operation:command.operation,fiscalPeriodId:command.fiscalPeriodId,expectedVersion:2});
+    expect(await verify()).toMatchObject({closedAtCapturedVersion:false,matches:false,totals:{matches:true}});
+    await sdk.commands.deposits.record({operation:command.operation,idempotencyKey:"state:changed",date:"2026-08-21",amount:"0.01",bankAccount:{accountId:"account_cash"},clearingAccount:{accountId:"account_ar"}});
+    expect(await verify()).toMatchObject({closedAtCapturedVersion:false,matches:false,totals:{matches:false}});
+    await pool.query("update erp_financials.reporting_books set status='archived' where book_id=$1",[scope.bookId]);
+    await expect(verify()).rejects.toMatchObject({code:"terminal_state_conflict"});
+  });
+
+  it.each(["reopen","posting"] as const)("closed state verification holds coherent evidence against concurrent %s until the host transaction ends",async action=>{
+    const {sdk,scope,command}=await canonicalCloseFixture();
+    await sdk.commands.fiscalPeriods.define({operation:command.operation,fiscalYear:2026,periodNumber:9,periodStart:"2026-09-01",periodEnd:"2026-09-30"});
+    const closed=await sdk.commands.fiscalPeriods.closeCanonical(command);
+    let enter!:(pid:number)=>void,release!:()=>void;
+    const entered=new Promise<number>(resolve=>{enter=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+    const first=Promise.allSettled([runner.transaction(async client=>{
+      const bound=createErpFinancialsSdk({...scope,database:{transaction:work=>work(client)}});
+      const result=await bound.fiscalCloseCertificates.verifyClosedState(closed.certificateId);
+      enter(Number((await client.query("select pg_backend_pid() pid")).rows[0]?.pid));await gate;return result;
+    })]);
+    let second:Promise<PromiseSettledResult<unknown>[]>|undefined;
+    try{
+      const pid=await Promise.race([entered,first.then(()=>{throw Error("Verification ended before lock barrier");})]);
+      second=Promise.allSettled([action==="reopen"?sdk.commands.fiscalPeriods.reopen({operation:command.operation,fiscalPeriodId:command.fiscalPeriodId,expectedVersion:2}):sdk.commands.deposits.record({operation:command.operation,idempotencyKey:"state:future",date:"2026-09-12",amount:"1.00",bankAccount:{accountId:"account_cash"},clearingAccount:{accountId:"account_ar"}})]);
+      await expect.poll(async()=>(await pool.query<{blocked:boolean}>("select exists(select 1 from pg_stat_activity where $1=any(pg_blocking_pids(pid))) blocked",[pid])).rows[0]?.blocked).toBe(true);
+      release();expect((await first)[0]).toMatchObject({status:"fulfilled",value:{matches:true}});expect((await second)[0]).toMatchObject({status:"fulfilled"});
+      expect(await sdk.fiscalCloseCertificates.verifyClosedState(closed.certificateId)).toMatchObject({matches:action!=="reopen",totals:{matches:true}});
+    }finally{release();await first;await second;}
+  },15000);
+
+  it("close totals verification compares exact history without confusing future posting or period state", async () => {
+    const { sdk, scope, command } = await canonicalCloseFixture();
+    const closed = await sdk.commands.fiscalPeriods.closeCanonical(command);
+    const verify = () => sdk.fiscalCloseCertificates.verifyCurrentTotals(closed.certificateId);
+    const original = await verify();
+    expect(original).toEqual({ certificateId: closed.certificateId, matches: true, differingAccountGroupCount: "0", capturedAccountGroupCount: "4", currentAccountGroupCount: "4" });
+    for (const change of [{ companyId: "other" }, { tenantId: "other" }, { writeSourceId: "other" }, { bookId: "other" }]) {
+      await expect(createErpFinancialsSdk({ ...scope, ...change, database: runner }).fiscalCloseCertificates.verifyCurrentTotals(closed.certificateId)).rejects.toMatchObject({ code: "missing_document" });
+    }
+    await sdk.commands.fiscalPeriods.define({ operation: command.operation, fiscalYear: 2026, periodNumber: 9, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    await sdk.commands.deposits.record({ operation: command.operation, idempotencyKey: "verify:future", date: "2026-09-12", amount: "999999999.99", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+    expect(await verify()).toEqual(original);
+    // This is a totals comparison, not a substitute for the period lifecycle.
+    await sdk.commands.fiscalPeriods.reopen({ operation: command.operation, fiscalPeriodId: command.fiscalPeriodId, expectedVersion: 2 });
+    expect(await verify()).toEqual(original);
+    await sdk.commands.deposits.record({ operation: command.operation, idempotencyKey: "verify:changed", date: "2026-08-20", amount: "0.01", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_income" } });
+    expect(await verify()).toMatchObject({ matches: false, differingAccountGroupCount: "4", capturedAccountGroupCount: "4", currentAccountGroupCount: "6" });
+    // Rollback must restore the exact verification result.
+    const changed = await verify();
+    await expect(runner.transaction(async client => {
+      const transactional = createErpFinancialsSdk({ ...scope, database: { transaction: work => work(client) } });
+      await transactional.commands.deposits.record({ operation: command.operation, idempotencyKey: "verify:rollback", date: "2026-08-21", amount: "0.02", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+      expect((await transactional.fiscalCloseCertificates.verifyCurrentTotals(closed.certificateId)).differingAccountGroupCount).toBe("6");
+      throw new Error("rollback verification probe");
+    })).rejects.toThrow("rollback verification probe");
+    expect(await verify()).toEqual(changed);
+    expect((await sdk.fiscalCloseCertificates.totals({ certificateId: closed.certificateId })).items).toHaveLength(4);
+  });
+
+  it("close totals verification detects changed opening history above safe integer money", async () => {
+    const { sdk, command } = await canonicalCloseFixture();
+    const closed = await sdk.commands.fiscalPeriods.closeCanonical(command);
+    await sdk.commands.fiscalPeriods.define({ operation: command.operation, fiscalYear: 2026, periodNumber: 7, periodStart: "2026-07-01", periodEnd: "2026-07-31" });
+    const opening = { operation: command.operation, idempotencyKey: "verify:opening", date: "2026-07-12", amount: "90071992547409.91", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } };
+    await expect(sdk.commands.deposits.record(opening)).rejects.toThrow("locked");
+    expect((await sdk.fiscalCloseCertificates.verifyCurrentTotals(closed.certificateId)).matches).toBe(true);
+    await sdk.commands.fiscalPeriods.reopen({ operation: command.operation, fiscalPeriodId: command.fiscalPeriodId, expectedVersion: 2 });
+    await sdk.commands.deposits.record(opening);
+    expect((await sdk.queries.getFiscalPeriod("source_1", command.fiscalPeriodId)).status).toBe("open");
+    expect(await sdk.fiscalCloseCertificates.verifyCurrentTotals(closed.certificateId)).toMatchObject({ matches: false, differingAccountGroupCount: "4", capturedAccountGroupCount: "4", currentAccountGroupCount: "4" });
+    const frozen = await sdk.fiscalCloseCertificates.totals({ certificateId: closed.certificateId });
+    expect(frozen.items.find(item => item.accountId === "account_cash" && item.accountingBasis === "accrual")?.closingNet).toBe("123.45");
+  });
+
+  it("close bank receipt preserves immutable completion after reopening without reading current statement or ledger", async () => {
+    const { sdk, scope, command, completed } = await canonicalCloseFixture();
+    const closed = await sdk.commands.fiscalPeriods.closeCanonical(command);
+    const input = { certificateId: closed.certificateId, accountId: "account_cash" };
+    const receipt = await sdk.fiscalCloseCertificates.bankReceipt(input);
+    if (!receipt) throw new Error("Expected historical bank receipt");
+    const { recordedAt, ...bankCompletion } = receipt;
+    expect(Number.isFinite(Date.parse(recordedAt))).toBe(true);
+    expect(bankCompletion).toEqual(completed);
+    await expect(sdk.fiscalCloseCertificates.bankReceipt({ ...input, accountId: "account_income" })).resolves.toBeNull();
+    for (const changed of [{ accountId: "missing" }, { certificateId: "missing" }]) {
+      await expect(sdk.fiscalCloseCertificates.bankReceipt({ ...input, ...changed })).rejects.toMatchObject({ code: "missing_document" });
+    }
+    for (const changed of [{ tenantId: "other" }, { companyId: "other" }, { writeSourceId: "other" }, { bookId: "other" }]) {
+      await expect(createErpFinancialsSdk({ ...scope, ...changed, database: runner }).fiscalCloseCertificates.bankReceipt(input)).rejects.toMatchObject({ code: "missing_document" });
+    }
+    for (const changed of [{ accountId: " " }, { certificateId: "x".repeat(1501) }]) {
+      await expect(sdk.fiscalCloseCertificates.bankReceipt({ ...input, ...changed })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    await sdk.commands.fiscalPeriods.reopen({ operation: command.operation, fiscalPeriodId: command.fiscalPeriodId, expectedVersion: 2 });
+    await sdk.bankStatements.reopen({ operation: { ...command.operation, reasonDetail: "Correct later bank statement evidence" }, idempotencyKey: "receipt:reopen", expectedVersion: 2, statementId: completed.statementId });
+    await sdk.bankStatements.prepare({ operation: { ...command.operation, requestId: "receipt:edit" }, idempotencyKey: "receipt:edit", expectedVersion: 3,
+      externalStatementId: completed.externalStatementId, accountId: completed.accountId, statementDate: completed.statementDate, closingBalance: "124.00" });
+    expect(await sdk.bankStatements.get(completed.statementId)).toMatchObject({ status: "draft", version: 4, closingBalance: "124.00" });
+    expect(await sdk.fiscalCloseCertificates.bankReceipt(input)).toEqual(receipt);
+    await pool.query(`create role close_receipt_reader;
+      grant usage on schema erp_financials to close_receipt_reader;
+      grant select on erp_financials.fiscal_close_certificates,erp_financials.fiscal_close_banks,erp_financials.financial_lifecycle_events to close_receipt_reader;`);
+    try {
+      let queries = 0;
+      const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(async client => {
+        await client.query("set local role close_receipt_reader");
+        return work({ query: async (sql, values) => { queries++; return client.query(sql, values); } });
+      }) };
+      for (const table of ["bank_statements", "bank_statement_clearings", "ledger_postings"]) {
+        await expect(database.transaction(client => client.query(`select * from erp_financials.${table} limit 1`))).rejects.toMatchObject({ code: "42501" });
+      }
+      queries = 0;
+      await expect(createErpFinancialsSdk({ ...scope, database }).fiscalCloseCertificates.bankReceipt(input)).resolves.toEqual(receipt);
+      expect(queries).toBe(1);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const delayed = createErpFinancialsSdk({ ...scope, database: { transaction: async work => { await gate; return database.transaction(work); } } });
+      const mutable = { ...input }, pending = delayed.fiscalCloseCertificates.bankReceipt(mutable);
+      mutable.accountId = "missing"; mutable.certificateId = "missing"; release();
+      await expect(pending).resolves.toEqual(receipt);
+    } finally { await pool.query("drop owned by close_receipt_reader; drop role close_receipt_reader"); }
+  });
+
+  it("canonical close certificates roll back host failures and reject corrupted capture at commit", async () => {
+    const { sdk, scope, command } = await canonicalCloseFixture();
+    const before = await depositDatabaseState(pool);
+    await expect(runner.transaction(async client => {
+      await createErpFinancialsSdk({ ...scope, database: { transaction: work => work(client) } }).commands.fiscalPeriods.closeCanonical(command);
+      throw new Error("host failure after certificate");
+    })).rejects.toThrow("host failure after certificate");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const corrupted: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async (sql, values) => {
+      if (sql.startsWith("insert into erp_financials.fiscal_close_totals")) {
+        const changed = sql.replace("coalesce(sum(net_amount) filter(where posting_date<$5::date),0)", "(coalesce(sum(net_amount) filter(where posting_date<$5::date),0)+1)").replace("sum(net_amount),", "sum(net_amount)+1,");
+        expect(changed).not.toBe(sql); return client.query(changed, values);
+      }
+      return client.query(sql, values);
+    } })) };
+    await expect(createErpFinancialsSdk({ ...scope, database: corrupted }).commands.fiscalPeriods.closeCanonical(command)).rejects.toThrow("control totals differ");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(sdk.commands.fiscalPeriods.closeCanonical({ ...command, operation: { ...command.operation, approverRef: command.operation.actorRef } })).rejects.toMatchObject({ code: "authorization_context_invalid" });
+    await expect(sdk.commands.fiscalPeriods.closeCanonical({ ...command, bookId: "different" })).rejects.toMatchObject({ code: "scope_mismatch" });
+    await expect(runner.transaction(async client => {
+      const inside = createErpFinancialsSdk({ ...scope, database: { transaction: work => work(client) } });
+      await inside.commands.fiscalPeriods.closeCanonical(command);
+      await inside.invoices.createDraft({ operation: command.operation, idempotencyKey: "cert:late-draft", customerId: "customer_1", documentDate: "2026-08-12", dueDate: "2026-08-31", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "1.00" }] });
+    })).rejects.toThrow("certificate is incomplete");
+
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const closed = await sdk.commands.fiscalPeriods.closeCanonical(command);
+    expect(closed.status).toBe("closed");
+  });
+
+  it.each(["close", "reopen"] as const)("canonical close certificates serialize statement reopening when %s wins", async first => {
+    const { sdk, scope, command, completed } = await canonicalCloseFixture();
+    let entered!: () => void, release!: () => void;
+    const locked = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const held = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(async client => { const result = await work(client); entered(); await gate; return result; }) } });
+    const reopen = { operation: { ...command.operation, reasonDetail: "Correct bank evidence before fiscal cutoff" }, statementId: completed.statementId, expectedVersion: 2, idempotencyKey: "cert:reopen" };
+    const firstResult = Promise.allSettled([first === "close" ? held.commands.fiscalPeriods.closeCanonical(command) : held.bankStatements.reopen(reopen)]);
+    await locked;
+    const secondResult = Promise.allSettled([first === "close" ? sdk.bankStatements.reopen(reopen) : sdk.commands.fiscalPeriods.closeCanonical(command)]);
+    try {
+      let blocked = false;
+      for (let i = 0; i < 200 && !blocked; i++) {
+        blocked = (await pool.query("select 1 from pg_stat_activity where datname=current_database() and cardinality(pg_blocking_pids(pid))>0")).rows.length > 0;
+        if (!blocked) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(blocked).toBe(true);
+    } finally { release(); }
+    expect((await firstResult)[0].status).toBe("fulfilled"); expect((await secondResult)[0].status).toBe("rejected");
+    expect((await sdk.queries.getFiscalPeriod("source_1", command.fiscalPeriodId)).status).toBe(first === "close" ? "closed" : "open");
+    expect((await pool.query<Record<string, unknown>>("select count(*)::int count from erp_financials.fiscal_close_certificates")).rows[0]?.count).toBe(first === "close" ? 1 : 0);
+  });
+
+  it.each(["close", "post"] as const)("canonical close certificates serialize native posting when %s wins", async first => {
+    const { sdk, scope, command } = await canonicalCloseFixture();
+    let entered!: () => void, release!: () => void;
+    const locked = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const held = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(async client => { const result = await work(client); entered(); await gate; return result; }) } });
+    const post = { operation: command.operation, idempotencyKey: "cert:racing-post", date: "2026-08-20", amount: "1.00", bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } };
+    const firstResult = Promise.allSettled([first === "close" ? held.commands.fiscalPeriods.closeCanonical(command) : held.commands.deposits.record(post)]);
+    await Promise.race([locked, firstResult.then(() => { throw new Error("First command failed before lock boundary"); })]);
+    const secondResult = Promise.allSettled([first === "close" ? sdk.commands.deposits.record(post) : sdk.commands.fiscalPeriods.closeCanonical(command)]);
+    try {
+      let blocked = false;
+      for (let i = 0; i < 200 && !blocked; i++) {
+        blocked = (await pool.query("select 1 from pg_stat_activity where datname=current_database() and cardinality(pg_blocking_pids(pid))>0")).rows.length > 0;
+        if (!blocked) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(blocked).toBe(true);
+    } finally { release(); }
+    expect((await firstResult)[0].status).toBe("fulfilled");
+    expect((await secondResult)[0].status).toBe("rejected");
+    if (first === "post") {
+      expect((await sdk.queries.getFiscalPeriod("source_1", command.fiscalPeriodId)).status).toBe("open");
+      const refreshed = await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", command.fiscalPeriodId, command.bankAccountIds);
+      await sdk.commands.fiscalPeriods.closeCanonical({ ...command, expectedApprovalToken: refreshed.approvalToken });
+    }
+    const period = await sdk.queries.getFiscalPeriod("source_1", command.fiscalPeriodId);
+    if (!period.canonicalCloseCertificateId) throw new Error("Missing close certificate");
+    const rows = await sdk.fiscalCloseCertificates.totals({ certificateId: period.canonicalCloseCertificateId });
+    expect(rows.items.find(row => row.accountId === "account_cash" && row.accountingBasis === "accrual")).toMatchObject({ debitAmount: first === "close" ? "123.45" : "124.45", postingCount: first === "close" ? "1" : "2" });
+  });
+
+  it.each(["close", "draft"] as const)("canonical close certificates serialize draft creation when %s wins", async first => {
+    const { sdk, scope, command } = await canonicalCloseFixture();
+    let entered!: () => void, release!: () => void;
+    const locked = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const held = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(async client => { const result = await work(client); entered(); await gate; return result; }) } });
+    const draft = { operation: command.operation, idempotencyKey: "cert:racing-draft", customerId: "customer_1", documentDate: "2026-08-20", dueDate: "2026-08-31", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "1.00" }] };
+    const firstResult = Promise.allSettled([first === "close" ? held.commands.fiscalPeriods.closeCanonical(command) : held.invoices.createDraft(draft)]);
+    await Promise.race([locked, firstResult.then(() => { throw new Error("First command failed before lock boundary"); })]);
+    const secondResult = Promise.allSettled([first === "close" ? sdk.invoices.createDraft(draft) : sdk.commands.fiscalPeriods.closeCanonical(command)]);
+    try {
+      let blocked = false;
+      for (let i = 0; i < 200 && !blocked; i++) {
+        blocked = (await pool.query("select 1 from pg_stat_activity where datname=current_database() and cardinality(pg_blocking_pids(pid))>0")).rows.length > 0;
+        if (!blocked) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(blocked).toBe(true);
+    } finally { release(); }
+    expect((await firstResult)[0].status).toBe("fulfilled");
+    expect((await secondResult)[0].status).toBe(first === "close" ? "fulfilled" : "rejected");
+    const period = await sdk.queries.getFiscalPeriod("source_1", command.fiscalPeriodId);
+    expect(period.status).toBe(first === "close" ? "closed" : "open");
+    if (first === "close") {
+      // Drafting is non-posting; later drafts cannot rewrite the close snapshot
+      // and must be redated/reopened before issuance into the locked period.
+      const saved = await sdk.invoices.createDraft(draft);
+      await expect(sdk.invoices.issue({ operation: command.operation, invoiceDraftId: saved.invoiceDraftId, expectedVersion: 1, idempotencyKey: "cert:locked-issue" })).rejects.toMatchObject({ code: "fiscal_period_closed" });
+      if (!period.canonicalCloseCertificateId) throw new Error("Missing close certificate");
+      expect((await sdk.fiscalCloseCertificates.get(period.canonicalCloseCertificateId)).diagnostics.draftInvoiceCount).toBe("0");
+    }
+  });
+
+  it("canonical fiscal readiness requires exact cutoff statements including inactive banks and prior-period activity", async () => {
+    const { deposit } = await depositFixture("close-readiness");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "close-readiness", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const period = await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const read = () => sdk.queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, ["account_cash", "account_income"]);
+    const initial = await read();
+    expect(initial.ready).toBe(false);
+    expect(initial.banks).toEqual([
+      expect.objectContaining({ accountId: "account_cash", hasActivity: true, reason: "missing_statement", ready: false, evidenceRef: null }),
+      expect.objectContaining({ accountId: "account_income", hasActivity: false, reason: "no_activity", ready: true, evidenceRef: null })
+    ]);
+    const postingId = String((await pool.query<Record<string, unknown>>(`select posting_id from erp_financials.ledger_postings where transaction_id=$1 and account_id='account_cash' and accounting_basis='accrual'`, [deposit.journal.transactionId])).rows[0]?.posting_id);
+    const prepare = { operation, idempotencyKey: "close-ready:early", expectedVersion: 0, externalStatementId: "early", accountId: "account_cash", statementDate: "2026-08-12", closingBalance: "123.45", addPostingIds: [postingId] };
+    const early = await sdk.bankStatements.prepare(prepare);
+    const complete = { operation: { ...operation, actorRef: "controller" }, idempotencyKey: "close-ready:early-complete", expectedVersion: 1, statementId: early.statementId };
+    await sdk.bankStatements.complete(complete);
+    expect((await read()).banks[0]?.reason).toBe("missing_statement"); // Midmonth evidence does not certify the cutoff.
+    const last = await sdk.bankStatements.prepare({ ...prepare, idempotencyKey: "close-ready:end", externalStatementId: "month-end", statementDate: "2026-08-31", addPostingIds: [] });
+    expect((await read()).banks[0]?.reason).toBe("statement_not_completed");
+    const completed = await sdk.bankStatements.complete({ ...complete, idempotencyKey: "close-ready:end-complete", statementId: last.statementId });
+    expect(await read()).toMatchObject({ ready: true, banks: [
+      { accountId: "account_cash", statementVersion: 2, statementStatus: "completed", evidenceRef: completed.evidenceRef, reason: "ready" },
+      { accountId: "account_income", reason: "no_activity" }
+    ] });
+    await pool.query("update erp_financials.accounts set active=false where account_id='account_cash'");
+    expect((await read()).banks[0]?.evidenceRef).toBe(completed.evidenceRef);
+    const september = await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 9, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    const next = await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", september.fiscalPeriodId, ["account_cash"]);
+    expect(next).toMatchObject({ ready: false, diagnostics: { postingCount: "0" }, banks: [{ hasActivity: true, reason: "missing_statement" }] });
+    await sdk.bankStatements.reopen({ operation: { ...operation, reasonDetail: "Correct statement evidence before final close" }, idempotencyKey: "close-ready:reopen", expectedVersion: 2, statementId: last.statementId });
+    expect((await read()).banks[0]).toMatchObject({ ready: false, evidenceRef: null, statementVersion: 3, reason: "statement_not_completed" });
+    await sdk.bankStatements.cancel({ operation: { ...operation, reasonDetail: "Replace invalid end-of-month statement" }, idempotencyKey: "close-ready:cancel", expectedVersion: 3, statementId: last.statementId });
+    expect((await read()).banks[0]).toMatchObject({ ready: false, evidenceRef: null, statementId: null, reason: "missing_statement" });
+
+  });
+
+  it("canonical fiscal readiness isolates scope, rejects missing configuration, snapshots inputs and uses a fixed query count", async () => {
+    await depositFixture("close-readiness");
+    const scope = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "close-readiness", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(scope), operation = sdkOperation();
+    const period = await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const call = (ids: readonly string[]) => sdk.queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, ids);
+    expect(await call(["missing"])).toMatchObject({ ready: false, banks: [{ reason: "missing_account" }] });
+    await expect(call(["account_cash", "account_cash"])).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(call(Array.from({ length: 201 }, (_, i) => String(i)))).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(sdk.queries.getCanonicalFiscalCloseReadiness("source_2", period.fiscalPeriodId, [])).rejects.toMatchObject({ code: "missing_document" });
+    for (const changed of [{ tenantId: "other" }, { companyId: "other" }, { bookId: "other" }]) {
+      await expect(createErpFinancialsSdk({ ...scope, ...changed }).queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, [])).rejects.toThrow();
+    }
+    let queries = 0;
+    const counted: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async (sql, values) => { queries++; return client.query(sql, values); } })) };
+    const observed = createErpFinancialsSdk({ ...scope, database: counted });
+    await observed.queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, ["account_cash"]); const one = queries;
+    queries = 0;
+    await observed.queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, ["account_cash", "account_income"]);
+    expect(queries).toBe(one); expect(one).toBe(2);
+    let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+    const delayed = createErpFinancialsSdk({ ...scope, database: { transaction: async work => { await gate; return runner.transaction(work); } } });
+    const mutable = ["account_cash"];
+    const pending = delayed.queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, mutable);
+    mutable[0] = "missing"; release(); expect((await pending).banks[0]?.accountId).toBe("account_cash");
+    await sdk.invoices.createDraft({ operation, idempotencyKey: "close-ready:draft", customerId: "customer_1", documentDate: "2026-08-12", dueDate: "2026-08-31", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "10.00" }] });
+    expect(await call([])).toMatchObject({ ready: false, diagnostics: { draftInvoiceCount: "1" } });
+    const basis = await sdk.books.define({ operation, bookId: "empty-cash-basis", name: "Separate basis", baseCurrencyCode: "USD", accountingBasis: "modified_cash" });
+    await sdk.books.bindSource({ operation, bookId: basis.bookId, sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    expect((await createErpFinancialsSdk({ ...scope, bookId: basis.bookId }).queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, ["account_cash"])).banks[0]).toMatchObject({ hasActivity: false, reason: "no_activity" });
+  });
+
+  async function statementRetirementFixture(action: BankStatementCommandAttempt["action"]) {
+    await depositFixture("statement-retirement");
+    const options = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "statement-retirement", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(options), operation = sdkOperation();
+    const prepare = { operation, externalStatementId: "retirement-fixture", accountId: "account_cash", statementDate: "2026-08-12", closingBalance: "0.00", expectedVersion: 0, idempotencyKey: "statement:original" };
+    let command: BankStatementCommandAttempt;
+    if (action === "prepare") command = { action, input: prepare };
+    else {
+      let statement = await sdk.bankStatements.prepare({ ...prepare, idempotencyKey: "statement:setup" });
+      if (action === "reopen") statement = await sdk.bankStatements.complete({ operation: { ...operation, actorRef: "controller" }, statementId: statement.statementId, expectedVersion: statement.version, idempotencyKey: "statement:setup-complete" });
+      command = { action, input: { operation: { ...operation, actorRef: action === "complete" ? "controller" : operation.actorRef, reasonDetail: "Correct original statement evidence" },
+        statementId: statement.statementId, expectedVersion: statement.version, idempotencyKey: "statement:original" } };
+    }
+    const retirement = { ...command.input.operation, reasonCode: "cancel_unaccepted_statement_command", reasonDetail: "Resolve this uncertain statement attempt" };
+    return { sdk, options, command, retirement };
+  }
+  const runStatementAttempt = (sdk: ErpFinancialsSdk, command: BankStatementCommandAttempt) => command.action === "prepare"
+    ? sdk.bankStatements.prepare(command.input) : sdk.bankStatements[command.action](command.input);
+
+  it.each(["prepare", "complete", "reopen", "cancel"] as const)("bank statement retirement fences exact %s command without changing accounting", async action => {
+    const { sdk, options, command, retirement } = await statementRetirementFixture(action);
+    const before = await depositDatabaseState(pool);
+    const result = await sdk.bankStatements.retireCommandAttempt({ command, operation: retirement });
+    expect(result).toMatchObject({ status: "retired", action, idempotencyKey: command.input.idempotencyKey });
+    const retired = await depositDatabaseState(pool);
+    for (const table of ["ledger_postings", "bank_statements", "bank_statement_clearings", "bank_statement_clearing_history", "financial_outbox"]) expect(retired[table]).toEqual(before[table]);
+    await expect(runStatementAttempt(sdk, command)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    const freshTransport = { ...command, input: { ...command.input, operation: { ...command.input.operation, requestId: "fresh-request", occurredAt: "2026-09-01T00:00:00Z" } } } as BankStatementCommandAttempt;
+    expect(await sdk.bankStatements.retireCommandAttempt({ command: freshTransport, operation: { ...retirement, requestId: "fresh-retirement" } })).toEqual({ ...result, status: "already_retired" });
+    for (const changed of [{ expectedVersion: command.input.expectedVersion + 1 }, { operation: { ...command.input.operation, reasonDetail: "Different original accounting reason" } },
+      ...(command.action === "prepare" ? [{ closingBalance: "0.01" }, { addPostingIds: ["another-posting"] }] : [])]) {
+      const altered = { ...command, input: { ...command.input, ...changed } } as BankStatementCommandAttempt;
+      await expect(sdk.bankStatements.retireCommandAttempt({ command: altered, operation: retirement })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    await expect(sdk.bankStatements.retireCommandAttempt({ command, operation: { ...retirement, reasonDetail: "Different retirement explanation" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(sdk.bankStatements.retireCommandAttempt({ command, operation: { ...retirement, actorRef: "other-actor" } })).rejects.toMatchObject({ code: "authorization_context_invalid" });
+    for (const foreign of [{ tenantId: "foreign" }, { companyId: "foreign" }, { bookId: "foreign" }, { writeSourceId: "foreign" }]) {
+      await expect(createErpFinancialsSdk({ ...options, ...foreign }).bankStatements.retireCommandAttempt({ command, operation: retirement })).rejects.toThrow();
+    }
+    expect(await depositDatabaseState(pool)).toEqual(retired);
+    if (result.status !== "retired") throw Error("Missing retirement receipt");
+    await expect(pool.query("delete from erp_financials.financial_lifecycle_events where event_id=$1", [result.lifecycleEventId])).rejects.toThrow();
+  });
+
+  it.each(["prepare", "complete", "reopen", "cancel"] as const)("bank statement retirement recovers accepted %s historical receipt without writes", async action => {
+    const { sdk, options, command, retirement } = await statementRetirementFixture(action);
+    const original = await runStatementAttempt(sdk, command);
+    if (action === "prepare") await sdk.bankStatements.complete({ operation: { ...sdkOperation(), actorRef: "controller" }, statementId: original.statementId, expectedVersion: original.version, idempotencyKey: "later-completion" });
+    if (action === "complete") await sdk.bankStatements.reopen({ operation: { ...sdkOperation(), reasonDetail: "Later independent statement correction" }, statementId: original.statementId, expectedVersion: original.version, idempotencyKey: "later-reopen" });
+    if (action === "reopen") await sdk.bankStatements.cancel({ operation: { ...sdkOperation(), reasonDetail: "Later independent statement cancellation" }, statementId: original.statementId, expectedVersion: original.version, idempotencyKey: "later-cancel" });
+    const current = await sdk.bankStatements.get(original.statementId), before = await depositDatabaseState(pool);
+    const readOnly = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({ query: async (sql, values) => {
+      if (/\b(insert|update|delete)\s+(into|erp_financials|"erp_financials"|from)/iu.test(sql)) throw Error("Recovery attempted a write");
+      return client.query(sql, values);
+    } })) } });
+    expect(await readOnly.bankStatements.retireCommandAttempt({ command, operation: retirement })).toEqual({ status: "already_recorded", action, idempotencyKey: command.input.idempotencyKey, statement: original, currentStatement: current });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["prepare", "complete", "reopen", "cancel"] as const)("bank statement retirement remains possible after %s command becomes stale and fiscal closing begins", async action => {
+    const { sdk, command, retirement } = await statementRetirementFixture(action);
+    const period = (await pool.query<{ fiscalPeriodId: string; version: number }>('select fiscal_period_id as "fiscalPeriodId",version from erp_financials.fiscal_periods')).rows[0];
+    if (!period) throw Error("Missing fixture period");
+    await sdk.commands.fiscalPeriods.beginClose({ operation: sdkOperation(), fiscalPeriodId: period.fiscalPeriodId, expectedVersion: period.version });
+    const stale = { ...command, input: { ...command.input, expectedVersion: 999 } } as BankStatementCommandAttempt;
+    expect((await sdk.bankStatements.retireCommandAttempt({ command: stale, operation: retirement })).status).toBe("retired");
+    await expect(runStatementAttempt(sdk, stale)).rejects.toMatchObject({ code: "idempotency_conflict" });
+  });
+
+  it.each(["prepare", "complete", "reopen", "cancel"].flatMap(action => ["retirement", "command"].map(winner => ({ action: action as BankStatementCommandAttempt["action"], winner }))))("bank statement retirement actual lock race: $action, $winner wins", async ({ action, winner }) => {
+    const { sdk, options, command, retirement } = await statementRetirementFixture(action);
+    let entered!: () => void, release!: () => void;
+    const locked = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const held = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => { const result = await work(client); entered(); await gate; return result; }) } });
+    const first = Promise.allSettled([winner === "retirement" ? held.bankStatements.retireCommandAttempt({ command, operation: retirement }) : runStatementAttempt(held, command)]);
+    await locked;
+    const second = Promise.allSettled([winner === "retirement" ? runStatementAttempt(sdk, command) : sdk.bankStatements.retireCommandAttempt({ command, operation: retirement })]);
+    try {
+      let blocked = false;
+      for (let i = 0; i < 200 && !blocked; i++) { blocked = (await pool.query("select 1 from pg_stat_activity where datname=current_database() and wait_event='advisory' and cardinality(pg_blocking_pids(pid))>0")).rows.length > 0; if (!blocked) await new Promise(resolve => setTimeout(resolve, 10)); }
+      expect(blocked).toBe(true);
+    } finally { release(); }
+    expect((await first)[0].status).toBe("fulfilled");
+    const later = (await second)[0]; expect(later.status).toBe(winner === "retirement" ? "rejected" : "fulfilled");
+    if (later.status === "fulfilled") expect(later.value).toMatchObject({ status: "already_recorded" });
+    else expect(later.reason).toMatchObject({ code: "idempotency_conflict" });
+  });
+
+  it("bank statement retirement rolls back its receipt and recovers a lost commit acknowledgement", async () => {
+    const { sdk, options, command, retirement } = await statementRetirementFixture("prepare");
+    const before = await depositDatabaseState(pool);
+    const failing = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => { await work(client); throw Error("retirement outer rollback"); }) } });
+    await expect(failing.bankStatements.retireCommandAttempt({ command, operation: retirement })).rejects.toThrow("retirement outer rollback");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const lost = createErpFinancialsSdk({ ...options, database: { transaction: async work => { await runner.transaction(work); throw Error("retirement committed but response lost"); } } });
+    await expect(lost.bankStatements.retireCommandAttempt({ command, operation: retirement })).rejects.toThrow("retirement committed but response lost");
+    const after = await depositDatabaseState(pool);
+    expect((await sdk.bankStatements.retireCommandAttempt({ command, operation: retirement })).status).toBe("already_retired");
+    await expect(runStatementAttempt(sdk, command)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("bank statement retirement snapshots caller-owned payload before waiting", async () => {
+    const { sdk, options, command, retirement } = await statementRetirementFixture("prepare");
+    let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+    const delayed = createErpFinancialsSdk({ ...options, database: { transaction: async work => { await gate; return runner.transaction(work); } } });
+    const mutable = structuredClone({ command, operation: retirement });
+    const pending = delayed.bankStatements.retireCommandAttempt(mutable);
+    Object.assign(mutable.command.input, { closingBalance: "99.99", expectedVersion: 777 });
+    Object.assign(mutable.operation, { actorRef: "other", reasonCode: "changed" });
+    release(); expect((await pending).status).toBe("retired");
+    expect((await sdk.bankStatements.retireCommandAttempt({ command, operation: retirement })).status).toBe("already_retired");
+    await expect(runStatementAttempt(sdk, command)).rejects.toMatchObject({ code: "idempotency_conflict" });
+  });
+
+  it("bank statement retirement survives actual backend termination before commit", async () => {
+    const { sdk, options, command, retirement } = await statementRetirementFixture("prepare");
+    const before = await depositDatabaseState(pool), connection = await pool.connect();
+    connection.on("error", () => undefined);
+    let release!: () => void, reached!: () => void, intercepted = false;
+    const gate = new Promise<void>(resolve => { release = resolve; }), boundary = new Promise<void>(resolve => { reached = resolve; });
+    let pending: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      await connection.query("begin");
+      const pid = (await connection.query<{ pid: number }>("select pg_backend_pid() pid")).rows[0]?.pid;
+      if (!pid) throw Error("Missing owned test backend");
+      const scoped = createErpFinancialsSdk({ ...options, database: { transaction: async work => {
+        const result = await work({ async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+          const rows = await new PgQueryClient(connection).query<Row>(sql, params);
+          if (!intercepted && sql.includes('insert into "erp_financials"."financial_lifecycle_events"')) { intercepted = true; reached(); await gate; }
+          return rows;
+        } });
+        await connection.query("commit"); return result;
+      } } });
+      pending = Promise.allSettled([scoped.bankStatements.retireCommandAttempt({ command, operation: retirement })]);
+      await Promise.race([boundary, pending.then(() => { throw Error("Command ended before crash boundary"); })]);
+      expect((await pool.query<{ terminated: boolean }>("select pg_terminate_backend($1) terminated", [pid])).rows[0]?.terminated).toBe(true);
+      release(); expect((await pending)[0]?.status).toBe("rejected");
+    } finally { release(); await pending; connection.release(true); }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    expect((await sdk.bankStatements.retireCommandAttempt({ command, operation: retirement })).status).toBe("retired");
+  }, 15000);
+
+  it.each(["facade", "runner"] as const)("default SDK pool boundary survives real backend termination through %s", async mode => {
+    const { sdk, options, command, retirement } = await statementRetirementFixture("prepare");
+    const before = await depositDatabaseState(pool);
+    let reached!: () => void, release!: () => void, intercepted = false, pid = 0;
+    const boundary = new Promise<void>(resolve => { reached = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const releases: unknown[] = [], errors: Error[] = [];
+    const onPoolError = (error: Error) => { errors.push(error); }; pool.on("error", onPoolError);
+    const observed: ErpFinancialsPostgresPool = { connect: async () => {
+      const client = await pool.connect(), backend = (await client.query<{ pid: number }>("select pg_backend_pid() pid")).rows[0];
+      if (!backend) { client.release(true); throw Error("Missing owned backend"); } pid = backend.pid;
+      return {
+        query: async <Row extends Record<string, unknown>>(sql: string, values: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> => {
+          const result = await new PgQueryClient(client).query<Row>(sql, values);
+          if (!intercepted && sql.includes('insert into "erp_financials"."financial_lifecycle_events"')) { intercepted = true; reached(); await gate; }
+          return result;
+        },
+        release: (error?: Error | boolean) => { releases.push(error); client.release(error); },
+        on: (event, listener) => client.on(event, listener), off: (event, listener) => client.off(event, listener),
+      };
+    } };
+    const current = createErpFinancialsSdk({ ...options, database: mode === "facade" ? observed : createPostgresTransactionRunner(observed) });
+    const pending = Promise.allSettled([current.bankStatements.retireCommandAttempt({ command, operation: retirement })]);
+    try {
+      await Promise.race([boundary, pending.then(() => { throw Error("Command ended before owned crash boundary"); })]);
+      expect((await pool.query<{ terminated: boolean }>("select pg_terminate_backend($1) terminated", [pid])).rows[0]?.terminated).toBe(true);
+      release(); expect((await pending)[0]).toMatchObject({ status: "rejected" });
+      expect(releases).toHaveLength(1); expect(releases[0]).toBeTruthy();
+      expect(await depositDatabaseState(pool)).toEqual(before);
+      expect((await sdk.bankStatements.retireCommandAttempt({ command, operation: retirement })).status).toBe("retired");
+      expect(errors.every(error => /terminat|connection/i.test(error.message))).toBe(true);
+    } finally { release(); await pending; pool.off("error", onPoolError); }
+  }, 15000);
+
+  it.each(["facade", "runner"] as const)("default SDK pool boundary preserves uncertain commit and recovers exact statement through %s", async mode => {
+    const { sdk, options, command } = await statementRetirementFixture("prepare");
+    const original = Error("commit acknowledgement lost"), rollback = Error("rollback transport also lost"); let commits = 0;
+    const releases: unknown[] = [];
+    const observed: ErpFinancialsPostgresPool = { connect: async () => {
+      const client = await pool.connect();
+      return {
+        query: async <Row extends Record<string, unknown>>(sql: string, values: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> => {
+          if (sql === "rollback") throw rollback;
+          const result = await new PgQueryClient(client).query<Row>(sql, values);
+          if (sql === "commit") { commits++; throw original; } return result;
+        },
+        release: (error?: Error | boolean) => { releases.push(error); client.release(error); },
+        on: (event, listener) => client.on(event, listener), off: (event, listener) => client.off(event, listener),
+      };
+    } };
+    const current = createErpFinancialsSdk({ ...options, database: mode === "facade" ? observed : createPostgresTransactionRunner(observed) });
+    await expect(runStatementAttempt(current, command)).rejects.toBe(original);
+    expect(commits).toBe(1); expect(releases).toEqual([true]);
+    const before = await depositDatabaseState(pool), replay = await runStatementAttempt(sdk, command);
+    expect(replay).toMatchObject({ status: "draft", version: 1 });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    expect((await pool.query<{ count: number }>("select count(*)::int count from erp_financials.bank_statements")).rows[0]?.count).toBe(1);
+  });
+
+  it("bank statements own exact balances, completion and outstanding carryover without posting money", async () => {
+    const { deposit } = await depositFixture("statements");
+    const scope = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "statements", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(scope), operation = sdkOperation();
+    const receipt = await sdk.commands.customerPayments.record({ operation, idempotencyKey: "statement-outstanding", date: "2026-08-11", customerId: "customer_1", amount: "10.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const allPostings = (await pool.query<Record<string, unknown>>(`select posting_id,transaction_id from erp_financials.ledger_postings where account_id='account_cash' and accounting_basis='accrual' order by posting_id`)).rows;
+    const depositPosting = String(allPostings.find(p => p.transaction_id === deposit.journal.transactionId)?.posting_id);
+    const receiptPosting = String(allPostings.find(p => p.transaction_id === receipt.journal.transactionId)?.posting_id);
+    const initialAccounting = (await depositDatabaseState(pool)).ledger_postings;
+    const create = { operation, idempotencyKey: "statement:create", expectedVersion: 0, externalStatementId: "August-mid", accountId: "account_cash", statementDate: "2026-08-12", closingBalance: "123.45" };
+    const first = await sdk.bankStatements.prepare(create);
+    expect(first).toMatchObject({ status: "draft", version: 1, openingBalance: "0.00", selectedAmount: "0.00", difference: "123.45", selectedCount: "0", evidenceRef: null });
+    const page = await sdk.bankStatements.activity({ statementId: first.statementId, limit: 1 });
+    expect(page.items).toHaveLength(1); expect(page.nextCursor).toBeDefined();
+    if (!page.nextCursor) throw new Error("Expected statement continuation");
+    const next = await sdk.bankStatements.activity({ statementId: first.statementId, limit: 1, cursor: page.nextCursor });
+    expect([...page.items, ...next.items].map(p => p.postingId).sort()).toEqual([depositPosting, receiptPosting].sort());
+    const selected = await sdk.bankStatements.prepare({ ...create, idempotencyKey: "statement:select", expectedVersion: 1, addPostingIds: [depositPosting] });
+    expect(selected).toMatchObject({ version: 2, selectedAmount: "123.45", difference: "0.00", selectedCount: "1" });
+    await expect(sdk.bankStatements.activity({ statementId: first.statementId, cursor: page.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+    let before = await depositDatabaseState(pool);
+    await expect(sdk.bankStatements.complete({ operation, idempotencyKey: "statement:self", statementId: first.statementId, expectedVersion: 2 })).rejects.toMatchObject({ code: "authorization_context_invalid" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const complete = { operation: { ...operation, actorRef: "controller:real-actor" }, idempotencyKey: "statement:complete", statementId: first.statementId, expectedVersion: 2 };
+    const [done, retry] = await Promise.all([sdk.bankStatements.complete(complete), sdk.bankStatements.complete({ ...complete, operation: { ...complete.operation, requestId: "fresh-transport" } })]);
+    expect(done).toEqual(retry); expect(done).toMatchObject({ status: "completed", version: 3, completedBy: "controller:real-actor" }); expect(done.evidenceRef).toContain(done.lifecycleEventId);
+    before = await depositDatabaseState(pool);
+    await expect(pool.query<Record<string, unknown>>(`delete from erp_financials.bank_statement_clearings where statement_id=$1`, [first.statementId])).rejects.toThrow("completed statement clearings are immutable");
+    await expect(sdk.commands.deposits.reverse({ operation, depositId: deposit.documentId, idempotencyKey: "statement:illegal-reverse", date: "2026-08-12" })).rejects.toThrow("statement-cleared accounting");
+    await expect(sdk.bankStatements.complete({ ...complete, operation: { ...complete.operation, actorRef: "changed" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await sdk.bankStatements.prepare(create)).toEqual(first); // historical command receipt, not current mutable state
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const second = await sdk.bankStatements.prepare({ ...create, idempotencyKey: "statement:second", externalStatementId: "August-end", statementDate: "2026-08-20", closingBalance: "133.45", addPostingIds: [receiptPosting] });
+    expect(second).toMatchObject({ openingBalance: "123.45", selectedAmount: "10.00", difference: "0.00", previousStatementId: first.statementId });
+    before = await depositDatabaseState(pool);
+    await expect(sdk.bankStatements.reopen({ operation: { ...operation, reasonDetail: "Correct prior statement evidence" }, idempotencyKey: "statement:old-reopen", statementId: first.statementId, expectedVersion: 3 })).rejects.toMatchObject({ code: "reconciliation_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await sdk.bankStatements.complete({ ...complete, idempotencyKey: "statement:second-complete", statementId: second.statementId, expectedVersion: 1 });
+    expect((await sdk.bankStatements.get(second.statementId)).difference).toBe("0.00");
+    expect((await depositDatabaseState(pool)).ledger_postings).toEqual(initialAccounting);
+    await expect(createErpFinancialsSdk({ ...scope, writeSourceId: "source_2" }).bankStatements.get(first.statementId)).rejects.toMatchObject({ code: "missing_document" });
+  });
+
+  it("bank statements list current receipts in bounded scope-bound pages including cancelled replacements", async () => {
+    await depositFixture("statements");
+    const scope = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "statements", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(scope), operation = sdkOperation();
+    const prepare = { operation, idempotencyKey: "list:first", expectedVersion: 0, externalStatementId: "first", accountId: "account_cash", statementDate: "2026-08-12", closingBalance: "0.00" };
+    const first = await sdk.bankStatements.prepare(prepare);
+    const firstDone = await sdk.bankStatements.complete({ operation: { ...operation, actorRef: "controller" }, idempotencyKey: "list:first-done", expectedVersion: 1, statementId: first.statementId });
+    const discarded = await sdk.bankStatements.prepare({ ...prepare, idempotencyKey: "list:discard", externalStatementId: "discard", statementDate: "2026-08-20" });
+    const cancelled = await sdk.bankStatements.cancel({ operation: { ...operation, reasonDetail: "Replace incorrectly dated bank evidence" }, idempotencyKey: "list:cancel", expectedVersion: 1, statementId: discarded.statementId });
+    const replacement = await sdk.bankStatements.prepare({ ...prepare, idempotencyKey: "list:replacement", externalStatementId: "replacement", statementDate: "2026-08-20" });
+    const range = { accountId: "account_cash", fromDate: "2026-08-01", throughDate: "2026-08-31" };
+    let queries = 0;
+    const counted: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({ query: async (sql, values) => { queries++; return client.query(sql, values); } })) };
+    const read = createErpFinancialsSdk({ ...scope, database: counted }).bankStatements;
+    expect((await read.list(range)).items).toEqual([replacement, firstDone]);
+    expect(queries).toBe(1); // No per-statement detail queries or selection scans.
+    const page = await read.list({ ...range, limit: 1 });
+    expect(page.items).toEqual([replacement]);
+    if (!page.nextCursor) throw new Error("Expected statement page continuation");
+    const next = await read.list({ ...range, limit: 1, cursor: page.nextCursor });
+    expect(next).toEqual({ items: [firstDone] });
+    const all = await read.list({ ...range, includeCancelled: true, limit: 1 });
+    const ids = all.items.map(item => item.statementId);
+    let cursor = all.nextCursor;
+    while (cursor) {
+      const continuation = await read.list({ ...range, includeCancelled: true, limit: 1, cursor });
+      ids.push(...continuation.items.map(item => item.statementId)); cursor = continuation.nextCursor;
+    }
+    expect([...ids].sort()).toEqual([replacement.statementId, cancelled.statementId, first.statementId].sort());
+    expect(new Set(ids).size).toBe(3);
+    expect((await read.list({ ...range, includeCancelled: true })).items.find(item => item.statementId === cancelled.statementId)).toEqual(cancelled);
+    for (const change of [{ accountId: "account_ar" }, { fromDate: "2026-08-02" }, { includeCancelled: true }]) {
+      await expect(read.list({ ...range, ...change, cursor: page.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const change of [{ tenantId: "other" }, { companyId: "other" }, { writeSourceId: "source_2" }, { bookId: "other" }]) {
+      const other = createErpFinancialsSdk({ ...scope, ...change }).bankStatements;
+      expect(await other.list(range)).toEqual({ items: [] });
+      await expect(other.list({ ...range, cursor: page.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const change of [{ limit: 201 }, { fromDate: "2026-02-30" }, { throughDate: "2026-07-31" }, { cursor: "broken" }]) {
+      await expect(read.list({ ...range, ...change })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    expect(await read.list({ ...range, throughDate: "2026-08-11" })).toEqual({ items: [] });
+    expect(await sdk.bankStatements.prepare(prepare)).toEqual(first);
+    expect((await read.list(range)).items[1]).toEqual(await sdk.bankStatements.get(first.statementId));
+  });
+
+  it("bank statements roll back, snapshot commands and guard evidence against unversioned writes", async () => {
+    const { deposit } = await depositFixture("statements");
+    const scope = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "statements", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    const postingId = String((await pool.query<Record<string, unknown>>(`select posting_id from erp_financials.ledger_postings where transaction_id=$1 and account_id='account_cash' and accounting_basis='accrual'`, [deposit.journal.transactionId])).rows[0]?.posting_id);
+    const prepare = { operation, idempotencyKey: "statement:atomic", expectedVersion: 0, externalStatementId: "August", accountId: "account_cash", statementDate: "2026-08-12", closingBalance: "123.45", addPostingIds: [postingId] };
+    const before = await depositDatabaseState(pool);
+    await expect(runner.transaction(async client => { await createErpFinancialsSdk({ ...scope, database: { transaction: work => work(client) } }).bankStatements.prepare(prepare); throw new Error("host failed"); })).rejects.toThrow("host failed");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+    const delayed = createErpFinancialsSdk({ ...scope, database: { transaction: async work => { await gate; return runner.transaction(work); } } });
+    const mutable = structuredClone(prepare); const pending = delayed.bankStatements.prepare(mutable);
+    mutable.accountId = "account_ar"; mutable.closingBalance = "999.99"; mutable.addPostingIds.length = 0;
+    release(); const draft = await pending;
+    expect(draft).toMatchObject({ accountId: "account_cash", closingBalance: "123.45", selectedAmount: "123.45" });
+    const after = await depositDatabaseState(pool);
+    await expect(pool.query<Record<string, unknown>>(`delete from erp_financials.bank_statement_clearings where statement_id=$1`, [draft.statementId])).rejects.toThrow("statement selection changes require a pending new version");
+    await expect(pool.query<Record<string, unknown>>(`update erp_financials.bank_statements set closing_balance=999 where statement_id=$1`, [draft.statementId])).rejects.toThrow("bank statement requires next version");
+    await expect(sdk.bankStatements.prepare({ ...prepare, idempotencyKey: "statement:duplicate", expectedVersion: 1 })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    const complete = await sdk.bankStatements.complete({ operation: { ...operation, actorRef: "controller" }, idempotencyKey: "statement:done", statementId: draft.statementId, expectedVersion: 1 });
+    const reopened = await sdk.bankStatements.reopen({ operation: { ...operation, reasonDetail: "Correct statement clearing selection" }, idempotencyKey: "statement:reopen", statementId: draft.statementId, expectedVersion: complete.version });
+    expect(reopened).toMatchObject({ status: "draft", version: 3, evidenceRef: null });
+    await sdk.bankStatements.prepare({ ...prepare, idempotencyKey: "statement:remove", expectedVersion: 3, addPostingIds: [], removePostingIds: [postingId] });
+    await expect(sdk.commands.deposits.reverse({ operation, depositId: deposit.documentId, idempotencyKey: "statement:allowed-reverse", date: "2026-08-12" })).resolves.toMatchObject({ status: "reversed" });
+  });
+
+  it("bank statements cancel drafts to unwind dependencies while preserving historical receipts", async () => {
+    const { deposit } = await depositFixture("statements");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "statements", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const id = String((await pool.query<Record<string, unknown>>(`select posting_id from erp_financials.ledger_postings where transaction_id=$1 and account_id='account_cash' and accounting_basis='accrual'`, [deposit.journal.transactionId])).rows[0]?.posting_id);
+    const create = { operation, idempotencyKey: "cancel:first", expectedVersion: 0, externalStatementId: "first", accountId: "account_cash", statementDate: "2026-08-12", closingBalance: "123.45", addPostingIds: [id] };
+    const first = await sdk.bankStatements.prepare(create);
+    await sdk.bankStatements.complete({ operation: { ...operation, actorRef: "controller" }, idempotencyKey: "cancel:first-done", expectedVersion: 1, statementId: first.statementId });
+    const second = await sdk.bankStatements.prepare({ ...create, externalStatementId: "second", idempotencyKey: "cancel:second", statementDate: "2026-08-20", addPostingIds: [] });
+    const cancel = { operation: { ...operation, reasonDetail: "Unwind later draft to correct prior evidence" }, idempotencyKey: "cancel:second-cancel", statementId: second.statementId, expectedVersion: 1 };
+    const cancelled = await sdk.bankStatements.cancel(cancel);
+    expect(cancelled).toMatchObject({ status: "cancelled", version: 2, selectedCount: "0", openingBalance: "123.45", evidenceRef: null });
+    await sdk.bankStatements.reopen({ ...cancel, statementId: first.statementId, expectedVersion: 2, idempotencyKey: "cancel:first-reopen" });
+    await sdk.bankStatements.prepare({ ...create, expectedVersion: 3, idempotencyKey: "cancel:amend", closingBalance: "0.00", addPostingIds: [], removePostingIds: [id] });
+    const before = await depositDatabaseState(pool);
+    expect(await sdk.bankStatements.cancel(cancel)).toEqual(cancelled);
+    expect((await sdk.bankStatements.get(second.statementId)).openingBalance).toBe("123.45");
+    await expect(sdk.bankStatements.prepare({ ...create, externalStatementId: "second", expectedVersion: 2, idempotencyKey: "cancel:reuse" })).rejects.toMatchObject({ code: "reconciliation_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("bank statements preserve money beyond safe integer cents and cancel selected drafts atomically", async () => {
+    await depositFixture("statements");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "statements", currencyCode: "USD" });
+    const operation = sdkOperation(), amount = "90071992547409.93";
+    const huge = await sdk.commands.deposits.record({ operation, idempotencyKey: "statement:huge", date: "2026-08-12", amount, bankAccount: { accountId: "account_cash" }, clearingAccount: { accountId: "account_ar" } });
+    const posting = String((await pool.query<Record<string, unknown>>(`select posting_id from erp_financials.ledger_postings where transaction_id=$1 and account_id='account_cash' and accounting_basis='accrual'`, [huge.journal.transactionId])).rows[0]?.posting_id);
+    const input = { operation, idempotencyKey: "statement:huge-prepare", expectedVersion: 0, externalStatementId: "huge", accountId: "account_cash", statementDate: "2026-08-12", closingBalance: amount, addPostingIds: [posting] };
+    const before = await depositDatabaseState(pool);
+    for (const changed of [{ closingBalance: "NaN" }, { statementDate: "2026-02-30" }, { addPostingIds: Array.from({ length: 501 }, (_, i) => String(i)) }]) {
+      await expect(sdk.bankStatements.prepare({ ...input, ...changed })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const draft = await sdk.bankStatements.prepare(input);
+    expect(draft).toMatchObject({ closingBalance: amount, selectedAmount: amount, difference: "0.00" });
+    expect(await sdk.bankStatements.find("huge")).toEqual(draft); expect(await sdk.bankStatements.find("missing")).toBeNull();
+    await sdk.bankStatements.prepare({ ...input, idempotencyKey: "statement:huge-cent", expectedVersion: 1, addPostingIds: [], closingBalance: "90071992547409.94" });
+    const cent = await sdk.bankStatements.get(draft.statementId); expect(cent.difference).toBe("0.01");
+    await expect(sdk.bankStatements.complete({ operation: { ...operation, actorRef: "controller" }, idempotencyKey: "statement:huge-bad-complete", statementId: draft.statementId, expectedVersion: 2 })).rejects.toMatchObject({ code: "reconciliation_conflict" });
+    const cancelled = await sdk.bankStatements.cancel({ operation: { ...operation, reasonDetail: "Discard incorrect large statement evidence" }, idempotencyKey: "statement:huge-cancel", statementId: draft.statementId, expectedVersion: 2 });
+    expect(cancelled).toMatchObject({ status: "cancelled", selectedCount: "0", selectedAmount: "0.00" });
+    const history = await sdk.bankStatements.history({ statementId: draft.statementId, limit: 1 });
+    expect(history.items).toEqual([expect.objectContaining({ action: "added", amount, statementVersion: 1, postingId: posting })]);
+    if (!history.nextCursor) throw new Error("Expected immutable clearing history continuation");
+    const historyNext = await sdk.bankStatements.history({ statementId: draft.statementId, limit: 1, cursor: history.nextCursor });
+    expect(historyNext.items).toEqual([expect.objectContaining({ action: "removed", amount, statementVersion: 3, postingId: posting })]);
+    await expect(pool.query(`delete from erp_financials.bank_statement_clearing_history where statement_id=$1`, [draft.statementId])).rejects.toThrow("statement clearing history is immutable");
+    expect((await pool.query<Record<string, unknown>>("select count(*)::int count from erp_financials.bank_statement_clearings where statement_id=$1", [draft.statementId])).rows[0]?.count).toBe(0);
+    await expect(sdk.commands.deposits.reverse({ operation, depositId: huge.documentId, idempotencyKey: "statement:huge-reverse", date: "2026-08-12" })).resolves.toMatchObject({ status: "reversed" });
+  });
+
+  it.each(["complete", "close"] as const)("bank statements serialize completion against fiscal close when %s wins", async first => {
+    const { financials } = await depositFixture("statements");
+    const scope = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "statements", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    const prepared = await sdk.bankStatements.prepare({ operation, idempotencyKey: "race:prepare", expectedVersion: 0, externalStatementId: "race", accountId: "account_cash", statementDate: "2026-08-12", closingBalance: "0.00" });
+    const fiscalPeriodId = String((await pool.query<Record<string, unknown>>("select fiscal_period_id from erp_financials.fiscal_periods")).rows[0]?.fiscal_period_id);
+    const complete = { operation: { ...operation, actorRef: "controller" }, idempotencyKey: "race:complete", statementId: prepared.statementId, expectedVersion: 1 };
+    let entered!: () => void, release!: () => void;
+    const locked = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const held: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(async client => { const result = await work(client); entered(); await gate; return result; }) };
+    const heldSdk = createErpFinancialsSdk({ ...scope, database: held });
+    const close = { operation, fiscalPeriodId, expectedVersion: 1 };
+    const firstResult = Promise.allSettled([first === "complete" ? heldSdk.bankStatements.complete(complete) : heldSdk.commands.fiscalPeriods.beginClose(close)]);
+    await locked;
+    const secondResult = Promise.allSettled([first === "complete" ? financials.fiscalPeriods.beginClose(close) : sdk.bankStatements.complete(complete)]);
+    try {
+      let blocked = false;
+      for (let i = 0; i < 100; i++) {
+        blocked = (await pool.query<Record<string, unknown>>("select 1 from pg_stat_activity where datname=current_database() and wait_event='advisory' and cardinality(pg_blocking_pids(pid))>0")).rows.length > 0;
+        if (blocked) break; await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(blocked).toBe(true);
+    } finally { release(); }
+    expect((await firstResult)[0].status).toBe("fulfilled");
+    const second = (await secondResult)[0]; expect(second.status).toBe(first === "complete" ? "fulfilled" : "rejected");
+    expect((await sdk.bankStatements.get(prepared.statementId)).status).toBe(first === "complete" ? "completed" : "draft");
+    if (first === "complete") {
+      const before = await depositDatabaseState(pool);
+      await expect(sdk.bankStatements.complete(complete)).resolves.toMatchObject({ status: "completed" });
+      await expect(sdk.bankStatements.reopen({ ...complete, expectedVersion: 2, idempotencyKey: "race:reopen", operation: { ...operation, reasonDetail: "Correct reconciliation while fiscal closing" } })).rejects.toThrow();
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+  });
+
+  it.each(["accrual", "cash", "modified_cash"] as const)("bank reconciliation uses the reporting book's %s basis exactly once", async accountingBasis => {
+    await depositFixture();
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "bank_basis", currencyCode: "USD" });
+    await sdk.books.define({ operation: sdkOperation(), bookId: "bank_basis", name: "Bank basis", baseCurrencyCode: "USD", accountingBasis });
+    await sdk.books.bindSource({ operation: sdkOperation(), bookId: "bank_basis", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    // One imported transaction can have postings in more than one basis.
+    // Distinct exact values ensure neither summing all bases nor hard-coding
+    // accrual can accidentally satisfy the statement evidence.
+    await pool.query(`insert into erp_financials.ledger_postings
+      (posting_id,tenant_id,source_id,source_posting_id,transaction_id,account_id,posting_date,accounting_basis,
+       debit_amount,credit_amount,net_amount,currency_code,dimension_hash,dimension_refs,import_batch_id)
+      select 'bank_basis_'||basis||'_'||side,'tenant_1','source_1',basis||'_'||side,'journal_1',
+        case when side=0 then 'account_cash' else 'account_income' end,date '2026-08-12',basis,
+        case when side=0 then amount else 0 end,case when side=1 then amount else 0 end,
+        amount*case when side=0 then 1 else -1 end,'USD',repeat('0',64),'[]','batch_1'
+      from (values ('accrual',90071992547409.93::numeric),('cash',22.22),('modified_cash',33.33)) v(basis,amount)
+      cross join generate_series(0,1) side`);
+    const amount = { accrual: "90071992547409.93", cash: "22.22", modified_cash: "33.33" }[accountingBasis];
+    const wrong = await sdk.bankReconciliation.ingest({ operation: sdkOperation(), externalLineId: "basis-sum", bankAccountId: "account_cash", postedDate: "2026-08-12", amount: "90071992547465.48" });
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.bankReconciliation.match({ operation: sdkOperation(), bankStatementLineId: wrong.bankStatementLineId, transactionId: "journal_1", expectedVersion: 1, idempotencyKey: "wrong-basis-sum", method: "manual" })).rejects.toMatchObject({ code: "reconciliation_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const line = await sdk.bankReconciliation.ingest({ operation: sdkOperation(), externalLineId: "basis-line", bankAccountId: "account_cash", postedDate: "2026-08-12", amount });
+    const input = { operation: sdkOperation(), bankStatementLineId: line.bankStatementLineId, transactionId: "journal_1", expectedVersion: 1, idempotencyKey: "basis-match", method: "manual" as const };
+    await expect(sdk.bankReconciliation.match(input)).resolves.toMatchObject({ status: "matched", matchedAmount: amount });
+    const after = await depositDatabaseState(pool);
+    await expect(sdk.bankReconciliation.match(input)).resolves.toMatchObject({ status: "already_matched", matchedAmount: amount });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("bank reconciliation commands cannot cross sources within one reporting book", async () => {
+    const { deposit } = await depositFixture("bank_sources");
+    await pool.query(`insert into erp_financials.company_sources values ('company_source_2','tenant_1','company_1','source_2',now())`);
+    const scope = { database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "bank_sources", currencyCode: "USD" };
+    const owner = createErpFinancialsSdk({ ...scope, writeSourceId: "source_1" });
+    const other = createErpFinancialsSdk({ ...scope, writeSourceId: "source_2" });
+    await owner.books.bindSource({ operation: sdkOperation(), bookId: "bank_sources", sourceId: "source_2", sourceRole: "adjustment", effectiveFrom: "2026-01-01" });
+    const line = await owner.bankReconciliation.ingest({ operation: sdkOperation(), externalLineId: "source-line", bankAccountId: "account_cash", postedDate: "2026-08-10", amount: "123.45" });
+    const match = { operation: sdkOperation(), bankStatementLineId: line.bankStatementLineId, transactionId: deposit.journal.transactionId, expectedVersion: 1, idempotencyKey: "source-match", method: "manual" as const };
+    let before = await depositDatabaseState(pool);
+    await expect(other.bankReconciliation.ignore({ operation: sdkOperation(), bankStatementLineId: line.bankStatementLineId, expectedVersion: 1 })).rejects.toMatchObject({ code: "reconciliation_conflict" });
+    await expect(other.bankReconciliation.match(match)).rejects.toMatchObject({ code: "missing_document" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const ignored = await owner.bankReconciliation.ignore({ operation: sdkOperation(), bankStatementLineId: line.bankStatementLineId, expectedVersion: 1 });
+    const unignore = { operation: { ...sdkOperation(), reasonDetail: "Correct bank statement disposition" }, bankStatementLineId: line.bankStatementLineId, expectedVersion: ignored.version };
+    before = await depositDatabaseState(pool);
+    await expect(other.bankReconciliation.unignore(unignore)).rejects.toMatchObject({ code: "missing_document" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const reopened = await owner.bankReconciliation.unignore(unignore);
+    const result = await owner.bankReconciliation.match({ ...match, expectedVersion: reopened.version });
+    before = await depositDatabaseState(pool);
+    await expect(other.bankReconciliation.match({ ...match, expectedVersion: reopened.version })).rejects.toMatchObject({ code: "missing_document" });
+    await expect(other.bankReconciliation.unmatch({ operation: sdkOperation(), bankReconciliationMatchId: result.bankReconciliationMatchId, expectedVersion: result.version })).rejects.toMatchObject({ code: "missing_document" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(owner.bankReconciliation.unmatch({ operation: sdkOperation(), bankReconciliationMatchId: result.bankReconciliationMatchId, expectedVersion: result.version })).resolves.toMatchObject({ status: "unmatched" });
+  });
+
+  it("fiscal command retries bind prior version and semantic evidence without duplicate writes", async () => {
+    const { financials } = await depositFixture();
+    const fiscalPeriodId = String((await pool.query<{ fiscal_period_id: string }>("select fiscal_period_id from erp_financials.fiscal_periods")).rows[0]?.fiscal_period_id);
+    const begin = { fiscalPeriodId, expectedVersion: 1, operation: sdkOperation() };
+    const begins = await Promise.all([financials.fiscalPeriods.beginClose(begin), financials.fiscalPeriods.beginClose({ ...begin, operation: { ...begin.operation, requestId: "retry-begin" } })]);
+    expect(begins.map(result => result.outcome).sort()).toEqual(["already_closing", "closing"]);
+    expect(new Set(begins.map(result => result.lifecycleEventId)).size).toBe(1);
+    const afterBegin = await depositDatabaseState(pool);
+    for (const changed of [{ expectedVersion: 2 }, { operation: { ...begin.operation, actorRef: "changed-actor" } }, { operation: { ...begin.operation, reasonCode: "changed-reason" } }]) {
+      await expect(financials.fiscalPeriods.beginClose({ ...begin, ...changed })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    expect(await depositDatabaseState(pool)).toEqual(afterBegin);
+    const material = { trialBalanceSnapshotId: "fiscal-trial", reconciliationRefs: ["bank-recon", "ar-recon"], checklistRef: "fiscal-checklist", postingMaxUpdatedAt: "2026-08-12T12:00:00Z" };
+    const close = { fiscalPeriodId, expectedVersion: 2, operation: sdkOperation(), evidence: { ...material, evidenceChecksum: createFiscalCloseEvidenceChecksum(material) } };
+    const closes = await Promise.all([financials.fiscalPeriods.close(close), financials.fiscalPeriods.close({ ...close, operation: { ...close.operation, requestId: "retry-close", correlationId: "new-transport", occurredAt: "2026-09-01T00:00:00Z" } })]);
+    expect(closes.map(result => result.outcome).sort()).toEqual(["already_closed", "closed"]);
+    expect(new Set(closes.map(result => result.lifecycleEventId)).size).toBe(1);
+    const afterClose = await depositDatabaseState(pool);
+    await expect(financials.fiscalPeriods.close({ ...close, evidence: { ...close.evidence, postingMaxUpdatedAt: "2026-08-12T12:00:00.000Z" } })).resolves.toMatchObject({ outcome: "already_closed", version: 3 });
+    for (const changed of [{ expectedVersion: 3 }, { operation: { ...close.operation, actorRef: "changed" } }, { operation: { ...close.operation, approverRef: "changed" } }, { operation: { ...close.operation, reasonDetail: "different business reason" } }]) {
+      await expect(financials.fiscalPeriods.close({ ...close, ...changed })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    for (const change of [{ trialBalanceSnapshotId: "other-trial" }, { checklistRef: "other-checklist" }, { reconciliationRefs: ["ar-recon", "bank-recon"] }, { postingMaxUpdatedAt: "2026-08-13T00:00:00Z" }]) {
+      const evidence = { ...material, ...change };
+      await expect(financials.fiscalPeriods.close({ ...close, evidence: { ...evidence, evidenceChecksum: createFiscalCloseEvidenceChecksum(evidence) } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    expect(await depositDatabaseState(pool)).toEqual(afterClose);
+    const reopen = { fiscalPeriodId, expectedVersion: 3, operation: sdkOperation() };
+    const reopens = await Promise.all([financials.fiscalPeriods.reopen(reopen), financials.fiscalPeriods.reopen({ ...reopen, operation: { ...reopen.operation, requestId: "retry-reopen" } })]);
+    expect(reopens[0]).toEqual(reopens[1]);
+    const afterReopen = await depositDatabaseState(pool);
+    await expect(financials.fiscalPeriods.reopen({ ...reopen, operation: { ...reopen.operation, reasonCode: "different" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(afterReopen);
+    // A new close/reopen cycle must never accept an old cycle's replay.
+    await financials.fiscalPeriods.beginClose({ ...begin, expectedVersion: 4 });
+    await financials.fiscalPeriods.close({ ...close, expectedVersion: 5 });
+    await expect(financials.fiscalPeriods.close(close)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await financials.fiscalPeriods.reopen({ ...reopen, expectedVersion: 6 });
+    await expect(financials.fiscalPeriods.reopen(reopen)).rejects.toMatchObject({ code: "idempotency_conflict" });
+  });
+
+  it("fiscal close rolls back with its host transaction and snapshots mutable command evidence", async () => {
+    const { financials } = await depositFixture();
+    const fiscalPeriodId = String((await pool.query<{ fiscal_period_id: string }>("select fiscal_period_id from erp_financials.fiscal_periods")).rows[0]?.fiscal_period_id);
+    const before = await depositDatabaseState(pool);
+    const material = { trialBalanceSnapshotId: "trial", reconciliationRefs: ["recon"], checklistRef: "checklist", postingMaxUpdatedAt: "2026-08-12T12:00:00Z" };
+    const close = { fiscalPeriodId, expectedVersion: 2, operation: sdkOperation(), evidence: { ...material, evidenceChecksum: createFiscalCloseEvidenceChecksum(material) } };
+    await expect(runner.transaction(async client => {
+      const periods = depositService({ transaction: async work => work(client) }).fiscalPeriods;
+      await periods.beginClose({ fiscalPeriodId, expectedVersion: 1, operation: sdkOperation() });
+      await periods.close(close);
+      throw new Error("host failed after close");
+    })).rejects.toThrow("host failed after close");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await financials.fiscalPeriods.beginClose({ fiscalPeriodId, expectedVersion: 1, operation: sdkOperation() });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const delayed = depositService({ transaction: async work => { await gate; return runner.transaction(work); } });
+    const mutable = { ...structuredClone(close), operation: { ...close.operation } as FinancialOperationContext }, original = structuredClone(close);
+    const result = delayed.fiscalPeriods.close(mutable);
+    mutable.evidence.reconciliationRefs.push("mutated"); mutable.expectedVersion = 99;
+    mutable.operation = { ...mutable.operation, actorRef: "mutated" };
+    release();
+    await expect(result).resolves.toMatchObject({ outcome: "closed", version: 3 });
+    await expect(financials.fiscalPeriods.close(original)).resolves.toMatchObject({ outcome: "already_closed", version: 3 });
+  });
+
+  it("fiscal close diagnostics return canonical counts without collecting posting rows", async () => {
+    await depositFixture("fiscal_diagnostics");
+    const options = { database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "fiscal_diagnostics", writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(options);
+    const period = (await sdk.queries.listFiscalPeriods({ sourceId: "source_1" })).items[0];
+    if (!period) throw new Error("Missing diagnostic fixture period");
+    const read = () => sdk.queries.getFiscalCloseDiagnostics("source_1", period.fiscalPeriodId);
+    await expect(read()).resolves.toEqual({ fiscalPeriodId: period.fiscalPeriodId, sourceId: "source_1",
+      periodStart: "2026-08-01", periodEnd: "2026-08-31", version: 1, status: "open",
+      postingCount: "4", postedTransactionCount: "2", postingGroupCount: "2", unbalancedPostingGroupCount: "0",
+      draftTransactionCount: "0", draftInvoiceCount: "0" });
+    await sdk.invoices.createDraft({ operation: sdkOperation(), idempotencyKey: "diagnostic:draft", customerId: "customer_1",
+      documentDate: "2026-08-20", dueDate: "2026-08-31", receivableAccount: { accountId: "account_ar" },
+      revenueLines: [{ accountId: "account_income", amount: "17.23" }] });
+    await expect(read()).resolves.toMatchObject({ draftInvoiceCount: "1", draftTransactionCount: "0", postingCount: "4" });
+    await expect(sdk.queries.getFiscalCloseDiagnostics("source_2", period.fiscalPeriodId)).rejects.toMatchObject({ code: "missing_document" });
+    for (const changed of [{ tenantId: "other" }, { companyId: "other" }, { bookId: "other" }]) {
+      await expect(createErpFinancialsSdk({ ...options, ...changed }).queries.getFiscalCloseDiagnostics("source_1", period.fiscalPeriodId)).rejects.toMatchObject({ code: "missing_book" });
+    }
+    // Other valid books do not gain access to this source's fiscal diagnostics.
+    await sdk.books.define({ operation: sdkOperation(), bookId: "unbound", name: "Unbound", baseCurrencyCode: "USD" });
+    await expect(createErpFinancialsSdk({ ...options, bookId: "unbound" }).queries.getFiscalCloseDiagnostics("source_1", period.fiscalPeriodId)).rejects.toMatchObject({ code: "missing_document" });
+    const queries: string[] = [];
+    const observed = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({ query: async (sql, values) => {
+      queries.push(sql); return client.query(sql, values);
+    } })) } });
+    await observed.queries.getFiscalCloseDiagnostics("source_1", period.fiscalPeriodId);
+    expect(queries).toHaveLength(2); // Book validation + one aggregate, irrespective of row count.
+    expect(queries[1]).toContain("posting_groups");
+    expect(queries[1]).not.toContain("limit 10000");
+  });
+
+  it.each(["currency", "basis", "day", "transaction", "exact_money", "nonfinite"] as const)(
+    "fiscal close rejects %s posting defects that a net total can conceal", async kind => {
+    const { financials } = await depositFixture("fiscal_integrity");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "fiscal_integrity", writeSourceId: "source_1", currencyCode: "USD" });
+    const period = (await sdk.queries.listFiscalPeriods({ sourceId: "source_1" })).items[0];
+    if (!period) throw new Error("Missing diagnostic fixture period");
+    const templates = (await pool.query<Record<string, unknown>>("select * from erp_financials.ledger_postings where debit_amount>0 order by accounting_basis")).rows;
+    const first = templates[0], second = templates[1];
+    if (!first || !second) throw new Error("Missing diagnostic fixture posting templates");
+    const amount = kind === "nonfinite" ? "NaN" : kind === "exact_money" ? "9007199254740993.01" : "0.01";
+    const debit = { posting_id: "diagnostic:debit", source_posting_id: "diagnostic:debit", debit_amount: amount, credit_amount: "0", net_amount: amount };
+    const credit = { posting_id: "diagnostic:credit", source_posting_id: "diagnostic:credit", debit_amount: "0", credit_amount: amount, net_amount: kind === "nonfinite" ? "NaN" : `-${amount}`,
+      ...(kind === "currency" ? { currency_code: "EUR" } : {}),
+      ...(kind === "basis" ? { accounting_basis: "cash" } : {}),
+      ...(kind === "day" ? { posting_date: "2026-08-11" } : {}),
+      ...(kind === "transaction" ? { transaction_id: second.transaction_id, transaction_line_id: second.transaction_line_id } : {}),
+      ...(kind === "exact_money" ? { credit_amount: "9007199254740993.00", net_amount: "-9007199254740993.00" } : {}) };
+    // Deliberately malformed persisted data in the isolated test database,
+    // inserted directly to test the close-time guarantee independently of posting commands.
+    for (const patch of [debit, credit]) await pool.query(`insert into erp_financials.ledger_postings
+      select (jsonb_populate_record(null::erp_financials.ledger_postings,to_jsonb(p)||$2::jsonb)).*
+      from erp_financials.ledger_postings p where p.posting_id=$1`, [first.posting_id, JSON.stringify(patch)]);
+    const facts = await sdk.queries.getFiscalCloseDiagnostics("source_1", period.fiscalPeriodId);
+    expect(facts.unbalancedPostingGroupCount).not.toBe("0");
+    const closing = await financials.fiscalPeriods.beginClose({ fiscalPeriodId: period.fiscalPeriodId, expectedVersion: 1, operation: sdkOperation() });
+    const before = await depositDatabaseState(pool);
+    const material = { trialBalanceSnapshotId: "host-claims-balanced", checklistRef: "host-claims-ready", reconciliationRefs: ["host-claims-reconciled"], postingMaxUpdatedAt: "2026-08-12T12:00:00.000Z" };
+    await expect(financials.fiscalPeriods.close({ fiscalPeriodId: period.fiscalPeriodId, expectedVersion: closing.version,
+      operation: sdkOperation(), evidence: { ...material, evidenceChecksum: createFiscalCloseEvidenceChecksum(material) } })).rejects.toMatchObject({ code: "posting_unbalanced", message: "Fiscal period cannot close with unbalanced ledger postings" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("operational account lookup is scoped, bounded and works without ledger access", async () => {
+    await depositFixture("lookup_book");
+    await pool.query(`create role account_lookup_reader;
+      grant usage on schema erp_financials to account_lookup_reader;
+      grant select on erp_financials.accounts,erp_financials.reporting_books,erp_financials.reporting_book_sources to account_lookup_reader;
+      update erp_financials.accounts set account_number='1000' where account_id='account_cash';`);
+    try {
+      const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(async client => {
+        await client.query("set local role account_lookup_reader");
+        return work(client);
+      }) };
+      const scope = { database, tenantId: "tenant_1", companyId: "company_1", bookId: "lookup_book" };
+      const reads = createFinancialReadModels(scope);
+      const request = { sourceId: "source_1", accountId: "account_cash", asOfDate: "2026-08-12" };
+      await expect(database.transaction(client => client.query("select * from erp_financials.ledger_postings limit 1"))).rejects.toMatchObject({ code: "42501" });
+      await expect(reads.getOperationalAccount(request)).resolves.toEqual({ accountId: "account_cash", sourceId: "source_1", sourceAccountId: "cash",
+        accountNumber: "1000", name: "Cash", type: "asset", classification: "asset", active: true });
+      for (const changed of [{ accountId: "missing" }, { sourceId: "source_2" }, { asOfDate: "2025-12-31" }]) {
+        await expect(reads.getOperationalAccount({ ...request, ...changed })).rejects.toMatchObject({ code: "missing_account" });
+      }
+      for (const changed of [{ companyId: "other_company" }, { tenantId: "other_tenant" }, { bookId: "other_book" }]) {
+        await expect(createFinancialReadModels({ ...scope, ...changed }).getOperationalAccount(request)).rejects.toMatchObject({ code: "missing_book" });
+      }
+      for (const changed of [{ sourceId: "" }, { accountId: " " }, { accountId: "a".repeat(501) }, { asOfDate: "2026-02-30" }]) {
+        await expect(reads.getOperationalAccount({ ...request, ...changed })).rejects.toMatchObject({ code: "invalid_input" });
+      }
+      await pool.query("update erp_financials.accounts set active=false where account_id='account_cash'");
+      await expect(reads.getOperationalAccount(request)).resolves.toMatchObject({ active: false });
+      await pool.query("update erp_financials.reporting_book_sources set effective_through='2026-08-11' where book_id='lookup_book'");
+      await expect(reads.getOperationalAccount(request)).rejects.toMatchObject({ code: "missing_account" });
+      // The lookup snapshots its scalar request before any transaction/connection wait.
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const delayed = createFinancialReadModels({ ...scope, database: { transaction: async work => { await gate; return database.transaction(work); } } });
+      const mutable = { ...request, asOfDate: "2026-08-10" };
+      const pending = delayed.getOperationalAccount(mutable);
+      mutable.sourceId = "source_2"; mutable.accountId = "missing"; mutable.asOfDate = "2030-01-01";
+      release();
+      await expect(pending).resolves.toMatchObject({ accountId: "account_cash", active: false });
+    } finally {
+      await pool.query("drop owned by account_lookup_reader; drop role account_lookup_reader");
+    }
+  });
+
+  it("bounded operational account metadata batches preserve identity and require no ledger access",async()=>{
+    await depositFixture("batch_lookup_book");
+    await pool.query(`insert into erp_financials.accounts(account_id,tenant_id,source_id,source_account_id,account_number,name,type,classification,active)
+      select 'batch_'||n,'tenant_1','source_1','batch_source_'||n,n::text,'Account '||n,'income','income',n<>200 from generate_series(1,200) n;
+      create role account_batch_reader;
+      grant usage on schema erp_financials to account_batch_reader;
+      grant select on erp_financials.accounts,erp_financials.reporting_books,erp_financials.reporting_book_sources to account_batch_reader;`);
+    try{
+      let queries=0;
+      const database:ErpFinancialsTransactionRunner={transaction:work=>runner.transaction(async client=>{
+        await client.query('set local role account_batch_reader');
+        return work({query:(sql,values)=>{queries++;return client.query(sql,values);}});
+      })};
+      const scope={database,tenantId:'tenant_1',companyId:'company_1',bookId:'batch_lookup_book'};
+      const sdk=createErpFinancialsSdk({...scope,writeSourceId:'source_1',currencyCode:'USD'});
+      const request={sourceId:'source_1',accountIds:Array.from({length:200},(_,n)=>`batch_${String(200-n)}`),asOfDate:'2026-08-12'};
+      const rows=await sdk.queries.getOperationalAccounts(request);
+      expect(queries).toBe(2);expect(rows.map(row=>row.accountId)).toEqual(request.accountIds);
+      expect(rows[0]).toMatchObject({accountId:'batch_200',accountNumber:'200',name:'Account 200',active:false,classification:'income'});
+      expect(rows).toHaveLength(200);
+      await expect(database.transaction(c=>c.query('select * from erp_financials.ledger_postings limit 1'))).rejects.toMatchObject({code:'42501'});
+      for(const patch of [{accountIds:[]},{accountIds:['batch_1','batch_1']},{accountIds:[...request.accountIds,'overflow']},{accountIds:[' ']},{accountIds:['a'.repeat(501)]},{sourceId:''},{asOfDate:'2026-02-30'}])
+        await expect(sdk.queries.getOperationalAccounts({...request,...patch})).rejects.toMatchObject({code:'invalid_input'});
+      for(const patch of [{accountIds:['batch_1','missing']},{sourceId:'source_2'},{asOfDate:'2025-12-31'}])
+        await expect(sdk.queries.getOperationalAccounts({...request,...patch})).rejects.toMatchObject({code:'missing_account'});
+      for(const patch of [{tenantId:'other'},{companyId:'other'},{bookId:'other'}])
+        await expect(createFinancialReadModels({...scope,...patch}).getOperationalAccounts(request)).rejects.toMatchObject({code:'missing_book'});
+      let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+      const delayed=createFinancialReadModels({...scope,database:{transaction:async work=>{await gate;return database.transaction(work);}}});
+      const mutable={...request,accountIds:['batch_1','batch_2']};const pending=delayed.getOperationalAccounts(mutable);
+      mutable.accountIds[0]='missing';mutable.accountIds.push('missing');mutable.sourceId='source_2';mutable.asOfDate='2030-01-01';release();
+      expect((await pending).map(row=>row.accountId)).toEqual(['batch_1','batch_2']);
+      await pool.query("update erp_financials.reporting_book_sources set effective_through='2026-08-11' where book_id='batch_lookup_book'");
+      await expect(sdk.queries.getOperationalAccounts(request)).rejects.toMatchObject({code:'missing_account'});
+    }finally{await pool.query('drop owned by account_batch_reader;drop role account_batch_reader');}
+  });
+
+  it("native account key lookup reuses command identities without ledger or crosswalk access", async () => {
+    await depositFixture("key_lookup_book");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "key_lookup_book", writeSourceId: "source_1", currencyCode: "USD" });
+    const created = await sdk.commands.accounts.upsertTree({ operation: sdkOperation(), parent: {
+      accountKey: "blu-1000", sourceAccountId: "immutable-legacy-account-id", accountNumber: "1000", name: "Configured bank",
+      classification: "asset", type: "debit", active: true, currencyCode: "USD"
+    } });
+    const accountId = created.accounts[0]?.accountId;
+    if (accountId === undefined) throw new Error("Fixture account was not created");
+    await pool.query(`create role account_key_reader;
+      grant usage on schema erp_financials to account_key_reader;
+      grant select on erp_financials.accounts,erp_financials.reporting_books,erp_financials.reporting_book_sources to account_key_reader;`);
+    try {
+      const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(async client => {
+        await client.query("set local role account_key_reader"); return work(client);
+      }) };
+      const scope = { database, tenantId: "tenant_1", companyId: "company_1", bookId: "key_lookup_book" };
+      const reads = createFinancialReadModels(scope);
+      const request = { sourceId: "source_1", accountKey: "blu-1000", asOfDate: "2026-08-12" };
+      await expect(database.transaction(client => client.query("select * from erp_financials.ledger_postings limit 1"))).rejects.toMatchObject({ code: "42501" });
+      await expect(reads.getOperationalAccountByKey(request)).resolves.toEqual(await reads.getOperationalAccount({ sourceId: request.sourceId, accountId, asOfDate: request.asOfDate }));
+      // Never reinterpret a number/provider ID as a native key or fall back to a whole chart.
+      for (const changed of [{ accountKey: "1000" }, { accountKey: "immutable-legacy-account-id" }, { sourceId: "source_2" }, { asOfDate: "2025-12-31" }]) {
+        await expect(reads.getOperationalAccountByKey({ ...request, ...changed })).rejects.toMatchObject({ code: "missing_account" });
+      }
+      for (const changed of [{ sourceId: "" }, { accountKey: " " }, { accountKey: "a".repeat(501) }, { asOfDate: "2026-02-30" }]) {
+        await expect(reads.getOperationalAccountByKey({ ...request, ...changed })).rejects.toMatchObject({ code: "invalid_input" });
+      }
+      for (const changed of [{ tenantId: "other_tenant" }, { companyId: "other_company" }, { bookId: "other_book" }]) {
+        await expect(createFinancialReadModels({ ...scope, ...changed }).getOperationalAccountByKey(request)).rejects.toMatchObject({ code: "missing_book" });
+      }
+      await pool.query("update erp_financials.accounts set active=false where account_id=$1", [accountId]);
+      await expect(reads.getOperationalAccountByKey(request)).resolves.toMatchObject({ accountId, active: false });
+      await pool.query("update erp_financials.reporting_book_sources set effective_through='2026-08-11' where book_id='key_lookup_book'");
+      await expect(reads.getOperationalAccountByKey(request)).rejects.toMatchObject({ code: "missing_account" });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const delayed = createFinancialReadModels({ ...scope, database: { transaction: async work => { await gate; return database.transaction(work); } } });
+      const mutable = { ...request, asOfDate: "2026-08-10" };
+      const pending = delayed.getOperationalAccountByKey(mutable);
+      mutable.accountKey = "missing"; mutable.sourceId = "source_2"; mutable.asOfDate = "2030-01-01";
+      release();
+      await expect(pending).resolves.toMatchObject({ accountId, active: false });
+    } finally {
+      await pool.query("drop owned by account_key_reader; drop role account_key_reader");
+    }
+  });
+
+  it("bill payment pages count applications only after pagination and preserve mixed lifecycle reads",async()=>{
+    const {sdk,options,operation,payment}=await paymentHoldFixture();
+    const pageIndexes=(await pool.query<{indexname:string;indexdef:string}>("select indexname,indexdef from pg_indexes where schemaname='erp_financials' and indexname=any($1::text[]) order by indexname",[["subledger_documents_payment_page_idx","bill_payment_disbursements_page_idx"]])).rows;
+    expect(pageIndexes).toHaveLength(2);
+    expect(pageIndexes[0]?.indexdef).toContain("payment_date DESC, bill_payment_id DESC");
+    expect(pageIndexes[1]?.indexdef).toContain("document_date DESC, subledger_document_id DESC");
+    const cleared=await sdk.commands.billPayments.recordAndApply(payment);
+    const recorded=await sdk.commands.billPayments.record({operation,idempotencyKey:"page:recorded",date:"2026-08-11",vendorId:payment.vendorId,
+      amount:"10.01",payableAccount:payment.payableAccount,cashAccount:payment.cashAccount});
+    const scheduled=await sdk.commands.billPayments.schedule({...payment,idempotencyKey:"page:scheduled",date:"2026-08-12",
+      allocations:payment.allocations.map(item=>({...item,expectedBillVersion:2}))});
+    let captured:{text:string;parameters:readonly unknown[]|undefined}|undefined;
+    const database:ErpFinancialsTransactionRunner={transaction:work=>runner.transaction(client=>work(new Proxy(client,{get(target,key,receiver){
+      if(key==='query')return async(text:string,parameters?:readonly unknown[])=>{
+        if(text.includes('payment_page as materialized'))captured={text,parameters};
+        return target.query(text,parameters);
+      };
+      const value:unknown=Reflect.get(target,key,receiver);return typeof value==='function'?value.bind(target) as unknown:value;
+    }})))};
+    const reads=createErpFinancialsSdk({...options,database}).queries;
+    const first=await reads.listBillPayments({limit:1});
+    expect(first.items).toHaveLength(1);expect(first.items[0]).toMatchObject({paymentId:scheduled.billPaymentId,status:"scheduled",matchedApplicationCount:0});
+    if(!first.nextCursor||!captured)throw Error("Missing first page evidence");
+    type PlanNode={"Node Type":string;"Relation Name"?:string;"Subplan Name"?:string;"Actual Rows":number;"Actual Loops":number;Plans?:PlanNode[]};
+    const plan=(await pool.query<{"QUERY PLAN":{Plan:PlanNode;"Execution Time":number}[]}>("explain (analyze,buffers,format json) "+captured.text,[...(captured.parameters??[])])).rows[0]?.["QUERY PLAN"][0];
+    if(!plan)throw Error("Missing plan");
+    const applicationScans:PlanNode[]=[],boundedPages:PlanNode[]=[];
+    const visit=(node:PlanNode)=>{if(node["Relation Name"]==='subledger_applications')applicationScans.push(node);if(node["Subplan Name"]==='CTE payment_page')boundedPages.push(node);node.Plans?.forEach(visit);};
+    const containsApplications=(node:PlanNode):boolean=>node["Relation Name"]==='subledger_applications'||(node.Plans??[]).some(containsApplications);
+    visit(plan.Plan);
+    expect(boundedPages).toHaveLength(1);expect(boundedPages[0]?.["Actual Rows"]).toBe(2);
+    expect(boundedPages.some(containsApplications)).toBe(false);
+    expect(applicationScans).toHaveLength(1);expect(applicationScans[0]?.["Actual Loops"]).toBe(2);
+    const second=await reads.listBillPayments({limit:1,cursor:first.nextCursor});
+    expect(second.items[0]).toMatchObject({paymentId:recorded.documentId,status:"cleared",amount:"10.01",applicationStatus:"unapplied",matchedApplicationCount:0});
+    if(!second.nextCursor)throw Error("Missing second cursor");
+    const third=await reads.listBillPayments({limit:1,cursor:second.nextCursor});
+    expect(third.items[0]).toMatchObject({paymentId:cleared.billPaymentId,status:"cleared",applicationStatus:"applied",matchedApplicationCount:1});expect(third.nextCursor).toBeUndefined();
+    expect((await reads.listBillPayments({status:"scheduled",limit:1})).items.map(item=>item.paymentId)).toEqual([scheduled.billPaymentId]);
+    expect((await reads.listBillPayments({paymentMethod:"ach",limit:10})).items.map(item=>item.paymentId)).toEqual([scheduled.billPaymentId,cleared.billPaymentId]);
+    expect((await reads.listBillPayments({periodStart:"2026-08-11",periodEnd:"2026-08-11",limit:1})).items.map(item=>item.paymentId)).toEqual([recorded.documentId]);
+    expect((await reads.listBillPayments({vendorId:"foreign",limit:1})).items).toEqual([]);
+    expect(await reads.getBillPayment(cleared.billPaymentId)).toMatchObject({paymentId:cleared.billPaymentId,matchedApplicationCount:1});
+    const general=await reads.listPayments({paymentType:"bill_payment",limit:1});
+    expect(general.items[0]).toMatchObject({paymentId:recorded.documentId,status:"unapplied",matchedApplicationCount:0});
+    if(!general.nextCursor)throw Error("Missing general page evidence");
+    const generalPlan=(await pool.query<{"QUERY PLAN":{Plan:PlanNode}[]}>("explain (analyze,buffers,format json) "+captured.text,[...(captured.parameters??[])])).rows[0]?.["QUERY PLAN"][0];
+    if(!generalPlan)throw Error("Missing general plan");
+    applicationScans.length=0;boundedPages.length=0;visit(generalPlan.Plan);
+    expect(boundedPages).toHaveLength(1);expect(boundedPages[0]?.["Actual Rows"]).toBe(2);
+    expect(boundedPages.some(containsApplications)).toBe(false);
+    expect(applicationScans).toHaveLength(1);expect(applicationScans[0]?.["Actual Loops"]).toBe(2);
+    expect((await reads.listPayments({paymentType:"bill_payment",limit:1,cursor:general.nextCursor})).items[0]).toMatchObject({paymentId:cleared.billPaymentId,status:"applied",matchedApplicationCount:1});
+    expect((await reads.listPayments({paymentType:"bill_payment",status:"unapplied",limit:1})).items.map(item=>item.paymentId)).toEqual([recorded.documentId]);
+    expect((await reads.listPayments({paymentType:"bill_payment",status:"applied",limit:1})).items.map(item=>item.paymentId)).toEqual([cleared.billPaymentId]);
+    console.log("BILL PAYMENT PAGE PLAN",JSON.stringify({pageLimit:1,lookahead:1,applicationScanLoops:applicationScans.map(node=>node["Actual Loops"]),executionMs:plan["Execution Time"]}));
+  });
+
+  async function paymentHoldFixture(dueDate = "2026-08-31") {
+    await depositFixture("hold_book");
+    const options = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "hold_book", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(options);
+    const operation = sdkOperation();
+    const bill = await sdk.commands.vendorBills.create({ operation, idempotencyKey: "hold:bill", date: "2026-08-01", dueDate, vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "100.00" }] });
+    const hold = { operation, idempotencyKey: "hold:enable", vendorBillId: bill.documentId, expectedVersion: 1, paymentHold: true, reason: "Invoice under review" };
+    const payment = { operation, idempotencyKey: "hold:payment", date: "2026-08-10" as const, vendorId: "vendor_1", amount: "20.00", paymentMethod: "ach" as const,
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" }, allocations: [{ billId: bill.documentId, amount: "20.00", expectedBillVersion: 1 }] };
+    return { sdk, options, operation, bill, hold, payment };
+  }
+
+  it("bill recording retirement fences delayed immediate, raw and scheduled payment commands after close", async () => {
+    const {sdk,options,operation,hold,payment}=await paymentHoldFixture();
+    await sdk.commands.vendorBills.setPaymentHold(hold);
+    await closeDepositPeriod(pool,depositService(runner,{bookId:options.bookId}));
+    const allocation=payment.allocations[0];if(!allocation)throw Error("Missing fixture allocation");
+    const before=await depositDatabaseState(pool), retirement={...operation,reasonCode:"abandon_uncertain_recording",reasonDetail:"Do not record this unresolved attempt"};
+    const result=await sdk.commands.billPayments.retireRecordingAttempt({command:payment,operation:retirement});
+    expect(result.status).toBe("retired");
+    const after=await depositDatabaseState(pool);
+    for(const [table,rows] of Object.entries(before))if(table!=="financial_lifecycle_events")expect(after[table],table).toEqual(rows);
+    const events=before.financial_lifecycle_events;if(!events)throw Error("Missing lifecycle snapshot");
+    expect(after.financial_lifecycle_events?.length).toBe(events.length+1);
+    expect(await sdk.commands.billPayments.retireRecordingAttempt({command:{...payment,operation:{...operation,requestId:"new-transport"}},operation:{...retirement,requestId:"new-retirement-transport"}})).toEqual({...result,status:"already_retired"});
+    await expect(sdk.commands.billPayments.recordAndApply(payment)).rejects.toMatchObject({code:"idempotency_conflict"});
+    await expect(sdk.commands.billPayments.schedule(payment)).rejects.toMatchObject({code:"idempotency_conflict"});
+    const {allocations,...raw}=payment;void allocations;
+    await expect(sdk.commands.billPayments.record(raw)).rejects.toMatchObject({code:"idempotency_conflict"});
+    for(const change of [{amount:"21.00",allocations:[{...allocation,amount:"21.00"}]},{reference:"different"},{allocations:[{...allocation,expectedBillVersion:2}]}]) {
+      await expect(sdk.commands.billPayments.retireRecordingAttempt({command:{...payment,...change},operation:retirement})).rejects.toMatchObject({code:"idempotency_conflict"});
+    }
+    await expect(sdk.commands.billPayments.retireRecordingAttempt({command:payment,operation:{...retirement,reasonDetail:"Different retirement"}})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it.each([false,true])("bill recording retirement resolves recorded money after later void=%s without changing any accounting", async voided => {
+    const {sdk,options,operation,payment}=await paymentHoldFixture();
+    const recorded=await sdk.commands.billPayments.recordAndApply(payment);
+    const retirement={...operation,reasonCode:"resolve_uncertain_recording"};
+    if(voided)await sdk.commands.billPayments.voidAndUnapply({operation,billPaymentId:recorded.billPaymentId,expectedVersion:2,idempotencyKey:"retirement:void",date:"2026-08-12"});
+    await closeDepositPeriod(pool,depositService(runner,{bookId:options.bookId}));
+    const before=await depositDatabaseState(pool);
+    const readOnly=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
+        if(/\b(insert|update|delete)\s+(into|erp_financials|"erp_financials"|from)/iu.test(sql))throw Error("Recovery attempted a writer");
+        return client.query<Row>(sql,params);
+      }
+    }))}});
+    expect(await readOnly.commands.billPayments.retireRecordingAttempt({command:payment,operation:retirement})).toEqual({status:"already_recorded",billPaymentId:recorded.billPaymentId,idempotencyKey:payment.idempotencyKey,lifecycleEventId:recorded.lifecycleEventId,
+      paymentStatus:voided?"voided":"cleared",paymentTransactionId:recorded.payment.journal.transactionId,amount:"20.00",currencyCode:"USD",applicationIds:recorded.applications.map(row=>row.applicationId)});
+    await expect(sdk.commands.billPayments.retireRecordingAttempt({command:{...payment,reference:"changed"},operation:retirement})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["current","legacy"] as const)("bill recording retirement reports direct document void for %s instruction state", async mode => {
+    const {sdk,options,operation,payment}=await paymentHoldFixture();
+    const recorded=await sdk.commands.billPayments.recordAndApply(payment),application=recorded.applications[0];
+    if(!application)throw Error("Missing fixture application");
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-12"});
+    const current=await sdk.queries.getOperationalDocumentSummary(recorded.billPaymentId);
+    const command={operation,billPaymentId:recorded.billPaymentId,expectedVersion:current.version,idempotencyKey:"retirement:direct-void",date:"2026-08-12"};
+    const beforeFailure=await depositDatabaseState(pool);let interrupted=false;
+    await runner.transaction(async client=>{
+      const failing=createErpFinancialsSdk({...options,database:{transaction:work=>work({
+        async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
+          const result=await client.query<Row>(sql,params);
+          if(sql.includes('update "erp_financials"."bill_payment_disbursements"')){interrupted=true;throw Error("instruction void interrupted");}
+          return result;
+        }
+      })}});
+      await expect(failing.commands.billPayments.void(command)).rejects.toThrow("instruction void interrupted");
+    });
+    expect(interrupted).toBe(true);expect(await depositDatabaseState(pool)).toEqual(beforeFailure);
+    let omitted=false;
+    // Reproduce the pre-upgrade direct-void behavior in real PostgreSQL: only
+    // omit the new instruction update, retaining the genuine void and reversal.
+    const writer=mode==="current"?sdk:createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
+        if(sql.includes('update "erp_financials"."bill_payment_disbursements"')){omitted=true;return client.query<Row>("select 3 as version");}
+        return client.query<Row>(sql,params);
+      }
+    }))}});
+    const voided=await writer.commands.billPayments.void(command);
+    expect(omitted).toBe(mode==="legacy");
+    expect((await sdk.queries.getOperationalDocumentSummary(recorded.billPaymentId)).status).toBe("voided");
+    expect(await sdk.queries.findBillPaymentCommandByKey({sourceId:"source_1",idempotencyKey:payment.idempotencyKey})).toMatchObject({status:mode==="legacy"?"cleared":"voided",version:mode==="legacy"?2:3});
+    const before=await depositDatabaseState(pool);
+    expect(await sdk.commands.billPayments.retireRecordingAttempt({command:payment,operation:{...operation,reasonCode:"retire"}})).toMatchObject({status:"already_recorded",paymentStatus:"voided",paymentTransactionId:recorded.payment.journal.transactionId});
+    expect(await sdk.commands.billPayments.void(command)).toMatchObject({status:"already_voided",originalBillPaymentId:voided.originalBillPaymentId,originalVersion:voided.originalVersion,reversal:{transactionId:voided.reversal.transactionId,status:"already_posted"}});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("bill recording retirement rejects foreign actor/book and independent raw or scheduled money", async () => {
+    const {sdk,options,operation,payment}=await paymentHoldFixture(),retirement={...operation,reasonCode:"retire"};
+    await expect(sdk.commands.billPayments.retireRecordingAttempt({command:payment,operation:{...retirement,actorRef:"other"}})).rejects.toMatchObject({code:"authorization_context_invalid"});
+    const other=createErpFinancialsSdk({...options,bookId:"retirement_other"});
+    await other.books.define({operation,bookId:"retirement_other",name:"Other",baseCurrencyCode:"USD"});
+    await other.books.bindSource({operation,bookId:"retirement_other",sourceId:"source_1",sourceRole:"active",effectiveFrom:"2026-01-01"});
+    await expect(other.commands.billPayments.retireRecordingAttempt({command:payment,operation:retirement})).rejects.toMatchObject({code:"scope_mismatch"});
+    for(const foreign of [{tenantId:"other"},{companyId:"other"},{writeSourceId:"other"}]) {
+      await expect(createErpFinancialsSdk({...options,...foreign}).commands.billPayments.retireRecordingAttempt({command:payment,operation:retirement})).rejects.toThrow();
+    }
+    const {allocations,...raw}=payment;void allocations;
+    await sdk.commands.billPayments.record(raw);
+    await expect(sdk.commands.billPayments.retireRecordingAttempt({command:payment,operation:retirement})).rejects.toMatchObject({code:"idempotency_conflict"});
+    const scheduledCommand={...payment,idempotencyKey:"retirement:scheduled"},scheduled=await sdk.commands.billPayments.schedule(scheduledCommand);
+    await expect(sdk.commands.billPayments.retireRecordingAttempt({command:scheduledCommand,operation:retirement})).rejects.toMatchObject({code:"unsupported_operation"});
+    await sdk.commands.billPayments.cancel({operation,billPaymentId:scheduled.billPaymentId,expectedVersion:1,idempotencyKey:"retirement:cancel"});
+    await expect(sdk.commands.billPayments.retireRecordingAttempt({command:scheduledCommand,operation:retirement})).rejects.toMatchObject({code:"unsupported_operation"});
+  });
+
+  it("bill recording retirement fails closed when a retained clear receipt is missing", async () => {
+    const {sdk,options,operation,payment}=await paymentHoldFixture();
+    const recorded=await sdk.commands.billPayments.recordAndApply(payment),before=await depositDatabaseState(pool);
+    const incomplete=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
+        const result=await client.query<Row>(sql,params);
+        return sql.includes("event_id=any($4::text[])")?{...result,rows:result.rows.filter(row=>row.event_id!==recorded.lifecycleEventId)}:result;
+      }
+    }))}});
+    await expect(incomplete.commands.billPayments.retireRecordingAttempt({command:payment,operation:{...operation,reasonCode:"retire"}})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("bill recording retirement rolls back caught receipt failures and recovers lost commit acknowledgement", async () => {
+    const {sdk,options,operation,payment}=await paymentHoldFixture(),retirement={...operation,reasonCode:"retire"};
+    const before=await depositDatabaseState(pool);let failed=false;
+    await runner.transaction(async client=>{
+      const faulty=createErpFinancialsSdk({...options,database:{transaction:work=>work({
+        async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
+          const result=await client.query<Row>(sql,params);
+          if(sql.includes('insert into "erp_financials"."financial_lifecycle_events"')&&params[6]==="bill_payment.recording_retired"){failed=true;throw Error("retirement receipt interrupted");}
+          return result;
+        }
+      })}});
+      await expect(faulty.commands.billPayments.retireRecordingAttempt({command:payment,operation:retirement})).rejects.toThrow("retirement receipt interrupted");
+    });
+    expect(failed).toBe(true);expect(await depositDatabaseState(pool)).toEqual(before);
+    const lost=createErpFinancialsSdk({...options,database:{transaction:async work=>{await runner.transaction(work);throw Error("retirement acknowledgement lost");}}});
+    await expect(lost.commands.billPayments.retireRecordingAttempt({command:payment,operation:retirement})).rejects.toThrow("retirement acknowledgement lost");
+    expect((await sdk.commands.billPayments.retireRecordingAttempt({command:payment,operation:retirement})).status).toBe("already_retired");
+    await expect(sdk.commands.billPayments.recordAndApply(payment)).rejects.toMatchObject({code:"idempotency_conflict"});
+  });
+
+  it.each([
+    {kind:"immediate",retireFirst:false},{kind:"immediate",retireFirst:true},
+    {kind:"raw",retireFirst:false},{kind:"raw",retireFirst:true},
+  ] as const)("bill recording retirement observes a real lock waiter for $kind, retire first=$retireFirst", async ({kind,retireFirst}) => {
+    const {sdk,options,operation,payment}=await paymentHoldFixture();
+    const {allocations,...raw}=payment;void allocations;
+    const record=(target:ErpFinancialsSdk)=>kind==="raw"?target.commands.billPayments.record(raw):target.commands.billPayments.recordAndApply(payment);
+    const retire=(target:ErpFinancialsSdk)=>target.commands.billPayments.retireRecordingAttempt({command:payment,operation:{...operation,reasonCode:"retire"}});
+    const blocker=await pool.connect();
+    try {
+      await blocker.query("begin");
+      const first=createErpFinancialsSdk({...options,database:{transaction:work=>work({
+        query:<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[])=>blocker.query<Row>(sql,[...params]),
+      })}});
+      await (retireFirst?retire(first):record(first));
+      const pending=(retireFirst?record(sdk):retire(sdk)).then(value=>({status:"fulfilled" as const,value}),(error:unknown)=>({status:"rejected" as const,error}));
+      let waiting=false;
+      for(let i=0;i<100;i++) {
+        if((await pool.query("select 1 from pg_stat_activity where datname=current_database() and wait_event='advisory'")).rows.length){waiting=true;break;}
+        await new Promise(resolve=>setTimeout(resolve,10));
+      }
+      expect(waiting).toBe(true);await blocker.query("commit");
+      const result=await pending;
+      if(retireFirst||kind==="raw")expect(result).toMatchObject({status:"rejected",error:{code:"idempotency_conflict"}});
+      else expect(result).toMatchObject({status:"fulfilled",value:{status:"already_recorded"}});
+      if(retireFirst) {
+        expect((await retire(sdk)).status).toBe("already_retired");
+        expect((await pool.query<{n:number}>("select count(*)::int n from erp_financials.subledger_documents where document_type='bill_payment'")).rows[0]?.n).toBe(0);
+      } else {
+        expect((await pool.query<{n:number}>("select count(*)::int n from erp_financials.subledger_documents where document_type='bill_payment'")).rows[0]?.n).toBe(1);
+      }
+    } finally {await blocker.query("rollback");blocker.release();}
+  });
+
+  it.each([true, false])("hold retirement fences unaccepted paymentHold=%s without changing current accounting", async paymentHold => {
+    const { sdk, options, operation, hold, bill, payment } = await paymentHoldFixture();
+    if (!paymentHold) await sdk.commands.vendorBills.setPaymentHold(hold);
+    const command = { ...hold, paymentHold, expectedVersion: paymentHold ? 1 : 2, idempotencyKey: "retire:hold", reason: "Original reviewed command" };
+    // A later state/version and closed period do not establish the uncertain outcome.
+    if (paymentHold) await sdk.commands.billPayments.recordAndApply(payment);
+    await closeDepositPeriod(pool, depositService(runner, { bookId: options.bookId }));
+    const before = await depositDatabaseState(pool), retirement = { ...operation, reasonCode: "retire_uncertain_hold", reasonDetail: "Cancel the uncertain original command" };
+    const result = await sdk.commands.vendorBills.retirePaymentHoldAttempt({ command, operation: retirement });
+    expect(result).toMatchObject({ status: "retired", vendorBillId: bill.documentId, idempotencyKey: command.idempotencyKey });
+    const after = await depositDatabaseState(pool);
+    for (const [table, rows] of Object.entries(before)) if (table !== "financial_lifecycle_events") expect(after[table], table).toEqual(rows);
+    expect(after.financial_lifecycle_events?.length).toBe((before.financial_lifecycle_events?.length ?? 0) + 1);
+    expect(await sdk.commands.vendorBills.retirePaymentHoldAttempt({ command: { ...command, operation: { ...command.operation, requestId: "transport-retry" } }, operation: { ...retirement, requestId: "transport-retry" } })).toEqual({ ...result, status: "already_retired" });
+    await expect(sdk.commands.vendorBills.setPaymentHold(command)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await sdk.queries.findVendorBillHoldCommandByKey({ sourceId: options.writeSourceId, idempotencyKey: command.idempotencyKey })).toBeNull();
+    for (const patch of [{ expectedVersion: 99 }, { reason: "Different purpose" }, { paymentHold: !paymentHold }, { vendorBillId: "other" }, { operation: { ...command.operation, actorRef: "other" } }]) {
+      await expect(sdk.commands.vendorBills.retirePaymentHoldAttempt({ command: { ...command, ...patch }, operation: retirement })).rejects.toThrow();
+    }
+    await expect(sdk.commands.vendorBills.retirePaymentHoldAttempt({ command, operation: { ...retirement, reasonDetail: "A different cancellation" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("hold retirement preserves accepted hold and release receipts after later settlement without DML", async () => {
+    const { sdk, options, operation, hold, bill, payment } = await paymentHoldFixture();
+    const held = await sdk.commands.vendorBills.setPaymentHold(hold);
+    const release = { ...hold, expectedVersion: 2, paymentHold: false, reason: "Independent review finished", idempotencyKey: "release:accepted" };
+    const released = await sdk.commands.vendorBills.setPaymentHold(release);
+    await sdk.commands.billPayments.recordAndApply({ ...payment, amount: "100.00", allocations: [{ billId: bill.documentId, amount: "100.00", expectedBillVersion: 3 }] });
+    await closeDepositPeriod(pool, depositService(runner, { bookId: options.bookId }));
+    const before = await depositDatabaseState(pool), retirement = { ...operation, reasonCode: "retire_uncertain_hold" };
+    for (const [command, receipt] of [[hold, held], [release, released]] as const) {
+      expect(await sdk.commands.vendorBills.retirePaymentHoldAttempt({ command, operation: retirement })).toEqual({ status: "already_recorded", vendorBillId: bill.documentId, idempotencyKey: command.idempotencyKey,
+        receipt: { ...receipt, status: "already_changed" }, current: { version: 4, paymentHold: false, paymentHoldReason: null } });
+      await expect(sdk.commands.vendorBills.retirePaymentHoldAttempt({ command: { ...command, expectedVersion: 4 }, operation: retirement })).rejects.toMatchObject({ code: "idempotency_conflict" });
+      await expect(sdk.commands.vendorBills.retirePaymentHoldAttempt({ command: { ...command, operation: { ...operation, reasonDetail: "Changed audit" } }, operation: retirement })).rejects.toMatchObject({ code: "idempotency_conflict" });
+      await expect(sdk.commands.vendorBills.retirePaymentHoldAttempt({ command: { ...command, operation: { ...operation, actorRef: "other" } }, operation: { ...retirement, actorRef: "other" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("hold retirement rejects foreign scope, caller and provider provenance without writes", async () => {
+    const { sdk, options, operation, hold } = await paymentHoldFixture(), retirement = { ...operation, reasonCode: "retire_uncertain_hold" };
+    const other = createErpFinancialsSdk({ ...options, bookId: "hold_retirement_other" });
+    await other.books.define({ operation, bookId: "hold_retirement_other", name: "Other", baseCurrencyCode: "USD" });
+    await other.books.bindSource({ operation, bookId: "hold_retirement_other", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    const before = await depositDatabaseState(pool);
+    await expect(other.commands.vendorBills.retirePaymentHoldAttempt({ command: hold, operation: retirement })).rejects.toMatchObject({ code: "scope_mismatch" });
+    for (const scope of [{ tenantId: "other" }, { companyId: "other" }, { writeSourceId: "source_2" }, { currencyCode: "EUR" }]) {
+      await expect(createErpFinancialsSdk({ ...options, ...scope }).commands.vendorBills.retirePaymentHoldAttempt({ command: hold, operation: retirement })).rejects.toThrow();
+    }
+    await expect(sdk.commands.vendorBills.retirePaymentHoldAttempt({ command: hold, operation: { ...retirement, actorRef: "other" } })).rejects.toMatchObject({ code: "authorization_context_invalid" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await pool.query("update erp_financials.accounting_sources set source_system='quickbooks' where source_id='source_1'");
+    const providerBefore = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.retirePaymentHoldAttempt({ command: hold, operation: retirement })).rejects.toMatchObject({ code: "provider_dependency" });
+    expect(await depositDatabaseState(pool)).toEqual(providerBefore);
+  });
+
+  it("hold retirement rolls back a caught insert failure and recovers a genuinely lost commit acknowledgement", async () => {
+    const { sdk, options, operation, hold } = await paymentHoldFixture(), retirement = { ...operation, reasonCode: "retire_uncertain_hold" };
+    const before = await depositDatabaseState(pool); let interrupted = false;
+    await runner.transaction(async client => {
+      const faulty = createErpFinancialsSdk({ ...options, database: { transaction: work => work({
+        async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+          const result = await client.query<Row>(sql, params);
+          if (sql.includes('insert into "erp_financials"."financial_lifecycle_events"') && params[6] === "subledger.vendor_bill.payment_hold_retired") { interrupted = true; throw Error("hold retirement insert interrupted"); }
+          return result;
+        }
+      }) } });
+      await expect(faulty.commands.vendorBills.retirePaymentHoldAttempt({ command: hold, operation: retirement })).rejects.toThrow("hold retirement insert interrupted");
+    });
+    expect(interrupted).toBe(true); expect(await depositDatabaseState(pool)).toEqual(before);
+    const lost = createErpFinancialsSdk({ ...options, database: { transaction: async work => { await runner.transaction(work); throw Error("hold retirement commit acknowledgement lost"); } } });
+    await expect(lost.commands.vendorBills.retirePaymentHoldAttempt({ command: hold, operation: retirement })).rejects.toThrow("hold retirement commit acknowledgement lost");
+    expect((await sdk.commands.vendorBills.retirePaymentHoldAttempt({ command: hold, operation: retirement })).status).toBe("already_retired");
+    await expect(sdk.commands.vendorBills.setPaymentHold(hold)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect((await pool.query<{ n: number }>("select count(*)::int n from erp_financials.financial_lifecycle_events where event_type='subledger.vendor_bill.payment_hold_retired'")).rows[0]?.n).toBe(1);
+  });
+
+  it.each([{ paymentHold: true, retireFirst: true }, { paymentHold: true, retireFirst: false }, { paymentHold: false, retireFirst: true }, { paymentHold: false, retireFirst: false }])(
+    "hold retirement observes a real PostgreSQL waiter, hold=$paymentHold retireFirst=$retireFirst", async ({ paymentHold, retireFirst }) => {
+      const { sdk, options, operation, hold, bill } = await paymentHoldFixture();
+      if (!paymentHold) await sdk.commands.vendorBills.setPaymentHold(hold);
+      const command = { ...hold, paymentHold, expectedVersion: paymentHold ? 1 : 2, idempotencyKey: "hold:race-retirement" };
+      const retire = (target: ErpFinancialsSdk) => target.commands.vendorBills.retirePaymentHoldAttempt({ command, operation: { ...operation, reasonCode: "retire_uncertain_hold" } });
+      const change = (target: ErpFinancialsSdk) => target.commands.vendorBills.setPaymentHold(command);
+      const blocker = await pool.connect();
+      try {
+        await blocker.query("begin");
+        const first = createErpFinancialsSdk({ ...options, database: { transaction: work => work({ query: <Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []) => blocker.query<Row>(sql, [...params]) }) } });
+        await (retireFirst ? retire(first) : change(first));
+        const pending = (retireFirst ? change(sdk) : retire(sdk)).then(value => ({ status: "fulfilled" as const, value }), (error: unknown) => ({ status: "rejected" as const, error }));
+        let waiting = false;
+        for (let i = 0; i < 100; i++) { if ((await pool.query("select 1 from pg_stat_activity where datname=current_database() and wait_event='advisory'")).rows.length) { waiting = true; break; } await new Promise(resolve => setTimeout(resolve, 10)); }
+        expect(waiting).toBe(true); await blocker.query("commit");
+        expect(await pending).toMatchObject(retireFirst ? { status: "rejected", error: { code: "idempotency_conflict" } } : { status: "fulfilled", value: { status: "already_recorded" } });
+        expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ version: command.expectedVersion + (retireFirst ? 0 : 1), paymentHold: retireFirst ? !paymentHold : paymentHold });
+      } finally { await blocker.query("rollback"); blocker.release(); }
+    });
+
+  it("hold retirement snapshots caller payload and does not overwrite an accepted command identity", async () => {
+    const { sdk, options, operation, hold } = await paymentHoldFixture();
+    const mutable = { command: structuredClone(hold), operation: { ...operation, reasonCode: "retire_uncertain_hold", reasonDetail: "Original cancellation reason" } };
+    const original = structuredClone(mutable), pending = sdk.commands.vendorBills.retirePaymentHoldAttempt(mutable);
+    mutable.command.reason = "Mutated after invocation"; mutable.operation.reasonDetail = "Changed cancellation";
+    expect((await pending).status).toBe("retired");
+    expect((await sdk.commands.vendorBills.retirePaymentHoldAttempt(original)).status).toBe("already_retired");
+    // Exact original namespace prevents pre-upgrade writers from accepting this key:
+    // old setPaymentHold requires payload.result, which a retirement never has.
+    const rows = await pool.query<{ payload: Record<string, unknown> }>("select payload from erp_financials.financial_lifecycle_events where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4", [options.tenantId, options.companyId, options.writeSourceId, `vendor-bill-hold:${hold.idempotencyKey}`]);
+    expect(rows.rows).toHaveLength(1); expect(rows.rows[0]?.payload.result).toBeUndefined();
+  });
+
+  it("exact vendor bill hold receipt preserves original version across release and enforces posting book scope", async () => {
+    const { sdk, options, operation, hold, bill } = await paymentHoldFixture();
+    const key = { sourceId: "source_1", idempotencyKey: hold.idempotencyKey };
+    expect(await sdk.queries.findVendorBillHoldCommandByKey(key)).toBeNull();
+    const held = await sdk.commands.vendorBills.setPaymentHold(hold);
+    const receipt = await sdk.queries.findVendorBillHoldCommandByKey(key);
+    expect(receipt).toEqual({ lifecycleEventId: held.lifecycleEventId, ...key, vendorBillId: bill.documentId,
+      originalExpectedVersion: 1, resultingVersion: 2, paymentHold: true, reason: "Invoice under review" });
+    await sdk.commands.vendorBills.setPaymentHold({ ...hold, idempotencyKey: "hold:release", expectedVersion: 2, paymentHold: false, reason: "Review completed" });
+    expect(await sdk.queries.findVendorBillHoldCommandByKey(key)).toEqual(receipt);
+    if (!receipt) throw new Error("hold receipt missing");
+    const before = await depositDatabaseState(pool);
+    expect((await sdk.commands.vendorBills.setPaymentHold({ ...hold, expectedVersion: receipt.originalExpectedVersion })).status).toBe("already_changed");
+    await expect(sdk.commands.vendorBills.setPaymentHold({ ...hold, expectedVersion: 3 })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(sdk.commands.vendorBills.setPaymentHold({ ...hold, reason: "Changed purpose" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    expect((await sdk.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: bill.documentId, limit: 1 })).bill.paymentHold).toBe(false);
+    const other = createErpFinancialsSdk({ ...options, bookId: "hold_receipt_other", postingPolicy: "legacy_unrestricted" });
+    await other.books.define({ operation, bookId: "hold_receipt_other", name: "Different posting book", baseCurrencyCode: "USD" });
+    await other.books.bindSource({ operation, bookId: "hold_receipt_other", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    expect(await other.queries.findVendorBillHoldCommandByKey(key)).toBeNull();
+    expect(await sdk.queries.findVendorBillHoldCommandByKey({ ...key, sourceId: "other_source" })).toBeNull();
+    const wrongCompany = createErpFinancialsSdk({ ...options, companyId: "other_company" });
+    await expect(wrongCompany.queries.findVendorBillHoldCommandByKey(key)).rejects.toMatchObject({ code: "missing_book" });
+    await expect(sdk.queries.findVendorBillHoldCommandByKey({ ...key, idempotencyKey: " " })).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  it.each(["schedule", "schedule-retry", "record-and-apply", "clear", "cancel", "compensate", "void"] as const)("bill payment lifecycle rejects %s from another book without changing accounting", async action => {
+    const { sdk, options, operation, payment } = await paymentHoldFixture();
+    const other = createErpFinancialsSdk({ ...options, bookId: "payment_other_book", postingPolicy: "legacy_unrestricted" });
+    await other.books.define({ operation, bookId: "payment_other_book", name: "Other payment book", baseCurrencyCode: "USD" });
+    await other.books.bindSource({ operation, bookId: "payment_other_book", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    let billPaymentId: string;
+    if (action === "compensate") billPaymentId = (await sdk.commands.billPayments.recordAndApply(payment)).billPaymentId;
+    else if (action === "void") billPaymentId = (await sdk.commands.billPayments.record({ operation, idempotencyKey: "book:unapplied", date: payment.date,
+      vendorId: payment.vendorId, amount: payment.amount, payableAccount: payment.payableAccount, cashAccount: payment.cashAccount })).documentId;
+    else billPaymentId = (await sdk.commands.billPayments.schedule(payment)).billPaymentId;
+    const before = await depositDatabaseState(pool);
+    const lifecycle = { operation, billPaymentId, expectedVersion: action === "compensate" ? 2 : 1, idempotencyKey: `book:${action}`, date: "2026-08-12" };
+    const result = action === "schedule" ? other.commands.billPayments.schedule({ ...payment, idempotencyKey: "other:new-schedule" })
+      : action === "record-and-apply" ? other.commands.billPayments.recordAndApply({ ...payment, idempotencyKey: "other:new-cash" })
+      : action === "schedule-retry" ? other.commands.billPayments.schedule(payment)
+      : action === "clear" ? other.commands.billPayments.clear(lifecycle)
+      : action === "cancel" ? other.commands.billPayments.cancel(lifecycle)
+      : action === "compensate" ? other.commands.billPayments.voidAndUnapply(lifecycle)
+      : other.commands.billPayments.void(lifecycle);
+    await expect(result).rejects.toMatchObject({ code: "scope_mismatch" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("scheduled bill clear orders its source lock before bill rows when a correction races", async () => {
+    const { sdk, options, operation, payment, bill } = await paymentHoldFixture();
+    const scheduled = await sdk.commands.billPayments.schedule(payment);
+    let enter!: (pid: number) => void, release!: () => void;
+    const entered = new Promise<number>(resolve => { enter = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    let paused = false;
+    const held = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({
+      async query<Row extends Record<string, unknown>>(sql: string, values: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        const result = await client.query<Row>(sql, values);
+        if (!paused && sql.includes('and "subledger_document_id" = any($4::text[])') && sql.includes('for update')) {
+          paused = true; enter(Number((await client.query("select pg_backend_pid() pid")).rows[0]?.pid)); await gate;
+        }
+        return result;
+      }
+    })) } });
+    const first = Promise.allSettled([held.commands.billPayments.clear({ operation, billPaymentId: scheduled.billPaymentId, expectedVersion: 1, idempotencyKey: "race:clear" })]);
+    let second: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      const pid = await Promise.race([entered, first.then(() => { throw new Error("Clear ended before lock barrier"); })]);
+      second = Promise.allSettled([sdk.commands.vendorBills.correctPosted({ operation, vendorBillId: bill.documentId, expectedVersion: 1,
+        idempotencyKey: "race:bill-correction", date: "2026-08-12", releases: [] })]);
+      await expect.poll(async () => (await pool.query<{ blocked: boolean }>("select exists(select 1 from pg_stat_activity where $1=any(pg_blocking_pids(pid))) blocked", [pid])).rows[0]?.blocked).toBe(true);
+      release();
+      expect((await first)[0]).toMatchObject({ status: "fulfilled" });
+      expect((await second)[0]).toMatchObject({ status: "rejected", reason: { code: "optimistic_concurrency_conflict" } });
+      expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ openAmount: "80.00", version: 2 });
+    } finally { release(); await first; await second; }
+  }, 15000);
+
+  it("bill payment compensation orders source locks before application rows when correction races", async () => {
+    const { sdk, options, operation, payment, bill } = await paymentHoldFixture();
+    const paid = await sdk.commands.billPayments.recordAndApply(payment);
+    const review = await sdk.queries.getBillPaymentCorrectionReview({sourceId:"source_1",paymentId:paid.billPaymentId});
+    const application = paid.applications[0]; if (!application) throw new Error("Missing payment application");
+    let enter!: (pid: number) => void, release!: () => void;
+    const entered = new Promise<number>(resolve => { enter = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    let paused = false;
+    const held = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({
+      async query<Row extends Record<string, unknown>>(sql: string, values: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        const result = await client.query<Row>(sql, values);
+        if (!paused && sql.includes('and "source_document_id" = $4 and "application_type"') && sql.includes('for update')) {
+          paused = true; enter(Number((await client.query("select pg_backend_pid() pid")).rows[0]?.pid)); await gate;
+        }
+        return result;
+      }
+    })) } });
+    const first = Promise.allSettled([held.commands.billPayments.voidAndUnapply({ operation, billPaymentId: paid.billPaymentId, expectedVersion: 2, expectedReviewToken: review.reviewToken, idempotencyKey: "race:compensate", date: "2026-08-12" })]);
+    let second: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      const pid = await Promise.race([entered, first.then(() => { throw new Error("Compensation ended before lock barrier"); })]);
+      second = Promise.allSettled([sdk.commands.vendorBills.correctPosted({ operation, vendorBillId: bill.documentId, expectedVersion: 2,
+        idempotencyKey: "race:compensated-bill-correction", date: "2026-08-12", releases: [{ applicationId: application.applicationId, expectedVersion: 1, expectedSourceVersion: 2, reapplyAmount: "0.00" }] })]);
+      await expect.poll(async () => (await pool.query<{ blocked: boolean }>("select exists(select 1 from pg_stat_activity where $1=any(pg_blocking_pids(pid))) blocked", [pid])).rows[0]?.blocked).toBe(true);
+      release();
+      expect((await first)[0]).toMatchObject({ status: "fulfilled" });
+      expect((await second)[0]).toMatchObject({ status: "rejected", reason: { code: "optimistic_concurrency_conflict" } });
+      expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ openAmount: "100.00", version: 3 });
+      expect(await sdk.queries.getOperationalDocumentSummary(paid.billPaymentId)).toMatchObject({ status: "voided", openAmount: "0.00" });
+    } finally { release(); await first; await second; }
+  }, 15000);
+
+  it.each((["payment", "bill"] as const).flatMap(kind => (["correction", "close"] as const).map(winner => ({kind,winner}))))(
+    "canonical close and reviewed $kind correction serialize with $winner first", async ({kind,winner}) => {
+      const {sdk,options,operation,payment,bill}=await paymentHoldFixture();
+      const paid=await sdk.commands.billPayments.recordAndApply(payment),application=paid.applications[0];
+      if(!application)throw new Error("Missing application");
+      const review=await sdk.queries.getBillPaymentCorrectionReview({sourceId:"source_1",paymentId:paid.billPaymentId});
+      const paymentCommand={operation,billPaymentId:paid.billPaymentId,expectedVersion:2,expectedReviewToken:review.reviewToken,idempotencyKey:"close-race:payment-correction",date:"2026-08-12"};
+      const billCommand={operation,vendorBillId:bill.documentId,expectedVersion:2,idempotencyKey:"close-race:bill-correction",date:"2026-08-12",
+        releases:[{applicationId:application.applicationId,expectedVersion:1,expectedSourceVersion:2,reapplyAmount:"10.00"}],
+        replacement:{idempotencyKey:"close-race:replacement",date:"2026-08-12",dueDate:"2026-08-31",vendorId:"vendor_1",payableAccount:{accountId:"account_ap"},expenseLines:[{accountId:"account_cash",amount:"90.00"}]}};
+      const correct=(actor:ErpFinancialsSdk)=>kind==="payment"?actor.commands.billPayments.voidAndUnapply(paymentCommand):actor.commands.vendorBills.correctPosted(billCommand);
+      const period=(await sdk.queries.listFiscalPeriods({sourceId:"source_1"})).items[0];if(!period)throw new Error("Missing period");
+      // This isolated lock test declares a no-activity account. It does not certify a production bank policy.
+      const bankAccountIds=["account_income"];
+      const readiness=await sdk.queries.getCanonicalFiscalCloseReadiness("source_1",period.fiscalPeriodId,bankAccountIds);expect(readiness.ready).toBe(true);
+      const command={operation,bookId:options.bookId,fiscalPeriodId:period.fiscalPeriodId,expectedVersion:period.version,expectedApprovalToken:readiness.approvalToken,bankAccountIds,idempotencyKey:"close-race:close"};
+      const before=await depositDatabaseState(pool),first=await pool.connect();
+      let committed=false,waiter:Promise<PromiseSettledResult<unknown>>|undefined;
+      try{
+        await first.query("begin");const firstPid=Number((await first.query<{ pid: number }>("select pg_backend_pid() pid")).rows[0]?.pid);
+        const held=createErpFinancialsSdk({...options,database:{transaction:work=>work(first)}});
+        let secondPid:number|undefined;
+        const competing=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(async client=>{
+          secondPid=Number((await client.query("select pg_backend_pid() pid")).rows[0]?.pid);return work(client);
+        })}});
+        if(winner==="correction")await correct(held);else await held.commands.fiscalPeriods.closeCanonical(command);
+        const pending=winner==="correction"?competing.commands.fiscalPeriods.closeCanonical(command):correct(competing);
+        waiter=pending.then(value=>({status:"fulfilled" as const,value}),(reason:unknown)=>({status:"rejected" as const,reason}));
+        await expect.poll(async()=>secondPid!==undefined&&(await pool.query<{blocked:boolean}>("select $2::integer=any(pg_blocking_pids($1::integer)) blocked",[secondPid,firstPid])).rows[0]?.blocked,{timeout:5000}).toBe(true);
+        expect(await depositDatabaseState(pool)).toEqual(before);
+        await first.query("commit");committed=true;
+        expect(await waiter).toMatchObject({status:"rejected",reason:{code:winner==="correction"?"optimistic_concurrency_conflict":"fiscal_period_closed"}});
+        if(winner==="correction"){
+          const current=await sdk.queries.getCanonicalFiscalCloseReadiness("source_1",period.fiscalPeriodId,bankAccountIds);
+          expect(current.approvalToken).not.toBe(readiness.approvalToken);expect(current.ready).toBe(true);
+          if(kind==="payment"){
+            expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({openAmount:"100.00",version:3});
+            expect(await sdk.queries.getOperationalDocumentSummary(paid.billPaymentId)).toMatchObject({status:"voided",openAmount:"0.00"});
+          }else{
+            expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({status:"voided",openAmount:"0.00"});
+            expect(await sdk.queries.getOperationalDocumentSummary(paid.billPaymentId)).toMatchObject({openAmount:"10.00"});
+          }
+          await sdk.commands.fiscalPeriods.closeCanonical({...command,expectedApprovalToken:current.approvalToken,idempotencyKey:"close-race:refreshed"});
+          const closed=await depositDatabaseState(pool);await correct(sdk);expect(await depositDatabaseState(pool)).toEqual(closed);
+        }else{
+          expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({status:"partially_applied",openAmount:"80.00",version:2});
+          expect(await sdk.queries.getOperationalDocumentSummary(paid.billPaymentId)).toMatchObject({openAmount:"0.00"});
+          const closed=await depositDatabaseState(pool);await expect(correct(sdk)).rejects.toMatchObject({code:"fiscal_period_closed"});
+          await sdk.commands.fiscalPeriods.closeCanonical(command);expect(await depositDatabaseState(pool)).toEqual(closed);
+        }
+        const closedPeriod=await sdk.queries.getFiscalPeriod("source_1",period.fiscalPeriodId);expect(closedPeriod.status).toBe("closed");
+        expect(closedPeriod.canonicalCloseCertificateId).toBeTruthy();
+      }finally{if(!committed)await first.query("rollback");first.release();await waiter;}
+    },15000);
+
+  it.each(["cancel", "compensate", "void"] as const)("bill payment %s snapshots the authorized command before awaiting a transaction", async action => {
+    const { sdk, options, operation, payment } = await paymentHoldFixture();
+    const id = action === "cancel" ? (await sdk.commands.billPayments.schedule(payment)).billPaymentId
+      : action === "compensate" ? (await sdk.commands.billPayments.recordAndApply(payment)).billPaymentId
+      : (await sdk.commands.billPayments.record({ operation, idempotencyKey: "snapshot:cash", date: payment.date, vendorId: payment.vendorId,
+        amount: payment.amount, payableAccount: payment.payableAccount, cashAccount: payment.cashAccount })).documentId;
+    let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+    const held = createErpFinancialsSdk({ ...options, database: { transaction: async work => { await gate; return runner.transaction(work); } } });
+    const mutableOperation: { -readonly [Key in keyof FinancialOperationContext]: FinancialOperationContext[Key] } = { ...operation };
+    const input = { operation: mutableOperation, billPaymentId: id, expectedVersion: action === "compensate" ? 2 : 1,
+      idempotencyKey: `snapshot:${action}`, date: "2026-08-12", memo: "Authorized correction" };
+    const original = structuredClone(input);
+    const pending = action === "cancel" ? held.commands.billPayments.cancel(input)
+      : action === "compensate" ? held.commands.billPayments.voidAndUnapply(input) : held.commands.billPayments.void(input);
+    input.billPaymentId = "mutated-target"; input.idempotencyKey = "mutated-key"; input.operation.actorRef = "mutated-actor"; input.date = "2026-08-15"; input.memo = "Mutated reason";
+    release();
+    await expect(pending).resolves.toMatchObject({ status: "voided" });
+    const events = (await pool.query<{ actor_ref: string; idempotency_key: string }>("select actor_ref,idempotency_key from erp_financials.financial_lifecycle_events where idempotency_key like $1", [`%${original.idempotencyKey}%`])).rows;
+    expect(events.length).toBeGreaterThan(0); expect(events.every(event => event.actor_ref === operation.actorRef)).toBe(true);
+    expect((await pool.query("select 1 from erp_financials.financial_lifecycle_events where actor_ref='mutated-actor' or idempotency_key like '%mutated-key%'")).rows).toEqual([]);
+  });
+
+  it("scheduled cancellation retries accept new transport metadata and reject changed authorization without writing", async () => {
+    const { sdk, operation, payment } = await paymentHoldFixture();
+    const scheduled = await sdk.commands.billPayments.schedule(payment);
+    const input = { operation, billPaymentId: scheduled.billPaymentId, expectedVersion: 1, idempotencyKey: "retry:cancel" };
+    const result = await sdk.commands.billPayments.cancel(input), before = await depositDatabaseState(pool);
+    const fresh = { ...operation, requestId: "retry-transport", correlationId: "retry-correlation", occurredAt: "2026-08-14T00:00:00.000Z" };
+    await expect(sdk.commands.billPayments.cancel({ ...input, operation: fresh })).resolves.toEqual({ ...result, status: "already_voided" });
+    for (const change of [{ actorRef: "other" }, { approverRef: "other" }, { reasonCode: "other" }, { reasonDetail: "changed" }]) {
+      await expect(sdk.commands.billPayments.cancel({ ...input, operation: { ...fresh, ...change } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["schedule", "recordAndApply", "clear", "cancel", "compensate", "void"] as const)("bill payment %s rolls back a caught late interruption while preserving outer host work", async action => {
+    const { sdk, options, operation, payment } = await paymentHoldFixture();
+    const id = action === "clear" || action === "cancel" ? (await sdk.commands.billPayments.schedule(payment)).billPaymentId
+      : action === "compensate" ? (await sdk.commands.billPayments.recordAndApply(payment)).billPaymentId
+      : action === "void" ? (await sdk.commands.billPayments.record({ operation, idempotencyKey: "caught:cash", date: payment.date, vendorId: payment.vendorId,
+        amount: payment.amount, payableAccount: payment.payableAccount, cashAccount: payment.cashAccount })).documentId : "unused";
+    const input = { operation, billPaymentId: id, expectedVersion: action === "compensate" ? 2 : 1, idempotencyKey: `caught:${action}`, date: "2026-08-12", memo: "Correct approved cash" };
+    const invoke = (target: ErpFinancialsSdk) => action === "schedule" ? target.commands.billPayments.schedule(payment)
+      : action === "recordAndApply" ? target.commands.billPayments.recordAndApply(payment)
+      : action === "clear" ? target.commands.billPayments.clear(input)
+      : action === "cancel" ? target.commands.billPayments.cancel(input)
+      : action === "compensate" ? target.commands.billPayments.voidAndUnapply(input) : target.commands.billPayments.void(input);
+    const stage = action === "schedule" ? "scheduled" : action === "clear" || action === "recordAndApply" ? "cleared" : action === "cancel" ? "cancelled" : action === "compensate" ? "compensated" : "voided";
+    const before = await depositDatabaseState(pool); let interrupted = false;
+    await runner.transaction(async client => {
+      await client.query("create temporary table retained_payment_host_work(value integer) on commit drop");
+      await client.query("insert into retained_payment_host_work values(1)");
+      const scoped = createErpFinancialsSdk({ ...options, database: { transaction: work => work({
+        async query<Row extends Record<string, unknown>>(sql: string, values: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+          const result = await client.query<Row>(sql, values);
+          if (!interrupted && sql.includes('insert into "erp_financials"."financial_outbox"') && values[5] === `bill_payment.${stage}`) {
+            interrupted = true; throw new Error("Injected caught payment interruption");
+          }
+          return result;
+        }
+      }) } });
+      await expect(invoke(scoped)).rejects.toThrow("Injected caught payment interruption");
+      expect((await client.query("select value from retained_payment_host_work")).rows).toEqual([{ value: 1 }]);
+    });
+    expect(interrupted).toBe(true); expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(invoke(sdk)).resolves.toMatchObject({ status: action === "schedule" ? "scheduled" : action === "clear" || action === "recordAndApply" ? "cleared" : "voided" });
+  });
+
+  it.each(["cancel", "compensate", "void"] as const)("bill payment %s retains administrator confirmation through defensive snapshots and savepoints", async action => {
+    const { sdk, options, operation, payment } = await paymentHoldFixture();
+    const billPaymentId = action === "cancel" ? (await sdk.commands.billPayments.schedule(payment)).billPaymentId
+      : action === "compensate" ? (await sdk.commands.billPayments.recordAndApply(payment)).billPaymentId
+      : (await sdk.commands.billPayments.record({ operation, idempotencyKey: "admin:cash", date: payment.date, vendorId: payment.vendorId,
+        amount: payment.amount, payableAccount: payment.payableAccount, cashAccount: payment.cashAccount })).documentId;
+    const financialAction = action === "cancel" ? "billPayments.cancel" : action === "compensate" ? "billPayments.voidAndUnapply" : "billPayments.void";
+    const input = { operation: { ...operation, approverRef: operation.actorRef }, billPaymentId, expectedVersion: action === "compensate" ? 2 : 1,
+      idempotencyKey: `admin:${action}`, date: "2026-08-12", memo: "Confirmed correction" };
+    const scope = { ...options, sourceId: options.writeSourceId, accountingBasis: "accrual" as const, postingPolicy: "enforce_fiscal_periods" as const };
+    const checksum = createFinancialActionCommandChecksum(scope, financialAction, input);
+    const admin = createErpFinancialsSdk({ ...options, financialApprovalPolicy: { mode: "administrator_direct", actions: [financialAction],
+      guard: request => Promise.resolve({ ...scope, action: financialAction, actorRef: operation.actorRef, requestId: operation.requestId,
+        commandChecksum: checksum, active: true, administrator: true, confirmed: request.commandChecksum === checksum }) } });
+    const confirmed = { ...input, operation: { ...input.operation, administratorConfirmation: { confirmationRef: "payment-fixture-confirmation", commandChecksum: checksum } } };
+    const invoke = (target: ErpFinancialsSdk) => action === "cancel" ? target.commands.billPayments.cancel(confirmed)
+      : action === "compensate" ? target.commands.billPayments.voidAndUnapply(confirmed) : target.commands.billPayments.void(confirmed);
+    await expect(invoke(sdk)).rejects.toMatchObject({ code: "authorization_context_invalid" });
+    await expect(invoke(admin)).resolves.toMatchObject({ status: "voided" });
+    const events = (await pool.query("select actor_ref,approver_ref,payload->'financialApproval' approval from erp_financials.financial_lifecycle_events where idempotency_key like $1", [`%${input.idempotencyKey}%`])).rows;
+    expect(events.length).toBeGreaterThan(0);
+    for (const event of events) expect(event).toMatchObject({ actor_ref: operation.actorRef, approver_ref: operation.actorRef,
+      approval: { action: financialAction, policy: "administrator_direct", commandChecksum: checksum } });
+  });
+
+  it("bill payment savepoint rejects an autocommit host runner before changing accounting", async () => {
+    const { sdk, options, operation, payment } = await paymentHoldFixture();
+    const scheduled = await sdk.commands.billPayments.schedule(payment), before = await depositDatabaseState(pool);
+    const client = await pool.connect();
+    try {
+      const invalid = createErpFinancialsSdk({ ...options, database: { transaction: work => work(new PgQueryClient(client)) } });
+      await expect(invalid.commands.billPayments.cancel({ operation, billPaymentId: scheduled.billPaymentId, expectedVersion: 1,
+        idempotencyKey: "autocommit:cancel" })).rejects.toMatchObject({ code: "25P01" });
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    } finally { client.release(); }
+  });
+
+  it.each(["void", "compensate", "raw-compensate"] as const)("bill payment %s completion is a payload-bound read-only receipt after close", async mode => {
+    const { sdk, options, operation, bill, payment } = await paymentHoldFixture();
+    const billPaymentId = mode === "compensate" ? (await sdk.commands.billPayments.recordAndApply(payment)).billPaymentId
+      : (await sdk.commands.billPayments.record({ operation, idempotencyKey: "completion:raw", date: payment.date,
+        vendorId: payment.vendorId, amount: payment.amount, payableAccount: payment.payableAccount, cashAccount: payment.cashAccount })).documentId;
+    if (mode === "raw-compensate") await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "completion:apply",
+      applicationType: "bill_payment_to_bill", sourceDocumentId: billPaymentId, targetDocumentId: bill.documentId,
+      amount: "10.00", applicationDate: payment.date, expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    const command = { operation, billPaymentId, expectedVersion: mode === "void" ? 1 : 2,
+      idempotencyKey: `completion:${mode}`, date: "2026-08-12", memo: "Rejected payment" };
+    const invoke = (target: ErpFinancialsSdk, input: VoidPostedBillPaymentInput = command) => mode === "void" ? target.commands.billPayments.void(input) : target.commands.billPayments.voidAndUnapply(input);
+    const original = await invoke(sdk), before = await depositDatabaseState(pool);
+    // The original receipt, not a fresh posting operation, supplies retry data.
+    const receipt = { ...original, status: "already_voided", reversal: { ...original.reversal, status: "already_posted",
+      snapshotsMarkedStale: 0, writeCounts: { importBatches: 0, transactions: 0, transactionLines: 0, postings: 0 } } };
+    const readOnly = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({
+      async query<Row extends Record<string, unknown>>(sql: string, values: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        if (/\b(insert|update|delete)\s+(into|erp_financials|"erp_financials"|from)/iu.test(sql)) throw new Error("Completion retry attempted a write");
+        return client.query<Row>(sql, values);
+      }
+    })) } });
+    // Simulate pre-0.3.116 retained history by hiding only new completion
+    // reads; all journal, application, ownership and audit evidence stays real.
+    const legacy = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({
+      async query<Row extends Record<string, unknown>>(sql: string, values: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        if (sql.includes("select event_id,aggregate_id,payload") && String(values[3]).startsWith("bill-payment-completion:")) return { rows: [] };
+        if (/\b(insert|update|delete)\s+(into|erp_financials|"erp_financials"|from)/iu.test(sql)) throw new Error("Legacy retry attempted a write");
+        return client.query<Row>(sql, values);
+      }
+    })) } });
+    const fresh = { ...command, operation: { ...operation, requestId: "fresh-completion", correlationId: "fresh-correlation", occurredAt: "2026-08-15T00:00:00.000Z" } };
+    await expect(invoke(readOnly, fresh)).resolves.toEqual(receipt);
+    if (mode === "raw-compensate") await expect(invoke(legacy, fresh)).rejects.toMatchObject({ code: "terminal_state_conflict",
+      message: "Legacy compensated payment lacks a provable outer command receipt; reconcile retained evidence before recovery" });
+    else await expect(invoke(legacy, fresh)).resolves.toEqual(receipt);
+    for (const change of [{ expectedVersion: 99 }, { date: "2026-08-13" }, { memo: "Different reason" },
+      ...[{ actorRef: "other" }, { approverRef: "other" }, { reasonCode: "other" }, { reasonDetail: "changed" }].map(change => ({ operation: { ...fresh.operation, ...change } }))]) {
+      await expect(invoke(readOnly, { ...fresh, ...change })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    await expect(invoke(readOnly, { ...fresh, idempotencyKey: "different-command" })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await closeDepositPeriod(pool, depositService(runner, { bookId: options.bookId }));
+    const closed = await depositDatabaseState(pool);
+    await expect(invoke(readOnly, fresh)).resolves.toEqual(receipt);
+    if (mode === "raw-compensate") await expect(invoke(legacy, fresh)).rejects.toMatchObject({ code: "terminal_state_conflict",
+      message: "Legacy compensated payment lacks a provable outer command receipt; reconcile retained evidence before recovery" });
+    else await expect(invoke(legacy, fresh)).resolves.toEqual(receipt);
+    expect(await depositDatabaseState(pool)).toEqual(closed);
+  });
+
+  it.each(["void", "compensate"] as const)("bill payment %s completion receipt is atomic under a caught final-write failure and concurrent retries", async action => {
+    const { sdk, options, operation, payment } = await paymentHoldFixture();
+    const billPaymentId = action === "compensate" ? (await sdk.commands.billPayments.recordAndApply(payment)).billPaymentId
+      : (await sdk.commands.billPayments.record({ operation, idempotencyKey: "final:raw", date: payment.date, vendorId: payment.vendorId,
+        amount: payment.amount, payableAccount: payment.payableAccount, cashAccount: payment.cashAccount })).documentId;
+    const input = { operation, billPaymentId, expectedVersion: action === "void" ? 1 : 2, idempotencyKey: `final:${action}`, date: "2026-08-12" };
+    const invoke = (target: ErpFinancialsSdk) => action === "void" ? target.commands.billPayments.void(input) : target.commands.billPayments.voidAndUnapply(input);
+    const before = await depositDatabaseState(pool); let interrupted = false;
+    await runner.transaction(async client => {
+      const scoped = createErpFinancialsSdk({ ...options, database: { transaction: work => work({
+        async query<Row extends Record<string, unknown>>(sql: string, values: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+          const result = await client.query<Row>(sql, values);
+          if (sql.includes('insert into "erp_financials"."financial_lifecycle_events"') && values[6] === `bill_payment.${action}_completed`) {
+            interrupted = true; throw new Error("Completion receipt interrupted");
+          }
+          return result;
+        }
+      }) } });
+      await expect(invoke(scoped)).rejects.toThrow("Completion receipt interrupted");
+    });
+    expect(interrupted).toBe(true); expect(await depositDatabaseState(pool)).toEqual(before);
+    const results = await Promise.all([invoke(sdk), invoke(sdk)]);
+    expect(results.map(result => result.status).sort()).toEqual(["already_voided", "voided"]);
+    expect(results[0].reversal.transactionId).toBe(results[1].reversal.transactionId);
+    const completed = await pool.query<{event_id: string}>("select event_id from erp_financials.financial_lifecycle_events where idempotency_key=$1", [`bill-payment-completion:${action}:${input.idempotencyKey}`]);
+    expect(completed.rows).toHaveLength(1);
+    await expect(pool.query("delete from erp_financials.financial_lifecycle_events where event_id=$1", [completed.rows[0]?.event_id])).rejects.toThrow();
+  });
+
+  it.each(["scheduled", "cleared", "raw"] as const)("bill payment correction review exposes scoped native %s evidence in one read-only snapshot", async kind => {
+    const {sdk,options,operation,payment,bill}=await paymentHoldFixture();
+    const paymentId=kind==="scheduled"?(await sdk.commands.billPayments.schedule(payment)).billPaymentId:
+      kind==="cleared"?(await sdk.commands.billPayments.recordAndApply(payment)).billPaymentId:
+      (await sdk.commands.billPayments.record({...payment,idempotencyKey:"review:raw"})).documentId;
+    let queries=0;
+    const observed=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,values:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
+        queries++; if (/\b(insert|update|delete)\s+(into|erp_financials|"erp_financials"|from)/iu.test(sql)) throw new Error("Review attempted a write");
+        return client.query<Row>(sql,values);
+      }
+    }))}});
+    const before=await depositDatabaseState(pool);
+    const review=await observed.queries.getBillPaymentCorrectionReview({sourceId:"source_1",paymentId,limit:1});
+    expect(queries).toBe(1); expect(review.payment).toMatchObject({paymentId,vendorId:"vendor_1",date:payment.date,amount:"20.00",currencyCode:"USD",
+      status:kind==="scheduled"?"scheduled":"cleared",version:kind==="cleared"?2:1,documentVersion:kind==="scheduled"?null:kind==="cleared"?2:1,
+      fundingAccountId:"account_cash",payableAccountId:"account_ap"});
+    expect(review.activeApplicationCount).toBe(kind==="cleared"?"1":"0"); expect(review.appliedAmount).toBe(kind==="cleared"?"20.00":"0.00");
+    if(kind==="cleared") expect(review.items[0]).toMatchObject({billId:bill.documentId,billVersion:2,billOpenAmount:"80.00",amount:"20.00"});
+    else expect(review.items).toEqual([]);
+    for(const scope of [{companyId:"other"},{tenantId:"other"},{bookId:"other"}]) await expect(createErpFinancialsSdk({...options,...scope}).queries.getBillPaymentCorrectionReview({sourceId:"source_1",paymentId})).rejects.toMatchObject({code:"missing_document"});
+    await sdk.books.define({operation,bookId:"review-other",name:"Other",baseCurrencyCode:"USD"});
+    await sdk.books.bindSource({operation,bookId:"review-other",sourceId:"source_1",sourceRole:"active",effectiveFrom:"2026-01-01"});
+    await expect(createErpFinancialsSdk({...options,bookId:"review-other"}).queries.getBillPaymentCorrectionReview({sourceId:"source_1",paymentId})).rejects.toMatchObject({code:"missing_document"});
+    const after=await depositDatabaseState(pool); expect(after.ledger_postings).toEqual(before.ledger_postings);
+  });
+
+  it("bill payment correction review prevents stale approvals despite unchanged disbursement version and supports immutable completion retry", async()=>{
+    const {sdk,options,operation,payment}=await paymentHoldFixture(); const paid=await sdk.commands.billPayments.recordAndApply(payment);
+    const request={sourceId:"source_1",paymentId:paid.billPaymentId};const review=await sdk.queries.getBillPaymentCorrectionReview(request);
+    const application=paid.applications[0];if(!application)throw new Error("Missing application");
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-12"});
+    const current=await sdk.queries.getBillPaymentCorrectionReview(request);
+    expect(current.payment.version).toBe(review.payment.version);expect(current.payment.documentVersion).toBe(3);expect(current.reviewToken).not.toBe(review.reviewToken);
+    const command={operation,billPaymentId:paid.billPaymentId,expectedVersion:2,expectedReviewToken:review.reviewToken,idempotencyKey:"review:compensate",date:"2026-08-12"};
+    const before=await depositDatabaseState(pool);
+    await expect(sdk.commands.billPayments.voidAndUnapply(command)).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const frozen={...command,expectedReviewToken:current.reviewToken};await expect(sdk.commands.billPayments.voidAndUnapply(frozen)).resolves.toMatchObject({status:"voided"});
+    await closeDepositPeriod(pool,depositService(runner,{bookId:options.bookId}));const closed=await depositDatabaseState(pool);
+    await expect(sdk.commands.billPayments.voidAndUnapply({...frozen,operation:{...operation,requestId:"review:retry",occurredAt:"2026-08-15T00:00:00.000Z"}})).resolves.toMatchObject({status:"already_voided"});
+    await expect(sdk.commands.billPayments.voidAndUnapply(command)).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(closed);
+  });
+
+  it("bill payment correction review pages beyond 200 active applications and rejects stale or foreign cursors",async()=>{
+    const {sdk,operation,payment,bill}=await paymentHoldFixture();
+    const raw=await sdk.commands.billPayments.record({...payment,idempotencyKey:"review:many",amount:"3.00"});
+    for(let i=0;i<205;i++)await sdk.commands.paymentApplications.apply({operation,idempotencyKey:`review:apply:${String(i)}`,applicationType:"bill_payment_to_bill",
+      sourceDocumentId:raw.documentId,targetDocumentId:bill.documentId,amount:"0.01",applicationDate:payment.date,expectedSourceVersion:i+1,expectedTargetVersion:i+1});
+    const request={sourceId:"source_1",paymentId:raw.documentId,limit:200}; const first=await sdk.queries.getBillPaymentCorrectionReview(request);
+    expect(first.items).toHaveLength(200);expect(first.activeApplicationCount).toBe("205");expect(first.appliedAmount).toBe("2.05");
+    if(!first.nextCursor)throw new Error("Missing next cursor");
+    const next=await sdk.queries.getBillPaymentCorrectionReview({...request,cursor:first.nextCursor});expect(next.items).toHaveLength(5);expect(next.nextCursor).toBeUndefined();expect(next.reviewToken).toBe(first.reviewToken);
+    expect(new Set([...first.items,...next.items].map(row=>row.applicationId)).size).toBe(205);
+    await expect(sdk.queries.getBillPaymentCorrectionReview({...request,paymentId:"other",cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    const application=first.items[0];if(!application)throw new Error("Missing reviewed application");
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-12"});
+    await expect(sdk.queries.getBillPaymentCorrectionReview({...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    const refreshed=await sdk.queries.getBillPaymentCorrectionReview(request);expect(refreshed.activeApplicationCount).toBe("204");expect(refreshed.appliedAmount).toBe("2.04");expect(refreshed.items.some(item=>item.applicationId===application.applicationId)).toBe(false);
+  });
+
+  it("bill payment correction review binds target bill state and allows reviewed compensation of a held bill",async()=>{
+    const {sdk,operation,payment,bill}=await paymentHoldFixture();const paid=await sdk.commands.billPayments.recordAndApply(payment);
+    const request={sourceId:"source_1",paymentId:paid.billPaymentId};const beforeReview=await sdk.queries.getBillPaymentCorrectionReview(request);
+    await sdk.commands.vendorBills.setPaymentHold({operation,idempotencyKey:"review:hold",vendorBillId:bill.documentId,expectedVersion:2,paymentHold:true,reason:"Disputed bill"});
+    const current=await sdk.queries.getBillPaymentCorrectionReview(request);expect(current.payment).toEqual(beforeReview.payment);expect(current.reviewToken).not.toBe(beforeReview.reviewToken);
+    const command={operation,billPaymentId:paid.billPaymentId,expectedVersion:2,expectedReviewToken:beforeReview.reviewToken,idempotencyKey:"review:held-compensation",date:"2026-08-12"};
+    const before=await depositDatabaseState(pool);await expect(sdk.commands.billPayments.voidAndUnapply(command)).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(sdk.commands.billPayments.voidAndUnapply({...command,expectedReviewToken:current.reviewToken})).resolves.toMatchObject({status:"voided"});
+    expect(await sdk.queries.getVendorBill(bill.documentId)).toMatchObject({openAmount:"100.00",paymentHold:true});
+  });
+
+  it("bill payment correction review returns one coherent snapshot during concurrent unapplication and exports the public facade",async()=>{
+    const {sdk,options,operation,payment}=await paymentHoldFixture();const paid=await sdk.commands.billPayments.recordAndApply(payment);
+    const application=paid.applications[0];if(!application)throw new Error("Missing application");let changed=false;
+    const measured=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,values:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
+        const result=await client.query<Row>(sql,values);
+        if(sql.startsWith("with candidates as materialized")&&!changed){changed=true;await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-12"});}
+        return result;
+      }
+    }))}});
+    const request={sourceId:"source_1",paymentId:paid.billPaymentId};const old=await measured.queries.getBillPaymentCorrectionReview(request);
+    expect(changed).toBe(true);expect(old).toMatchObject({payment:{documentVersion:2,unappliedAmount:"0.00"},activeApplicationCount:"1",appliedAmount:"20.00",items:[{applicationId:application.applicationId,version:1}]});
+    const built=await import("../dist/sdk.js");const current=await built.createErpFinancialsSdk(options).queries.getBillPaymentCorrectionReview(request);
+    expect(current).toMatchObject({payment:{documentVersion:3,unappliedAmount:"20.00"},activeApplicationCount:"0",appliedAmount:"0.00",items:[]});expect(current.reviewToken).not.toBe(old.reviewToken);
+  });
+
+  it.each(["immediate", "scheduled"] as const)("cleared payment %s retry is a historical receipt after bill correction", async mode => {
+    const { sdk, options, operation, bill, payment } = await paymentHoldFixture();
+    const scheduled = mode === "scheduled" ? await sdk.commands.billPayments.schedule(payment) : undefined;
+    const clear = { operation, idempotencyKey: "receipt:clear", billPaymentId: scheduled?.billPaymentId ?? "unused", expectedVersion: 1 };
+    const original = scheduled ? await sdk.commands.billPayments.clear(clear) : await sdk.commands.billPayments.recordAndApply(payment);
+    const retry = (target: typeof sdk, freshOperation: FinancialOperationContext = operation) => scheduled
+      ? target.commands.billPayments.clear({ ...clear, operation: freshOperation })
+      : target.commands.billPayments.recordAndApply({ ...payment, operation: freshOperation });
+    const receipt = await retry(sdk);
+    expect(receipt).toMatchObject({ status: "already_cleared", payment: { version: 2, openAmount: "0.00", documentStatus: "settled" },
+      applications: [{ version: 1, lifecycleEventId: original.applications[0]?.lifecycleEventId }] });
+    const application = original.applications[0]; if (!application) throw new Error("Missing payment application");
+    const corrected = await sdk.commands.vendorBills.correctPosted({ operation, vendorBillId: bill.documentId, expectedVersion: 2,
+      idempotencyKey: "receipt:correct", date: "2026-08-12", releases: [{ applicationId: application.applicationId, expectedVersion: 1, expectedSourceVersion: 2, reapplyAmount: "10.00" }],
+      replacement: { date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "90.00" }] } });
+    expect(corrected.applications).toHaveLength(1);
+    expect(await sdk.queries.getOperationalDocumentSummary(original.billPaymentId)).toMatchObject({ openAmount: "10.00", version: 4 });
+    // No writer is allowed on a completion retry, including ON CONFLICT inserts.
+    const readOnlyReplay = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({
+      async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        if (/\b(insert|update|delete)\s+(into|erp_financials|"erp_financials"|from)/iu.test(sql)) throw new Error("Retry attempted a write");
+        return client.query<Row>(sql, params);
+      }
+    })) } });
+    const before = await depositDatabaseState(pool);
+    await expect(retry(readOnlyReplay, { ...operation, requestId: "fresh-request", correlationId: "fresh-correlation", occurredAt: "2026-08-14T00:00:00.000Z" })).resolves.toEqual(receipt);
+    for (const change of [{ actorRef: "other" }, { approverRef: "other" }, { reasonCode: "other" }]) {
+      await expect(retry(sdk, { ...operation, ...change })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    for (const scope of [{ bookId: "other-book" }, { companyId: "other-company" }, { writeSourceId: "other-source" }]) {
+      await expect(retry(createErpFinancialsSdk({ ...options, ...scope }))).rejects.toThrow();
+    }
+    if (!scheduled) await expect(sdk.commands.billPayments.recordAndApply({ ...payment, reference: "changed" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    // Closing the posting period must not turn a receipt lookup into a new post.
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await closeDepositPeriod(pool, depositService(runner, { bookId: options.bookId }));
+    const closed = await depositDatabaseState(pool);
+    await expect(retry(readOnlyReplay)).resolves.toEqual(receipt);
+    expect(await depositDatabaseState(pool)).toEqual(closed);
+  });
+
+  it.each(["missing", "changed"] as const)("cleared payment retry fails closed for %s application evidence", async kind => {
+    const { sdk, options, payment } = await paymentHoldFixture();
+    const cleared = await sdk.commands.billPayments.recordAndApply(payment);
+    const applicationId = cleared.applications[0]?.applicationId;
+    if (!applicationId) throw new Error("Missing application");
+    const before = await depositDatabaseState(pool);
+    // Native constraints prohibit corrupting this evidence. Inject a faulty read
+    // over the real database to additionally verify that replay cannot repair it.
+    if (kind === "missing") await expect(pool.query("delete from erp_financials.subledger_applications where subledger_application_id=$1", [applicationId])).rejects.toThrow();
+    else await expect(pool.query("update erp_financials.subledger_applications set applied_amount=19 where subledger_application_id=$1", [applicationId])).rejects.toThrow();
+    let injected = false;
+    const faulty = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({
+      async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        const result = await client.query<Row>(sql, params);
+        if (sql.includes('from "erp_financials"."subledger_applications"') && sql.includes('"idempotency_key" = $4')) {
+          injected = true;
+          return { ...result, rows: kind === "missing" ? [] : result.rows.map(row => ({ ...row, applied_amount: "19.00" })) };
+        }
+        return result;
+      }
+    })) } });
+    await expect(faulty.commands.billPayments.recordAndApply(payment)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(injected).toBe(true);
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("exact source account summaries preserve precision, mapping independence and scoped read-only access", async()=>{
+    const {sdk,options,operation}=await paymentHoldFixture();
+    await sdk.books.defineAccount({operation,bookId:options.bookId,bookAccountKey:"combined-assets",expectedVersion:0,name:"Combined assets",classification:"asset",accountRole:"posting",currencyCode:"USD"});
+    for(const accountId of ["account_cash","account_ar"])await sdk.books.mapAccount({operation,bookId:options.bookId,sourceId:"source_1",accountId,bookAccountKey:"combined-assets"});
+    await sdk.commands.journalEntries.post({operation,idempotencyKey:"exact-source-large",date:"2026-08-28",lines:[{accountId:"account_cash",debit:"90071992547409.93"},{accountId:"account_ap",credit:"90071992547409.93"}]});
+    await sdk.commands.fiscalPeriods.define({operation,fiscalYear:2040,periodNumber:1,periodStart:"2040-01-01",periodEnd:"2040-01-31"});
+    await sdk.commands.journalEntries.post({operation,idempotencyKey:"exact-source-future",date:"2040-01-01",lines:[{accountId:"account_cash",debit:"0.01"},{accountId:"account_ap",credit:"0.01"}]});
+    const request={sourceId:"source_1",accountIds:["account_income","account_ap","account_ar"]};
+    const before=await depositDatabaseState(pool),result=await sdk.queries.getSourceAccountBalanceSummary(request);
+    expect(result).toMatchObject({sourceId:"source_1",accountingBasis:"accrual",currencyCode:"USD"});
+    expect(result.items.map(item=>item.accountId)).toEqual(["account_ap","account_ar","account_income"]);
+    expect(result.items[0]).toMatchObject({debitAmount:"0.00",creditAmount:"90071992547509.94",netAmount:"-90071992547509.94",postingCount:"3"});
+    expect(result.items[1]).toMatchObject({netAmount:"-123.45",postingCount:"1"});
+    expect(result.items[2]).toMatchObject({debitAmount:"0.00",creditAmount:"0.00",netAmount:"0.00",postingCount:"0"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    for(const accountIds of [[],["account_ap","account_ap"],Array.from({length:201},(_,i)=>`account-${String(i)}`)])await expect(sdk.queries.getSourceAccountBalanceSummary({sourceId:"source_1",accountIds})).rejects.toMatchObject({code:"invalid_input"});
+    for(const changed of [{tenantId:"other"},{companyId:"other"},{bookId:"other"}])await expect(createErpFinancialsSdk({...options,...changed}).queries.getSourceAccountBalanceSummary(request)).rejects.toBeDefined();
+    await expect(sdk.queries.getSourceAccountBalanceSummary({...request,sourceId:"other"})).rejects.toMatchObject({code:"missing_account"});
+    await expect(sdk.queries.getSourceAccountBalanceSummary({...request,accountIds:["missing"]})).rejects.toMatchObject({code:"missing_account"});
+    await pool.query(`create role exact_account_reader;grant usage on schema erp_financials to exact_account_reader;
+      grant select on erp_financials.reporting_books,erp_financials.reporting_book_sources,erp_financials.accounts,erp_financials.ledger_postings to exact_account_reader`);
+    try{
+      const database:ErpFinancialsTransactionRunner={transaction:work=>runner.transaction(async client=>{await client.query("set local role exact_account_reader");return work(client);})};
+      await expect(database.transaction(client=>client.query("select * from erp_financials.subledger_applications limit 1"))).rejects.toMatchObject({code:"42501"});
+      expect(await createFinancialReadModels({...options,database}).getSourceAccountBalanceSummary(request)).toEqual(result);
+    }finally{await pool.query("drop owned by exact_account_reader;drop role exact_account_reader");}
+  });
+
+  it("current invoice line pages are exact, bounded, scoped and disjoint across draft issuance", async () => {
+    const bookId="current-lines"; await depositFixture(bookId);
+    const options={database:runner,tenantId:"tenant_1",companyId:"company_1",bookId,writeSourceId:"source_1",currencyCode:"USD"};
+    const sdk=createErpFinancialsSdk(options),operation=sdkOperation();
+    const input={operation,idempotencyKey:"line-page:draft",customerId:"customer_1",documentDate:"2026-08-28",dueDate:"2026-08-31",
+      receivableAccount:{accountId:"account_ar"},revenueLines:[
+        {accountId:"account_income",description:"Precise rate",quantity:"3",unitAmount:"0.33",unitCost:"0.1250",amount:"0.99",dimensionRefs:[]},
+        {accountId:"account_income",description:"Large exact amount",amount:"90071992547409.91"},
+        {accountId:"account_income",description:"Last line",amount:"0.01"}]};
+    const draft=await sdk.invoices.createDraft(input);
+    const request={sourceId:"source_1",provenance:"draft" as const,limit:2};
+    const first=await sdk.queries.getCurrentInvoiceLinePage(request);
+    expect(first).toMatchObject({basis:"current",sourceId:"source_1",currencyCode:"USD",provenance:"draft"});expect(first.items).toHaveLength(2);
+    if(!first.nextCursor)throw Error("Missing line cursor");
+    const last=await sdk.queries.getCurrentInvoiceLinePage({...request,cursor:first.nextCursor});
+    expect(last.items).toHaveLength(1);expect(last.nextCursor).toBeUndefined();
+    const detail=await sdk.queries.getInvoice(draft.invoiceDraftId);
+    expect([...first.items,...last.items]).toEqual(detail.lines.map(line=>({...line,invoiceId:draft.invoiceDraftId,invoiceVersion:1})));
+    expect(first.items[0]).toMatchObject({quantity:"3",unitAmount:"0.33",amount:"0.99",unitCost:"0.1250",dimensionRefs:[]});
+    expect(first.items[1]?.amount).toBe("90071992547409.91");
+    for(const changed of [{tenantId:"other"},{companyId:"other"},{bookId:"other"}])await expect(createErpFinancialsSdk({...options,...changed}).queries.getCurrentInvoiceLinePage({...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    for(const changed of [{sourceId:"other"},{provenance:"posted" as const}])await expect(sdk.queries.getCurrentInvoiceLinePage({...request,...changed,cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    for(const cursor of ["invalid",Buffer.from(JSON.stringify({...JSON.parse(Buffer.from(first.nextCursor,"base64url").toString()) as object,line:0})).toString("base64url")])await expect(sdk.queries.getCurrentInvoiceLinePage({...request,cursor})).rejects.toMatchObject({code:"invalid_input"});
+    expect((await sdk.queries.getCurrentInvoiceLinePage({...request,sourceId:"other"})).items).toEqual([]);
+    const issued=await sdk.invoices.issue({operation,invoiceDraftId:draft.invoiceDraftId,expectedVersion:1,idempotencyKey:"line-page:issue"});
+    expect((await sdk.queries.getCurrentInvoiceLinePage(request)).items).toEqual([]);
+    const posted=await sdk.queries.getCurrentInvoiceLinePage({...request,provenance:"posted",limit:200});
+    expect(posted.items).toEqual((await sdk.queries.getInvoice(issued.invoiceDocumentId)).lines.map(line=>({...line,invoiceId:issued.invoiceDocumentId,invoiceVersion:1})));
+    // A later draft is included without a current-date cutoff; source membership
+    // dates still apply, and the reader performs no writes.
+    const another=await sdk.invoices.createDraft({...input,idempotencyKey:"line-page:another"});
+    await sdk.books.bindSource({operation,bookId,sourceId:"source_1",sourceRole:"active",effectiveFrom:"2026-01-01",effectiveThrough:"2026-08-27"});
+    for(const provenance of ["draft","posted"] as const)expect((await sdk.queries.getCurrentInvoiceLinePage({...request,provenance})).items).toEqual([]);
+    await sdk.books.bindSource({operation,bookId,sourceId:"source_1",sourceRole:"active",effectiveFrom:"2026-01-01"});
+    await pool.query(`create role current_invoice_line_reader;grant usage on schema erp_financials to current_invoice_line_reader;
+      grant select on erp_financials.reporting_books,erp_financials.reporting_book_sources,erp_financials.invoice_drafts,erp_financials.invoice_draft_lines,erp_financials.subledger_documents,erp_financials.subledger_document_lines,erp_financials.accounts to current_invoice_line_reader`);
+    try{
+      const database:ErpFinancialsTransactionRunner={transaction:work=>runner.transaction(async client=>{await client.query("set local role current_invoice_line_reader");await client.query("set transaction read only");return work(client);})};
+      const reader=createFinancialReadModels({...options,database});
+      expect((await reader.getCurrentInvoiceLinePage({...request,limit:200})).items.map(item=>item.invoiceId)).toEqual(Array(3).fill(another.invoiceDraftId));
+      expect(await reader.getCurrentInvoiceLinePage({...request,provenance:"posted",limit:200})).toEqual(posted);
+    }finally{await pool.query("drop owned by current_invoice_line_reader;drop role current_invoice_line_reader");}
+  });
+
+  it("current vendor bill pages include later liabilities and settlements with scoped bounded reads", async () => {
+    const {sdk,options,operation,bill}=await paymentHoldFixture();
+    const later=await sdk.commands.vendorBills.create({operation,idempotencyKey:"current:later",date:"2026-08-28",dueDate:"2026-08-31",vendorId:"vendor_1",
+      payableAccount:{accountId:"account_ap"},expenseLines:[{accountId:"account_cash",amount:"25.01"}]});
+    await sdk.commands.billPayments.recordAndApply({operation,idempotencyKey:"current:pay",date:"2026-08-25",vendorId:"vendor_1",amount:"20.00",paymentMethod:"ach",
+      payableAccount:{accountId:"account_ap"},cashAccount:{accountId:"account_cash"},allocations:[{billId:bill.documentId,amount:"20.00",expectedBillVersion:1}]});
+    await sdk.commands.vendorBills.setPaymentHold({operation,vendorBillId:bill.documentId,expectedVersion:2,paymentHold:true,reason:"Review supplier evidence",idempotencyKey:"current:hold"});
+    const first=await sdk.queries.getCurrentVendorBillPage({sourceId:"source_1",limit:1});
+    expect(first).toMatchObject({basis:"current",sourceId:"source_1",currencyCode:"USD"});expect(first.items).toHaveLength(1);
+    if(first.nextCursor===undefined)throw new Error("Expected current bill cursor");
+    const second=await sdk.queries.getCurrentVendorBillPage({sourceId:"source_1",limit:1,cursor:first.nextCursor});
+    const current=[...first.items,...second.items];
+    expect(current.map(item=>item.billId)).toEqual([bill.documentId,later.documentId].sort());
+    expect(current.find(item=>item.billId===later.documentId)).toMatchObject({openAmount:"25.01"});
+    expect(current.find(item=>item.billId===bill.documentId)).toMatchObject({originalAmount:"100.00",openAmount:"80.00",status:"partially_applied",paymentHold:true,paymentHoldReason:"Review supplier evidence"});
+    expect(second.nextCursor).toBeUndefined();
+    const historical=await sdk.queries.getVendorBillRegister({asOfDate:"2026-08-12"});
+    expect(historical.items.map(item=>item.billId)).toEqual([bill.documentId]);expect(historical.items[0]?.openAmount).toBe("100.00");
+    for(const changed of [{tenantId:"other"},{companyId:"other"},{bookId:"other"}])await expect(createErpFinancialsSdk({...options,...changed}).queries.getCurrentVendorBillPage({sourceId:"source_1",cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    await expect(sdk.queries.getCurrentVendorBillPage({sourceId:"other",cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    expect((await sdk.queries.getCurrentVendorBillPage({sourceId:"other"})).items).toEqual([]);
+    await pool.query(`create role current_bill_reader;grant usage on schema erp_financials to current_bill_reader;
+      grant select on erp_financials.reporting_books,erp_financials.reporting_book_sources,erp_financials.subledger_documents to current_bill_reader`);
+    try {
+      const database:ErpFinancialsTransactionRunner={transaction:work=>runner.transaction(async client=>{await client.query("set local role current_bill_reader");return work(client);})};
+      await expect(database.transaction(client=>client.query("select * from erp_financials.subledger_applications limit 1"))).rejects.toMatchObject({code:"42501"});
+      expect(await createFinancialReadModels({...options,database}).getCurrentVendorBillPage({sourceId:"source_1",limit:1})).toEqual(first);
+    } finally {await pool.query("drop owned by current_bill_reader;drop role current_bill_reader");}
+    await sdk.commands.vendorBills.voidPosted({operation,vendorBillId:later.documentId,expectedVersion:1,date:"2026-08-29",idempotencyKey:"current:void"});
+    expect((await sdk.queries.getCurrentVendorBillPage({sourceId:"source_1",limit:200})).items.find(item=>item.billId===later.documentId)).toMatchObject({status:"voided",openAmount:"0.00"});
+  });
+
+  it("vendor bill register pages and exact global totals agree across payments, holds and corrections", async () => {
+    const { sdk, operation, bill } = await paymentHoldFixture();
+    const create = async (key: string, amount: string, dueDate: string) => sdk.commands.vendorBills.create({
+      operation, idempotencyKey: `register:${key}`, date: "2026-08-01", dueDate, vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount }]
+    });
+    const partial = await create("partial", "40.00", "2026-08-15");
+    const held = await create("held", "30.00", "2026-08-10");
+    const overdue = await create("overdue", "50.00", "2026-08-10");
+    const paid = await create("paid", "60.00", "2026-08-10");
+    const voided = await create("voided", "70.00", "2026-08-10");
+    await sdk.commands.vendorBills.setPaymentHold({ operation, vendorBillId: held.documentId, expectedVersion: 1,
+      paymentHold: true, reason: "Receiving discrepancy", idempotencyKey: "register:hold" });
+    const payment = await sdk.commands.billPayments.recordAndApply({ operation, idempotencyKey: "register:payment", date: "2026-08-10",
+      vendorId: "vendor_1", amount: "80.00", paymentMethod: "ach", payableAccount: { accountId: "account_ap" },
+      cashAccount: { accountId: "account_cash" }, allocations: [
+        { billId: partial.documentId, amount: "20.00", expectedBillVersion: 1 },
+        { billId: paid.documentId, amount: "60.00", expectedBillVersion: 1 }
+      ] });
+    await sdk.commands.vendorBills.voidPosted({ operation, vendorBillId: voided.documentId, expectedVersion: 1,
+      date: "2026-08-12", idempotencyKey: "register:void" });
+    const request = { asOfDate: "2026-08-12", limit: 2 };
+    const first = await sdk.queries.getVendorBillRegister(request);
+    expect(first.summary).toEqual({ asOfDate: request.asOfDate, currencyCode: "USD", dueSoonThrough: "2026-08-19",
+      outstandingAmount: "200.00", outstandingBillCount: "4", overdueAmount: "80.00", overdueBillCount: "2",
+      dueSoonAmount: "20.00", dueSoonBillCount: "1",
+      counts: { all: "6", open: "2", overdue: "1", on_hold: "1", paid: "1", voided: "1", replaced: "0" } });
+    const items = [...first.items];
+    let cursor = first.nextCursor;
+    while (cursor !== undefined) {
+      const page = await sdk.queries.getVendorBillRegister({ ...request, cursor });
+      expect(page.summary).toEqual(first.summary);
+      expect(page.items.length).toBeLessThanOrEqual(2);
+      items.push(...page.items); cursor = page.nextCursor;
+    }
+    expect(items).toHaveLength(6);
+    expect(new Set(items.map(item => item.billId)).size).toBe(6);
+    expect(items).toEqual((await sdk.queries.getVendorBillRegister({ ...request, limit: 200 })).items);
+    expect(items.map(item => `${item.dueDate}:${item.billId}`)).toEqual(items.map(item => `${item.dueDate}:${item.billId}`).sort());
+    for (const item of items) {
+      const detail = await sdk.queries.getVendorBill(item.billId, request.asOfDate);
+      expect(item).toMatchObject({ originalAmount: detail.originalAmount, openAmount: detail.openAmount, status: detail.status, version: detail.version });
+    }
+    expect(items.find(item => item.billId === voided.documentId)).toMatchObject({ appliedAmount: "0.00", openAmount: "0.00", registerStatus: "voided" });
+    expect(items.find(item => item.billId === partial.documentId)).toMatchObject({ appliedAmount: "20.00", openAmount: "20.00", registerStatus: "open" });
+    expect(items.find(item => item.billId === held.documentId)).toMatchObject({ paymentHold: true, paymentHoldReason: "Receiving discrepancy", registerStatus: "on_hold" });
+    expect(items.find(item => item.billId === overdue.documentId)).toMatchObject({ registerStatus: "overdue" });
+    expect(items.find(item => item.billId === bill.documentId)).toMatchObject({ registerStatus: "open" });
+    const filtered = await sdk.queries.getVendorBillRegister({ ...request, status: "on_hold" });
+    expect(filtered.items.map(item => item.billId)).toEqual([held.documentId]);
+    expect(filtered.summary).toEqual(first.summary);
+    const empty = await sdk.queries.getVendorBillRegister({ ...request, vendorId: "absent" });
+    expect(empty.items).toEqual([]); expect(empty.nextCursor).toBeUndefined();
+    expect(empty.summary).toMatchObject({ outstandingAmount: "0.00", overdueAmount: "0.00", dueSoonAmount: "0.00", counts: { all: "0" } });
+    const historical = await sdk.queries.getVendorBillRegister({ asOfDate: "2026-08-09" });
+    expect(historical.summary).toMatchObject({ outstandingAmount: "350.00", overdueAmount: "0.00", dueSoonAmount: "250.00", counts: { paid: "0", voided: "0" } });
+    await sdk.commands.billPayments.voidAndUnapply({ operation, idempotencyKey: "register:void-payment", billPaymentId: payment.billPaymentId,
+      expectedVersion: 2, date: "2026-08-14", memo: "Bank rejected payment" });
+    const afterUnapply = await sdk.queries.getVendorBillRegister({ ...request, limit: 200 });
+    expect(afterUnapply.summary).toEqual(first.summary);
+    // Versions/holds are current command guards; accounting amounts are as-of.
+    expect(afterUnapply.items.map(({ version, ...item }) => { void version; return item; }))
+      .toEqual(items.map(({ version, ...item }) => { void version; return item; }));
+    expect((await sdk.queries.getVendorBillRegister({ asOfDate: "2026-08-14" })).summary).toMatchObject({ outstandingAmount: "280.00", overdueAmount: "140.00", dueSoonAmount: "40.00", counts: { paid: "0", overdue: "2" } });
+  });
+
+  it("vendor bill register preserves replacement history and aggregates beyond safe integer cents", async () => {
+    const { sdk, operation, bill } = await paymentHoldFixture();
+    const replacement = await sdk.commands.vendorBills.replacePosted({ operation, vendorBillId: bill.documentId, expectedVersion: 1,
+      idempotencyKey: "register:replace", date: "2026-08-12", replacement: { idempotencyKey: "register:replacement",
+        date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" },
+        expenseLines: [{ accountId: "account_cash", amount: "90071992547409.91" }] } });
+    if (replacement.replacement === undefined) throw new Error("Expected replacement");
+    const current = await sdk.queries.getVendorBillRegister({ asOfDate: "2026-08-12" });
+    expect(current.summary).toMatchObject({ outstandingAmount: "90071992547409.91", counts: { all: "2", open: "1", replaced: "1" } });
+    expect(current.items.find(item => item.billId === bill.documentId)).toMatchObject({ registerStatus: "replaced", openAmount: "0.00", appliedAmount: "0.00" });
+    const before = await sdk.queries.getVendorBillRegister({ asOfDate: "2026-08-11" });
+    expect(before.summary).toMatchObject({ outstandingAmount: "100.00", counts: { all: "1", open: "1", replaced: "0" } });
+    await sdk.commands.vendorBills.create({ operation, idempotencyKey: "register:huge-second", date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "90071992547409.92" }] });
+    expect((await sdk.queries.getVendorBillRegister({ asOfDate: "2026-08-12", limit: 1 })).summary)
+      .toMatchObject({ outstandingAmount: "180143985094819.83", outstandingBillCount: "2", counts: { all: "3", open: "2", replaced: "1" } });
+  });
+
+  it("vendor bill register keeps page and totals consistent when a payment commits before the response", async () => {
+    const { sdk, options, payment } = await paymentHoldFixture();
+    let queries = 0;
+    let committed = false;
+    const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(client => work({
+      query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]): Promise<PostgresQueryResult<Row>> => {
+        queries += 1;
+        const result = await client.query<Row>(sql, values);
+        if (sql.includes("register_rows as")) {
+          await sdk.commands.billPayments.recordAndApply(payment);
+          committed = true;
+        }
+        return result;
+      }
+    })) };
+    const before = await createFinancialReadModels({ ...options, database }).getVendorBillRegister({ asOfDate: "2026-08-12" });
+    expect(committed).toBe(true);
+    expect(queries).toBe(2); // Book resolution and one register statement, independent of page size.
+    expect(before.summary.outstandingAmount).toBe("100.00");
+    expect(before.items).toEqual([expect.objectContaining({ openAmount: "100.00", appliedAmount: "0.00", version: 1 })]);
+    const after = await sdk.queries.getVendorBillRegister({ asOfDate: "2026-08-12" });
+    expect(after.summary.outstandingAmount).toBe("80.00");
+    expect(after.items).toEqual([expect.objectContaining({ openAmount: "80.00", appliedAmount: "20.00", version: 2 })]);
+  });
+
+  it("vendor bill register includes imported vendor credits without counting them as cash payments", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:register-import" });
+    await seedQuickBooksAllDocumentScope(pool);
+    await runner.transaction(client => persistQuickBooksSubledgerResources({ client, companyId: "company_qbo",
+      importedAt: "2026-08-12T10:01:00Z", facts: quickBooksAllDocumentFacts(), resources: quickBooksAllDocumentResources() }));
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "book_qbo", writeSourceId: "source_qbo", currencyCode: "USD" });
+    await sdk.books.define({ operation: sdkOperation(), bookId: "book_qbo", name: "Imported register", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation: sdkOperation(), bookId: "book_qbo", sourceId: "source_qbo", sourceRole: "historical", effectiveThrough: "2026-08-31" });
+    const reads = sdk.queries;
+    const page = await reads.getVendorBillRegister({ asOfDate: "2026-08-12" });
+    expect(page.items).toEqual([expect.objectContaining({ originalAmount: "80.00", appliedAmount: "30.00", openAmount: "50.00", registerStatus: "open" })]);
+    expect(page.summary).toMatchObject({ outstandingAmount: "50.00", counts: { all: "1", open: "1" } });
+    expect((await reads.getVendorBillRegister({ asOfDate: "2026-08-10" })).items)
+      .toEqual([expect.objectContaining({ originalAmount: "80.00", appliedAmount: "20.00", openAmount: "60.00" })]);
+    for (const changed of [{ tenantId: "other" }, { companyId: "other" }, { bookId: "other" }]) {
+      await expect(createFinancialReadModels({ database: runner, tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "book_qbo", ...changed })
+        .getVendorBillRegister({ asOfDate: "2026-08-12" })).rejects.toMatchObject({ code: "missing_book" });
+    }
+    await pool.query("update erp_financials.reporting_book_sources set effective_through='2026-08-04' where book_id='book_qbo'");
+    expect((await reads.getVendorBillRegister({ asOfDate: "2026-08-12" })).summary).toMatchObject({ outstandingAmount: "0.00", counts: { all: "0" } });
+  });
+
+  it("vendor bill register scopes cursors, snapshots requests and needs no posting or detail-table access", async () => {
+    const { sdk, options, operation } = await paymentHoldFixture();
+    await sdk.commands.vendorBills.create({ operation, idempotencyKey: "register:second", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "25.00" }] });
+    const first = await sdk.queries.getVendorBillRegister({ asOfDate: "2026-08-12", limit: 1 });
+    const cursor = first.nextCursor;
+    if (cursor === undefined) throw new Error("Expected register cursor");
+    for (const changed of [{ asOfDate: "2026-08-13" }, { vendorId: "vendor_1" }, { status: "open" as const }]) {
+      await expect(sdk.queries.getVendorBillRegister({ asOfDate: "2026-08-12", cursor, ...changed })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const changed of [{ companyId: "other" }, { tenantId: "other" }, { bookId: "other" }]) {
+      await expect(createErpFinancialsSdk({ ...options, ...changed }).queries.getVendorBillRegister({ asOfDate: "2026-08-12", cursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const invalid of [{ limit: 0 }, { limit: 201 }, { limit: 1.5 }, { cursor: "x".repeat(4097) }, { asOfDate: "2026-02-30" }, { vendorId: " " }]) {
+      await expect(sdk.queries.getVendorBillRegister(invalid)).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    await pool.query(`create role bill_register_reader;
+      grant usage on schema erp_financials to bill_register_reader;
+      grant select on erp_financials.reporting_books,erp_financials.reporting_book_sources,erp_financials.subledger_documents,
+        erp_financials.subledger_applications,erp_financials.financial_lifecycle_events,erp_financials.journal_entry_links,
+        erp_financials.transactions,erp_financials.parties to bill_register_reader;`);
+    try {
+      const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(async client => {
+        await client.query("set local role bill_register_reader"); return work(client);
+      }) };
+      for (const table of ["ledger_postings", "subledger_document_lines", "bill_payment_disbursements"]) {
+        await expect(database.transaction(client => client.query(`select * from erp_financials.${table} limit 1`))).rejects.toMatchObject({ code: "42501" });
+      }
+      const reads = createFinancialReadModels({ ...options, database });
+      expect(await reads.getVendorBillRegister({ asOfDate: "2026-08-12", limit: 1 })).toEqual(first);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const delayed = createFinancialReadModels({ ...options, database: { transaction: async work => { await gate; return database.transaction(work); } } });
+      const mutable = { asOfDate: "2026-08-12", limit: 1 };
+      const pending = delayed.getVendorBillRegister(mutable);
+      mutable.asOfDate = "2027-01-01"; mutable.limit = 200;
+      release();
+      expect(await pending).toEqual(first);
+    } finally { await pool.query("drop owned by bill_register_reader; drop role bill_register_reader"); }
+  });
+
+  it("payment holds have one versioned authority, payload-bound retries and current public reads", async () => {
+    const { sdk, bill, hold } = await paymentHoldFixture();
+    const held = await sdk.commands.vendorBills.setPaymentHold(hold);
+    expect(held).toMatchObject({ status: "changed", version: 2, paymentHold: true, paymentHoldReason: hold.reason });
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.setPaymentHold({ ...hold, operation: { ...hold.operation, requestId: "new-transport", occurredAt: "2026-08-13T12:00:00Z" } }))
+      .resolves.toEqual({ ...held, status: "already_changed" });
+    await expect(sdk.commands.vendorBills.setPaymentHold({ ...hold, reason: "Changed payload" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(sdk.commands.vendorBills.setPaymentHold({ ...hold, idempotencyKey: "hold:stale" })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const expected = { version: 2, paymentHold: true, paymentHoldReason: hold.reason, openAmount: "100.00" };
+    expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId, "source_1")).toMatchObject(expected);
+    expect(await sdk.queries.getVendorBill(bill.documentId, "2026-08-01")).toMatchObject(expected);
+    expect((await sdk.queries.listVendorBills({ asOfDate: "2026-08-31", limit: 1 })).items).toEqual([expect.objectContaining(expected)]);
+    await expect(sdk.commands.vendorBills.setPaymentHold({ ...hold, idempotencyKey: "hold:release", expectedVersion: 2, paymentHold: false, reason: "Review complete" }))
+      .resolves.toMatchObject({ version: 3, paymentHold: false, paymentHoldReason: null });
+    await expect(sdk.commands.vendorBills.setPaymentHold(hold)).resolves.toEqual({ ...held, status: "already_changed" });
+    expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ version: 3, paymentHold: false, openAmount: "100.00" });
+    expect(await reconciliationEvidenceCounts(pool, bill.documentId, "subledger.vendor_bill.payment_hold_changed")).toEqual({ auditCount: 2, outboxCount: 2 });
+  });
+
+  it("payment holds block scheduling, clearing, immediate payments and generic or raw applications without partial money", async () => {
+    const { sdk, operation, bill, hold, payment } = await paymentHoldFixture();
+    const scheduled = await sdk.commands.billPayments.schedule(payment);
+    const unapplied = await sdk.commands.billPayments.record({ operation, idempotencyKey: "hold:unapplied", date: payment.date, vendorId: "vendor_1", amount: "20.00",
+      payableAccount: payment.payableAccount, cashAccount: payment.cashAccount });
+    await sdk.commands.vendorBills.setPaymentHold(hold);
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.commands.billPayments.schedule({ ...payment, idempotencyKey: "hold:new-schedule" })).rejects.toThrow(/payment hold/);
+    await expect(sdk.commands.billPayments.clear({ operation, idempotencyKey: "hold:clear", billPaymentId: scheduled.billPaymentId, expectedVersion: 1 })).rejects.toThrow(/payment hold/);
+    await expect(sdk.commands.billPayments.recordAndApply({ ...payment, idempotencyKey: "hold:immediate" })).rejects.toThrow(/payment hold/);
+    await expect(sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "hold:generic", applicationType: "bill_payment_to_bill",
+      sourceDocumentId: unapplied.documentId, targetDocumentId: bill.documentId, amount: "20.00", applicationDate: payment.date, expectedSourceVersion: 1, expectedTargetVersion: 2 })).rejects.toThrow(/payment hold/);
+    await expect(pool.query(`insert into erp_financials.subledger_applications
+      (subledger_application_id,tenant_id,company_id,source_id,application_type,source_document_id,target_document_id,applied_amount,currency_code,application_date,status,version,idempotency_key,applied_event_id,created_at,updated_at)
+      values ('raw-held','tenant_1','company_1','source_1','bill_payment_to_bill',$1,$2,20,'USD','2026-08-10','applied',1,'raw-held','invalid-event',now(),now())`, [unapplied.documentId, bill.documentId])).rejects.toThrow(/payment hold/);
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await sdk.commands.vendorBills.setPaymentHold({ ...hold, idempotencyKey: "hold:release", expectedVersion: 2, paymentHold: false });
+    await expect(sdk.commands.billPayments.clear({ operation, idempotencyKey: "hold:clear", billPaymentId: scheduled.billPaymentId, expectedVersion: 1 })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    await expect(sdk.commands.billPayments.recordAndApply({ ...payment, idempotencyKey: "hold:revalidated", allocations: payment.allocations.map(allocation => ({ ...allocation, expectedBillVersion: 3 })) })).resolves.toMatchObject({ status: "cleared" });
+  });
+
+  it("payment holds allow exact completed-payment replay and corrective unapplication", async () => {
+    const { sdk, operation, bill, hold, payment } = await paymentHoldFixture();
+    const paid = await sdk.commands.billPayments.recordAndApply(payment);
+    await sdk.commands.vendorBills.setPaymentHold({ ...hold, expectedVersion: 2 });
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.commands.billPayments.recordAndApply(payment)).resolves.toMatchObject({ status: "already_cleared", billPaymentId: paid.billPaymentId });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await sdk.commands.billPayments.voidAndUnapply({ operation, idempotencyKey: "hold:void", billPaymentId: paid.billPaymentId, expectedVersion: 2, date: "2026-08-12", memo: "Rejected ACH" });
+    expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ paymentHold: true, openAmount: "100.00", version: 4 });
+  });
+
+  it("payment holds reject direct writes and roll back an interrupted lifecycle even if a host catches the failure", async () => {
+    const { options, bill, hold } = await paymentHoldFixture();
+    const before = await depositDatabaseState(pool);
+    for (const flag of ["application_balance_update", "quickbooks_projection_refresh"]) {
+      await expect(runner.transaction(async client => {
+        await client.query(`select set_config('erp_financials.${flag}','on',true)`);
+        await client.query(`update erp_financials.subledger_documents set payment_hold=true,payment_hold_reason='bypass',version=version+1 where subledger_document_id=$1`, [bill.documentId]);
+      })).rejects.toThrow(/versioned lifecycle/);
+    }
+    for (const fragment of ["update erp_financials.subledger_documents set payment_hold", 'insert into "erp_financials"."financial_outbox"']) {
+      await expect(runner.transaction(async client => {
+        const scoped = createErpFinancialsSdk({ ...options, database: { transaction: work => work(new FailingMigrationClient(client, fragment)) } });
+        await expect(scoped.commands.vendorBills.setPaymentHold(hold)).rejects.toThrow(/injected/);
+      })).rejects.toThrow(/hold must commit/);
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+  });
+
+  it("payment holds serialize competing versions and race safely with payment posting", async () => {
+    const { sdk, bill, hold, payment } = await paymentHoldFixture();
+    const outcomes = await Promise.allSettled([sdk.commands.vendorBills.setPaymentHold(hold), sdk.commands.billPayments.recordAndApply(payment)]);
+    expect(outcomes.filter(item => item.status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter(item => item.status === "rejected")).toHaveLength(1);
+    const current = await sdk.queries.getOperationalDocumentSummary(bill.documentId);
+    expect(current).toMatchObject({ version: 2, openAmount: current.paymentHold ? "100.00" : "80.00" });
+    const competing = await Promise.allSettled(["a", "b"].map(key => sdk.commands.vendorBills.setPaymentHold({ ...hold, idempotencyKey: `hold:race:${key}`, expectedVersion: 2, paymentHold: !current.paymentHold })));
+    expect(competing.filter(item => item.status === "fulfilled")).toHaveLength(1);
+    expect(competing.filter(item => item.status === "rejected")).toHaveLength(1);
+    expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ version: 3, paymentHold: !current.paymentHold });
+  });
+
+  it("payment holds upgrade schema 31 without rewriting existing financial facts", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "hold:old", targetVersion: 31 });
+    await seedAccountingScope(pool);
+    const service = depositService(preComponentFixtureRunner(runner), { postingPolicy: "legacy_unrestricted" });
+    const bill = await service.vendorBills.create({ operation: sdkOperation(), idempotencyKey: "hold:old-bill", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "100.00" }] });
+    const before = await depositDatabaseState(pool);
+    const result = await migratePostgresSchema(runner, { appliedByRef: "hold:upgrade" });
+    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[31, 32], [32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]]);
+    const after = stripNewComponentNulls(await depositDatabaseState(pool));
+    for (const table of Object.keys(before)) {
+      if (table === "schema_migrations") continue;
+      if (table === "subledger_documents") {
+        const rows = after[table];
+        if (rows === undefined) throw new Error("Missing upgraded table");
+        after[table] = rows.map(value => { const { row } = value as { row: Record<string, unknown> }; const { payment_hold, payment_hold_reason, ...rest } = row;
+          expect(payment_hold).toBe(false); expect(payment_hold_reason).toBeNull(); return { row: rest }; });
+      }
+      expect(after[table], table).toEqual(before[table]);
+    }
+    await expect(depositService(runner,{postingPolicy:"legacy_unrestricted"}).vendorBills.setPaymentHold({ operation: sdkOperation(), idempotencyKey: "hold:upgraded", vendorBillId: bill.documentId, expectedVersion: 1, paymentHold: true, reason: "Migrated bill review" })).resolves.toMatchObject({ version: 2 });
+  });
+
+  it.each(["hold", "payment"] as const)("payment holds enforce the committed winner when %s takes the row lock first", async first => {
+    const { options, sdk, bill, hold, payment } = await paymentHoldFixture();
+    let signalLocked!: () => void;
+    let release!: () => void;
+    const locked = new Promise<void>(resolve => { signalLocked = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let intercepted = false;
+    const firstSdk = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({
+      async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        const result = await client.query<Row>(sql, params);
+        const matches = first === "hold" ? sql.includes("for update of document") : sql.includes('"subledger_document_id" = any($4::text[])');
+        if (!intercepted && matches) { intercepted = true; signalLocked(); await gate; }
+        return result;
+      }
+    })) } });
+    const firstCommand = first === "hold" ? firstSdk.commands.vendorBills.setPaymentHold(hold) : firstSdk.commands.billPayments.recordAndApply(payment);
+    // Wire the rejection handler before waiting for the other transaction.
+    const firstResult = Promise.allSettled([firstCommand]);
+    await locked;
+    const secondResult = Promise.allSettled([first === "hold" ? sdk.commands.billPayments.recordAndApply(payment) : sdk.commands.vendorBills.setPaymentHold(hold)]);
+    release();
+    expect((await firstResult)[0].status).toBe("fulfilled");
+    const second = (await secondResult)[0];
+    expect(second.status).toBe("rejected");
+    if (second.status === "rejected") expect(second.reason).toMatchObject({ code: first === "hold" ? "terminal_state_conflict" : "optimistic_concurrency_conflict" });
+    expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ version: 2, paymentHold: first === "hold", openAmount: first === "hold" ? "100.00" : "80.00" });
+  });
+
+  it("payment holds reject invalid actors, foreign scopes and provider ownership without writes", async () => {
+    const { options, sdk, hold } = await paymentHoldFixture();
+    await pool.query(`insert into erp_financials.accounting_companies values
+      ('other_company','tenant_1','Other','Other','USD',1,'test','native_erp','other');
+      insert into erp_financials.company_sources values ('other_hold_binding','tenant_1','other_company','source_1',now()),
+      ('other_hold_source','tenant_1','company_1','source_2',now())`);
+    const before = await depositDatabaseState(pool);
+    for (const scope of [{ tenantId: "other_tenant" }, { companyId: "other_company" }, { writeSourceId: "source_2" }, { bookId: "other_book" }, { currencyCode: "EUR" }]) {
+      await expect(createErpFinancialsSdk({ ...options, ...scope }).commands.vendorBills.setPaymentHold(hold)).rejects.toThrow();
+    }
+    await expect(sdk.commands.vendorBills.setPaymentHold({ ...hold, operation: { ...hold.operation, actorRef: "" } })).rejects.toThrow();
+    await expect(sdk.commands.vendorBills.setPaymentHold({ ...hold, reason: " " })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await pool.query("update erp_financials.accounting_sources set source_system='quickbooks' where source_id='source_1'");
+    const providerBefore = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.setPaymentHold(hold)).rejects.toMatchObject({ code: "provider_dependency" });
+    expect(await depositDatabaseState(pool)).toEqual(providerBefore);
+  });
+
+  it("payment holds preserve input snapshots and support multiple complete transitions in one transaction", async () => {
+    const { options, sdk, bill, hold } = await paymentHoldFixture();
+    const mutable = structuredClone(hold);
+    const pending = sdk.commands.vendorBills.setPaymentHold(mutable);
+    mutable.reason = "Caller mutated after invocation";
+    expect(await pending).toMatchObject({ paymentHoldReason: hold.reason });
+    await runner.transaction(async client => {
+      const scoped = createErpFinancialsSdk({ ...options, database: { transaction: work => work(client) } });
+      await scoped.commands.vendorBills.setPaymentHold({ ...hold, idempotencyKey: "hold:release-transaction", expectedVersion: 2, paymentHold: false });
+      await scoped.commands.vendorBills.setPaymentHold({ ...hold, idempotencyKey: "hold:rehold-transaction", expectedVersion: 3 });
+    });
+    expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ version: 4, paymentHold: true, paymentHoldReason: hold.reason });
+  });
+
+  it("enforces vendor bill account policy before writes and binds it to issuance replay", async () => {
+    const { sdk, operation } = await paymentHoldFixture();
+    const command: CreateVendorBillInput = { operation, idempotencyKey: "policy:bill", date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "20.00" }],
+      accountPolicy: { expenseClassifications: ["asset", "cost_of_goods_sold", "expense"], payableClassifications: ["liability"] } };
+    const before = await depositDatabaseState(pool);
+    for (const changed of [
+      { expenseLines: [{ accountId: "account_income", amount: "20.00" }] },
+      { payableAccount: { accountId: "account_cash" } },
+      { accountPolicy: { expenseClassifications: [], payableClassifications: ["liability" as const] } }
+    ]) {
+      await expect(sdk.commands.vendorBills.create({ ...command, ...changed })).rejects.toThrow(/account|classification/i);
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+    // A caller catching the error in its own transaction cannot commit partial accounting.
+    await runner.transaction(async client => {
+      const scoped = createErpFinancialsSdk({ database: { transaction: work => work(client) }, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "hold_book", currencyCode: "USD" });
+      await expect(scoped.commands.vendorBills.create({ ...command, payableAccount: { accountId: "account_cash" } })).rejects.toMatchObject({ code: "invalid_input" });
+    });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const mutable = { ...command, accountPolicy: { expenseClassifications: ["asset" as const], payableClassifications: ["liability" as const] } };
+    const pending = sdk.commands.vendorBills.create({ ...mutable, idempotencyKey: "policy:snapshot" });
+    mutable.accountPolicy.expenseClassifications.splice(0);
+    await expect(pending).resolves.toMatchObject({ status: "posted" });
+    const issued = await sdk.commands.vendorBills.create(command);
+    const after = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.create({ ...command, accountPolicy: { expenseClassifications: ["expense", "asset", "cost_of_goods_sold", "asset"], payableClassifications: ["liability"] } }))
+      .resolves.toMatchObject({ status: "already_posted", documentId: issued.documentId });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    await expect(sdk.commands.vendorBills.create({ ...command, accountPolicy: { expenseClassifications: ["asset"], payableClassifications: ["liability"] } }))
+      .rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    await sdk.commands.accounts.upsertTree({ operation: { ...operation, requestId: "policy:reclassify" }, parent: { accountId: "account_cash", sourceAccountId: "cash", name: "Reclassified", classification: "liability", active: true } });
+    const reclassified = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.create({ ...command, idempotencyKey: "policy:new-bill" })).rejects.toMatchObject({ code: "invalid_input" });
+    expect(await depositDatabaseState(pool)).toEqual(reclassified);
+    await expect(sdk.commands.vendorBills.create(command)).resolves.toMatchObject({ documentId: issued.documentId });
+    expect(await depositDatabaseState(pool)).toEqual(reclassified);
+  });
+
+  it.each(["post", "reclassify"] as const)("vendor bill account policy serializes when %s acquires the account lock first", async first => {
+    const { options, sdk, operation } = await paymentHoldFixture();
+    let signal!: () => void;
+    let release!: () => void;
+    const locked = new Promise<void>(resolve => { signal = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let intercepted = false;
+    const firstSdk = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({
+      async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        const result = await client.query<Row>(sql, params);
+        if (!intercepted && sql.includes("pg_advisory_xact_lock") && params.includes("account-hierarchy:tenant_1:source_1")) {
+          intercepted = true; signal(); await gate;
+        }
+        return result;
+      }
+    })) } });
+    const post = (target: ErpFinancialsSdk) => target.commands.vendorBills.create({ operation, idempotencyKey: "policy:race", date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "20.00" }],
+      accountPolicy: { expenseClassifications: ["asset"], payableClassifications: ["liability"] } });
+    const reclassify = (target: ErpFinancialsSdk) => target.commands.accounts.upsertTree({ operation: { ...operation, requestId: "policy:race:reclassify" },
+      parent: { accountId: "account_cash", sourceAccountId: "cash", name: "Reclassified", classification: "liability", active: true } });
+    const firstResult = Promise.allSettled([first === "post" ? post(firstSdk) : reclassify(firstSdk)]);
+    await locked;
+    const secondResult = Promise.allSettled([first === "post" ? reclassify(sdk) : post(sdk)]);
+    release();
+    expect((await firstResult)[0].status).toBe("fulfilled");
+    const second = (await secondResult)[0];
+    expect(second.status).toBe(first === "post" ? "fulfilled" : "rejected");
+    if (second.status === "rejected") expect(second.reason).toMatchObject({ code: "invalid_input" });
+    expect((await pool.query<{ count: number }>("select count(*)::int count from erp_financials.subledger_documents where idempotency_key='policy:race'")).rows[0]?.count).toBe(first === "post" ? 1 : 0);
+  });
+
+  it("scheduled bill payment retries preserve original evidence with fresh transport metadata", async () => {
+    const { sdk, operation, payment } = await paymentHoldFixture();
+    const scheduled = await sdk.commands.billPayments.schedule(payment);
+    const fresh = { ...operation, requestId: "fresh-request", correlationId: "fresh-correlation", occurredAt: "2026-08-25T12:00:00Z" };
+    const beforeScheduleRetry = await depositDatabaseState(pool);
+    await expect(sdk.commands.billPayments.schedule({ ...payment, operation: fresh })).resolves.toMatchObject({ status: "already_scheduled" });
+    expect(await depositDatabaseState(pool)).toEqual(beforeScheduleRetry);
+    await expect(sdk.commands.billPayments.schedule({ ...payment, operation: { ...fresh, actorRef: "different-actor" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    const clear = { operation, billPaymentId: scheduled.billPaymentId, expectedVersion: 1, idempotencyKey: "retry:clear" };
+    await sdk.commands.billPayments.clear(clear);
+    const beforeClearRetry = await depositDatabaseState(pool);
+    await expect(sdk.commands.billPayments.clear({ ...clear, operation: fresh })).resolves.toMatchObject({ status: "already_cleared" });
+    expect(await depositDatabaseState(pool)).toEqual(beforeClearRetry);
+    await expect(sdk.commands.billPayments.clear({ ...clear, operation: { ...fresh, reasonDetail: "changed authorization" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(beforeClearRetry);
+  });
+
+  it("round-trips civil dates through native registers, details and pagination", async () => {
+    await depositFixture("civil_dates");
+    const operation = sdkOperation();
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "civil_dates", currencyCode: "USD" });
+    const date = "2026-08-12";
+    const dates = { servicePeriodStart: "2026-08-01", servicePeriodEnd: "2026-08-31" };
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "civil:invoice", date, dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00", ...dates }] });
+    const receipts = [];
+    for (const key of ["a", "b"]) receipts.push(await sdk.commands.customerPayments.record({ operation, idempotencyKey: `civil:receipt:${key}`, date, customerId: "customer_1", amount: "20.00",
+      cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } }));
+    const receipt = receipts[0];
+    const unusedReceipt = receipts[1];
+    if (!receipt || !unusedReceipt) throw new Error("Missing fixture receipt");
+    const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "civil:apply", applicationType: "customer_payment_to_invoice",
+      sourceDocumentId: receipt.documentId, targetDocumentId: invoice.documentId, amount: "10.00", applicationDate: date, expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    expect.soft(await sdk.queries.getCustomerPayment(receipt.documentId)).toMatchObject({ paymentDate: date, applications: [{ applicationDate: date }] });
+    expect.soft(await sdk.queries.getPaymentApplication(application.applicationId)).toMatchObject({ applicationDate: date });
+    expect.soft(await sdk.queries.getOperationalDocument(invoice.documentId)).toMatchObject({ documentDate: date, lines: [dates] });
+    const register = await sdk.queries.listCustomerPaymentRegister({ periodStart: "2026-08-01", periodEnd: "2026-08-31", sort: "date", direction: "asc", limit: 1 });
+    expect.soft(register.items).toEqual([expect.objectContaining({ paymentDate: date, sortValue: date })]);
+    if (register.nextBoundary === undefined) throw new Error("Missing register continuation");
+    const registerNext = await sdk.queries.listCustomerPaymentRegister({ periodStart: "2026-08-01", periodEnd: "2026-08-31", sort: "date", direction: "asc", limit: 1, boundary: register.nextBoundary });
+    expect.soft([...register.items, ...registerNext.items].map(item => item.paymentId).sort()).toEqual(receipts.map(item => item.documentId).sort());
+    expect.soft(await sdk.queries.getOpenInvoicesByIds([invoice.documentId])).toEqual([expect.objectContaining({ dueDate: "2026-08-31" })]);
+    const credits = [];
+    for (const key of ["a", "b"]) credits.push(await sdk.commands.credits.issue({ operation, idempotencyKey: `civil:credit:${key}`, date, customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "5.00", ...dates }] }));
+    const adjustments = await sdk.queries.listAdjustmentRegister({ asOfDate: "2026-08-31", filter: "all", sort: "date", direction: "asc", limit: 1 });
+    expect.soft(adjustments.items).toEqual([expect.objectContaining({ adjustmentDate: date, sortValue: date })]);
+    if (adjustments.nextBoundary === undefined) throw new Error("Missing adjustments continuation");
+    const adjustmentsNext = await sdk.queries.listAdjustmentRegister({ asOfDate: "2026-08-31", filter: "all", sort: "date", direction: "asc", limit: 1, boundary: adjustments.nextBoundary });
+    expect.soft([...adjustments.items, ...adjustmentsNext.items].map(item => item.adjustmentId).sort()).toEqual(credits.map(item => item.documentId).sort());
+    const credit = credits[0];
+    if (!credit) throw new Error("Missing fixture credit");
+    expect.soft(await sdk.queries.getAdjustment(credit.documentId)).toMatchObject({ adjustmentDate: date, lines: [dates] });
+    const bill = await sdk.commands.vendorBills.create({ operation, idempotencyKey: "civil:bill", date, dueDate: "2026-08-31", vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "20.00", ...dates }] });
+    const scheduled = await sdk.commands.billPayments.schedule({ operation, idempotencyKey: "civil:schedule", date, vendorId: "vendor_1", amount: "20.00", paymentMethod: "ach",
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" }, allocations: [{ billId: bill.documentId, amount: "20.00", expectedBillVersion: 1 }] });
+    const clear = { operation, idempotencyKey: "civil:clear", billPaymentId: scheduled.billPaymentId, expectedVersion: 1 };
+    await sdk.commands.billPayments.clear(clear);
+    await expect(sdk.commands.billPayments.clear(clear)).resolves.toMatchObject({ status: "already_cleared" });
+    expect.soft(await sdk.queries.getBillPayment(scheduled.billPaymentId)).toMatchObject({ paymentDate: date, applications: [{ applicationDate: date }] });
+    expect.soft(await sdk.queries.getVendorBill(bill.documentId, "2026-08-31")).toMatchObject({ documentDate: date, dueDate: "2026-08-31", lines: [dates], applications: [{ applicationDate: date }] });
+    const bankIds = [];
+    for (const key of ["a", "b"]) {
+      const input = { operation, externalLineId: `civil:bank:${key}`, bankAccountId: "account_cash", postedDate: date, amount: "20.00" };
+      const line = await sdk.bankReconciliation.ingest(input);
+      expect.soft(line.postedDate).toBe(date);
+      expect.soft(await sdk.bankReconciliation.ingest(input)).toEqual(line);
+      bankIds.push(line.bankStatementLineId);
+    }
+    const bankFirst = await sdk.queries.listBankReconciliation({ limit: 1 });
+    expect.soft(bankFirst.items[0]?.postedDate).toBe(date);
+    if (bankFirst.nextCursor === undefined) throw new Error("Missing bankFirst continuation");
+    const bankNext = await sdk.queries.listBankReconciliation({ limit: 1, cursor: bankFirst.nextCursor });
+    expect.soft([...bankFirst.items, ...bankNext.items].map(line => line.bankStatementLineId).sort()).toEqual(bankIds.sort());
+    expect.soft(bankNext.items[0]?.postedDate).toBe(date);
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.commands.customerPayments.previewReturnCash({ paymentId: unusedReceipt.documentId, customerId: "customer_1", expectedVersion: 1,
+      date: "2026-08-11", amount: "20.00", returnKind: "refund", releases: [] })).rejects.toThrow(/precede receipt/);
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("changes and removes existing posting locks with optimistic versions and no partial stale writes", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:lock-update" });
+    await seedAccountingScope(pool);
+    const service = depositService(runner);
+    const operation = sdkOperation();
+    const beforeMissing = await depositDatabaseState(pool);
+    await expect(service.fiscalPeriods.setPostingLockDate({ operation: { ...operation, requestId: "lock-missing" }, expectedVersion: 5, postingLockDate: "2026-08-31" })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(beforeMissing);
+    await expect(service.fiscalPeriods.setPostingLockDate({ operation: { ...operation, requestId: "lock-create" }, expectedVersion: 0, postingLockDate: "2026-08-15" })).resolves.toMatchObject({ version: 1, postingLockDate: "2026-08-15" });
+    await expect(service.fiscalPeriods.setPostingLockDate({ operation: { ...operation, requestId: "lock-advance" }, expectedVersion: 1, postingLockDate: "2026-08-31" })).resolves.toMatchObject({ version: 2, postingLockDate: "2026-08-31" });
+    const beforeStale = await depositDatabaseState(pool);
+    await expect(service.fiscalPeriods.setPostingLockDate({ operation: { ...operation, requestId: "lock-stale" }, expectedVersion: 1 })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(beforeStale);
+    const cleared = await service.fiscalPeriods.setPostingLockDate({ operation: { ...operation, requestId: "lock-clear" }, expectedVersion: 2 });
+    expect(cleared.version).toBe(3); expect(cleared.postingLockDate).toBeUndefined();
+  });
+
+  it("preserves fiscal civil dates across definition replay and lock boundaries", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:fiscal-civil-date" });
+    await seedAccountingScope(pool);
+    const service = depositService(runner);
+    const operation = sdkOperation();
+    const input = { operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" };
+    expect(await service.fiscalPeriods.define(input)).toMatchObject({ periodStart: input.periodStart, periodEnd: input.periodEnd });
+    expect(await service.fiscalPeriods.define(input)).toMatchObject({ outcome: "already_defined", periodStart: input.periodStart, periodEnd: input.periodEnd });
+    expect(await service.fiscalPeriods.setPostingLockDate({ operation, postingLockDate: "2026-08-31", expectedVersion: 0 })).toMatchObject({ postingLockDate: "2026-08-31" });
+    const before = await depositDatabaseState(pool);
+    await expect(service.journalEntries.post({ operation, idempotencyKey: "date:locked-boundary", date: "2026-08-31",
+      lines: [{ accountId: "account_cash", debit: "10.00" }, { accountId: "account_income", credit: "10.00" }]
+    })).rejects.toMatchObject({ code: "fiscal_period_closed" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("rejects posting on the exact civil lock date without changing accounting", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:exact-lock-date" });
+    await seedAccountingScope(pool);
+    const service = depositService(runner);
+    const operation = sdkOperation();
+    await service.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    await service.fiscalPeriods.setPostingLockDate({ operation, postingLockDate: "2026-08-31", expectedVersion: 0 });
+    const before = await depositDatabaseState(pool);
+    await expect(service.journalEntries.post({ operation, idempotencyKey: "date:exact-lock", date: "2026-08-31",
+      lines: [{ accountId: "account_cash", debit: "10.00" }, { accountId: "account_income", credit: "10.00" }]
+    })).rejects.toMatchObject({ code: "fiscal_period_closed" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("source-scoped outbox claims and acknowledgements isolate sources while omitted scope remains compatible", async () => {
+    await migratePostgresSchema(runner, {appliedByRef:"synthetic:outbox-source-scope"});
+    await seedQuickBooksImportScope(pool);
+    await pool.query(`insert into erp_financials.accounting_sources(source_id,tenant_id,source_system,provider_environment,connection_ref,status)
+      values('source_other','tenant_qbo','quickbooks','sandbox','other','active');
+      insert into erp_financials.company_sources values('company_source_other','tenant_qbo','company_qbo','source_other',now());
+      insert into erp_financials.reporting_books(tenant_id,company_id,book_id,name,base_currency_code,accounting_basis,status,created_at,updated_at)
+      values('tenant_qbo','company_qbo','book_scope','Scoped','USD','accrual','active',now(),now());
+      insert into erp_financials.reporting_book_sources(book_source_id,tenant_id,company_id,book_id,source_id,source_role,created_at)
+      values('scope_a','tenant_qbo','company_qbo','book_scope','source_qbo','active',now()),
+            ('scope_b','tenant_qbo','company_qbo','book_scope','source_other','adjustment',now())`);
+    let now="2026-08-12T12:00:00.000Z";
+    const scope={database:runner,tenantId:"tenant_qbo",companyId:"company_qbo",bookId:"book_scope",now:()=>now};
+    const a=createFinancialOutboxService({...scope,sourceId:"source_qbo"});
+    const b=createFinancialOutboxService({...scope,sourceId:"source_other"});
+    const all=createFinancialOutboxService(scope);
+    const append=(sourceId:string,key:string)=>runner.transaction(client=>appendFinancialOutboxEvent(client,{...scope,sourceId,eventType:"ledger.posted",aggregateType:"ledger",aggregateId:key,idempotencyKey:key,payload:{key},availableAt:now}));
+    const aid=await append("source_qbo","a"),bid=await append("source_other","b");
+    expect((await a.claim()).map(event=>event.outboxEventId)).toEqual([aid]);
+    expect((await b.claim()).map(event=>event.outboxEventId)).toEqual([bid]);
+    await expect(a.markPublished(bid)).rejects.toMatchObject({code:"terminal_state_conflict"});
+    await expect(a.markFailed({outboxEventId:bid,error:"wrong source"})).rejects.toMatchObject({code:"terminal_state_conflict"});
+    expect((await pool.query("select status,last_error from erp_financials.financial_outbox where outbox_event_id=$1",[bid])).rows[0]).toEqual({status:"processing",last_error:null});
+    await a.markFailed({outboxEventId:aid,error:"retry",retryAt:"2026-08-12T12:00:10.000Z"});
+    expect(await a.claim()).toEqual([]);
+    now="2026-08-12T12:00:11.000Z";
+    expect((await a.claim()).map(event=>event.outboxEventId)).toEqual([aid]);
+    await a.markPublished(aid);
+    now="2026-08-12T12:01:01.000Z";
+    expect(await a.claim()).toEqual([]);
+    expect((await b.claim()).map(event=>event.outboxEventId)).toEqual([bid]);
+    await b.markPublished(bid);
+    await append("source_qbo","a2");await append("source_other","b2");
+    const compatible=await all.claim();expect(compatible.map(event=>event.sourceId).sort()).toEqual(["source_other","source_qbo"]);
+    for(const event of compatible)await all.markPublished(event.outboxEventId);
+    const c1=await append("source_qbo","c1"),c2=await append("source_qbo","c2");
+    const concurrent=await Promise.all([a.claim({limit:1}),a.claim({limit:1})]);
+    expect(concurrent.flat().map(event=>event.outboxEventId).sort()).toEqual([c1,c2].sort());
+    expect(await b.claim()).toEqual([]);
   });
 
   async function correctionFixture(guardOverride?: CustomerPaymentCorrectionGuard, targetVersion?: number) {
@@ -186,9 +4960,17 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     const before=await depositDatabaseState(pool);
     const result=await migratePostgresSchema(runner,{appliedByRef:'synthetic:correction-replay-upgrade'});
     expect(result.currentVersion).toBe(26);
-    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[26,27]]);
-    const after=await depositDatabaseState(pool);
-    for (const table of Object.keys(before).filter(table=>table!=='schema_migrations')) expect(after[table]).toEqual(before[table]);
+    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[26,27],[27,28],[28,29],[29,30],[30,31],[31,32],[32,33],[33,34],[34,35],[35,36],[36,37],[37,38],[38,39],[39,40],[40,41],[41,42],[42,43],[43,44],[44,45],[45,46],[46,47],[47,48]]);
+    const after=stripNewComponentNulls(await depositDatabaseState(pool));
+    for (const table of Object.keys(before).filter(table=>table!=='schema_migrations')) {
+      const rows = before[table];
+      if (rows === undefined) throw new Error('Missing original table');
+      const expected = table === 'subledger_documents' ? rows.map(value => {
+        const { row } = value as { row: Record<string, unknown> };
+        return { row: { ...row, payment_hold: false, payment_hold_reason: null } };
+      }) : before[table];
+      expect(after[table], table).toEqual(expected);
+    }
     await expect(runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:quickBooksSubledgerFacts(),resources:f.resources}))).resolves.toMatchObject({correctionDependencies:[{code:'provider_dependency',paymentId:f.input.paymentId}]});
     expect((await f.service.customerPayments.voidAndUnapply(f.input)).status).toBe('already_voided');
   });
@@ -401,8 +5183,8 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     }
   });
 
-  async function depositFixture(bookId?: string) {
-    await migratePostgresSchema(runner, { appliedByRef: "integration:deposit-reversal" });
+  async function depositFixture(bookId?: string, targetVersion?: number) {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:deposit-reversal", ...(targetVersion === undefined ? {} : {targetVersion}) });
     await seedAccountingScope(pool);
     const scope = bookId === undefined ? {} : { bookId };
     if (bookId !== undefined) {
@@ -1643,6 +6425,473 @@ insert into erp_financials.ledger_postings (
     ]);
   });
 
+  it.each(["accrual", "cash"] as const)("cash-flow purpose correction restates receipts and refunds with exact replay on %s basis", async accountingMethod => {
+    const bookId = "cash-purpose-correction";
+    await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    const record = { operation, idempotencyKey: "purpose-correct:receipt", cashFlowActivity: "operating" as const, customerId: "customer_1", date: "2026-08-15", amount: "50.01", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } };
+    const receipt = await sdk.commands.customerPayments.record(record);
+    await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 9, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    await sdk.commands.customerPayments.returnCash({ operation, paymentId: receipt.documentId, expectedVersion: 1, customerId: "customer_1", amount: "10.01", date: "2026-09-02", returnKind: "refund", releases: [], idempotencyKey: "purpose-correct:refund", externalReturnRef: "test:refund" });
+    const request = { accountingMethod, periodStart: "2026-08-15", periodEnd: "2026-09-30", accountRoles: [{ bookAccountKey: "source_1:account_cash", role: "cash" }] } as const;
+    const before = await sdk.queries.getCashFlowSummary(request);
+    expect(before).toMatchObject({ operating: "40.00", investing: "0.00", netCashFlow: "40.00" });
+    const command = { operation, documentId: receipt.documentId, expectedRevision: 0, idempotencyKey: "purpose-correct:one", operating: "0.00", investing: "50.01", financing: "0.00" };
+    const state = await depositDatabaseState(pool);
+    for (const bad of [{ operating: "0.001" }, { investing: "49.01" }, { operating: "1.00", investing: "49.01" }, { expectedRevision: 1 }, { operation: { ...operation, approverRef: operation.actorRef } }]) {
+      await expect(sdk.commands.cashFlow.correctPurpose({ ...command, ...bad })).rejects.toThrow();
+      expect(await depositDatabaseState(pool)).toEqual(state);
+    }
+    await expect(createErpFinancialsSdk({ ...scope, database: runner, currencyCode: "EUR" }).commands.cashFlow.correctPurpose(command)).rejects.toMatchObject({ code: "scope_mismatch" });
+    const results = await Promise.all([sdk.commands.cashFlow.correctPurpose(command), sdk.commands.cashFlow.correctPurpose({ ...command, operation: { ...operation, requestId: "transport-retry" } })]);
+    expect(results.map(result => result.status).sort()).toEqual(["already_corrected", "corrected"]);
+    expect(await sdk.queries.getCashFlowPurpose({ sourceId: "source_1", documentId: receipt.documentId })).toMatchObject({ revision: 1, operating: "0.00", investing: "50.01" });
+    expect(await sdk.queries.getCashFlowSummary(request)).toMatchObject({ supportStatus: "supported", operating: "0.00", investing: "40.00", netCashFlow: "40.00", beginningCash: before.beginningCash, endingCash: before.endingCash });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodEnd: "2026-08-31" })).toMatchObject({ investing: "50.01" });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodStart: "2026-09-01" })).toMatchObject({ investing: "-10.01" });
+    expect((await sdk.queries.getCustomerPayment(receipt.documentId)).cashFlowActivity).toBe("operating");
+    expect(await sdk.commands.customerPayments.record(record)).toMatchObject({ status: "already_posted" });
+    await expect(sdk.commands.cashFlow.correctPurpose({ ...command, operating: "50.01", investing: "0.00" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    const after = await depositDatabaseState(pool);
+    expect(after.ledger_postings).toEqual(state.ledger_postings);
+    expect(after.subledger_documents).toEqual(state.subledger_documents);
+    expect(await reconciliationEvidenceCounts(pool, receipt.documentId, "cash_flow_purpose.corrected")).toEqual({ auditCount: 1, outboxCount: 1 });
+    for (const sql of ["update erp_financials.cash_flow_purpose_corrections set operating=50.01,investing=0", "delete from erp_financials.cash_flow_purpose_corrections"]) await expect(pool.query(sql)).rejects.toThrow("immutable");
+  });
+
+  it("cash-flow purpose correction rolls back host-caught failures and excludes fiscal close and competing revisions", async () => {
+    const bookId = "cash-purpose-lock";
+    await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    const receipt = await sdk.commands.customerPayments.record({ operation, idempotencyKey: "purpose-lock:receipt", customerId: "customer_1", date: "2026-08-15", amount: "25.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const command = { operation, documentId: receipt.documentId, expectedRevision: 0, idempotencyKey: "purpose-lock:one", operating: "25.00", investing: "0.00", financing: "0.00" };
+    const before = await depositDatabaseState(pool);
+    await runner.transaction(async client => {
+      const wrapped = { query: (async (sql: string, params?: readonly unknown[]) => {
+        if (sql.includes('insert into "erp_financials"."financial_outbox"')) throw new Error("injected purpose outbox failure");
+        return client.query(sql, params);
+      }) as typeof client.query };
+      const isolated = createErpFinancialsSdk({ ...scope, database: { transaction: work => work(wrapped) } });
+      await expect(isolated.commands.cashFlow.correctPurpose(command)).rejects.toThrow("injected purpose outbox failure");
+      await client.query("select 1"); // host catches the failure and commits
+    });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const competing = await Promise.allSettled([sdk.commands.cashFlow.correctPurpose(command), sdk.commands.cashFlow.correctPurpose({ ...command, idempotencyKey: "purpose-lock:competitor", operating: "0.00", investing: "25.00" })]);
+    expect(competing.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    expect(competing.filter(result => result.status === "rejected")).toMatchObject([{ reason: { code: "optimistic_concurrency_conflict" } }]);
+    const fiscalPeriodId = String((await pool.query<{ fiscal_period_id: string }>("select fiscal_period_id from erp_financials.fiscal_periods")).rows[0]?.fiscal_period_id);
+    const readiness = await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", fiscalPeriodId, ["account_cash"]);
+    const second = { ...command, idempotencyKey: "purpose-lock:second", expectedRevision: 1, operating: "0.00", investing: "0.00", financing: "25.00" };
+    await sdk.commands.cashFlow.correctPurpose(second);
+    expect((await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", fiscalPeriodId, ["account_cash"])).approvalToken).not.toBe(readiness.approvalToken);
+    const lock = await sdk.commands.fiscalPeriods.setPostingLockDate({ operation, expectedVersion: 0, postingLockDate: "2026-08-31" });
+    const lockedState = await depositDatabaseState(pool);
+    await expect(sdk.commands.cashFlow.correctPurpose({ ...second, idempotencyKey: "purpose-lock:third", expectedRevision: 2 })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(lockedState);
+    expect(await sdk.commands.cashFlow.correctPurpose(second)).toMatchObject({ status: "already_corrected", revision: 2 });
+    await sdk.commands.fiscalPeriods.setPostingLockDate({ operation: { ...operation, requestId: "purpose-lock:unlock" }, expectedVersion: lock.version });
+    const september = await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 9, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    await sdk.commands.customerPayments.returnCash({ operation, paymentId: receipt.documentId, expectedVersion: 1, customerId: "customer_1", amount: "5.00", date: "2026-09-02", returnKind: "refund", releases: [], idempotencyKey: "purpose-lock:refund", externalReturnRef: "lock:refund" });
+    await sdk.commands.fiscalPeriods.beginClose({ operation, fiscalPeriodId: september.fiscalPeriodId, expectedVersion: 1 });
+    const closingState = await depositDatabaseState(pool);
+    await expect(sdk.commands.cashFlow.correctPurpose({ ...second, idempotencyKey: "purpose-lock:fourth", expectedRevision: 2 })).rejects.toMatchObject({ code: "fiscal_period_closing" });
+    expect(await depositDatabaseState(pool)).toEqual(closingState);
+  });
+
+  it("cash-flow purpose administrator confirmation rolls back with a host-caught command failure", async () => {
+    const bookId = "cash-purpose-admin"; await depositFixture(bookId);
+    const options = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...options, database: runner }), operation = sdkOperation();
+    const receipt = await sdk.commands.customerPayments.record({ operation, idempotencyKey: "purpose-admin:receipt", customerId: "customer_1", date: "2026-08-15", amount: "1.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const command = { operation: { ...operation, approverRef: operation.actorRef }, documentId: receipt.documentId, expectedRevision: 0, idempotencyKey: "purpose-admin:correct", operating: "1.00", investing: "0.00", financing: "0.00" };
+    const scope = { ...options, sourceId: options.writeSourceId, accountingBasis: "accrual" as const, postingPolicy: "enforce_fiscal_periods" as const };
+    const checksum = createFinancialActionCommandChecksum(scope, "cashFlow.correctPurpose", command);
+    const confirmed = { ...command, operation: { ...command.operation, administratorConfirmation: { confirmationRef: "purpose-admin-confirmation", commandChecksum: checksum } } };
+    const policy = { mode: "administrator_direct" as const, actions: ["cashFlow.correctPurpose" as const], guard: () => Promise.resolve({ ...scope, action: "cashFlow.correctPurpose" as const, actorRef: operation.actorRef, requestId: operation.requestId,
+      commandChecksum: checksum, active: true, administrator: true, confirmed: true }) };
+    const before = await depositDatabaseState(pool);
+    await runner.transaction(async client => {
+      const wrapped = { query: (async (sql: string, params?: readonly unknown[]) => {
+        if (sql.includes('insert into "erp_financials"."financial_outbox"')) throw Error("purpose admin outbox failure");
+        return client.query(sql, params);
+      }) as typeof client.query };
+      const admin = createErpFinancialsSdk({ ...options, database: { transaction: work => work(wrapped) }, financialApprovalPolicy: policy });
+      await expect(admin.commands.cashFlow.correctPurpose(confirmed)).rejects.toThrow("purpose admin outbox failure");
+    });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const admin = createErpFinancialsSdk({ ...options, database: runner, financialApprovalPolicy: policy });
+    expect(await admin.commands.cashFlow.correctPurpose(confirmed)).toMatchObject({ status: "corrected", revision: 1 });
+    const event = (await pool.query<Record<string, unknown>>("select payload->'financialApproval' approval from erp_financials.financial_lifecycle_events where event_type='cash_flow_purpose.corrected'")).rows[0];
+    expect(event?.approval).toMatchObject({ policy: "administrator_direct", action: "cashFlow.correctPurpose", commandChecksum: checksum });
+  });
+
+  it.each(["correction_first", "close_first"] as const)("cash-flow purpose correction serializes with fiscal close: %s", async order => {
+    const bookId = "cash-purpose-race"; await depositFixture(bookId);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    const receipt = await sdk.commands.customerPayments.record({ operation, idempotencyKey: "purpose-race:receipt", customerId: "customer_1", date: "2026-08-15", amount: "1.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const command = { operation, documentId: receipt.documentId, expectedRevision: 0, idempotencyKey: "purpose-race:correct", operating: "1.00", investing: "0.00", financing: "0.00" };
+    const fiscalPeriodId = String((await pool.query<{ fiscal_period_id: string }>("select fiscal_period_id from erp_financials.fiscal_periods")).rows[0]?.fiscal_period_id);
+    const client = await pool.connect();
+    let pending: Promise<unknown> | undefined;
+    try {
+      await client.query("begin");
+      const pid = (await client.query<{ pid: number }>("select pg_backend_pid() pid")).rows[0]?.pid;
+      const held = createErpFinancialsSdk({ ...scope, database: { transaction: work => work(client) } });
+      const closing = { operation, fiscalPeriodId, expectedVersion: 1 };
+      if (order === "correction_first") {
+        await held.commands.cashFlow.correctPurpose(command);
+        pending = sdk.commands.fiscalPeriods.beginClose(closing);
+      } else {
+        await held.commands.fiscalPeriods.beginClose(closing);
+        pending = sdk.commands.cashFlow.correctPurpose(command).then(() => { throw Error("Correction escaped fiscal close"); }, (error: unknown) => { expect(error).toMatchObject({ code: "fiscal_period_closing" }); });
+      }
+      await expect.poll(async () => (await pool.query<{ blocked: boolean }>("select exists(select 1 from pg_stat_activity where $1=any(pg_blocking_pids(pid))) blocked", [pid])).rows[0]?.blocked).toBe(true);
+      await client.query("commit");
+      await pending;
+      const purpose = await sdk.queries.getCashFlowPurpose({ sourceId: "source_1", documentId: receipt.documentId });
+      expect(purpose?.revision ?? 0).toBe(order === "correction_first" ? 1 : 0);
+    } finally {
+      await client.query("rollback"); client.release();
+      if (pending) await pending.catch(() => undefined);
+    }
+  });
+
+  it.each(["accrual", "cash"] as const)("cash-flow bill purpose correction retains exact splits through void on %s basis", async accountingMethod => {
+    const bookId = "cash-bill-purpose"; await depositFixture(bookId);
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId, writeSourceId: "source_1", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const expense = (await sdk.commands.accounts.upsertTree({ operation, parent: { accountKey: "supplies", sourceAccountId: "supplies", name: "Supplies", classification: "expense", type: "expense", active: true } })).accounts[0];
+    if (!expense) throw Error("Missing bill-purpose account");
+    const bill = await sdk.commands.vendorBills.create({ operation, idempotencyKey: "bill-purpose:bill", date: "2026-08-15", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: expense.accountId, amount: "100.01" }] });
+    const payment = await sdk.commands.billPayments.recordAndApply({ operation, idempotencyKey: "bill-purpose:pay", date: "2026-08-20", vendorId: "vendor_1", amount: "100.01", paymentMethod: "ach", payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" }, allocations: [{ billId: bill.documentId, amount: "100.01", expectedBillVersion: 1 }] });
+    const request = { accountingMethod, periodStart: "2026-08-15", periodEnd: "2026-08-31", accountRoles: [{ bookAccountKey: "source_1:account_cash", role: "cash" }, { bookAccountKey: `source_1:${expense.accountId}`, role: "operating" }] } as const;
+    expect(await sdk.queries.getCashFlowSummary(request)).toMatchObject({ operating: "-100.01" });
+    const correction = { operation, documentId: payment.billPaymentId, expectedRevision: 0, idempotencyKey: "bill-purpose:correction", operating: "50.01", investing: "50.00", financing: "0.00" };
+    await sdk.commands.cashFlow.correctPurpose(correction);
+    expect(await sdk.queries.getCashFlowSummary(request)).toMatchObject({ supportStatus: "supported", operating: "-50.01", investing: "-50.00", netCashFlow: "-100.01" });
+    await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 9, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    await sdk.commands.billPayments.voidAndUnapply({ operation, billPaymentId: payment.billPaymentId, expectedVersion: payment.version, idempotencyKey: "bill-purpose:void", date: "2026-09-10" });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodStart: "2026-09-01", periodEnd: "2026-09-30" })).toMatchObject({ supportStatus: "supported", operating: "50.01", investing: "50.00", netCashFlow: "100.01" });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodEnd: "2026-09-30" })).toMatchObject({ supportStatus: "supported", operating: "0.00", investing: "0.00", netCashFlow: "0.00" });
+    await sdk.commands.cashFlow.correctPurpose({ ...correction, expectedRevision: 1, idempotencyKey: "bill-purpose:revised", operating: "0.00", investing: "100.01" });
+    expect(await sdk.queries.getCashFlowSummary(request)).toMatchObject({ operating: "0.00", investing: "-100.01" });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodStart: "2026-09-01", periodEnd: "2026-09-30" })).toMatchObject({ operating: "0.00", investing: "100.01" });
+    expect(await sdk.commands.cashFlow.correctPurpose(correction)).toMatchObject({ status: "already_corrected", revision: 1, operating: "50.01" });
+  });
+
+  it.each(["accrual", "cash"] as const)("cash-flow receipt purpose survives later invoicing, partial cash returns and noncash credit on %s basis", async accountingMethod => {
+    await depositFixture("cash-receipt-book");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "cash-receipt-book", writeSourceId: "source_1", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const receiptCommand = { operation, idempotencyKey: "cash-purpose:receipt", collectionRef: "order:cash-purpose", cashFlowActivity: "operating" as const,
+      customerId: "customer_1", date: "2026-08-15", amount: "50.01", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } };
+    const receipt = await sdk.commands.customerPayments.record(receiptCommand);
+    const request = { periodStart: "2026-08-15", periodEnd: "2026-08-19", accountingMethod,
+      accountRoles: [{ bookAccountKey: "source_1:account_cash", role: "cash" }] } as const;
+    const beforeInvoice = await sdk.queries.getCashFlowSummary(request);
+    expect(beforeInvoice).toMatchObject({ supportStatus: "supported", operating: "50.01", netCashFlow: "50.01", unclassifiedTransactionCount: "0" });
+    expect(await sdk.commands.customerPayments.record(receiptCommand)).toMatchObject({ status: "already_posted" });
+    const unchanged = await depositDatabaseState(pool);
+    await expect(sdk.commands.customerPayments.record({ ...receiptCommand, cashFlowActivity: "investing" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(unchanged);
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "cash-purpose:invoice", customerId: "customer_1", date: "2026-08-20", dueDate: "2026-08-31",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "30.00" }] });
+    const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "cash-purpose:apply", applicationType: "customer_payment_to_invoice",
+      sourceDocumentId: receipt.documentId, targetDocumentId: invoice.documentId, amount: "30.00", applicationDate: "2026-08-20", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    expect(await sdk.queries.getCashFlowSummary(request)).toEqual(beforeInvoice);
+    const firstReturn = { operation, idempotencyKey: "cash-purpose:return-unused", externalReturnRef: "gateway:return-unused", paymentId: receipt.documentId, customerId: "customer_1",
+      expectedVersion: (await sdk.queries.getCustomerPayment(receipt.documentId)).version, date: "2026-08-25", amount: "10.01", returnKind: "refund" as const, releases: [] };
+    await sdk.commands.customerPayments.returnCash(firstReturn);
+    expect(await sdk.commands.customerPayments.returnCash(firstReturn)).toMatchObject({ status: "already_returned" });
+    await sdk.commands.customerPayments.returnCash({ operation, idempotencyKey: "cash-purpose:return-applied", externalReturnRef: "gateway:return-applied", paymentId: receipt.documentId, customerId: "customer_1",
+      expectedVersion: (await sdk.queries.getCustomerPayment(receipt.documentId)).version, date: "2026-08-26", amount: "20.00", returnKind: "refund", releases: [{ applicationId: application.applicationId, expectedVersion: 1, amount: "10.00" }] });
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ originalAmount: "30.00", openAmount: "10.00" });
+    const fullRequest = { ...request, periodEnd: "2026-08-31" };
+    const net = await sdk.queries.getCashFlowSummary(fullRequest);
+    expect(net).toMatchObject({ supportStatus: "supported", operating: "20.00", investing: "0.00", financing: "0.00", netCashFlow: "20.00", cashTransactionCount: "3" });
+    expect(await sdk.queries.getCashFlowSummary({ ...fullRequest, periodStart: "2026-08-25" })).toMatchObject({ operating: "-30.01", netCashFlow: "-30.01", cashTransactionCount: "2" });
+    expect(await sdk.queries.getCashFlowSummary(request)).toEqual(beforeInvoice);
+    // Issuing a sale credit is noncash, so it cannot silently become a refund.
+    await sdk.commands.credits.issue({ operation, idempotencyKey: "cash-purpose:credit", customerId: "customer_1", date: "2026-08-27", amount: "10.00",
+      receivableAccount: { accountId: "account_ar" }, revenueAccount: { accountId: "account_income" } });
+    expect(await sdk.queries.getCashFlowSummary(fullRequest)).toEqual(net);
+  });
+
+  it.each(["operating", "investing", "financing"] as const)("cash-flow explicit %s receipt purpose is validated and inherited by captured cash voids", async cashFlowActivity => {
+    await depositFixture("cash-purpose-book");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "cash-purpose-book", writeSourceId: "source_1", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const command = { operation, idempotencyKey: "purpose:receipt", cashFlowActivity, customerId: "customer_1", date: "2026-08-15", amount: "0.01", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } };
+    await expect(sdk.commands.customerPayments.record({ ...command, cashFlowActivity: "cash" as never })).rejects.toThrow("cashFlowActivity must");
+    const receipt = await sdk.commands.customerPayments.record(command);
+    expect((await sdk.queries.getCustomerPayment(receipt.documentId)).cashFlowActivity).toBe(cashFlowActivity);
+    await sdk.commands.customerPayments.returnCash({ operation, idempotencyKey: "purpose:void", externalReturnRef: "gateway:void", paymentId: receipt.documentId, customerId: "customer_1",
+      expectedVersion: 1, date: "2026-08-16", amount: "0.01", returnKind: "void", releases: [] });
+    const request = { periodStart: "2026-08-15", periodEnd: "2026-08-15", accountRoles: [{ bookAccountKey: "source_1:account_cash", role: "cash" }] } as const;
+    expect(await sdk.queries.getCashFlowSummary(request)).toMatchObject({ supportStatus: "supported", [cashFlowActivity]: "0.01", netCashFlow: "0.01" });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodStart: "2026-08-16", periodEnd: "2026-08-16" })).toMatchObject({ supportStatus: "supported", [cashFlowActivity]: "-0.01", netCashFlow: "-0.01" });
+    // Older receipts have no explicit purpose. A blanket AR role is not proof.
+    const { cashFlowActivity: declaredActivity, ...legacy } = command;
+    void declaredActivity;
+    await sdk.commands.customerPayments.record({ ...legacy, idempotencyKey: "purpose:legacy", date: "2026-08-17" });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodEnd: "2026-08-31", accountRoles: [...request.accountRoles, { bookAccountKey: "source_1:account_ar", role: "operating" }] })).toMatchObject({ supportStatus: "partial", unclassified: "0.01", unclassifiedTransactionCount: "1" });
+    if (cashFlowActivity === "operating") {
+      // Simulate ambiguous migrated ownership without changing any ledger fact.
+      await pool.query(`insert into erp_financials.subledger_documents
+        select (jsonb_populate_record(null::erp_financials.subledger_documents,to_jsonb(d)||jsonb_build_object(
+          'subledger_document_id',d.subledger_document_id||':duplicate','idempotency_key',d.idempotency_key||':duplicate'))).*
+        from erp_financials.subledger_documents d where d.subledger_document_id=$1`, [receipt.documentId]);
+      await expect(sdk.queries.getCashFlowSummary(request)).rejects.toMatchObject({ code: "invalid_input", message: "Cash transaction has ambiguous native document ownership" });
+    }
+  });
+
+  it.each(["accrual", "cash"] as const)("cash-flow bill reallocation preserves additive historical cash purpose on %s basis", async accountingMethod => {
+    await depositFixture("cash-reallocate-book");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "cash-reallocate-book", writeSourceId: "source_1", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const [equipment] = (await sdk.commands.accounts.upsertTree({ operation: { ...operation, requestId: "reallocate:equipment" }, parent: { accountKey: "equipment", sourceAccountId: "equipment", name: "Equipment", classification: "asset", type: "asset", active: true } })).accounts;
+    const [expense] = (await sdk.commands.accounts.upsertTree({ operation: { ...operation, requestId: "reallocate:expense" }, parent: { accountKey: "expense", sourceAccountId: "expense", name: "Supplies", classification: "expense", type: "expense", active: true } })).accounts;
+    if (!equipment || !expense) throw new Error("Missing reallocation accounts");
+    const bill = (key: string, accountId: string) => sdk.commands.vendorBills.create({ operation, idempotencyKey: key, date: "2026-08-15", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId, amount: "100.00" }] });
+    const original = await bill("reallocate:operating", expense.accountId), replacement = await bill("reallocate:investing", equipment.accountId);
+    const payment = await sdk.commands.billPayments.recordAndApply({ operation, idempotencyKey: "reallocate:pay", date: "2026-08-20", vendorId: "vendor_1", amount: "100.00", paymentMethod: "ach", payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" }, allocations: [{ billId: original.documentId, amount: "100.00", expectedBillVersion: 1 }] });
+    const [application] = payment.applications;
+    if (!application) throw new Error("Missing initial cash allocation");
+    const request = { accountingMethod, periodStart: "2026-08-15", periodEnd: "2026-08-31", accountRoles: [
+      { bookAccountKey: "source_1:account_cash", role: "cash" }, { bookAccountKey: `source_1:${expense.accountId}`, role: "operating" }, { bookAccountKey: `source_1:${equipment.accountId}`, role: "investing" },
+    ] } as const;
+    const august = await sdk.queries.getCashFlowSummary(request);
+    expect(august).toMatchObject({ supportStatus: "supported", operating: "-100.00", investing: "0.00" });
+    await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 9, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: application.applicationId, effectiveDate: "2026-09-03", expectedVersion: 1 });
+    await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "reallocate:apply", applicationType: "bill_payment_to_bill", sourceDocumentId: payment.billPaymentId, targetDocumentId: replacement.documentId,
+      amount: "100.00", applicationDate: "2026-09-03", expectedSourceVersion: 3, expectedTargetVersion: 1 });
+    expect(await sdk.queries.getCashFlowSummary(request)).toEqual(august);
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodStart: "2026-09-01", periodEnd: "2026-09-30" })).toMatchObject({ operating: "0.00", investing: "0.00", netCashFlow: "0.00" });
+    // Noncash reassignment cannot silently reclassify the earlier cash payment.
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodEnd: "2026-09-30" })).toMatchObject({ supportStatus: "supported", operating: "-100.00", investing: "0.00", netCashFlow: "-100.00" });
+    await sdk.commands.billPayments.voidAndUnapply({ operation, billPaymentId: payment.billPaymentId, expectedVersion: payment.version, idempotencyKey: "reallocate:void", date: "2026-09-10" });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodStart: "2026-09-01", periodEnd: "2026-09-30" })).toMatchObject({ supportStatus: "supported", operating: "100.00", investing: "0.00", netCashFlow: "100.00" });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodEnd: "2026-09-30" })).toMatchObject({ supportStatus: "supported", operating: "0.00", investing: "0.00", netCashFlow: "0.00" });
+  });
+
+  it.each(["accrual", "cash"] as const)("cash-flow native bill allocation retains exact mixed-purpose partial payments on %s basis", async accountingMethod => {
+    await depositFixture("cash-bill-book");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "cash-bill-book", writeSourceId: "source_1", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const equipment = (await sdk.commands.accounts.upsertTree({ operation: { ...operation, requestId: "cash-equipment" }, parent: { accountKey: "equipment", sourceAccountId: "equipment", name: "Equipment", classification: "asset", type: "asset", active: true } })).accounts[0];
+    const expense = (await sdk.commands.accounts.upsertTree({ operation: { ...operation, requestId: "cash-expense" }, parent: { accountKey: "expense", sourceAccountId: "expense", name: "Supplies", classification: "expense", type: "expense", active: true } })).accounts[0];
+    if (!equipment || !expense) throw new Error("Missing cash-flow fixture accounts");
+    const bill = await sdk.commands.vendorBills.create({ operation, idempotencyKey: "cash-report:bill", date: "2026-08-15", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" },
+      expenseLines: [{ accountId: equipment.accountId, amount: "100.01" }, { accountId: expense.accountId, amount: "100.02" }] });
+    const paid = await sdk.commands.billPayments.recordAndApply({ operation, idempotencyKey: "cash-report:partial", date: "2026-08-20", vendorId: "vendor_1", amount: "100.01", paymentMethod: "ach",
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" }, allocations: [{ billId: bill.documentId, amount: "100.01", expectedBillVersion: 1 }] });
+    const request = { periodStart: "2026-08-15", periodEnd: "2026-08-31", accountingMethod, accountRoles: [
+      { bookAccountKey: "source_1:account_cash", role: "cash" },
+      { bookAccountKey: `source_1:${equipment.accountId}`, role: "investing" },
+      { bookAccountKey: `source_1:${expense.accountId}`, role: "operating" },
+    ] } as const;
+    const first = await sdk.queries.getCashFlowSummary(request);
+    expect(first).toMatchObject({ supportStatus: "supported", operating: "-50.01", investing: "-50.00", financing: "0.00", netCashFlow: "-100.01", unclassified: "0.00", cashTransactionCount: "1", allocatedTransactionCount: "1" });
+    // A misleading blanket AP role must not override the bill's economic lines.
+    expect(await sdk.queries.getCashFlowSummary({ ...request, accountRoles: [...request.accountRoles, { bookAccountKey: "source_1:account_ap", role: "operating" }] })).toEqual(first);
+    // Missing economic policy must stay visibly partial even with an AP default.
+    expect(await sdk.queries.getCashFlowSummary({ ...request, accountRoles: [request.accountRoles[0], request.accountRoles[1], { bookAccountKey: "source_1:account_ap", role: "operating" }] })).toMatchObject({ supportStatus: "partial", unclassified: "-100.01", unclassifiedTransactionCount: "1" });
+    // Future unapplication does not rewrite the prior period's cash flow.
+    await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 9, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    const application = paid.applications[0];
+    if (!application) throw new Error("Missing cash-flow fixture application");
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: application.applicationId, effectiveDate: "2026-09-03", expectedVersion: 1 });
+    expect(await sdk.queries.getCashFlowSummary(request)).toEqual(first);
+    // Unapplication moves no cash. The immutable clearing purpose remains
+    // authoritative; current payable allocation is a different lifecycle fact.
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodEnd: "2026-09-30" })).toMatchObject({ supportStatus: "supported", unclassified: "0.00", operating: "-50.01", investing: "-50.00" });
+    // A raw/imported-style payment lacks an immutable clearing instruction.
+    // Even a current full application and blanket AP role cannot fill that gap.
+    const raw = await sdk.commands.billPayments.record({ operation, idempotencyKey: "cash-report:raw", date: "2026-09-05", vendorId: "vendor_1", amount: "1.00", cashAccount: { accountId: "account_cash" }, payableAccount: { accountId: "account_ap" } });
+    await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "cash-report:raw-apply", applicationType: "bill_payment_to_bill", sourceDocumentId: raw.documentId, targetDocumentId: bill.documentId, amount: "1.00", applicationDate: "2026-09-05", expectedSourceVersion: 1, expectedTargetVersion: 3 });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodStart: "2026-09-01", periodEnd: "2026-09-30", accountRoles: [...request.accountRoles, { bookAccountKey: "source_1:account_ap", role: "operating" }] })).toMatchObject({ supportStatus: "partial", unclassified: "-1.00", unclassifiedTransactionCount: "1" });
+  });
+
+  it.each(["accrual", "cash"] as const)("cash-flow native bill compensation reverses the original exact allocation on %s basis", async accountingMethod => {
+    await depositFixture("cash-bill-book");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "cash-bill-book", writeSourceId: "source_1", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const equipment = (await sdk.commands.accounts.upsertTree({ operation: { ...operation, requestId: "cash-equipment" }, parent: { accountKey: "equipment", sourceAccountId: "equipment", name: "Equipment", classification: "asset", type: "asset", active: true } })).accounts[0];
+    const expense = (await sdk.commands.accounts.upsertTree({ operation: { ...operation, requestId: "cash-expense" }, parent: { accountKey: "expense", sourceAccountId: "expense", name: "Supplies", classification: "expense", type: "expense", active: true } })).accounts[0];
+    if (!equipment || !expense) throw new Error("Missing cash-flow fixture accounts");
+    const bill = await sdk.commands.vendorBills.create({ operation, idempotencyKey: "cash-report:bill", date: "2026-08-15", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" },
+      expenseLines: [{ accountId: equipment.accountId, amount: "100.01" }, { accountId: expense.accountId, amount: "100.02" }] });
+    const paid = await sdk.commands.billPayments.recordAndApply({ operation, idempotencyKey: "cash-report:partial", date: "2026-08-20", vendorId: "vendor_1", amount: "100.01", paymentMethod: "ach",
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" }, allocations: [{ billId: bill.documentId, amount: "100.01", expectedBillVersion: 1 }] });
+    const request = { periodStart: "2026-08-15", periodEnd: "2026-08-31", accountingMethod, accountRoles: [
+      { bookAccountKey: "source_1:account_cash", role: "cash" },
+      { bookAccountKey: `source_1:${equipment.accountId}`, role: "investing" },
+      { bookAccountKey: `source_1:${expense.accountId}`, role: "operating" },
+    ] } as const;
+    const first = await sdk.queries.getCashFlowSummary(request);
+    expect(first).toMatchObject({ supportStatus: "supported", operating: "-50.01", investing: "-50.00", financing: "0.00", netCashFlow: "-100.01", unclassified: "0.00", cashTransactionCount: "1", allocatedTransactionCount: "1" });
+    // A misleading blanket AP role must not override the bill's economic lines.
+    expect(await sdk.queries.getCashFlowSummary({ ...request, accountRoles: [...request.accountRoles, { bookAccountKey: "source_1:account_ap", role: "operating" }] })).toEqual(first);
+    await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 9, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    await sdk.commands.billPayments.voidAndUnapply({ operation, billPaymentId: paid.billPaymentId, expectedVersion: paid.version, idempotencyKey: "cash-report:void", date: "2026-09-03" });
+    expect(await sdk.queries.getCashFlowSummary(request)).toEqual(first);
+    const september = await sdk.queries.getCashFlowSummary({ ...request, periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+    expect(september).toMatchObject({ supportStatus: "supported", operating: "50.01", investing: "50.00", financing: "0.00", netCashFlow: "100.01", cashTransactionCount: "1", allocatedTransactionCount: "1" });
+    expect(await sdk.queries.getCashFlowSummary({ ...request, periodEnd: "2026-09-30" })).toMatchObject({ supportStatus: "supported", operating: "0.00", investing: "0.00", financing: "0.00", netCashFlow: "0.00", cashTransactionCount: "2", allocatedTransactionCount: "2" });
+  });
+
+  it("cash-flow transaction lookup migration is atomic over populated schema44 and preserves receipt facts",async()=>{
+    const bookId="cash_lookup_upgrade";await depositFixture(bookId,44);
+    const sdk=createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",bookId,writeSourceId:"source_1",currencyCode:"USD"});
+    const command={operation:sdkOperation(),idempotencyKey:"cash_lookup:receipt",date:"2026-08-12",customerId:"customer_1",amount:"100.01",cashFlowActivity:"operating" as const,cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}};
+    const receipt=await sdk.commands.customerPayments.record(command);
+    const request={periodStart:"2026-08-01",periodEnd:"2026-08-31",accountRoles:[{bookAccountKey:"source_1:account_cash",role:"cash" as const}]};
+    const report=await sdk.queries.getCashFlowSummary(request),before=await depositDatabaseState(pool);
+    const failed={transaction:<Result>(work:(client:PostgresQueryClient)=>Promise<Result>)=>runner.transaction(client=>work(new FailingMigrationClient(client,'insert into "erp_financials"."schema_migrations"')))};
+    await expect(migratePostgresSchema(failed,{appliedByRef:"cash_lookup:failed"})).rejects.toThrow("injected real migration failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    expect((await pool.query("select to_regclass('erp_financials.subledger_documents_transaction_idx') index_name")).rows).toEqual([{index_name:null}]);
+    expect((await migratePostgresSchema(runner,{appliedByRef:"cash_lookup:upgrade"})).applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[44,45],[45,46],[46,47],[47,48]]);
+    const index=(await pool.query<{indexdef:string}>("select indexdef from pg_indexes where schemaname='erp_financials' and indexname='subledger_documents_transaction_idx'")).rows[0];
+    expect(index?.indexdef).toContain("(tenant_id, company_id, source_id, transaction_id, document_type)");
+    const after=stripNewRecognitionNulls(await depositDatabaseState(pool));delete before.schema_migrations;delete after.schema_migrations;expect(after).toEqual(before);
+    expect(await sdk.queries.getCashFlowSummary(request)).toEqual(report);
+    expect((await sdk.commands.customerPayments.record(command)).documentId).toBe(receipt.documentId);
+    expect((await migratePostgresSchema(runner,{appliedByRef:"cash_lookup:retry"})).applied).toEqual([]);
+  });
+
+  it("cash-flow optimization retains historical noncash precision validation and empty-window behavior", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "cash-flow-precision" });
+    await seedAccountingScope(pool);
+    const sdk=createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",bookId:"cash-precision",writeSourceId:"source_1",currencyCode:"USD"});
+    await sdk.books.define({operation:sdkOperation(),bookId:"cash-precision",name:"Cash precision",baseCurrencyCode:"USD"});
+    await sdk.books.bindSource({operation:sdkOperation(),bookId:"cash-precision",sourceId:"source_1",sourceRole:"active"});
+    const request={periodStart:"2026-08-01",periodEnd:"2026-08-31",accountRoles:[{bookAccountKey:"source_1:account_cash",role:"cash" as const}]};
+    const empty=await sdk.queries.getCashFlowSummary(request);
+    expect(empty).toMatchObject({supportStatus:"supported",beginningCash:"0.00",endingCash:"0.00",netCashFlow:"0.00",cashPostingCount:"0",cashTransactionCount:"0"});
+    // Deliberate imported sub-cent history: noncash, before the report window,
+    // balanced in total. A faster report must still reject these scoped facts.
+    await pool.query(`insert into erp_financials.ledger_postings
+      (posting_id,tenant_id,source_id,source_posting_id,transaction_id,account_id,posting_date,accounting_basis,
+        debit_amount,credit_amount,net_amount,currency_code,dimension_hash,dimension_refs,import_batch_id)
+      values ('cash-precision-dr','tenant_1','source_1','cash-precision-dr','journal_1','account_ar','2026-07-31','accrual',
+        0.001,0,0.001,'USD',repeat('0',64),'[]','batch_1'),
+      ('cash-precision-cr','tenant_1','source_1','cash-precision-cr','journal_1','account_income','2026-07-31','accrual',
+        0,0.001,-0.001,'USD',repeat('0',64),'[]','batch_1')`);
+    await expect(sdk.queries.getCashFlowSummary(request)).rejects.toMatchObject({code:"invalid_input",message:"Cash-flow postings exceed two-decimal precision"});
+    expect(await sdk.queries.getCashFlowSummary({...request,periodStart:"2026-07-01",periodEnd:"2026-07-30"})).toMatchObject({supportStatus:"supported",endingCash:"0.00",cashTransactionCount:"0"});
+    await pool.query("update erp_financials.reporting_book_sources set effective_from='2026-08-01' where book_id='cash-precision'");
+    expect(await sdk.queries.getCashFlowSummary(request)).toEqual(empty);
+  });
+
+  it("cash-flow summary aggregates a scoped exact-money SQL snapshot without hiding unknown offsetting movements", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "cash-flow-summary" });
+    await seedAccountingScope(pool);
+    await pool.query(`insert into erp_financials.accounts(account_id,tenant_id,source_id,source_account_id,name,type,classification,active,parent_account_id) values
+      ('cash_child','tenant_1','source_1','cash-child','Savings','asset','asset',true,'account_cash'),
+      ('equipment','tenant_1','source_1','equipment','Equipment','asset','asset',true,null),
+      ('loan','tenant_1','source_1','loan','Loan','liability','liability',true,null),
+      ('interest','tenant_1','source_1','interest','Interest','expense','expense',true,null),
+      ('unknown','tenant_1','source_1','unknown','Unclassified clearing','liability','liability',true,null)`);
+    const sdk = createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",bookId:"cash-book",writeSourceId:"source_1",currencyCode:"USD",postingPolicy:"legacy_unrestricted"});
+    await sdk.books.define({operation:sdkOperation(),bookId:"cash-book",name:"Cash report",baseCurrencyCode:"USD"});
+    await sdk.books.bindSource({operation:sdkOperation(),bookId:"cash-book",sourceId:"source_1",sourceRole:"active",effectiveFrom:"2026-01-01"});
+    const post = (key:string,date:string,lines:Parameters<typeof sdk.commands.journalEntries.post>[0]["lines"]) => sdk.commands.journalEntries.post({operation:sdkOperation(),idempotencyKey:`cash-report:${key}`,date,memo:key,lines});
+    await post("opening","2026-07-31",[{accountId:"account_cash",debit:"1000.00"},{accountId:"account_income",credit:"1000.00"}]);
+    await post("receipt","2026-08-01",[{accountId:"account_cash",debit:"100.00"},{accountId:"account_ar",credit:"100.00"}]);
+    await post("supplier","2026-08-10",[{accountId:"account_ap",debit:"30.00"},{accountId:"account_cash",credit:"30.00"}]);
+    await post("equipment","2026-08-10",[{accountId:"equipment",debit:"20.00"},{accountId:"account_cash",credit:"20.00"}]);
+    await post("loan","2026-08-10",[{accountId:"account_cash",debit:"50.00"},{accountId:"loan",credit:"50.00"}]);
+    await post("transfer","2026-08-10",[{accountId:"cash_child",debit:"10.00"},{accountId:"account_cash",credit:"10.00"}]);
+    await post("noncash","2026-08-10",[{accountId:"account_ar",debit:"99.00"},{accountId:"account_income",credit:"99.00"}]);
+    await post("mixed","2026-08-10",[{accountId:"loan",debit:"20.00"},{accountId:"interest",debit:"5.00"},{accountId:"account_cash",credit:"25.00"}]);
+    await post("noncash-financing","2026-08-10",[{accountId:"equipment",debit:"100.00"},{accountId:"loan",credit:"80.00"},{accountId:"account_cash",credit:"20.00"}]);
+    await post("unknown-in","2026-08-10",[{accountId:"account_cash",debit:"7.00"},{accountId:"unknown",credit:"7.00"}]);
+    await post("unknown-out","2026-08-31",[{accountId:"unknown",debit:"7.00"},{accountId:"account_cash",credit:"7.00"}]);
+    await post("future","2026-09-01",[{accountId:"account_cash",debit:"999.00"},{accountId:"account_income",credit:"999.00"}]);
+    const request = {periodStart:"2026-08-01",periodEnd:"2026-08-31",accountRoles:[
+      {bookAccountKey:"source_1:account_cash",role:"cash"},
+      {bookAccountKey:"source_1:account_ar",role:"operating"},{bookAccountKey:"source_1:account_ap",role:"operating"},
+      {bookAccountKey:"source_1:account_income",role:"operating"},{bookAccountKey:"source_1:interest",role:"operating"},
+      {bookAccountKey:"source_1:equipment",role:"investing"},{bookAccountKey:"source_1:loan",role:"financing"},
+    ]} as const;
+    let calls=0,rows=0;
+    const measured:ErpFinancialsTransactionRunner={transaction:work=>runner.transaction(client=>work({query:async <Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{
+      calls++;const result=await client.query<Row>(sql,values);rows+=result.rows.length;return result;
+    }}))};
+    const reads=createFinancialReadModels({database:measured,tenantId:"tenant_1",companyId:"company_1",bookId:"cash-book"});
+    expect(await reads.getCashFlowSummary(request)).toMatchObject({
+      tenantId:"tenant_1",companyId:"company_1",bookId:"cash-book",periodStart:request.periodStart,periodEnd:request.periodEnd,accountingBasis:"accrual",currencyCode:"USD",
+      supportStatus:"partial",beginningCash:"1000.00",operating:"65.00",investing:"-20.00",financing:"30.00",unclassified:"-20.00",netCashFlow:"55.00",endingCash:"1055.00",
+      cashTransactionCount:"9",cashPostingCount:"10",transferTransactionCount:"1",allocatedTransactionCount:"1",unclassifiedTransactionCount:"3",unbalancedTransactionCount:"0",
+      reconciliation:{cashLedgerDifference:"0.00",classificationDifference:"0.00"},
+    });
+    expect({calls,rows}).toEqual({calls:1,rows:1});
+    const offsettingOnly=await sdk.queries.getCashFlowSummary({...request,periodStart:"2026-08-31",periodEnd:"2026-08-31"});
+    expect(offsettingOnly).toMatchObject({unclassified:"-7.00",unclassifiedTransactionCount:"1",supportStatus:"partial"});
+    // Unknown +7/-7 cancel numerically, but cannot make the statement supported.
+    await expect(sdk.queries.getCashFlowSummary({...request,accountRoles:[{bookAccountKey:"source_1:unknown",role:"cash"}]})).rejects.toMatchObject({code:"invalid_input"});
+    const offsetting=await sdk.queries.getCashFlowSummary({...request,accountRoles:request.accountRoles.map(item=>item.role!=="cash"?{...item,role:"operating" as const}:item)});
+    expect(offsetting).toMatchObject({supportStatus:"partial",unclassified:"0.00",unclassifiedTransactionCount:"2"});
+    const complete=await sdk.queries.getCashFlowSummary({...request,accountRoles:[...request.accountRoles.map(item=>item.role!=="cash"?{...item,role:"operating" as const}:item),{bookAccountKey:"source_1:unknown",role:"operating"}]});
+    expect(complete).toMatchObject({supportStatus:"supported",unclassified:"0.00",unclassifiedTransactionCount:"0",reconciliation:{cashLedgerDifference:"0.00",classificationDifference:"0.00"}});
+    await expect(sdk.queries.getCashFlowSummary({...request,accountRoles:[...request.accountRoles,{bookAccountKey:"missing",role:"operating"}]})).rejects.toMatchObject({code:"invalid_input"});
+    for(const patch of [{tenantId:"foreign"},{companyId:"foreign"},{bookId:"foreign"}]) await expect(createFinancialReadModels({database:runner,tenantId:"tenant_1",companyId:"company_1",bookId:"cash-book",...patch}).getCashFlowSummary(request)).rejects.toMatchObject({code:"missing_book"});
+    await pool.query("update erp_financials.reporting_book_sources set effective_from='2026-08-01' where book_id='cash-book'");
+    expect(await sdk.queries.getCashFlowSummary(request)).toMatchObject({beginningCash:"0.00",endingCash:"55.00"});
+    await pool.query("update erp_financials.accounts set parent_account_id='cash_child' where account_id='account_cash'");
+    await expect(sdk.queries.getCashFlowSummary(request)).rejects.toMatchObject({code:"invalid_input"});
+    await pool.query("update erp_financials.accounts set parent_account_id=null where account_id='account_cash'");
+    await pool.query("update erp_financials.reporting_book_sources set effective_from='2026-01-01',effective_through='2026-08-10' where book_id='cash-book'");
+    expect(await sdk.queries.getCashFlowSummary(request)).toMatchObject({beginningCash:"1000.00",endingCash:"1062.00"});
+    await pool.query("update erp_financials.reporting_book_sources set effective_through=null where book_id='cash-book'");
+    await sdk.books.defineAccount({operation:sdkOperation(),bookId:"cash-book",bookAccountKey:"treasury",name:"Treasury",classification:"asset",accountRole:"posting",expectedVersion:0});
+    await sdk.books.mapAccount({operation:sdkOperation(),bookId:"cash-book",sourceId:"source_1",accountId:"account_cash",bookAccountKey:"treasury"});
+    const mappedRequest={...request,accountRoles:request.accountRoles.map(item=>item.role==="cash"?{...item,bookAccountKey:"treasury"}:item)};
+    expect(await sdk.queries.getCashFlowSummary(mappedRequest)).toMatchObject({beginningCash:"1000.00",endingCash:"1055.00",transferTransactionCount:"1"});
+    await expect(sdk.queries.getCashFlowSummary(request)).rejects.toMatchObject({code:"invalid_input"});
+    await post("large-exact","2026-08-15",[{accountId:"account_cash",debit:"90071992547409.91"},{accountId:"account_income",credit:"90071992547409.91"}]);
+    expect(await sdk.queries.getCashFlowSummary(mappedRequest)).toMatchObject({netCashFlow:"90071992547464.91",endingCash:"90071992548464.91"});
+    await sdk.books.defineAccount({operation:sdkOperation(),bookId:"cash-book",bookAccountKey:"source_1:cash_child",name:"Ambiguous fallback key",classification:"asset",accountRole:"posting",expectedVersion:0});
+    await expect(sdk.queries.getCashFlowSummary(mappedRequest)).rejects.toMatchObject({code:"invalid_input"});
+  });
+
+  it.each(["reverse", "void", "correct", "replace"] as const)("reads persisted journal %s lifecycle link provenance through the public SDK", async (action) => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:journal-link-provenance" });
+    await seedAccountingScope(pool);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", bookId: "journal-link-book", writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner });
+    const operation = sdkOperation();
+    await sdk.books.define({ operation, bookId: scope.bookId, name: "Journal link proof", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: scope.bookId, sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const posted = await sdk.commands.journalEntries.post({ operation, idempotencyKey: "journal-link-original", date: "2026-08-12",
+      lines: [{ accountId: "account_cash", debit: "25.00" }, { accountId: "account_income", credit: "25.00" }] });
+    const input = { operation: { ...operation, requestId: `journal-link-${action}` }, idempotencyKey: `journal-link-${action}`, originalTransactionId: posted.transactionId, date: "2026-08-13" };
+    const result = action === "reverse" || action === "void" ? await sdk.commands.journalEntries[action](input)
+      : await sdk.commands.journalEntries[action]({ ...input, replacement: { idempotencyKey: `journal-link-${action}-replacement`, date: "2026-08-13",
+        lines: [{ accountId: "account_cash", debit: "30.00" }, { accountId: "account_income", credit: "30.00" }] } });
+    const readonlySdk = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(async client => {
+      await client.query("set transaction read only"); return work(client);
+    }) } });
+    const original = await readonlySdk.queries.getJournalEntry(posted.transactionId);
+    expect(original.status).toBe(result.outcome);
+    expect(original.links.map(link => link.journalEntryLinkId).sort()).toEqual([...result.journalEntryLinkIds].sort());
+    for (const link of original.links) {
+      expect(link.originalTransactionId).toBe(posted.transactionId);
+      expect(result.lifecycleEventIds).toContain(link.lifecycle.lifecycleEventId);
+      expect(link.lifecycle).toMatchObject({ actorRef: operation.actorRef, approverRef: operation.approverRef,
+        requestId: input.operation.requestId, correlationId: operation.correlationId, reasonCode: operation.reasonCode });
+      expect(link.lifecycle.payloadChecksum).toMatch(/^[a-f0-9]{64}$/);
+      const related = await readonlySdk.queries.getJournalEntry(link.relatedTransactionId);
+      expect(related.links.find(row => row.journalEntryLinkId === link.journalEntryLinkId)).toEqual(link);
+    }
+  });
+
   it("reads canonical journal and fiscal controls through the public SDK", async () => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:accounting-control-reads" });
     await seedAccountingScope(pool);
@@ -2015,6 +7264,14 @@ values ('native_customer', 'tenant_1', 'source_2', 'customer:1', 'customer', 'Cu
     await expect(sdk.queries.getGeneralLedgerSummary(window)).resolves.toMatchObject({
       postingCount: 8, totalDebits: "280.00", totalCredits: "280.00", difference: "0.00"
     });
+    const chart = await sdk.queries.getAccountChart({ ...window, limit: 200 });
+    expect(chart.items).toHaveLength(4);
+    expect(chart.summary).toMatchObject({ accountCount: "4", debitAmount: "280.00", creditAmount: "280.00", postingCount: "8", trialDebit: "280.00", trialCredit: "280.00" });
+    expect(chart.items.find(item => item.bookAccountKey === "receivable")).toMatchObject({ direct: { openingNet: "0.00", closingNet: "200.00", postingCount: "2" } });
+    const afterCutoff = await sdk.queries.getAccountChart({ periodStart: "2026-09-01", periodEnd: "2026-09-01" });
+    expect(afterCutoff.summary).toMatchObject({ debitAmount: "140.00", creditAmount: "140.00", postingCount: "4", trialDebit: "280.00", trialCredit: "280.00" });
+    expect(afterCutoff.items.find(item => item.bookAccountKey === "receivable")).toMatchObject({ direct: { openingNet: "100.00", closingNet: "200.00", postingCount: "1" } });
+
     await expect(sdk.queries.getFinancialStatement({ reportName: "profit_and_loss", ...window })).resolves.toMatchObject({
       totals: { income: "200.00" }
     });
@@ -2296,12 +7553,14 @@ insert into erp_financials.journal_entry_links values
       limit: 1
     });
     expect(first.totals).toEqual({
+      settlement: { cashAppliedAmount: "90.00", creditAppliedAmount: "0.00", writeOffAppliedAmount: "0.00" },
       invoiceCount: 2,
       invoicedAmount: "130.00",
       appliedAmount: "90.00",
       outstandingAmount: "40.00"
     });
     expect(first.pageTotals).toEqual({
+      settlement: { cashAppliedAmount: "60.00", creditAppliedAmount: "0.00", writeOffAppliedAmount: "0.00" },
       invoiceCount: 1,
       invoicedAmount: "100.00",
       appliedAmount: "60.00",
@@ -2360,6 +7619,3440 @@ insert into erp_financials.journal_entry_links values
       "select open_amount::text from erp_financials.subledger_documents where subledger_document_id = 'invoice_1'"
     );
     expect(mutableBalance.rows[0]?.open_amount).toBe("60");
+  });
+
+  it.each([false, true])("native receipt cash return preserves invoice and cash agreement (applied=%s)", async (applied) => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:receipt-return" });
+    await seedAccountingScope(pool);
+    const sdk = createErpFinancials({ database: runner, tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1", currencyCode: "USD" });
+    const operation = sdkOperation();
+    await sdk.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const receipt = await sdk.customerPayments.record({ operation, idempotencyKey: "return:receipt", ...(applied ? { collectionRef: "collection:original-order" } : {}), date: "2026-08-01", customerId: "customer_1", amount: "100.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const invoice = await sdk.invoices.create({ operation, idempotencyKey: "return:invoice", date: "2026-08-02", dueDate: "2026-08-31", customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const application = applied ? await sdk.paymentApplications.apply({ operation, idempotencyKey: "return:apply", applicationType: "customer_payment_to_invoice", sourceDocumentId: receipt.documentId, targetDocumentId: invoice.documentId, amount: "100.00", applicationDate: "2026-08-02", expectedSourceVersion: 1, expectedTargetVersion: 1 }) : undefined;
+    const command = { operation, idempotencyKey: "return:20", paymentId: receipt.documentId, customerId: "customer_1", expectedVersion: applied ? 2 : 1, date: "2026-08-03", amount: "20.00", returnKind: "refund" as const, externalReturnRef: "provider:return:20", releases: application ? [{ applicationId: application.applicationId, expectedVersion: 1, amount: "20.00" }] : [] };
+    const snapshot = async () => {
+      const result: Record<string, unknown> = {};
+      for (const table of ["subledger_documents", "subledger_applications", "ledger_postings", "financial_lifecycle_events", "financial_outbox"]) {
+        result[table] = (await pool.query(`select row_to_json(t)::text as row from erp_financials.${table} t order by row_to_json(t)::text`)).rows;
+      }
+      return result;
+    };
+    const before = await snapshot();
+    const readOnlyPlanner = createErpFinancials({ tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1", currencyCode: "USD",
+      database: { transaction: work => runner.transaction(client => work({
+        query<Row extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: readonly unknown[]) {
+          expect(sql.trim()).toMatch(/^select\b/iu);
+          return client.query<Row>(sql, params);
+        }
+      })) } });
+    const planInput = { paymentId: command.paymentId, customerId: command.customerId, expectedVersion: command.expectedVersion,
+      date: command.date, amount: command.amount, returnKind: command.returnKind, releases: command.releases.map(row => ({ ...row })) };
+    const pendingPreview = readOnlyPlanner.customerPayments.previewReturnCash(planInput);
+    planInput.amount = "999.00";
+    if (planInput.releases[0]) planInput.releases[0].amount = "999.00";
+    await expect(pendingPreview).resolves.toEqual({
+      paymentId: receipt.documentId, paymentVersion: applied ? 2 : 1, amount: "20.00",
+      unappliedAmount: applied ? "0.00" : "100.00", releasedAmount: applied ? "20.00" : "0.00",
+      remainingReturnableAmount: "80.00", releases: command.releases
+    });
+    expect(await snapshot()).toEqual(before);
+    for (const changed of [
+      { customerId: "customer_2" }, { amount: "101.00" }, { expectedVersion: 99 },
+      { date: "2026-07-31" }, { returnKind: "void" as const },
+      { releases: [{ applicationId: "missing-application", expectedVersion: 1, amount: "20.00" }] },
+      ...(application ? [{ releases: [{ applicationId: application.applicationId, expectedVersion: 99, amount: "20.00" }] }] : [])
+    ]) {
+      await expect(sdk.customerPayments.previewReturnCash({ ...command, ...changed })).rejects.toBeDefined();
+      expect(await snapshot()).toEqual(before);
+    }
+    await pool.query("update erp_financials.accounts set active=false where account_id='account_cash'");
+    await expect(sdk.customerPayments.previewReturnCash(command)).rejects.toBeDefined();
+    await pool.query("update erp_financials.accounts set active=true where account_id='account_cash'");
+    if (application) {
+      await pool.query("update erp_financials.accounts set active=false where account_id='account_income'");
+      await expect(sdk.customerPayments.previewReturnCash(command)).rejects.toBeDefined();
+      await pool.query("update erp_financials.accounts set active=true where account_id='account_income'");
+    }
+    expect(await snapshot()).toEqual(before);
+    for (const changed of [
+      { customerId: "customer_2" }, { amount: "101.00" }, { expectedVersion: 99 },
+      { date: "2026-07-31" }, { returnKind: "void" as const },
+      { operation: { ...operation, approverRef: operation.actorRef } },
+      { releases: [{ applicationId: "missing-application", expectedVersion: 1, amount: "20.00" }] }
+    ]) {
+      await expect(sdk.customerPayments.returnCash({ ...command, ...changed })).rejects.toBeDefined();
+      expect(await snapshot()).toEqual(before);
+    }
+    await expect(runner.transaction(async (client) => {
+      const atomic = createErpFinancials({ database: { transaction: async (work) => work(client) }, tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1", currencyCode: "USD" });
+      await atomic.customerPayments.returnCash(command);
+      throw new Error("late-host-failure");
+    })).rejects.toThrow("late-host-failure");
+    expect(await snapshot()).toEqual(before);
+    // Even a host that accidentally swallows an interruption before settlement
+    // cannot commit the already-posted cash return.
+    await expect(runner.transaction(async (client) => {
+      const interrupted = new FailingReceiptSettlementClient(client);
+      const atomic = createErpFinancials({ database: { transaction: async (work) => work(interrupted) }, tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1", currencyCode: "USD" });
+      await expect(atomic.customerPayments.returnCash(command)).rejects.toThrow("interrupted before receipt settlement");
+    })).rejects.toThrow("receipt return must commit with its settlement and completed lifecycle");
+    expect(await snapshot()).toEqual(before);
+    const results = await Promise.all([sdk.customerPayments.returnCash(command), sdk.customerPayments.returnCash(command)]);
+    expect(results.map((result) => result.status).sort()).toEqual(["already_returned", "returned"]);
+    const result = results.find((result) => result.status === "returned");
+    if (!result) throw new Error("Concurrent return did not produce a committed result");
+    expect(result).toMatchObject({ status: "returned", amount: "20.00", remainingReturnableAmount: "80.00" });
+    await expect(sdk.customerPayments.returnCash(command)).resolves.toMatchObject({ ...result, status: "already_returned" });
+    // Preflight did not reserve anything: its version is stale after another command commits.
+    await expect(sdk.customerPayments.previewReturnCash(command)).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    await expect(sdk.customerPayments.returnCash({ ...command, amount: "21.00" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    const docs = (await pool.query("select subledger_document_id as id, open_amount::numeric(18,2)::text as amount from erp_financials.subledger_documents order by id")).rows;
+    expect(docs).toContainEqual({ id: receipt.documentId, amount: applied ? "0.00" : "80.00" });
+    expect(docs).toContainEqual({ id: invoice.documentId, amount: applied ? "20.00" : "100.00" });
+    expect(docs).toContainEqual({ id: result.refundDocumentId, amount: "0.00" });
+    const balances = (await pool.query("select accounting_basis as basis, account_id as account, sum(debit_amount-credit_amount)::numeric(18,2)::text as balance from erp_financials.ledger_postings group by 1,2")).rows;
+    for (const basis of ["cash", "accrual"]) expect(balances).toContainEqual({ basis, account: "account_cash", balance: "80.00" });
+    expect(balances).toContainEqual({ basis: "accrual", account: "account_ar", balance: "20.00" });
+    if (applied) expect(balances).toContainEqual({ basis: "cash", account: "account_income", balance: "-80.00" });
+    const reporting = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "return_book", currencyCode: "USD" });
+    await reporting.books.define({ operation, bookId: "return_book", name: "Return reporting", baseCurrencyCode: "USD" });
+    await reporting.books.bindSource({ operation, bookId: "return_book", sourceId: "source_1", sourceRole: "active" });
+    const historical = await reporting.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-02", limit: 10 });
+    const current = await reporting.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-03", limit: 10 });
+    expect(historical.totals.outstandingAmount).toBe(applied ? "0.00" : "100.00");
+    expect(current.totals.outstandingAmount).toBe(applied ? "20.00" : "100.00");
+    expect((await reporting.queries.getAging({ kind: "receivables", asOfDate: "2026-08-02" })).totals.total).toBe("0.00");
+    expect((await reporting.queries.getAging({ kind: "receivables", asOfDate: "2026-08-03" })).totals.total).toBe("20.00");
+    const receiptDetail = await reporting.queries.getCustomerPayment(receipt.documentId);
+    const originalReceipt = (await pool.query<{ created_at: Date; updated_at: Date; idempotency_key: string; actor_ref: string }>(
+      `select document.created_at,document.updated_at,document.idempotency_key,event.actor_ref
+       from erp_financials.subledger_documents document join erp_financials.financial_lifecycle_events event
+       on event.event_id=document.lifecycle_event_id where document.subledger_document_id=$1`, [receipt.documentId])).rows[0];
+    expect(receiptDetail).toMatchObject({ createdAt: originalReceipt?.created_at.toISOString(), updatedAt: originalReceipt?.updated_at.toISOString(),
+      idempotencyKey: originalReceipt?.idempotency_key, creationLifecycle: { actorRef: originalReceipt?.actor_ref, lifecycleEventId: receiptDetail.lifecycleEventId } });
+    expect(receiptDetail.unappliedAmount).toBe(applied ? "0.00" : "80.00");
+    expect(receiptDetail).toMatchObject({ returnedAmount: "20.00", retainedAmount: "80.00", matchedApplicationCount: applied ? 1 : 0 });
+    expect(receiptDetail.applications).toEqual(expect.arrayContaining([expect.objectContaining({ applicationType: "customer_payment_to_refund", amount: "20.00", status: "applied" })]));
+    const paymentPage = await reporting.queries.listPayments({ paymentType: "customer_payment", limit: 10 });
+    expect(paymentPage.items).toEqual([expect.objectContaining({ paymentId: receipt.documentId, returnedAmount: "20.00", retainedAmount: "80.00", matchedApplicationCount: applied ? 1 : 0 })]);
+    expect(paymentPage.items[0]?.collectionRef).toBe(applied ? "collection:original-order" : undefined);
+    for(const status of ["applied","partial","unapplied","returned","voided"] as const){
+      const filtered=await reporting.queries.listPayments({paymentType:"customer_payment",status,limit:1});
+      expect(filtered.items.map(item=>item.paymentId)).toEqual(status===(applied?"applied":"partial")?[receipt.documentId]:[]);
+    }
+    const register = await reporting.queries.listCustomerPaymentRegister({ periodStart: "2026-08-01", periodEnd: "2026-08-31", sort: "date", direction: "asc", limit: 10 });
+    expect(register.items).toEqual([expect.objectContaining({ paymentId: receipt.documentId, returnedAmount: "20.00", retainedAmount: "80.00", matchingMode: applied ? "manual" : "unmatched" })]);
+    expect(register.totals).toMatchObject({ returnedAmount: "20.00", retainedAmount: "80.00" });
+    const paymentSummary = await reporting.queries.getPaymentSummary({ periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    expect(paymentSummary.matchedPaymentCount).toBe(applied ? 1 : 0);
+    expect(paymentSummary).toMatchObject({ returnedAmount: "20.00", retainedAmount: "80.00" });
+    const after = await snapshot();
+    await expect(sdk.customerPayments.returnCash({ ...command, idempotencyKey: "different-key", expectedVersion: result.paymentVersion, releases: [] })).rejects.toBeDefined();
+    expect(await snapshot()).toEqual(after);
+    if (!applied) {
+      const competing = await Promise.allSettled(["a", "b"].map((key) => sdk.customerPayments.returnCash({
+        ...command, idempotencyKey: `return:remaining:${key}`, externalReturnRef: `provider:remaining:${key}`,
+        expectedVersion: result.paymentVersion, amount: "80.00"
+      })));
+      expect(competing.filter((entry) => entry.status === "fulfilled")).toHaveLength(1);
+      expect(competing.filter((entry) => entry.status === "rejected")).toHaveLength(1);
+      const totals = (await pool.query("select sum(applied_amount)::numeric(18,2)::text as total from erp_financials.subledger_applications where application_type='customer_payment_to_refund' and source_document_id=$1", [receipt.documentId])).rows;
+      expect(totals).toEqual([{ total: "100.00" }]);
+      expect(await reporting.queries.getCustomerPayment(receipt.documentId)).toMatchObject({
+        status: "returned", returnedAmount: "100.00", retainedAmount: "0.00", unappliedAmount: "0.00", matchedApplicationCount: 0
+      });
+      const returnedPage = await reporting.queries.listPayments({ paymentType: "customer_payment", status: "returned", limit: 10 });
+      expect(returnedPage.items).toEqual([expect.objectContaining({ paymentId: receipt.documentId, status: "returned", retainedAmount: "0.00" })]);
+      expect((await reporting.queries.listPayments({paymentType:"customer_payment",status:"applied",limit:1})).items).toEqual([]);
+      expect((await reporting.queries.listPayments({paymentType:"customer_payment",status:"partial",limit:1})).items).toEqual([]);
+    }
+    await expect(sdk.paymentApplications.unapply({ operation, applicationId: result.settlementApplicationId, expectedVersion: 1, effectiveDate: "2026-08-04" })).rejects.toMatchObject({ code: "terminal_state_conflict" });
+    await expect(pool.query("delete from erp_financials.subledger_applications where subledger_application_id=$1", [result.settlementApplicationId])).rejects.toThrow("receipt return settlement is immutable");
+  });
+
+  it.each(["refund", "void"] as const)("native receipt %s consumes available credit before releasing invoices", async (kind) => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:mixed-return" });
+    await seedAccountingScope(pool);
+    const sdk = depositService(runner);
+    const operation = sdkOperation();
+    await sdk.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const receipt = await sdk.customerPayments.record({ operation, idempotencyKey: "mixed:receipt", date: "2026-08-01", customerId: "customer_1", amount: "100.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const invoice = await sdk.invoices.create({ operation, idempotencyKey: "mixed:invoice", date: "2026-08-02", dueDate: "2026-08-31", customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "60.00" }] });
+    const application = await sdk.paymentApplications.apply({ operation, idempotencyKey: "mixed:apply", applicationType: "customer_payment_to_invoice", sourceDocumentId: receipt.documentId, targetDocumentId: invoice.documentId, amount: "60.00", applicationDate: "2026-08-02", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    const amount = kind === "void" ? "100.00" : "60.00";
+    const released = kind === "void" ? "60.00" : "20.00";
+    const retained = kind === "void" ? "0.00" : "40.00";
+    const command = { operation, idempotencyKey: "mixed:return", externalReturnRef: "provider:mixed", paymentId: receipt.documentId, customerId: "customer_1", expectedVersion: 2, date: "2026-08-03", amount, returnKind: kind,
+      releases: [{ applicationId: application.applicationId, expectedVersion: 1, amount: released }] };
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.customerPayments.returnCash({ ...command, releases: [{ ...command.releases[0], applicationId: application.applicationId, expectedVersion: 1, amount }] })).rejects.toThrow("Release plan must use available receipt credit first");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const result = await sdk.customerPayments.returnCash(command);
+    expect(result).toMatchObject({ amount, releasedAmount: released, remainingReturnableAmount: retained });
+    const balances = (await pool.query("select accounting_basis as basis, account_id as account, sum(debit_amount-credit_amount)::numeric(18,2)::text as balance from erp_financials.ledger_postings group by 1,2")).rows;
+    for (const basis of ["cash", "accrual"]) expect(balances).toContainEqual({ basis, account: "account_cash", balance: retained });
+    expect(balances).toContainEqual({ basis: "accrual", account: "account_ar", balance: released });
+    expect(balances).toContainEqual({ basis: "cash", account: "account_income", balance: kind === "void" ? "0.00" : "-40.00" });
+    await closeDepositPeriod(pool, sdk);
+    const closed = await depositDatabaseState(pool);
+    // Completed commands remain replayable after close; a new return cannot post.
+    await expect(sdk.customerPayments.returnCash(command)).resolves.toMatchObject({ status: "already_returned" });
+    if (kind === "refund") {
+      await expect(sdk.customerPayments.returnCash({ ...command, idempotencyKey: "closed:return", externalReturnRef: "provider:closed", expectedVersion: result.paymentVersion, amount: "40.00", releases: [] })).rejects.toMatchObject({ code: "fiscal_period_closed" });
+      expect(await depositDatabaseState(pool)).toEqual(closed);
+    }
+  });
+
+  it("pages scoped invoice audit across draft, posting, correction and application evidence without timestamp loss", async () => {
+    await depositFixture("invoice_audit");
+    const options = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_audit", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(options);
+    const operation = sdkOperation();
+    const draft = await sdk.invoices.createDraft({ operation, idempotencyKey: "audit:draft", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, documentDate: "2026-08-01", dueDate: "2026-08-31",
+      revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    expect((await sdk.queries.listInvoiceAudit(draft.invoiceDraftId)).items.map(event => event.eventType)).toEqual(["invoice.draft_created"]);
+    const issued = await sdk.invoices.issue({ operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1, idempotencyKey: "audit:issue" });
+    const payment = await sdk.commands.customerPayments.record({ operation, idempotencyKey: "audit:receipt", customerId: "customer_1",
+      date: "2026-08-10", amount: "25.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "audit:apply",
+      applicationType: "customer_payment_to_invoice", sourceDocumentId: payment.documentId, targetDocumentId: issued.invoiceDocumentId,
+      amount: "25.00", applicationDate: "2026-08-10", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: application.applicationId, expectedVersion: 1, effectiveDate: "2026-08-11" });
+    await sdk.commands.invoices.correctDates({ operation, invoiceId: issued.invoiceDocumentId, expectedVersion: 3,
+      idempotencyKey: "audit:correct", documentDate: "2026-08-02", dueDate: "2026-08-31" });
+    await sdk.invoices.recordDelivery({ operation, invoiceDocumentId: issued.invoiceDocumentId, idempotencyKey: "audit:delivery",
+      status: "delivered", channel: "test_sender", occurredAt: "2026-08-12T12:00:00.000Z" });
+    const unrelated = await sdk.commands.invoices.create({ operation, idempotencyKey: "audit:unrelated", customerId: "customer_1",
+      date: "2026-08-01", dueDate: "2026-08-31", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "10.00" }] });
+    const micros = [];
+    for (const suffix of ["001", "002", "003"]) {
+      const recordedAt = `2030-01-01T12:00:00.123${suffix}Z`;
+      const event = await appendFinancialLifecycleEvent(pool, { tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1",
+        aggregateType: "invoice", aggregateId: issued.invoiceDocumentId, eventType: "invoice.audit_fixture",
+        idempotencyKey: `audit:micros:${suffix}`, operation, recordedAt, payload: { synthetic: true } });
+      micros.push({ id: event.eventId, recordedAt });
+    }
+    const all = await sdk.queries.listInvoiceAudit(issued.invoiceDocumentId, { limit: 200 });
+    expect(all.items.map(event => event.eventType)).toEqual(expect.arrayContaining([
+      "invoice.draft_created", "invoice.issued", "subledger.invoice.posted", "subledger.invoice.dates_corrected",
+      "subledger_application.applied", "subledger_application.unapplied", "invoice.delivery_delivered"
+    ]));
+    expect(all.items).toHaveLength(10);
+    expect(all.items.slice(0, 3).map(event => ({ id: event.lifecycleEventId, recordedAt: event.recordedAt }))).toEqual(micros.reverse());
+    expect(all.items.every(event => event.actorRef === operation.actorRef && event.approverRef === operation.approverRef)).toBe(true);
+    expect(all.items.some(event => event.aggregateId === unrelated.documentId || event.aggregateId === unrelated.journal.transactionId)).toBe(false);
+    expect(all.items.some(event => event.aggregateId === payment.journal.transactionId)).toBe(false);
+    expect((await sdk.queries.listInvoiceAudit(draft.invoiceDraftId, { limit: 200 })).items).toEqual(all.items);
+    const paged = [];
+    let cursor: string | undefined;
+    do {
+      const page = await sdk.queries.listInvoiceAudit(issued.invoiceDocumentId, { limit: 1, ...(cursor ? { cursor } : {}) });
+      paged.push(...page.items);
+      if (page.nextCursor) {
+        await expect(sdk.queries.listInvoiceAudit(unrelated.documentId, { cursor: page.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+        const otherCompany = createErpFinancialsSdk({ ...options, companyId: "another_company" });
+        await expect(otherCompany.queries.listInvoiceAudit(issued.invoiceDocumentId, { cursor: page.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
+    expect(paged).toEqual(all.items);
+    await expect(sdk.queries.listInvoiceAudit("missing")).rejects.toMatchObject({ code: "missing_document" });
+    await expect(sdk.queries.listInvoiceAudit(issued.invoiceDocumentId, { limit: 201 })).rejects.toMatchObject({ code: "invalid_input" });
+    const unbound = createErpFinancialsSdk({ ...options, bookId: "audit_unbound" });
+    await unbound.books.define({ operation, bookId: "audit_unbound", name: "Audit unbound", baseCurrencyCode: "USD" });
+    await expect(unbound.queries.listInvoiceAudit(issued.invoiceDocumentId)).rejects.toMatchObject({ code: "missing_document" });
+  });
+
+  it("pages vendor bill audit across posting, holds, scheduled cancellation and settlement without unrelated evidence", async () => {
+    const { sdk, options, operation, bill, hold, payment } = await paymentHoldFixture();
+    const scheduled = await sdk.commands.billPayments.schedule({ ...payment, idempotencyKey: "bill-audit:cancelled" });
+    await sdk.commands.billPayments.cancel({ operation, billPaymentId: scheduled.billPaymentId, expectedVersion: 1, idempotencyKey: "bill-audit:cancel" });
+    await sdk.commands.vendorBills.setPaymentHold(hold);
+    await sdk.commands.vendorBills.setPaymentHold({ ...hold, idempotencyKey: "bill-audit:release", expectedVersion: 2, paymentHold: false, reason: "Review complete" });
+    const cleared = await sdk.commands.billPayments.recordAndApply({ ...payment, idempotencyKey: "bill-audit:paid",
+      allocations: [{ billId: bill.documentId, amount: "20.00", expectedBillVersion: 3 }] });
+    const application = cleared.applications[0];
+    if (!application) throw new Error("Expected a settled bill application");
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: application.applicationId, expectedVersion: 1, effectiveDate: "2026-08-13" });
+    const unrelated = await sdk.commands.vendorBills.create({ operation, idempotencyKey: "bill-audit:unrelated", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "100.00" }] });
+    const unrelatedPayment = await sdk.commands.billPayments.schedule({ ...payment, idempotencyKey: "bill-audit:unrelated-payment",
+      allocations: [{ billId: unrelated.documentId, amount: "20.00", expectedBillVersion: 1 }] });
+    const micros = [];
+    for (const suffix of ["001", "002", "003"]) {
+      const recordedAt = `2030-01-01T12:00:00.123${suffix}Z`;
+      const event = await appendFinancialLifecycleEvent(pool, { tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1",
+        aggregateType: "subledger_document", aggregateId: bill.documentId, eventType: "vendor_bill.audit_fixture",
+        idempotencyKey: `bill-audit:micros:${suffix}`, operation, recordedAt, payload: { synthetic: true } });
+      micros.push({ id: event.eventId, recordedAt });
+    }
+    const all = await sdk.queries.listVendorBillAudit(bill.documentId, { limit: 200 });
+    expect(all.items.map(event => event.eventType)).toEqual(expect.arrayContaining([
+      "subledger.vendor_bill.posted", "subledger.vendor_bill.payment_hold_changed", "bill_payment.scheduled", "bill_payment.cancelled",
+      "bill_payment.cleared", "subledger.bill_payment.posted", "subledger_application.applied", "subledger_application.unapplied"
+    ]));
+    expect(new Set(all.items.map(event => event.lifecycleEventId)).size).toBe(all.items.length);
+    expect(all.items.find(event => event.lifecycleEventId === bill.journal.lifecycleEventId)?.actorRef).toBe(operation.actorRef);
+    expect(all.items.some(event => event.aggregateId === unrelated.documentId || event.aggregateId === unrelated.journal.transactionId || event.aggregateId === unrelatedPayment.billPaymentId)).toBe(false);
+    expect(all.items.slice(0, 3).map(event => ({ id: event.lifecycleEventId, recordedAt: event.recordedAt }))).toEqual(micros.reverse());
+    const paged = [];
+    let cursor: string | undefined;
+    do {
+      const page = await sdk.queries.listVendorBillAudit(bill.documentId, { limit: 2, ...(cursor ? { cursor } : {}) });
+      paged.push(...page.items);
+      if (page.nextCursor) {
+        await expect(sdk.queries.listVendorBillAudit(unrelated.documentId, { cursor: page.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+        await expect(createErpFinancialsSdk({ ...options, companyId: "another_company" }).queries.listVendorBillAudit(bill.documentId, { cursor: page.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+        await expect(sdk.queries.listInvoiceAudit(bill.documentId, { cursor: page.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
+    expect(paged).toEqual(all.items);
+    await expect(sdk.queries.listVendorBillAudit("missing")).rejects.toMatchObject({ code: "missing_document" });
+    await expect(sdk.queries.listVendorBillAudit(bill.documentId, { limit: 201 })).rejects.toMatchObject({ code: "invalid_input" });
+    const unbound = createErpFinancialsSdk({ ...options, bookId: "bill_audit_unbound" });
+    await unbound.books.define({ operation, bookId: "bill_audit_unbound", name: "Audit unbound", baseCurrencyCode: "USD" });
+    await expect(unbound.queries.listVendorBillAudit(bill.documentId)).rejects.toMatchObject({ code: "missing_document" });
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+      await client.query("set local enable_seqscan=off");
+      const plan = await client.query("explain (costs off) select bill_payment_id from erp_financials.bill_payment_disbursements where allocations @> $1::jsonb", [JSON.stringify([{ billId: bill.documentId }])]);
+      expect(JSON.stringify(plan.rows)).toContain("bill_payment_disbursements_allocations_gin_idx");
+      await client.query("drop index erp_financials.bill_payment_disbursements_allocations_gin_idx");
+      await client.query("create index bill_payment_disbursements_allocations_gin_idx on erp_financials.bill_payment_disbursements using btree (allocations)");
+      const validation = await validatePostgresSchema(new PgQueryClient(client));
+      expect(validation.issues).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "incompatible_index_definition", objectName: "bill_payment_disbursements_allocations_gin_idx" })]));
+    } finally { await client.query("rollback"); client.release(); }
+  });
+
+  it("vendor bill audit index upgrades schema 32 without changing accounting data", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "bill-audit:old", targetVersion: 32 });
+    await seedAccountingScope(pool);
+    const service = depositService(preComponentFixtureRunner(runner), { postingPolicy: "legacy_unrestricted" });
+    const bill = await service.vendorBills.create({ operation: sdkOperation(), idempotencyKey: "bill-audit:old-bill", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "100.00" }] });
+    await service.billPayments.schedule({ operation: sdkOperation(), idempotencyKey: "bill-audit:old-payment", date: "2026-08-12", vendorId: "vendor_1", amount: "20.00", paymentMethod: "ach", reference: "AP-OLD",
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" }, allocations: [{ billId: bill.documentId, amount: "20.00", expectedBillVersion: 1 }] });
+    const before = await depositDatabaseState(pool);
+    const result = await migratePostgresSchema(runner, { appliedByRef: "bill-audit:upgrade" });
+    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48]]);
+    const after = stripNewComponentNulls(await depositDatabaseState(pool));
+    for (const table of Object.keys(before)) if (table !== "schema_migrations") expect(after[table], table).toEqual(before[table]);
+    expect((await validatePostgresSchema(pool)).compatible).toBe(true);
+  });
+
+  it("reads current scoped bill summaries without loading lines or payment history", async () => {
+    await depositFixture("bill_summary");
+    const sdk = createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",writeSourceId:"source_1",bookId:"bill_summary",currencyCode:"USD"});
+    const operation = { ...sdkOperation(), occurredAt: "2026-08-12T11:59:00Z" };
+    const bill = await sdk.commands.vendorBills.create({operation,idempotencyKey:"summary:bill",vendorId:"vendor_1",date:"2026-08-01",dueDate:"2026-08-31",
+      payableAccount:{accountId:"account_ap"},expenseLines:[{accountId:"account_cash",amount:"50.00"}]});
+    expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({documentType:"vendor_bill",sourceId:"source_1",partyId:"vendor_1",documentDate:"2026-08-01",dueDate:"2026-08-31",originalAmount:"50.00",openAmount:"50.00",version:1,status:"open"});
+    const paymentCommand = {operation,idempotencyKey:"summary:pay",vendorId:"vendor_1",date:"2026-08-10",amount:"20.00",paymentMethod:"ach" as const,
+      payableAccount:{accountId:"account_ap"},cashAccount:{accountId:"account_cash"},allocations:[{billId:bill.documentId,amount:"20.00",expectedBillVersion:1}]};
+    await sdk.commands.billPayments.recordAndApply(paymentCommand);
+    await expect(sdk.commands.billPayments.recordAndApply(paymentCommand)).resolves.toMatchObject({status:"already_cleared"});
+    const beforeRetry = await depositDatabaseState(pool);
+    await expect(sdk.commands.billPayments.recordAndApply({ ...paymentCommand, operation: { ...operation,
+      requestId: "retry-request", correlationId: "retry-correlation", occurredAt: "2026-08-12T11:59:01Z" } })).resolves.toMatchObject({ status: "already_cleared" });
+    expect(await depositDatabaseState(pool)).toEqual(beforeRetry);
+    for (const changed of [{ actorRef: "other" }, { approverRef: "other" }, { reasonCode: "other" }, { reasonDetail: "other" }]) {
+      await expect(sdk.commands.billPayments.recordAndApply({ ...paymentCommand, operation: { ...operation, ...changed } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+      expect(await depositDatabaseState(pool)).toEqual(beforeRetry);
+    }
+    const summary = await sdk.queries.getOperationalDocumentSummary(bill.documentId);
+    expect(summary).toMatchObject({openAmount:"30.00",version:2,status:"partially_applied"});
+    expect(summary).not.toHaveProperty("applications");expect(summary).not.toHaveProperty("lines");
+    // Fail if a point read regresses into detail/history queries. This runner
+    // delegates every permitted statement to real PostgreSQL.
+    const bounded = createErpFinancialsSdk({database:{transaction:work=>runner.transaction(client=>work({query:(text,values)=>{
+      if (/subledger_applications|subledger_document_lines/.test(text)) throw new Error("Summary loaded history");
+      return client.query(text,values);
+    }}))},tenantId:"tenant_1",companyId:"company_1",writeSourceId:"source_1",bookId:"bill_summary",currencyCode:"USD"});
+    expect(await bounded.queries.getOperationalDocumentSummary(bill.documentId)).toEqual(summary);
+    for (const foreign of [{companyId:"other",bookId:"bill_summary"},{companyId:"company_1",bookId:"other"}]) {
+      const outside=createErpFinancialsSdk({database:runner,tenantId:"tenant_1",...foreign,writeSourceId:"source_1",currencyCode:"USD"});
+      await expect(outside.queries.getOperationalDocumentSummary(bill.documentId)).rejects.toThrow();
+    }
+    await expect(sdk.queries.getOperationalDocumentSummary(bill.documentId,"source_2")).rejects.toMatchObject({code:"missing_document"});
+    await expect(sdk.queries.getOperationalDocumentSummary("missing")).rejects.toMatchObject({code:"missing_document"});
+  });
+
+  it("summarizes first cash coverage from effective receipt and application history independently of delivery order", async () => {
+    await depositFixture("coverage_history");
+    const sdk=createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",writeSourceId:"source_1",bookId:"coverage_history",currencyCode:"USD"});
+    const operation=sdkOperation(),base={sourceId:"source_1",customerId:"customer_1",collectionRef:"history:A"};
+    const record=async(key:string,date:string,amount:string,collectionRef=base.collectionRef)=>sdk.commands.customerPayments.record({operation,idempotencyKey:key,customerId:"customer_1",collectionRef,date,amount,cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    const first=await record("history:first","2026-08-08","50.00");
+    const request={...base,unbilledAmount:"106.00"};
+    const history=async(r=request)=>{const [result]=await sdk.queries.getReceivableCollectionCoverageHistory({requests:[r]});if(!result)throw new Error("Missing history result");return result;};
+    expect(await history()).toMatchObject({firstCoveredOn:null,currentCashCoverageAmount:"50.00"});
+    const second=await record("history:second","2026-08-09","56.00");
+    expect(await history()).toMatchObject({firstCoveredOn:"2026-08-09",requiredAmount:"106.00",currentCashCoverageAmount:"106.00"});
+    const invoice=await sdk.commands.invoices.create({operation,idempotencyKey:"history:invoice",customerId:"customer_1",date:"2026-08-08",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"106.00"}]});
+    const application=await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"history:move",applicationType:"customer_payment_to_invoice",sourceDocumentId:first.documentId,targetDocumentId:invoice.documentId,amount:"50.00",applicationDate:"2026-08-10",expectedSourceVersion:1,expectedTargetVersion:1});
+    expect(await history()).toMatchObject({firstCoveredOn:"2026-08-09",currentCashCoverageAmount:"56.00"});
+    const invoiceRequest={...base,collectionRef:"history:B",invoiceId:invoice.documentId};
+    expect((await sdk.queries.getReceivableCollectionCoverageHistory({requests:[invoiceRequest]}))[0]).toMatchObject({firstCoveredOn:null,currentCashCoverageAmount:"50.00"});
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-11"});
+    expect(await history()).toMatchObject({firstCoveredOn:"2026-08-09",currentCashCoverageAmount:"106.00"});
+    await sdk.commands.customerPayments.returnCash({operation:{...operation,approverRef:"independent"},idempotencyKey:"history:return",paymentId:second.documentId,customerId:"customer_1",expectedVersion:1,date:"2026-08-12",amount:"6.00",returnKind:"refund",externalReturnRef:"history:refund",releases:[]});
+    expect(await history()).toMatchObject({firstCoveredOn:"2026-08-09",currentCashCoverageAmount:"100.00"});
+    // A higher current target must not count refunded cash as later coverage.
+    expect(await history({...request,unbilledAmount:"110.00"})).toMatchObject({firstCoveredOn:null});
+    await record("history:topup","2026-08-13","10.00");
+    expect(await history({...request,unbilledAmount:"110.00"})).toMatchObject({firstCoveredOn:"2026-08-13",currentCashCoverageAmount:"110.00"});
+    // Entry order differs from effective order; an old effective receipt changes
+    // historical evidence without changing transport delivery semantics.
+    await record("history:backdated","2026-08-07","10.00");
+    expect(await history({...request,unbilledAmount:"110.00"})).toMatchObject({firstCoveredOn:"2026-08-09",currentCashCoverageAmount:"120.00"});
+    const cashVoid=await record("history:cash-void","2026-08-08","20.00","history:C");
+    await sdk.commands.customerPayments.returnCash({operation:{...operation,approverRef:"independent"},idempotencyKey:"history:void",paymentId:cashVoid.documentId,customerId:"customer_1",expectedVersion:1,date:"2026-08-09",amount:"20.00",returnKind:"void",externalReturnRef:"history:void",releases:[]});
+    expect(await history({...request,collectionRef:"history:C",unbilledAmount:"20.00"})).toMatchObject({firstCoveredOn:"2026-08-08",currentCashCoverageAmount:"0.00"});
+    expect(await history({...request,collectionRef:"history:C",unbilledAmount:"20.01"})).toMatchObject({firstCoveredOn:null});
+    const batch=await sdk.queries.getReceivableCollectionCoverageHistory({requests:[request,...Array.from({length:199},(_,i)=>({...request,collectionRef:`absent:${String(i)}`}))]});
+    expect(batch).toHaveLength(200);
+    expect(batch.slice(1).every(row=>row.firstCoveredOn===null&&row.currentCashCoverageAmount==="0.00")).toBe(true);
+    await expect(sdk.queries.getReceivableCollectionCoverageHistory({requests:[{...invoiceRequest,customerId:"other"}]})).rejects.toMatchObject({code:"missing_document"});
+    expect(await sdk.queries.getReceivableCollectionCoverageHistory({requests:[]})).toEqual([]);
+  });
+
+  it("queries a collection position from unused cash, current invoice allocations and returns without double counting", async () => {
+    await depositFixture("collection_position");
+    const options={tenantId:"tenant_1",companyId:"company_1",writeSourceId:"source_1",bookId:"collection_position",currencyCode:"USD"};
+    const sdk=createErpFinancialsSdk({database:runner,...options}),operation=sdkOperation();
+    const base={sourceId:"source_1",customerId:"customer_1",collectionRef:"order:A"};
+    const receiptInput={operation,idempotencyKey:"position:receipt",customerId:"customer_1",collectionRef:base.collectionRef,date:"2026-08-12",amount:"100.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}};
+    const receipt=await sdk.commands.customerPayments.record(receiptInput);
+    expect(await sdk.commands.customerPayments.record(receiptInput)).toMatchObject({status:"already_posted",documentId:receipt.documentId});
+    await expect(sdk.commands.customerPayments.record({...receiptInput,collectionRef:"order:B"})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await sdk.queries.getReceivableCollectionPosition({...base,unbilledAmount:"150.00"})).toMatchObject({basis:"unbilled",unallocatedCashAmount:"100.00",cashCoverageAmount:"100.00",collectionAmount:"50.00",receiptCount:1});
+    const draft=await sdk.invoices.createDraft({operation,idempotencyKey:"position:draft",customerId:"customer_1",documentDate:"2026-08-12",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"150.00"}]});
+    expect(await sdk.queries.getReceivableCollectionPosition({...base,invoiceId:draft.invoiceDraftId})).toMatchObject({basis:"draft",originalAmount:"150.00",collectionAmount:"50.00"});
+    const issued=await sdk.invoices.issue({operation,invoiceDraftId:draft.invoiceDraftId,expectedVersion:draft.version,idempotencyKey:"position:issue"});
+    const application=await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"position:apply",applicationType:"customer_payment_to_invoice",sourceDocumentId:receipt.documentId,targetDocumentId:issued.invoiceDocumentId,amount:"60.00",applicationDate:"2026-08-12",expectedSourceVersion:1,expectedTargetVersion:1});
+    expect(await sdk.queries.getReceivableCollectionPosition({...base,invoiceId:draft.invoiceDraftId})).toMatchObject({basis:"invoice",invoiceId:issued.invoiceDocumentId,openInvoiceAmount:"90.00",unallocatedCashAmount:"40.00",appliedCashAmount:"60.00",cashCoverageAmount:"100.00",collectionAmount:"50.00"});
+    await sdk.commands.customerPayments.returnCash({operation,paymentId:receipt.documentId,customerId:"customer_1",expectedVersion:2,idempotencyKey:"position:return",externalReturnRef:"provider:return",date:"2026-08-12",amount:"50.00",returnKind:"refund",releases:[{applicationId:application.applicationId,expectedVersion:1,amount:"10.00"}]});
+    expect(await sdk.queries.getReceivableCollectionPosition({...base,invoiceId:issued.invoiceDocumentId})).toMatchObject({openInvoiceAmount:"100.00",unallocatedCashAmount:"0.00",appliedCashAmount:"50.00",cashCoverageAmount:"50.00",collectionAmount:"100.00"});
+    // Cash assigned elsewhere no longer covers its original collection group.
+    const other=await sdk.commands.invoices.create({operation,idempotencyKey:"position:other",customerId:"customer_1",date:"2026-08-12",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"20.00"}]});
+    const second=await sdk.commands.customerPayments.record({...receiptInput,idempotencyKey:"position:second",amount:"20.00"});
+    const otherApplication=await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"position:other-apply",applicationType:"customer_payment_to_invoice",sourceDocumentId:second.documentId,targetDocumentId:other.documentId,amount:"20.00",applicationDate:"2026-08-12",expectedSourceVersion:1,expectedTargetVersion:1});
+    expect(await sdk.queries.getReceivableCollectionPosition({...base,invoiceId:issued.invoiceDocumentId})).toMatchObject({cashCoverageAmount:"50.00",collectionAmount:"100.00",receiptCount:2});
+    expect(await sdk.queries.getReceivableCollectionPosition({...base,collectionRef:"order:B",invoiceId:other.documentId})).toMatchObject({cashCoverageAmount:"20.00",appliedCashAmount:"20.00",unallocatedCashAmount:"0.00",collectionAmount:"0.00"});
+    await expect(runner.transaction(async client=>{await client.query("select set_config('erp_financials.application_balance_update','on',true)");await client.query("update erp_financials.subledger_documents set metadata=jsonb_set(metadata,'{collectionRef}','\"order:B\"') where subledger_document_id=$1",[receipt.documentId]);})).rejects.toThrow("Receipt collection identity is immutable");
+    const readOnly=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({query<Row extends Record<string,unknown>=Record<string,unknown>>(text:string,values?:readonly unknown[]){expect(text.trim()).toMatch(/^(select|with)\b/i);return client.query<Row>(text,values);}}))}});
+    expect(await readOnly.queries.getReceivableCollectionPosition({...base,invoiceId:issued.invoiceDocumentId})).toEqual(await sdk.queries.getReceivableCollectionPosition({...base,invoiceId:issued.invoiceDocumentId}));
+    await expect(sdk.queries.getReceivableCollectionPosition({...base,customerId:"customer_2",invoiceId:issued.invoiceDocumentId})).rejects.toMatchObject({code:"missing_document"});
+    await expect(sdk.queries.getReceivableCollectionPosition({...base,sourceId:"other",unbilledAmount:"1.00"})).rejects.toMatchObject({code:"missing_document"});
+    for(const unbilledAmount of ["-1.00","1.001","1e3","NaN"]){await expect(sdk.queries.getReceivableCollectionPosition({...base,unbilledAmount})).rejects.toMatchObject({code:"invalid_input"});}
+    await expect(sdk.queries.getReceivableCollectionPosition({...base,invoiceId:other.documentId,unbilledAmount:"1.00"})).rejects.toMatchObject({code:"invalid_input"});
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:otherApplication.applicationId,expectedVersion:1,effectiveDate:"2026-08-12"});
+    const target=await sdk.queries.getInvoice(other.documentId);
+    await sdk.invoices.voidIssued({operation,invoiceDocumentId:other.documentId,expectedVersion:target.version,idempotencyKey:"position:cancel",date:"2026-08-12"});
+    expect(await sdk.queries.getReceivableCollectionPosition({...base,collectionRef:"order:B",invoiceId:other.documentId})).toMatchObject({basis:"voided",collectionAmount:"0.00",openInvoiceAmount:"0.00"});
+    const pending=await sdk.invoices.createDraft({operation,idempotencyKey:"position:batch-draft",customerId:"customer_1",documentDate:"2026-08-12",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"17.23"}]});
+    const first={...base,invoiceId:draft.invoiceDraftId};
+    const special=[first,
+      {...base,collectionRef:"order:B",invoiceId:other.documentId},
+      {...base,collectionRef:"order:C",invoiceId:pending.invoiceDraftId},
+      {...base,collectionRef:"order:D",unbilledAmount:"9999999999999999.99"}];
+    const expected=[];
+    for(const request of special)expected.push(await sdk.queries.getReceivableCollectionPosition(request));
+    const requests=[...special,...Array.from({length:196},(_,i)=>({...base,collectionRef:`batch:${String(i)}`,unbilledAmount:"0.01"}))];
+    const statements:string[]=[];
+    const measured=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({query<Row extends Record<string,unknown>=Record<string,unknown>>(text:string,values?:readonly unknown[]){statements.push(text);return client.query<Row>(text,values);}}))}});
+    const batch=await measured.queries.getReceivableCollectionPositions({requests});
+    expect(statements).toHaveLength(2); // Book metadata + one financial snapshot, independent of batch size.
+    expect(statements.every(text=>/^(select|with)\b/i.test(text.trim()))).toBe(true);
+    expect(batch).toHaveLength(200);
+    expect(batch.slice(0,4)).toEqual(expected);
+    expect(batch[0]).toMatchObject({basis:"invoice",cashCoverageAmount:"70.00",collectionAmount:"80.00"});
+    expect(batch[1]).toMatchObject({basis:"voided",collectionAmount:"0.00"});
+    expect(batch[2]).toMatchObject({basis:"draft",collectionAmount:"17.23"});
+    expect(batch[3]).toMatchObject({basis:"unbilled",collectionAmount:"9999999999999999.99"});
+    expect(batch.slice(4).every((row,i)=>row.collectionRef===`batch:${String(i)}`&&row.cashCoverageAmount==="0.00"&&row.collectionAmount==="0.01"&&row.receiptCount===0)).toBe(true);
+    expect(await readOnly.queries.getReceivableCollectionPositions({requests:special})).toEqual(expected);
+    await expect(sdk.queries.getReceivableCollectionPositions({requests:[first,{...base,collectionRef:"wrong-customer",customerId:"customer_2",invoiceId:issued.invoiceDocumentId}]})).rejects.toMatchObject({code:"missing_document"});
+    await expect(sdk.queries.getReceivableCollectionPositions({requests:[first,{...base,collectionRef:"wrong-source",sourceId:"unbound",unbilledAmount:"1.00"}]})).rejects.toMatchObject({code:"missing_document"});
+    await expect(createErpFinancialsSdk({...options,database:runner,companyId:"other-company"}).queries.getReceivableCollectionPositions({requests:special})).rejects.toMatchObject({code:"missing_book"});
+    await expect(createErpFinancialsSdk({...options,database:runner,tenantId:"other-tenant"}).queries.getReceivableCollectionPositions({requests:special})).rejects.toMatchObject({code:"missing_book"});
+    await sdk.books.define({operation,bookId:"collection_future",name:"Future only",baseCurrencyCode:"USD"});
+    await sdk.books.bindSource({operation,bookId:"collection_future",sourceId:"source_1",sourceRole:"active",effectiveFrom:"2027-01-01"});
+    const future=createErpFinancialsSdk({...options,database:runner,bookId:"collection_future"});
+    expect(await future.queries.getReceivableCollectionPositions({requests:[{...base,unbilledAmount:"150.00"}]})).toMatchObject([{receiptCount:0,cashCoverageAmount:"0.00",collectionAmount:"150.00"}]);
+    await expect(future.queries.getReceivableCollectionPositions({requests:special})).rejects.toMatchObject({code:"missing_document"});
+
+  });
+
+  it.each((["refund","apply","unapply","draft_update","draft_issue","draft_void","invoice_void","receipt","date_correction","source_window"] as const)
+    .flatMap(kind => (["guard","writer"] as const).map(winner => ({kind,winner}))))("collection guard serializes $kind with $winner first", async ({kind,winner}) => {
+    await depositFixture("collection_guard");
+    const scope={tenantId:"tenant_1",companyId:"company_1",writeSourceId:"source_1",bookId:"collection_guard",currencyCode:"USD"};
+    const sdk=createErpFinancialsSdk({database:runner,...scope}),operation=sdkOperation();
+    const invoiceInput={operation,idempotencyKey:"guard:invoice",customerId:"customer_1",date:"2026-08-12",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"100.00"}]};
+    const invoice=await sdk.commands.invoices.create(invoiceInput);
+    const other=await sdk.commands.invoices.create({...invoiceInput,idempotencyKey:"guard:other",revenueLines:[{accountId:"account_income",amount:"20.00"}]});
+    const receiptInput={operation,idempotencyKey:"guard:receipt",customerId:"customer_1",date:"2026-08-12",amount:"100.00",collectionRef:"guard:order",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}};
+    const receipt=await sdk.commands.customerPayments.record(receiptInput);
+    const draftInput={operation,idempotencyKey:"guard:draft",customerId:"customer_1",documentDate:"2026-08-12",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"100.00"}]};
+    const draft=await sdk.invoices.createDraft(draftInput);
+    let applicationId="";
+    if(kind==="unapply")applicationId=(await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"guard:initial-apply",applicationType:"customer_payment_to_invoice",sourceDocumentId:receipt.documentId,targetDocumentId:invoice.documentId,amount:"40.00",applicationDate:"2026-08-12",expectedSourceVersion:1,expectedTargetVersion:1})).applicationId;
+    const request={sourceId:"source_1",customerId:"customer_1",collectionRef:"guard:order",invoiceId:kind.startsWith("draft_")?draft.invoiceDraftId:invoice.documentId};
+    const before=await sdk.queries.getReceivableCollectionPosition(request);
+    const mutate=async(actor:ErpFinancialsSdk)=>{
+      switch(kind){
+        case "refund":return actor.commands.customerPayments.returnCash({operation,paymentId:receipt.documentId,customerId:"customer_1",expectedVersion:1,idempotencyKey:"guard:refund",externalReturnRef:"provider:return",date:"2026-08-12",amount:"10.00",returnKind:"refund",releases:[]});
+        case "apply":return actor.commands.paymentApplications.apply({operation,idempotencyKey:"guard:apply",applicationType:"customer_payment_to_invoice",sourceDocumentId:receipt.documentId,targetDocumentId:other.documentId,amount:"20.00",applicationDate:"2026-08-12",expectedSourceVersion:1,expectedTargetVersion:1});
+        case "unapply":return actor.commands.paymentApplications.unapply({operation,applicationId,expectedVersion:1,effectiveDate:"2026-08-12"});
+        case "draft_update":return actor.invoices.updateDraft({...draftInput,invoiceDraftId:draft.invoiceDraftId,expectedVersion:1,revenueLines:[{accountId:"account_income",amount:"200.00"}]});
+        case "draft_issue":return actor.invoices.issue({operation,invoiceDraftId:draft.invoiceDraftId,expectedVersion:1,idempotencyKey:"guard:issue"});
+        case "draft_void":return actor.invoices.voidDraft({operation,invoiceDraftId:draft.invoiceDraftId,expectedVersion:1});
+        case "invoice_void":return actor.invoices.voidIssued({operation,invoiceDocumentId:invoice.documentId,expectedVersion:1,idempotencyKey:"guard:void",date:"2026-08-12"});
+        case "receipt":return actor.commands.customerPayments.record({...receiptInput,idempotencyKey:"guard:new-receipt",amount:"10.00"});
+        case "date_correction":return actor.commands.invoices.correctDates({operation,invoiceId:invoice.documentId,expectedVersion:1,idempotencyKey:"guard:date",documentDate:"2026-08-13",dueDate:"2026-08-31"});
+        case "source_window":return actor.books.bindSource({operation,bookId:scope.bookId,sourceId:"source_1",sourceRole:"active",effectiveFrom:"2027-01-01"});
+      }
+    };
+    await pool.query("create table public.collection_guard_outcome(position jsonb not null)");
+    const first=await pool.connect();let committed=false;let waiter:Promise<PromiseSettledResult<unknown>>|undefined;
+    try{
+      await first.query("begin");
+      const firstPid=(await first.query<{pid:number}>("select pg_backend_pid() as pid")).rows[0]?.pid;
+      const firstSdk=createErpFinancialsSdk({...scope,database:{transaction:work=>work(first)}});
+      let secondPid:number|undefined;
+      const secondSdk=createErpFinancialsSdk({...scope,database:{transaction:work=>runner.transaction(async client=>{
+        secondPid=Number((await client.query("select pg_backend_pid() as pid")).rows[0]?.pid);
+        return work(client);
+      })}});
+      const guarded=async(actor:ErpFinancialsSdk)=>actor.queries.withLockedReceivableCollectionPositions({requests:[request]},async({positions,client})=>{
+        const position=positions[0];if(!position)throw new Error("Missing guarded position");
+        expect(Object.isFrozen(positions)).toBe(true);expect(Object.isFrozen(position)).toBe(true);
+        await client.query("insert into public.collection_guard_outcome values($1::jsonb)",[JSON.stringify(position)]);
+        return position;
+      });
+      if(winner==="guard")expect(await guarded(firstSdk)).toEqual(before);
+      else await mutate(firstSdk);
+      const pending=winner==="guard"?mutate(secondSdk):guarded(secondSdk);
+      waiter=pending.then(value=>({status:"fulfilled",value}),(reason:unknown)=>({status:"rejected",reason}));
+      await expect.poll(async()=>{
+        if(secondPid===undefined||firstPid===undefined)return false;
+        const row=(await pool.query<{blocked:boolean}>("select $2::integer=any(pg_blocking_pids($1::integer)) as blocked",[secondPid,firstPid])).rows[0];
+        return row?.blocked;
+      }).toBe(true);
+      if(winner==="guard"&&(kind==="invoice_void"||kind.startsWith("draft_"))){
+        // A blocked writer must not hold a document row while waiting for the
+        // source lock. That inverted order could deadlock another application.
+        if(kind==="invoice_void")await pool.query("select subledger_document_id from erp_financials.subledger_documents where subledger_document_id=$1 for update nowait",[invoice.documentId]);
+        else await pool.query("select invoice_draft_id from erp_financials.invoice_drafts where invoice_draft_id=$1 for update nowait",[draft.invoiceDraftId]);
+      }
+      // Financial reads are intentionally nonlocking; the uncommitted winner
+      // is invisible. The guard must refresh after the writer actually commits.
+      expect(await sdk.queries.getReceivableCollectionPosition(request)).toEqual(before);
+      await first.query("commit");committed=true;
+      const outcome=await waiter;
+      const recorded=(await pool.query<{position:unknown}>("select position from public.collection_guard_outcome")).rows;
+      if(kind==="source_window"){
+        await expect(sdk.queries.getReceivableCollectionPosition(request)).rejects.toMatchObject({code:"missing_document"});
+        if(winner==="writer"){
+          expect(outcome).toMatchObject({status:"rejected",reason:{code:"missing_document"}});
+          expect(recorded).toHaveLength(0);
+        }else{
+          expect(outcome.status).toBe("fulfilled");expect(recorded).toHaveLength(1);expect(recorded[0]?.position).toEqual(before);
+        }
+      }else{
+        if(outcome.status==="rejected")throw outcome.reason;
+        const after=await sdk.queries.getReceivableCollectionPosition(request);
+        expect(after).not.toEqual(before);
+        expect(recorded).toHaveLength(1);expect(recorded[0]?.position).toEqual(winner==="guard"?before:after);
+      }
+    }finally{
+      if(!committed)await first.query("rollback");
+      if(waiter)await waiter;
+      first.release();await pool.query("drop table public.collection_guard_outcome");
+    }
+  },20_000);
+
+  it.each(["guard", "reset"] as const)("collection guard serializes imported-source reset with %s first", async (winner) => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:guard-reset" });
+    await seedSourceImportResetScenario(pool, runner);
+    const invoiceId = (await pool.query<{id: string}>(
+      "select subledger_document_id as id from erp_financials.subledger_documents where tenant_id='tenant_qbo' and source_id='source_qbo' and document_type='invoice'"
+    )).rows[0]?.id;
+    if (!invoiceId) throw new Error("Missing imported invoice fixture");
+    const scope = {tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "book_qbo", writeSourceId: "source_qbo", currencyCode: "USD"};
+    const input = {requests: [{sourceId: "source_qbo", customerId: "customer_qbo", collectionRef: "guard:import", invoiceId}]};
+    const sdk = createErpFinancialsSdk({...scope, database: runner});
+    const before = await sdk.queries.getReceivableCollectionPositions(input);
+    expect(before).toMatchObject([{openInvoiceAmount: "60.00"}]);
+    const first = await pool.connect();
+    let waiter: Promise<PromiseSettledResult<unknown>> | undefined;
+    let committed = false;
+    let callbackCount = 0;
+    try {
+      await first.query("begin");
+      const firstPid = (await first.query<{pid: number}>("select pg_backend_pid() as pid")).rows[0]?.pid;
+      let secondPid: number | undefined;
+      const firstRunner: ErpFinancialsTransactionRunner = {transaction: work => work(first)};
+      const secondRunner: ErpFinancialsTransactionRunner = {transaction: work => runner.transaction(async client => {
+        secondPid = Number((await client.query("select pg_backend_pid() as pid")).rows[0]?.pid);
+        return work(client);
+      })};
+      const reset = (database: ErpFinancialsTransactionRunner) => database.transaction(client => resetSourceImportState(client, {
+        tenantId: scope.tenantId, companyId: scope.companyId, sourceId: scope.writeSourceId
+      }));
+      const guard = (database: ErpFinancialsTransactionRunner) => createErpFinancialsSdk({...scope, database}).queries.withLockedReceivableCollectionPositions(input, async ({positions}) => {
+        callbackCount += 1;
+        return Promise.resolve(positions);
+      });
+      if (winner === "guard") expect(await guard(firstRunner)).toEqual(before);
+      else await reset(firstRunner);
+      waiter = (winner === "guard" ? reset(secondRunner) : guard(secondRunner)).then(
+        value => ({status: "fulfilled", value}), (reason: unknown) => ({status: "rejected", reason})
+      );
+      await expect.poll(async () => {
+        if (secondPid === undefined || firstPid === undefined) return false;
+        return (await pool.query<{blocked: boolean}>("select $2::integer=any(pg_blocking_pids($1::integer)) as blocked", [secondPid, firstPid])).rows[0]?.blocked;
+      }).toBe(true);
+      if (winner === "guard") {
+        // Reset must wait before taking scope rows, preserving source-first lock order.
+        await pool.query("select source_id from erp_financials.accounting_sources where source_id='source_qbo' for update nowait");
+      }
+      expect(await sdk.queries.getReceivableCollectionPositions(input)).toEqual(before);
+      await first.query("commit"); committed = true;
+      const outcome = await waiter;
+      if (winner === "reset") {
+        expect(outcome).toMatchObject({status: "rejected", reason: {code: "missing_document"}});
+        expect(callbackCount).toBe(0);
+      } else {
+        if (outcome.status === "rejected") throw outcome.reason;
+        expect(callbackCount).toBe(1);
+      }
+      await expect(sdk.queries.getReceivableCollectionPositions(input)).rejects.toMatchObject({code: "missing_document"});
+    } finally {
+      if (!committed) await first.query("rollback");
+      if (waiter) await waiter;
+      first.release();
+    }
+  }, 20_000);
+
+  it("collection guard shares read locks, rejects unsafe transactions and rolls back operational callbacks",async()=>{
+    await depositFixture("guard_contract");
+    const scope={tenantId:"tenant_1",companyId:"company_1",writeSourceId:"source_1",bookId:"guard_contract",currencyCode:"USD"};
+    const sdk=createErpFinancialsSdk({...scope,database:runner});
+    const input={requests:[{sourceId:"source_1",customerId:"customer_1",collectionRef:"guard:empty",unbilledAmount:"0.00"}]};
+    const first=await pool.connect();
+    try{
+      await first.query("begin");
+      const one=createErpFinancialsSdk({...scope,database:{transaction:work=>work(first)}});
+      await one.queries.withLockedReceivableCollectionPositions(input,async()=>Promise.resolve("first"));
+      // A second guard can complete while the first transaction still owns its shared lock.
+      await expect(sdk.queries.withLockedReceivableCollectionPositions(input,async()=>Promise.resolve("second"))).resolves.toBe("second");
+      await first.query("rollback");
+      await first.query("begin isolation level repeatable read");
+      await expect(one.queries.withLockedReceivableCollectionPositions(input,async()=>Promise.resolve("never"))).rejects.toMatchObject({code:"invalid_input"});
+      await first.query("rollback");
+      const autocommit=createErpFinancialsSdk({...scope,database:{transaction:work=>work(first)}});
+      await expect(autocommit.queries.withLockedReceivableCollectionPositions(input,async()=>Promise.resolve("never"))).rejects.toMatchObject({code:"invalid_input"});
+      await pool.query("create table public.collection_guard_rollback(value text)");
+      await expect(sdk.queries.withLockedReceivableCollectionPositions(input,async({client})=>{
+        await client.query("insert into public.collection_guard_rollback values('must rollback')");throw new Error("host failed");
+      })).rejects.toThrow("host failed");
+      expect((await pool.query("select * from public.collection_guard_rollback")).rows).toHaveLength(0);
+      await pool.query("drop table public.collection_guard_rollback");
+    }finally{await first.query("rollback");first.release();}
+  });
+
+  it("pages unapplied collection receipts with exact scope and no detail fanout", async () => {
+    await depositFixture("collection-pages");
+    const options = { tenantId: "tenant_1", companyId: "company_1", bookId: "collection-pages", writeSourceId: "source_1", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ database: runner, ...options }), operation = sdkOperation();
+    const receipts: string[] = [];
+    for (let index=0; index<4; index++) {
+      const receipt = await sdk.commands.customerPayments.record({ operation, idempotencyKey: `collection-page:${String(index)}`, customerId: "customer_1", collectionRef: index===3 ? "other-order" : "order-one",
+        date: "2026-08-12", amount: "40.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+      receipts.push(receipt.documentId);
+      expect((await sdk.queries.getCustomerPayment(receipt.documentId, { limit: 1 })).collectionRef).toBe(index===3 ? "other-order" : "order-one");
+    }
+    const request = { sourceId: "source_1", customerId: "customer_1", collectionRef: "order-one", limit: 1 };
+    let queries=0;
+    const counted = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({ query: async (sql, values) => { queries++; return client.query(sql, values); } })) } });
+    const before = await depositDatabaseState(pool);
+    const first = await counted.queries.listUnappliedCollectionReceipts(request);
+    expect(queries).toBe(2); // One book resolution and one bounded receipt page.
+    expect(first.items).toHaveLength(1); expect(first.nextCursor).toBeTypeOf("string");
+    expect(first.items[0]).toMatchObject({ sourceId: "source_1", customerId: "customer_1", collectionRef: "order-one", currencyCode: "USD", paymentDate: "2026-08-12", originalAmount: "40.00", unappliedAmount: "40.00", version: 1 });
+    if (!first.nextCursor) throw Error("Expected collection receipt continuation");
+    const second = await sdk.queries.listUnappliedCollectionReceipts({ ...request, cursor: first.nextCursor });
+    if (!second.nextCursor) throw Error("Expected second receipt continuation");
+    const third = await sdk.queries.listUnappliedCollectionReceipts({ ...request, cursor: second.nextCursor });
+    expect(third.nextCursor).toBeUndefined();
+    expect([...first.items,...second.items,...third.items].map(item => item.paymentId)).toEqual(receipts.slice(0,3).sort().reverse());
+    for (const changed of [{ collectionRef: "other-order" }, { customerId: "customer_other" }, { sourceId: "source_other" }]) {
+      await expect(sdk.queries.listUnappliedCollectionReceipts({ ...request, ...changed, cursor: first.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    expect((await sdk.queries.listUnappliedCollectionReceipts({ ...request, customerId: "customer_other" })).items).toEqual([]);
+    expect((await sdk.queries.listUnappliedCollectionReceipts({ ...request, sourceId: "source_other" })).items).toEqual([]);
+    expect((await sdk.queries.listUnappliedCollectionReceipts({ ...request, collectionRef: "other-order" })).items).toHaveLength(1);
+    for (const limit of [0,201]) await expect(sdk.queries.listUnappliedCollectionReceipts({ ...request, limit })).rejects.toMatchObject({ code: "invalid_input" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "collection-page:invoice", customerId: "customer_1", date: "2026-08-01", dueDate: "2026-08-31", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const selected = first.items[0]; if (!selected) throw Error("Missing selected receipt");
+    await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "collection-page:apply", applicationType: "customer_payment_to_invoice", sourceDocumentId: selected.paymentId, targetDocumentId: invoice.documentId, expectedSourceVersion: selected.version, expectedTargetVersion: 1, amount: "40.00", applicationDate: "2026-08-12" });
+    const refreshed = await sdk.queries.listUnappliedCollectionReceipts({ ...request, limit: 200 });
+    expect(refreshed.items.map(item => item.paymentId)).toEqual(receipts.slice(0,3).filter(id => id!==selected.paymentId).sort().reverse());
+    const returned = refreshed.items[0]; if (!returned) throw Error("Missing refundable collection receipt");
+    await sdk.commands.customerPayments.returnCash({ operation, idempotencyKey: "collection-page:return", externalReturnRef: "fixture:cash-return", paymentId: returned.paymentId, customerId: "customer_1", expectedVersion: returned.version, date: "2026-08-13", amount: "40.00", returnKind: "refund", releases: [] });
+    const afterReturn = await sdk.queries.listUnappliedCollectionReceipts({ ...request, limit: 200 });
+    expect(afterReturn.items).toHaveLength(1); expect(afterReturn.items[0]?.paymentId).not.toBe(returned.paymentId);
+    const excluded = createErpFinancialsSdk({ database: runner, ...options, bookId: "outside-collection" });
+    await excluded.books.define({ operation, bookId: "outside-collection", name: "Excluded receipt dates", baseCurrencyCode: "USD" });
+    await excluded.books.bindSource({ operation, bookId: "outside-collection", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-09-01" });
+    expect((await excluded.queries.listUnappliedCollectionReceipts(request)).items).toEqual([]);
+    await expect(excluded.queries.listUnappliedCollectionReceipts({ ...request, cursor: first.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+    const index = (await pool.query<{indexdef:string}>("select indexdef from pg_indexes where schemaname='erp_financials' and indexname='subledger_documents_unapplied_collection_page_idx'")).rows[0];
+    expect(index?.indexdef).toContain("document_date DESC, subledger_document_id DESC");
+  });
+
+  it("upgrades receipt-date enforcement from schema46 without rewriting accepted accounting", async () => {
+    const { financials } = await depositFixture(undefined, 46), operation = sdkOperation();
+    const invoice = await financials.invoices.create({ operation, idempotencyKey: "receipt-upgrade:invoice", customerId: "customer_1", date: "2026-08-01", dueDate: "2026-08-31",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const receipt = await financials.customerPayments.record({ operation, idempotencyKey: "receipt-upgrade:cash", customerId: "customer_1", date: "2026-08-12", amount: "40.00",
+      cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const command = { operation, idempotencyKey: "receipt-upgrade:allocate", applicationType: "customer_payment_to_invoice" as const,
+      sourceDocumentId: receipt.documentId, targetDocumentId: invoice.documentId, expectedSourceVersion: 1, expectedTargetVersion: 1,
+      amount: "20.00", applicationDate: "2026-08-12" };
+    const applied = await financials.paymentApplications.apply(command);
+    const before = await depositDatabaseState(pool);
+    const upgrade = await migratePostgresSchema(runner, { appliedByRef: "receipt-upgrade:47" });
+    expect(upgrade.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[46, 47], [47, 48]]);
+    const after = await depositDatabaseState(pool); delete before.schema_migrations; delete after.schema_migrations;
+    expect(after).toEqual(before);
+    await expect(pool.query(`insert into erp_financials.subledger_applications
+      select (jsonb_populate_record(null::erp_financials.subledger_applications,
+        to_jsonb(a)||jsonb_build_object('subledger_application_id','upgrade-early-cash-clone',
+          'idempotency_key','upgrade-early-cash-clone','application_date','2026-08-11'))).*
+      from erp_financials.subledger_applications a where a.subledger_application_id=$1`, [applied.applicationId])).rejects.toThrow("cannot precede cash receipt");
+    expect(await financials.paymentApplications.apply(command)).toMatchObject({ applicationId: applied.applicationId, status: "already_applied" });
+    expect((await migratePostgresSchema(runner, { appliedByRef: "receipt-upgrade:retry" })).applied).toEqual([]);
+  });
+
+  it("rejects allocating existing customer cash before it was received through API and storage", async () => {
+    const { financials } = await depositFixture("receipt-date-guard"), operation = sdkOperation();
+    const invoice = await financials.invoices.create({ operation, idempotencyKey: "receipt-date:invoice", customerId: "customer_1", date: "2026-08-01", dueDate: "2026-08-31",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const receipt = await financials.customerPayments.record({ operation, idempotencyKey: "receipt-date:cash", customerId: "customer_1", date: "2026-08-12", amount: "40.00",
+      cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const command = { operation, idempotencyKey: "receipt-date:allocate", applicationType: "customer_payment_to_invoice" as const,
+      sourceDocumentId: receipt.documentId, targetDocumentId: invoice.documentId, expectedSourceVersion: 1, expectedTargetVersion: 1,
+      amount: "20.00", applicationDate: "2026-08-11" };
+    const before = await depositDatabaseState(pool);
+    await expect(financials.paymentApplications.apply(command)).rejects.toThrow("cannot precede cash receipt");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const applied = await financials.paymentApplications.apply({ ...command, applicationDate: "2026-08-12" });
+    const after = await depositDatabaseState(pool);
+    await expect(pool.query(`insert into erp_financials.subledger_applications
+      select (jsonb_populate_record(null::erp_financials.subledger_applications,
+        to_jsonb(a)||jsonb_build_object('subledger_application_id','early-cash-clone',
+          'idempotency_key','early-cash-clone','application_date','2026-08-11'))).*
+      from erp_financials.subledger_applications a where a.subledger_application_id=$1`, [applied.applicationId])).rejects.toThrow("cannot precede cash receipt");
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    expect(await financials.paymentApplications.apply({ ...command, applicationDate: "2026-08-12" })).toMatchObject({ applicationId: applied.applicationId, status: "already_applied" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  async function receiptApplicationRetirementFixture() {
+    const { financials } = await depositFixture("allocation-retirement");
+    const options = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "allocation-retirement", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(options), operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "allocation-retirement:invoice", customerId: "customer_1", date: "2026-08-12", dueDate: "2026-08-31", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const receipt = await sdk.commands.customerPayments.record({ operation, idempotencyKey: "allocation-retirement:cash", customerId: "customer_1", date: "2026-08-12", amount: "40.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const command = { operation, idempotencyKey: "allocation-retirement:apply", applicationType: "customer_payment_to_invoice" as const,
+      sourceDocumentId: receipt.documentId, targetDocumentId: invoice.documentId, expectedSourceVersion: 1, expectedTargetVersion: 1, amount: "20.00", applicationDate: "2026-08-12" };
+    const retirement = { ...operation, requestId: "retire-allocation", reasonCode: "retire_unconfirmed_allocation", reasonDetail: "Do not apply this unresolved request" };
+    return { financials, sdk, options, command, retirement };
+  }
+
+  it("receipt allocation retirement fences delayed apply and binds payload without changing money", async () => {
+    const { sdk, command, retirement } = await receiptApplicationRetirementFixture();
+    const before = await depositDatabaseState(pool);
+    const result = await sdk.commands.paymentApplications.retireReceiptAttempt({ command, operation: retirement });
+    expect(result).toMatchObject({ status: "retired", sourceDocumentId: command.sourceDocumentId, targetDocumentId: command.targetDocumentId, idempotencyKey: command.idempotencyKey });
+    const after = await depositDatabaseState(pool);
+    for (const table of Object.keys(before)) if (table !== "financial_lifecycle_events") expect(after[table]).toEqual(before[table]);
+    expect((after.financial_lifecycle_events ?? []).length).toBe((before.financial_lifecycle_events ?? []).length + 1);
+    expect(await sdk.commands.paymentApplications.retireReceiptAttempt({ command, operation: { ...retirement, requestId: "fresh-transport" } })).toEqual({ ...result, status: "already_retired" });
+    await expect(sdk.commands.paymentApplications.apply(command)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    for (const change of [{ amount: "21.00" }, { expectedSourceVersion: 2 }, { expectedTargetVersion: 2 }, { sourceDocumentId: "other" }, { applicationDate: "2026-08-13" }]) {
+      await expect(sdk.commands.paymentApplications.retireReceiptAttempt({ command: { ...command, ...change }, operation: retirement })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    await expect(sdk.commands.paymentApplications.retireReceiptAttempt({ command, operation: { ...retirement, reasonDetail: "Changed retirement" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("receipt allocation retirement returns recorded then unapplied outcome after close without reapplying", async () => {
+    const { financials, sdk, command, retirement } = await receiptApplicationRetirementFixture();
+    const applied = await sdk.commands.paymentApplications.apply(command), before = await depositDatabaseState(pool);
+    expect(await sdk.commands.paymentApplications.retireReceiptAttempt({ command, operation: retirement })).toEqual({ status: "already_recorded", application: { ...applied, status: "already_applied" } });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const ended = await sdk.commands.paymentApplications.unapply({ operation: sdkOperation(), applicationId: applied.applicationId, expectedVersion: 1, effectiveDate: "2026-08-12" });
+    await closeDepositPeriod(pool, financials);
+    const after = await depositDatabaseState(pool);
+    expect(await sdk.commands.paymentApplications.retireReceiptAttempt({ command, operation: retirement })).toEqual({ status: "already_recorded", application: ended });
+    await expect(sdk.commands.paymentApplications.apply(command)).rejects.toThrow("cannot be replayed as applied");
+    await expect(sdk.commands.paymentApplications.retireReceiptAttempt({ command, operation: { ...retirement, actorRef: "other" } })).rejects.toMatchObject({ code: "authorization_context_invalid" });
+    await expect(sdk.commands.paymentApplications.retireReceiptAttempt({ command: { ...command, amount: "21.00" }, operation: retirement })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("receipt allocation retirement proves native book scope and rolls back or recovers lost commit acknowledgement", async () => {
+    const { sdk, options, command, retirement } = await receiptApplicationRetirementFixture();
+    const before = await depositDatabaseState(pool);
+    await expect(createErpFinancialsSdk({ ...options, bookId: "other" }).commands.paymentApplications.retireReceiptAttempt({ command, operation: retirement })).rejects.toMatchObject({ code: "scope_mismatch" });
+    const fail = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work(new FailingMigrationClient(client, 'insert into "erp_financials"."financial_lifecycle_events"'))) } });
+    await expect(fail.commands.paymentApplications.retireReceiptAttempt({ command, operation: retirement })).rejects.toThrow("injected real migration failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const lost = createErpFinancialsSdk({ ...options, database: { transaction: async work => { await runner.transaction(work); throw Error("lost allocation retirement ack"); } } });
+    await expect(lost.commands.paymentApplications.retireReceiptAttempt({ command, operation: retirement })).rejects.toThrow("lost allocation retirement ack");
+    const after = await depositDatabaseState(pool);
+    expect(await sdk.commands.paymentApplications.retireReceiptAttempt({ command, operation: retirement })).toMatchObject({ status: "already_retired" });
+    await expect(sdk.commands.paymentApplications.apply(command)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it.each(["apply", "retire"] as const)("receipt allocation retirement serializes with %s starting first", async first => {
+    const { sdk, command, retirement } = await receiptApplicationRetirementFixture();
+    const apply = () => sdk.commands.paymentApplications.apply(command), retire = () => sdk.commands.paymentApplications.retireReceiptAttempt({ command, operation: retirement });
+    const outcomes = await Promise.allSettled(first === "apply" ? [apply(), retire()] : [retire(), apply()]);
+    const posted = outcomes[first === "apply" ? 0 : 1], resolved = outcomes[first === "apply" ? 1 : 0];
+    expect(resolved.status).toBe("fulfilled"); if (resolved.status !== "fulfilled") throw resolved.reason;
+    const applications = (await pool.query<{ count: number }>("select count(*)::int count from erp_financials.subledger_applications")).rows[0]?.count;
+    if (resolved.value.status === "retired") { expect(posted.status).toBe("rejected"); expect(applications).toBe(0); }
+    else { expect(resolved.value.status).toBe("already_recorded"); expect(posted.status).toBe("fulfilled"); expect(applications).toBe(1); }
+    const payment = await sdk.queries.getCustomerPayment(command.sourceDocumentId), invoice = await sdk.queries.getInvoice(command.targetDocumentId);
+    expect(payment.unappliedAmount).toBe(resolved.value.status === "retired" ? "40.00" : "20.00");
+    expect(invoice.openAmount).toBe(resolved.value.status === "retired" ? "100.00" : "80.00");
+  });
+
+  it("receipt allocation retirement rejects historical missing command evidence instead of inventing it", async () => {
+    const { sdk, options, command, retirement } = await receiptApplicationRetirementFixture();
+    const historical = historicalApplicationSdk(options);
+    const applied = await historical.commands.paymentApplications.apply(command);
+    const before = await depositDatabaseState(pool);
+    expect(await sdk.queries.getPaymentApplication(applied.applicationId)).toMatchObject({ status: "applied", amount: "20.00" });
+    await expect(sdk.commands.paymentApplications.retireReceiptAttempt({ command, operation: retirement })).rejects.toMatchObject({ code: "unsupported_operation" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  async function collectionRetirementFixture() {
+    const {financials}=await depositFixture("receipt-retirement");
+    const sdk=createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",writeSourceId:"source_1",bookId:"receipt-retirement",currencyCode:"USD"});
+    const operation=sdkOperation();
+    const invoice=await sdk.commands.invoices.create({operation,idempotencyKey:"retirement:invoice",customerId:"customer_1",date:"2026-08-12",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"100.00"}]});
+    const command={operation,idempotencyKey:"retirement:receipt",customerId:"customer_1",invoiceId:invoice.documentId,expectedInvoiceVersion:1,date:"2026-08-12",amount:"40.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}};
+    const retirement={...operation,requestId:"retirement:request",reasonCode:"retire_unconfirmed_receipt",reasonDetail:"Do not record this unresolved receipt"};
+    return {financials,sdk,command,retirement};
+  }
+
+  it("collection attempt retirement fences delayed posting without changing any accounting rows",async()=>{
+    const {sdk,command,retirement}=await collectionRetirementFixture();
+    const before=await depositDatabaseState(pool);
+    const result=await sdk.commands.customerPayments.retireCollectionAttempt({command,operation:retirement});
+    expect(result).toMatchObject({status:"retired",invoiceId:command.invoiceId,idempotencyKey:command.idempotencyKey});
+    const after=await depositDatabaseState(pool);
+    for(const table of Object.keys(before))if(table!=="financial_lifecycle_events")expect(after[table]).toEqual(before[table]);
+    expect((after.financial_lifecycle_events??[]).length).toBe((before.financial_lifecycle_events??[]).length+1);
+    expect(await sdk.commands.customerPayments.retireCollectionAttempt({command,operation:{...retirement,requestId:"fresh-transport"}})).toEqual({...result,status:"already_retired"});
+    await expect(sdk.commands.customerPayments.recordAndApply(command)).rejects.toMatchObject({code:"idempotency_conflict"});
+    for(const change of [{amount:"41.00"},{expectedInvoiceVersion:2},{customerId:"other"},{invoiceId:"other"}])await expect(sdk.commands.customerPayments.retireCollectionAttempt({command:{...command,...change},operation:retirement})).rejects.toMatchObject({code:"idempotency_conflict"});
+    await expect(sdk.commands.customerPayments.retireCollectionAttempt({command,operation:{...retirement,reasonDetail:"A different reason"}})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("collection attempt retirement recovers committed cash after settlement and close without reversal",async()=>{
+    const {financials,sdk,command,retirement}=await collectionRetirementFixture();
+    const full={...command,amount:"100.00"};
+    const recorded=await sdk.commands.customerPayments.recordAndApply(full);
+    await closeDepositPeriod(pool,financials);
+    const before=await depositDatabaseState(pool);
+    expect(await sdk.commands.customerPayments.retireCollectionAttempt({command:full,operation:retirement})).toEqual({...recorded,status:"already_recorded_and_applied"});
+    expect(await sdk.commands.customerPayments.recordAndApply(full)).toEqual({...recorded,status:"already_recorded_and_applied"});
+    await expect(sdk.commands.customerPayments.retireCollectionAttempt({command:full,operation:{...retirement,actorRef:"different-actor"}})).rejects.toMatchObject({code:"authorization_context_invalid"});
+    await expect(sdk.commands.customerPayments.retireCollectionAttempt({command:{...full,amount:"99.00"},operation:retirement})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("collection attempt retirement enforces original book and rolls back or recovers uncertain commits",async()=>{
+    const {sdk,command,retirement}=await collectionRetirementFixture();
+    const before=await depositDatabaseState(pool);
+    const other=depositService(runner,{bookId:"unrelated-book"});
+    await expect(other.customerPayments.retireCollectionAttempt({command,operation:retirement})).rejects.toMatchObject({code:"scope_mismatch"});
+    const failing=depositService({transaction:work=>runner.transaction(client=>work(new FailingMigrationClient(client,'insert into "erp_financials"."financial_lifecycle_events"')))},{bookId:"receipt-retirement"});
+    await expect(failing.customerPayments.retireCollectionAttempt({command,operation:retirement})).rejects.toThrow("injected real migration failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const lostAck=depositService({transaction:async work=>{await runner.transaction(work);throw Error("lost retirement commit acknowledgement");}},{bookId:"receipt-retirement"});
+    await expect(lostAck.customerPayments.retireCollectionAttempt({command,operation:retirement})).rejects.toThrow("lost retirement commit acknowledgement");
+    const after=await depositDatabaseState(pool);
+    expect(await sdk.commands.customerPayments.retireCollectionAttempt({command,operation:retirement})).toMatchObject({status:"already_retired"});
+    await expect(sdk.commands.customerPayments.recordAndApply(command)).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("collection attempt retirement never hides independently recorded cash or allows reuse through raw record",async()=>{
+    const {sdk,command,retirement}=await collectionRetirementFixture();
+    const {invoiceId,expectedInvoiceVersion,...raw}=command;void invoiceId;void expectedInvoiceVersion;
+    await sdk.commands.customerPayments.record(raw);
+    const before=await depositDatabaseState(pool);
+    await expect(sdk.commands.customerPayments.retireCollectionAttempt({command,operation:retirement})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const unused={...command,idempotencyKey:"retirement:new-receipt"};
+    await sdk.commands.customerPayments.retireCollectionAttempt({command:unused,operation:retirement});
+    const after=await depositDatabaseState(pool);
+    await expect(sdk.commands.customerPayments.record({...raw,idempotencyKey:unused.idempotencyKey})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it.each(["post","retire"] as const)("collection attempt retirement serializes with %s starting first and permits exactly one terminal outcome",async first=>{
+    const {sdk,command,retirement}=await collectionRetirementFixture();
+    const postWork=()=>sdk.commands.customerPayments.recordAndApply(command);
+    const retireWork=()=>sdk.commands.customerPayments.retireCollectionAttempt({command,operation:retirement});
+    const started=first==="post"?[postWork(),retireWork()]:[retireWork(),postWork()];
+    const outcomes=await Promise.allSettled(started);
+    const post=outcomes[first==="post"?0:1],retire=outcomes[first==="post"?1:0];
+    if(!post||!retire)throw new Error("Missing race outcomes");
+    expect(retire.status).toBe("fulfilled");
+    if(retire.status!=="fulfilled")throw retire.reason;
+    const receipts=await pool.query<{count:number}>("select count(*)::int as count from erp_financials.subledger_documents where document_type='customer_payment'");
+    if(retire.value.status==="retired"){
+      expect(post.status).toBe("rejected");expect(receipts.rows[0]?.count).toBe(0);
+      await expect(sdk.commands.customerPayments.recordAndApply(command)).rejects.toMatchObject({code:"idempotency_conflict"});
+    }else{
+      expect(retire.value.status).toBe("already_recorded_and_applied");expect(post.status).toBe("fulfilled");expect(receipts.rows[0]?.count).toBe(1);
+      if(post.status==="fulfilled")expect(retire.value).toEqual({...post.value,status:"already_recorded_and_applied"});
+    }
+  });
+
+  it("records historical cash with a later explicit invoice application atomically", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "dated-collection" }); await seedAccountingScope(pool);
+    const options = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "dated-collection", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ database: runner, ...options }), operation = sdkOperation();
+    await sdk.books.define({ operation, bookId: options.bookId, name: "Dated collection", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: options.bookId, sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "dated:invoice", customerId: "customer_1", date: "2026-08-01", recognitionDate: "2026-08-12", dueDate: "2026-08-31",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const command = { operation, idempotencyKey: "dated:receipt", customerId: "customer_1", invoiceId: invoice.documentId, expectedInvoiceVersion: 1,
+      date: "2026-08-05", applicationDate: "2026-08-12", amount: "40.00", applicationAmount: "30.00",
+      cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } };
+    const before = await depositDatabaseState(pool);
+    for (const applicationDate of ["2026-08-04", "2026-08-11", "2026-02-30", "2026-09-01"]) {
+      await expect(sdk.commands.customerPayments.recordAndApply({ ...command, applicationDate })).rejects.toThrow();
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+    const failing = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work(new FailingMigrationClient(client, 'insert into "erp_financials"."subledger_applications"'))) } });
+    await expect(failing.commands.customerPayments.recordAndApply(command)).rejects.toThrow("injected real migration failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const results = await Promise.all([sdk.commands.customerPayments.recordAndApply(command), sdk.commands.customerPayments.recordAndApply(command)]);
+    expect(new Set(results.map(result => result.status))).toEqual(new Set(["recorded_and_applied", "already_recorded_and_applied"]));
+    expect(new Set(results.map(result => result.paymentId)).size).toBe(1);
+    const result = results[0];
+    expect(await sdk.queries.getCustomerPayment(result.paymentId)).toMatchObject({ paymentDate: "2026-08-05", amount: "40.00", unappliedAmount: "10.00" });
+    expect((await pool.query("select application_date::text as date from erp_financials.subledger_applications where subledger_application_id=$1", [result.applicationId])).rows).toEqual([{ date: "2026-08-12" }]);
+    for (const [date, total] of [["2026-08-11", "-40.00"], ["2026-08-12", "60.00"]] as const) {
+      expect((await sdk.queries.getAgingPage({ kind: "receivables", asOfDate: date })).totals.total).toBe(total);
+      expect((await pool.query<{ net: string }>("select coalesce(sum(net_amount),0)::text as net from erp_financials.ledger_postings where accounting_basis='accrual' and account_id='account_ar' and posting_date<=$1", [date])).rows[0]?.net).toBe(total);
+    }
+    const after = await depositDatabaseState(pool);
+    await expect(sdk.commands.customerPayments.recordAndApply({ ...command, applicationDate: "2026-08-13" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(sdk.commands.customerPayments.recordAndApply({ ...command, applicationDate: command.date })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    expect(await sdk.commands.customerPayments.recordAndApply(command)).toEqual({ ...result, status: "already_recorded_and_applied" });
+  });
+
+  it("atomically collects invoice cash with payload-bound replay and no orphan receipt", async () => {
+    await depositFixture("invoice_collection");
+    const options = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_collection", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ database: runner, ...options });
+    const operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "collection:invoice", customerId: "customer_1", date: "2026-08-01", dueDate: "2026-08-31",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const command = { operation, idempotencyKey: "collection:one", customerId: "customer_1", invoiceId: invoice.documentId, expectedInvoiceVersion: 1,
+      date: "2026-08-12", amount: "40.00", memo: "Check", documentNumber: "CHECK-1", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } };
+    const counts = async () => (await pool.query<{ documents: number; journals: number; events: number; outbox: number; applications: number }>(`select
+      (select count(*)::integer from erp_financials.subledger_documents) as documents,
+      (select count(*)::integer from erp_financials.transactions) as journals,
+      (select count(*)::integer from erp_financials.financial_lifecycle_events) as events,
+      (select count(*)::integer from erp_financials.financial_outbox) as outbox,
+      (select count(*)::integer from erp_financials.subledger_applications) as applications`)).rows;
+    const before = await counts();
+    const failing = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work(new FailingMigrationClient(client, 'insert into "erp_financials"."subledger_applications"'))) } });
+    await expect(failing.commands.customerPayments.recordAndApply(command)).rejects.toThrow("injected real migration failure");
+    expect(await counts()).toEqual(before);
+    const [result, concurrentReplay] = await Promise.all([
+      sdk.commands.customerPayments.recordAndApply(command), sdk.commands.customerPayments.recordAndApply(command)
+    ]);
+    expect(concurrentReplay.paymentId).toBe(result.paymentId);
+    expect(new Set([result.status, concurrentReplay.status])).toEqual(new Set(["recorded_and_applied", "already_recorded_and_applied"]));
+    expect(await sdk.queries.getCustomerPayment(result.paymentId)).toMatchObject({ amount: "40.00", unappliedAmount: "0.00", version: 2 });
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ originalAmount: "100.00", openAmount: "60.00", version: 2 });
+    const after = await counts();
+    const retry = await sdk.commands.customerPayments.recordAndApply({ ...command, operation: { ...operation, requestId: "retry:new", correlationId: "retry:new", occurredAt: "2026-08-13T12:00:00Z" } });
+    expect(retry).toEqual({ ...result, status: "already_recorded_and_applied" });
+    expect(await sdk.commands.customerPayments.recordAndApply({ ...command, applicationAmount: "40.0", applicationDate: command.date }))
+      .toEqual({ ...result, status: "already_recorded_and_applied" });
+    expect(await counts()).toEqual(after);
+    for (const changed of [{ expectedInvoiceVersion: 2 }, { invoiceId: "other-invoice" }, { amount: "41.00" }, { date: "2026-08-11" },
+      { operation: { ...operation, actorRef: "different-actor" } }, { operation: { ...operation, reasonDetail: "Different justification" } }]) {
+      await expect(sdk.commands.customerPayments.recordAndApply({ ...command, ...changed })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    await expect(sdk.commands.customerPayments.recordAndApply({ ...command, idempotencyKey: "collection:stale" })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    await expect(sdk.commands.customerPayments.recordAndApply({ ...command, idempotencyKey: "collection:excess", expectedInvoiceVersion: 2, amount: "61.00" })).rejects.toThrow();
+    expect(await counts()).toEqual(after);
+    const competitors = await Promise.allSettled(["left", "right"].map(key => sdk.commands.customerPayments.recordAndApply({ ...command, idempotencyKey: `collection:${key}`, expectedInvoiceVersion: 2, amount: "60.00" })));
+    expect(competitors.filter(item => item.status === "fulfilled")).toHaveLength(1);
+    expect(competitors.filter(item => item.status === "rejected")).toHaveLength(1);
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ openAmount: "0.00", version: 3 });
+    expect((await pool.query("select original_amount::text from erp_financials.subledger_documents where document_type='customer_payment' order by original_amount")).rows).toEqual([{ original_amount: "40.00" }, { original_amount: "60.00" }]);
+  });
+
+  it("cannot claim an independently recorded receipt as a composite collection retry", async () => {
+    await depositFixture("invoice_collection_existing");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_collection_existing", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "existing:invoice", customerId: "customer_1", date: "2026-08-01", dueDate: "2026-08-31",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const input = { operation, idempotencyKey: "existing:receipt", customerId: "customer_1", date: "2026-08-12", amount: "40.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } };
+    const receipt = await sdk.commands.customerPayments.record(input);
+    await expect(sdk.commands.customerPayments.recordAndApply({ ...input, invoiceId: invoice.documentId, expectedInvoiceVersion: 1 })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await sdk.queries.getCustomerPayment(receipt.documentId)).toMatchObject({ unappliedAmount: "40.00", version: 1 });
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ openAmount: "100.00", version: 1 });
+  });
+
+  it("atomically retains excess cash as receipt credit with payload-bound partial application", async () => {
+    await depositFixture("invoice_partial_collection");
+    const options = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_partial_collection", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ database: runner, ...options });
+    const operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "partial:invoice", customerId: "customer_1", date: "2026-08-01", dueDate: "2026-08-31",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "30.00" }] });
+    const command = { operation, idempotencyKey: "partial:receipt", customerId: "customer_1", invoiceId: invoice.documentId, expectedInvoiceVersion: 1,
+      date: "2026-08-12", amount: "40.00", applicationAmount: "30.00",
+      cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } };
+    const counts = async () => (await pool.query<Record<string, unknown>>(`select
+      (select count(*) from erp_financials.subledger_documents) as documents,
+      (select count(*) from erp_financials.ledger_postings) as postings,
+      (select count(*) from erp_financials.financial_lifecycle_events) as events,
+      (select count(*) from erp_financials.financial_outbox) as outbox,
+      (select count(*) from erp_financials.subledger_applications) as applications`)).rows;
+    const before = await counts();
+    for (const applicationAmount of ["0.00", "-1.00", "40.01", "0.001"]) {
+      await expect(sdk.commands.customerPayments.recordAndApply({ ...command, applicationAmount })).rejects.toThrow();
+    }
+    const failing = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work(new FailingMigrationClient(client, 'insert into "erp_financials"."subledger_applications"'))) } });
+    await expect(failing.commands.customerPayments.recordAndApply(command)).rejects.toThrow("injected real migration failure");
+    expect(await counts()).toEqual(before);
+    const results = await Promise.all([sdk.commands.customerPayments.recordAndApply(command), sdk.commands.customerPayments.recordAndApply(command)]);
+    expect(new Set(results.map(result => result.paymentId)).size).toBe(1);
+    expect(new Set(results.map(result => result.status))).toEqual(new Set(["recorded_and_applied", "already_recorded_and_applied"]));
+    const result = results[0];
+    expect(result.amount).toBe("40.00");
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ originalAmount: "30.00", openAmount: "0.00" });
+    expect(await sdk.queries.getCustomerPayment(result.paymentId)).toMatchObject({ amount: "40.00", unappliedAmount: "10.00" });
+    expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-12" })).totals)
+      .toMatchObject({ invoiceCount: 1, invoicedAmount: "30.00", appliedAmount: "30.00", outstandingAmount: "0.00" });
+    expect((await pool.query(`select account_id,sum(net_amount)::text as net from erp_financials.ledger_postings
+      where tenant_id='tenant_1' and source_id='source_1' and accounting_basis='accrual'
+      and transaction_id=any($1::text[]) group by account_id order by account_id`,
+    [[invoice.journal.transactionId, result.paymentTransactionId]])).rows).toEqual([
+        { account_id: "account_ar", net: "-10.00" },
+        { account_id: "account_cash", net: "40.00" },
+        { account_id: "account_income", net: "-30.00" },
+      ]);
+    const after = await counts();
+    await expect(sdk.commands.customerPayments.recordAndApply({ ...command, applicationAmount: "29.00" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    const { applicationAmount: omittedAmount, ...fullCommand } = command;
+    void omittedAmount;
+    await expect(sdk.commands.customerPayments.recordAndApply(fullCommand)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await counts()).toEqual(after);
+    expect(await sdk.commands.customerPayments.recordAndApply({ ...command, applicationAmount: "30.0" }))
+      .toEqual({ ...result, status: "already_recorded_and_applied" });
+  });
+
+  it("rejects reusing one issuance key across two identical drafts", async () => {
+    await depositFixture("invoice_issue_key_owner");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_issue_key_owner", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const input = { operation, customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, documentDate: "2026-08-01", dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "100.00" }] };
+    const first = await sdk.invoices.createDraft({ ...input, idempotencyKey: "issue-owner:draft:1" });
+    const second = await sdk.invoices.createDraft({ ...input, idempotencyKey: "issue-owner:draft:2" });
+    const issued = await sdk.invoices.issue({ operation, invoiceDraftId: first.invoiceDraftId, expectedVersion: 1, idempotencyKey: "issue-owner:issue" });
+    await expect(sdk.invoices.issue({ operation, invoiceDraftId: second.invoiceDraftId, expectedVersion: 1, idempotencyKey: "issue-owner:issue" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await sdk.queries.getInvoice(second.invoiceDraftId)).toMatchObject({ sourceProvenance: "draft", version: 1 });
+    expect((await sdk.queries.getInvoice(issued.invoiceDocumentId)).originalAmount).toBe("100.00");
+  });
+
+  it("reads receipt balances and application evidence from one snapshot during concurrent allocation", async () => {
+    await depositFixture("receipt_read_snapshot");
+    const options = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "receipt_read_snapshot", currencyCode: "USD" };
+    const writer = createErpFinancialsSdk({ ...options, database: runner });
+    const operation = sdkOperation();
+    await writer.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const receipt = await writer.commands.customerPayments.record({ operation, idempotencyKey: "snapshot:receipt", date: "2026-08-01", customerId: "customer_1", amount: "100.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const invoice = await writer.commands.invoices.create({ operation, idempotencyKey: "snapshot:invoice", date: "2026-08-02", dueDate: "2026-08-31", customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "10.00" }] });
+    let applied = false;
+    const database: PostgresMigrationTransactionRunner = { transaction: work => runner.transaction(client => work({
+      query: async <Row extends Record<string, unknown>>(sql: string, parameters?: readonly unknown[]): Promise<PostgresQueryResult<Row>> => {
+        const result = await client.query<Row>(sql, parameters);
+        if (!applied && sql.includes('as "payment_id"')) {
+          applied = true;
+          await writer.commands.paymentApplications.apply({ operation, idempotencyKey: "snapshot:allocation", applicationType: "customer_payment_to_invoice", sourceDocumentId: receipt.documentId, targetDocumentId: invoice.documentId, amount: "10.00", applicationDate: "2026-08-02", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+        }
+        return result;
+      }
+    })) };
+    const reader = createErpFinancialsSdk({ ...options, database });
+    const snapshot = await reader.queries.getCustomerPayment(receipt.documentId);
+    expect(applied).toBe(true);
+    expect(snapshot).toMatchObject({ version: 1, unappliedAmount: "100.00", matchedApplicationCount: 0, applications: [] });
+    expect(await writer.queries.getCustomerPayment(receipt.documentId)).toMatchObject({ version: 2, unappliedAmount: "90.00", matchedApplicationCount: 1, applications: [{ amount: "10.00" }] });
+  });
+
+  it("pages receipt application history beyond the former silent101 cap with receipt-scoped cursors", async () => {
+    await depositFixture("receipt_history");
+    const options = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "receipt_history", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(options);
+    const operation = sdkOperation();
+    const receipt = await sdk.commands.customerPayments.record({ operation, idempotencyKey: "history:receipt", date: "2026-08-01", customerId: "customer_1", amount: "3.00", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "history:invoice", date: "2026-08-01", dueDate: "2026-08-31", customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "2.00" }] });
+    const ids = [];
+    for (let index = 0; index < 103; index++) {
+      const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: `history:apply:${String(index)}`, applicationType: "customer_payment_to_invoice", sourceDocumentId: receipt.documentId, targetDocumentId: invoice.documentId, amount: "0.01", applicationDate: "2026-08-02", expectedSourceVersion: index + 1, expectedTargetVersion: index + 1 });
+      ids.push(application.applicationId);
+    }
+    const first = await sdk.queries.getCustomerPayment(receipt.documentId);
+    expect(first.applications).toHaveLength(100);
+    expect(first.applicationsNextCursor).toBeDefined();
+    const nextCursor = first.applicationsNextCursor;
+    if (nextCursor === undefined) throw new Error("Receipt application continuation missing");
+    expect(first).toMatchObject({ amount: "3.00", unappliedAmount: "1.97", matchedApplicationCount: 103, version: 104 });
+    const second = await sdk.queries.getCustomerPayment(receipt.documentId, { cursor: nextCursor, limit: 100 });
+    expect(second.applications).toHaveLength(3);
+    expect(second.applicationsNextCursor).toBeUndefined();
+    expect([...first.applications, ...second.applications].map(row => row.applicationId)).toEqual(ids.sort().reverse());
+    expect([...first.applications, ...second.applications].every(row => row.amount === "0.01")).toBe(true);
+    await expect(sdk.queries.getCustomerPayment(invoice.documentId, { cursor: nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(createErpFinancialsSdk({ ...options, companyId: "another_company" }).queries.getCustomerPayment(receipt.documentId, { cursor: nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(sdk.queries.getCustomerPayment(receipt.documentId, { limit: 201 })).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(sdk.queries.getCustomerPayment(receipt.documentId, { cursor: "x".repeat(4097) })).rejects.toMatchObject({ code: "invalid_input" });
+    await sdk.books.define({ operation, bookId: "receipt_later_book", name: "Later source binding", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: "receipt_later_book", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-08-02" });
+    await expect(createErpFinancialsSdk({ ...options, bookId: "receipt_later_book" }).queries.getCustomerPayment(receipt.documentId)).rejects.toMatchObject({ code: "missing_document" });
+  });
+
+  it("reads invoice headers and lines from the same snapshot during a concurrent draft edit", async () => {
+    await depositFixture("draft_read_snapshot");
+    await pool.query("update erp_financials.accounts set account_number='4000' where account_id='account_income'");
+    const options = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "draft_read_snapshot", currencyCode: "USD" };
+    const writer = createErpFinancialsSdk({ ...options, database: runner });
+    const create = { operation: sdkOperation(), idempotencyKey: "snapshot:read", customerId: "customer_1", receivableAccount: { accountId: "account_ar" },
+      documentDate: "2026-08-01", dueDate: "2026-08-31", memo: "original", revenueLines: [{ accountId: "account_income", amount: "25.00" }] };
+    const draft = await writer.invoices.createDraft(create);
+    let edited = false;
+    const readingDatabase: PostgresMigrationTransactionRunner = { transaction: work => runner.transaction(client => work({
+      query: async <Row extends Record<string, unknown>>(sql: string, parameters?: readonly unknown[]): Promise<PostgresQueryResult<Row>> => {
+        const result = await client.query<Row>(sql, parameters);
+        // Commit a competing edit immediately after the header snapshot was read.
+        // The old list/header/lines implementation returned total=25 with lines=50.
+        if (!edited && (sql.includes("with invoice_rows as") || sql.includes("invoice_detail_rows as"))) {
+          edited = true;
+          await writer.invoices.updateDraft({ ...create, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1, memo: "edited",
+            revenueLines: [{ accountId: "account_income", amount: "50.00" }] });
+        }
+        return result;
+      }
+    })) };
+    const reader = createErpFinancialsSdk({ ...options, database: readingDatabase });
+    const snapshot = await reader.queries.getInvoice(draft.invoiceDraftId, "2026-08-31");
+    expect(edited).toBe(true);
+    expect(snapshot).toMatchObject({ version: 1, memo: "original", originalAmount: "25.00", lines: [{ amount: "25.00", accountNumber: "4000" }],
+      idempotencyKey: create.idempotencyKey, creationLifecycle: { actorRef: create.operation.actorRef, requestId: create.operation.requestId, reasonCode: create.operation.reasonCode } });
+    expect(snapshot.settlement).toEqual({basis:"current",cashAppliedAmount:"0.00",creditAppliedAmount:"0.00",writeOffAppliedAmount:"0.00",cancellationAmount:"0.00",unclassifiedAmount:"0.00",balanceReductionAmount:"0.00"});
+    expect(snapshot.transactionId).toBeUndefined();
+    expect(snapshot.createdAt).toBe(snapshot.updatedAt);
+    const current = await writer.queries.getInvoice(draft.invoiceDraftId, "2026-08-31");
+    expect(current).toMatchObject({ version: 2, memo: "edited", originalAmount: "50.00", lines: [{ amount: "50.00" }] });
+    const batch = await writer.queries.getInvoicesByIds([draft.invoiceDraftId], "2026-08-31");
+    expect(batch.byInvoiceId[draft.invoiceDraftId]).toEqual(current);
+    await expect(writer.queries.getInvoice("missing", "2026-08-31")).rejects.toMatchObject({ code: "missing_document" });
+  });
+
+  it("reads scoped draft provenance after issuance and preserves order dimensions through cancellation", async () => {
+    await depositFixture("draft_provenance");
+    const scope = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "draft_provenance", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(scope);
+    const operation = sdkOperation();
+    const dimensions = [{ dimensionKind: "blu_order", sourceDimensionId: "order:1" }];
+    const metadata = { bluOrderId: "order:1", bluOrderAttributionVersion: 1 };
+    const draft = await sdk.invoices.createDraft({ operation, idempotencyKey: "provenance:create", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, documentDate: "2026-08-01", dueDate: "2026-08-31", metadata,
+      revenueLines: [{ accountId: "account_income", amount: "25.00", dimensionRefs: dimensions }] });
+    expect(await sdk.invoices.getDraft(draft.invoiceDraftId)).toEqual(draft);
+    expect(draft.metadata).toEqual(metadata);
+    expect(draft.lines[0]?.dimensionRefs).toEqual(dimensions);
+    const beforeReads = await depositDatabaseState(pool);
+    for (const change of [{ tenantId: "other" }, { companyId: "other" }, { bookId: "other" }, { writeSourceId: "other" }, { currencyCode: "EUR" }]) {
+      await expect(createErpFinancialsSdk({ ...scope, ...change }).invoices.getDraft(draft.invoiceDraftId)).rejects.toMatchObject({ code: "missing_document" });
+    }
+    await expect(sdk.invoices.getDraft("missing")).rejects.toMatchObject({ code: "missing_document" });
+    await expect(sdk.invoices.getDraft(" ")).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(sdk.invoices.getDraft("x".repeat(513))).rejects.toMatchObject({ code: "invalid_input" });
+    expect(await depositDatabaseState(pool)).toEqual(beforeReads);
+    const issued = await sdk.invoices.issue({ operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1, idempotencyKey: "provenance:issue" });
+    expect(await sdk.invoices.getDraft(draft.invoiceDraftId)).toMatchObject({ status: "issued", metadata, issuedDocumentId: issued.invoiceDocumentId });
+    await expect(sdk.invoices.getDraft(issued.invoiceDocumentId)).rejects.toMatchObject({ code: "missing_document" });
+    const filter = { periodStart: "2026-08-01", periodEnd: "2026-08-31", dimensionKind: "blu_order", dimensionId: "order:1", limit: 10 };
+    const posted = await sdk.queries.listGeneralLedger(filter);
+    expect(posted.items).toHaveLength(1);
+    expect(posted.items[0]).toMatchObject({ creditAmount: "25.00", debitAmount: "0.00", dimensions });
+    await sdk.invoices.voidIssued({ operation: { ...operation, approverRef: "reviewer" }, invoiceDocumentId: issued.invoiceDocumentId,
+      expectedVersion: 1, idempotencyKey: "provenance:void", date: "2026-08-02" });
+    const reversed = await sdk.queries.listGeneralLedger(filter);
+    expect(reversed.items).toHaveLength(2);
+    expect(reversed.items.map(line => line.netAmount).sort()).toEqual(["-25.00", "25.00"]);
+    expect(reversed.items.every(line => JSON.stringify(line.dimensions) === JSON.stringify(dimensions))).toBe(true);
+    expect((await sdk.invoices.getDraft(draft.invoiceDraftId)).metadata).toEqual(metadata);
+  });
+
+  async function invoiceCorrectionFixture(amount = "10.00", dueDate = "2026-08-31") {
+    await depositFixture("invoice_correction");
+    const options = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_correction", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(options), operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "correct:invoice", date: "2026-08-01", dueDate, customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const payment = await sdk.commands.customerPayments.record({ operation, idempotencyKey: "correct:payment", date: "2026-08-02", customerId: "customer_1", collectionRef: "correct:order",
+      amount, cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "correct:apply", applicationType: "customer_payment_to_invoice",
+      sourceDocumentId: payment.documentId, targetDocumentId: invoice.documentId, amount, applicationDate: "2026-08-02", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    const command = { operation, invoiceDocumentId: invoice.documentId, expectedVersion: 2, idempotencyKey: "correct:command", date: "2026-08-04",
+      memo: "Reviewed economic correction", releases: [{ applicationId: application.applicationId, expectedVersion: 1, expectedSourceVersion: 2, reapplyAmount: "0.00" }] as const };
+    return { sdk, options, operation, invoice, payment, application, command };
+  }
+
+  async function seedHistoricalInvoiceDraft(bookId:string) {
+    const invoiceDraftId=`historical:${bookId}`;
+    await pool.query(`insert into erp_financials.invoice_drafts
+      (invoice_draft_id,tenant_id,company_id,book_id,source_id,customer_id,receivable_account_id,document_date,due_date,currency_code,status,version,idempotency_key,metadata,created_at,updated_at)
+      values($1,'tenant_1','company_1',$2,'source_1','customer_1','account_ar','2026-08-03','2026-08-31','USD','draft',1,$1,'{}',now(),now())`,[invoiceDraftId,bookId]);
+    await pool.query(`insert into erp_financials.invoice_draft_lines
+      (invoice_draft_line_id,tenant_id,company_id,book_id,source_id,invoice_draft_id,line_number,account_id,quantity,unit_amount,discount_amount,tax_amount,dimension_refs,line_amount)
+      values($1,'tenant_1','company_1',$2,'source_1',$3,1,'account_income',1,5.00,0.00,0.00,'[]',5.00)`,[`${invoiceDraftId}:line`,bookId,invoiceDraftId]);
+    return {invoiceDraftId};
+  }
+
+  it("invoice component migration upgrades populated schema42 atomically and preserves old draft economics",async()=>{
+    await depositFixture("components_upgrade",42);
+    const draft=await seedHistoricalInvoiceDraft("components_upgrade");
+    const before=await depositDatabaseState(pool);
+    const failed={transaction:<Result>(work:(client:PostgresQueryClient)=>Promise<Result>)=>runner.transaction(client=>work(new FailingMigrationClient(client,'insert into "erp_financials"."schema_migrations"')))};
+    await expect(migratePostgresSchema(failed,{appliedByRef:"components:failed"})).rejects.toThrow("injected real migration failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const columns=await pool.query("select column_name from information_schema.columns where table_schema='erp_financials' and column_name in ('tax_account_id','discount_account_id')");
+    expect(columns.rows).toEqual([]);
+    const result=await migratePostgresSchema(runner,{appliedByRef:"components:upgrade"});
+    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[42,43],[43,44],[44,45],[45,46],[46,47],[47,48]]);
+    const after=stripNewRecognitionNulls(await depositDatabaseState(pool));
+    // New nullable provenance columns are the only changes to existing rows.
+    for(const table of ["invoice_draft_lines","subledger_document_lines"])for(const entry of after[table]??[]){
+      const row=(entry as {row:Record<string,unknown>}).row;
+      expect(row.tax_account_id).toBeNull();expect(row.discount_account_id).toBeNull();delete row.tax_account_id;delete row.discount_account_id;
+    }
+    expect(after.cash_flow_purpose_corrections).toEqual([]);before.cash_flow_purpose_corrections=[];
+    delete before.schema_migrations;delete after.schema_migrations;expect(after).toEqual(before);
+    const sdk=createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",bookId:"components_upgrade",writeSourceId:"source_1",currencyCode:"USD"});
+    expect(await sdk.invoices.getDraft(draft.invoiceDraftId)).toMatchObject({originalAmount:"5.00",lines:[{amount:"5.00"}]});
+    expect((await migratePostgresSchema(runner,{appliedByRef:"components:retry"})).applied).toEqual([]);
+  });
+
+  it("aging pages preserve historical net offsets, whole totals and strict scoped continuation",async()=>{
+    const {sdk,options,operation,application}=await invoiceCorrectionFixture();
+    await sdk.commands.customerPayments.record({operation,idempotencyKey:"aging:unapplied",date:"2026-08-03",customerId:"customer_1",amount:"7.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    await sdk.commands.credits.issue({operation,idempotencyKey:"aging:credit",date:"2026-08-04",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"2.00"}]});
+    await sdk.commands.invoices.create({operation,idempotencyKey:"aging:second",date:"2026-08-01",dueDate:"2026-08-31",customerId:"customer_2",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"50.00"}]});
+    const request={kind:"receivables" as const,asOfDate:"2026-08-31",limit:1};
+    const first=await sdk.queries.getAgingPage(request),legacy=await sdk.queries.getAging(request);
+    expect(first).toMatchObject({basis:"as_of",partyCount:"2",rows:[{partyId:"customer_1",current:"15.00",days1To30:"-9.00",total:"6.00"}],totals:{current:"65.00",days1To30:"-9.00",total:"56.00"}});
+    expect(first.totals).toEqual(legacy.totals);if(!first.nextCursor)throw Error("Expected aging cursor");
+    const second=await sdk.queries.getAgingPage({...request,cursor:first.nextCursor});
+    expect(second.rows).toMatchObject([{partyId:"customer_2",total:"50.00"}]);expect(second.nextCursor).toBeUndefined();expect(second.totals).toEqual(first.totals);expect(second.revision).toBe(first.revision);
+    expect([...first.rows,...second.rows].sort((a,b)=>a.partyId.localeCompare(b.partyId))).toEqual([...legacy.rows].sort((a,b)=>a.partyId.localeCompare(b.partyId)));
+    for(const change of [{asOfDate:"2026-08-30"},{kind:"payables" as const},{limit:0},{limit:201},{limit:1.5},{cursor:"x".repeat(8193)}])await expect(sdk.queries.getAgingPage({...request,cursor:first.nextCursor,...change})).rejects.toMatchObject({code:"invalid_input"});
+    await expect(createErpFinancialsSdk({...options,tenantId:"foreign"}).queries.getAgingPage({...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    expect(await sdk.queries.getAgingPage({...request,asOfDate:"2025-08-31"})).toMatchObject({partyCount:"0",rows:[],totals:{total:"0.00"}});
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-03"});
+    await expect(sdk.queries.getAgingPage({...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    for(const asOfDate of ["2026-08-01","2026-08-02","2026-08-03","2026-08-31"]){const page=await sdk.queries.getAgingPage({...request,asOfDate});expect(page.totals).toEqual((await sdk.queries.getAging({...request,asOfDate})).totals);}
+  });
+
+  it("aging pages retain a single financial snapshot while cash applications change",async()=>{
+    const {sdk,options,operation,application}=await invoiceCorrectionFixture();
+    const request={kind:"receivables" as const,asOfDate:"2026-08-31",limit:1};
+    const first=await sdk.queries.getAgingPage(request);
+    let captured!:()=>void,release!:()=>void;const ready=new Promise<void>(resolve=>{captured=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+    const observed=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{
+        const result=await client.query<Row>(sql,params);if(sql.includes("aging_rows as materialized")){captured();await gate;}return result;
+      }
+    }))}});
+    const pending=observed.queries.getAgingPage(request);
+    try{await ready;await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-03"});}finally{release();}
+    expect(await pending).toEqual(first);
+    const next=await sdk.queries.getAgingPage(request);expect(next.revision).not.toBe(first.revision);expect(next.totals).toMatchObject({current:"25.00",days1To30:"-10.00",total:"15.00"});
+  });
+
+  it("aging pages bound returned party rows beyond the 200-row page maximum",async()=>{
+    await depositFixture("aging_many");const operation=sdkOperation();
+    await pool.query(`insert into erp_financials.parties(party_id,tenant_id,source_id,source_party_id,party_type,display_name,active)
+      select 'aging:'||lpad(n::text,4,'0'),'tenant_1','source_1','aging:'||n,'customer','Aging customer '||n,true from generate_series(1,205) n`);
+    const options={database:runner,tenantId:"tenant_1",companyId:"company_1",bookId:"aging_many",writeSourceId:"source_1",currencyCode:"USD"};
+    const sdk=createErpFinancialsSdk(options);
+    for(let n=1;n<=205;n++)await sdk.commands.invoices.create({operation,idempotencyKey:`aging:${String(n)}`,customerId:`aging:${String(n).padStart(4,"0")}`,date:"2026-08-01",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"1.25"}]});
+    const returned:number[]=[];
+    const reader=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{const result=await client.query<Row>(sql,params);returned.push(result.rows.length);return result;}
+    }))}});
+    const ids:string[]=[];let cursor:string|undefined;let pages=0;
+    do{const page=await reader.queries.getAgingPage({kind:"receivables",asOfDate:"2026-08-31",limit:50,...(cursor?{cursor}:{})});pages++;expect(page.rows.length).toBeLessThanOrEqual(50);expect(page.partyCount).toBe("205");expect(page.totals.total).toBe("256.25");ids.push(...page.rows.map(row=>row.partyId));cursor=page.nextCursor;}while(cursor&&pages<10);
+    expect(pages).toBe(5);expect(cursor).toBeUndefined();expect(new Set(ids).size).toBe(205);expect(ids).toHaveLength(205);expect(Math.max(...returned)).toBeLessThanOrEqual(51);
+  });
+
+  it("invoice register revision migration upgrades populated schema41 atomically without rewriting financial facts",async()=>{
+    await depositFixture("register_upgrade",41);
+    const options={database:runner,tenantId:"tenant_1",companyId:"company_1",bookId:"register_upgrade",writeSourceId:"source_1",currencyCode:"USD"};
+    const sdk=createErpFinancialsSdk(options);
+    // Seed the historical row format: current writers require schema43 columns.
+    const draft=await seedHistoricalInvoiceDraft("register_upgrade");
+    const before=await depositDatabaseState(pool);
+    const failed={transaction:<Result>(work:(client:PostgresQueryClient)=>Promise<Result>)=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{
+        if(sql.includes('insert into "erp_financials"."schema_migrations"')&&params.includes("20261022040000_track_invoice_read_revisions"))throw Error("injected migration receipt failure");
+        return client.query<Row>(sql,params);
+      }
+    }))};
+    await expect(migratePostgresSchema(failed,{appliedByRef:"register:failed"})).rejects.toThrow("injected migration receipt failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const triggers=await pool.query<{count:number}>("select count(*)::integer count from pg_trigger where tgname='accounting_revision_insert' and tgrelid='erp_financials.invoice_draft_lines'::regclass");
+    expect(triggers.rows[0]?.count).toBe(0);
+    const upgraded=await migratePostgresSchema(runner,{appliedByRef:"register:upgrade",targetVersion:42});expect(upgraded.currentVersion).toBe(41);expect(upgraded.targetVersion).toBe(42);
+    const after=await depositDatabaseState(pool);
+    // This deliberately upgrades only to42. Cash-purpose receipts arrive in44.
+    expect(after.cash_flow_purpose_corrections).toBeUndefined();
+    delete before.schema_migrations;delete after.schema_migrations;expect(after).toEqual(before);
+    // Current read APIs require the current schema; the isolated v42 assertions above remain unchanged.
+    await migratePostgresSchema(runner,{appliedByRef:"register:current-reader"});
+    const first=await sdk.queries.getInvoiceRegister({asOfDate:"2026-08-31"});
+    await pool.query("update erp_financials.invoice_draft_lines set description='after upgrade' where invoice_draft_id=$1",[draft.invoiceDraftId]);
+    expect((await sdk.queries.getInvoiceRegister({asOfDate:"2026-08-31"})).revision).not.toBe(first.revision);
+  });
+
+  it("invoice register pages share global summaries and reject changed scope, filters, deliveries and draft lines", async () => {
+    const {sdk,options,operation,invoice}=await invoiceCorrectionFixture();
+    const draft=await sdk.invoices.createDraft({operation,idempotencyKey:"register:draft",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},
+      documentDate:"2026-08-03",dueDate:"2026-08-31",memo:"Draft terms",revenueLines:[{accountId:"account_income",amount:"5.00"}]});
+    const queries:string[]=[];
+    const reader=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{queries.push(sql);return client.query<Row>(sql,params);}
+    }))}});
+    const request={asOfDate:"2026-08-31",limit:1};
+    const first=await reader.queries.getInvoiceRegister(request);
+    expect(queries).toHaveLength(2);
+    expect(first).toMatchObject({basis:"current",currencyCode:"USD",summary:{counts:{all:"2",draft:"1",open:"1",overdue:"0",paid:"0",voided:"0"},outstandingAmount:"15.00",draftAmount:"5.00",averageOpenAgeDays:"30"},
+      items:[{invoiceId:draft.invoiceDraftId,registerStatus:"draft",memo:"Draft terms",originalAmount:"5.00",settlement:{cashAppliedAmount:"0.00"}}]});
+    if(!first.nextCursor)throw Error("Missing register cursor");
+    const second=await reader.queries.getInvoiceRegister({...request,cursor:first.nextCursor});
+    expect(queries).toHaveLength(4);expect(second.summary).toEqual(first.summary);expect(second.revision).toBe(first.revision);
+    expect(second.items).toMatchObject([{invoiceId:invoice.documentId,registerStatus:"open",settlement:{cashAppliedAmount:"10.00",creditAppliedAmount:"0.00"}}]);
+    expect(second.nextCursor).toBeUndefined();expect(second.items[0]).not.toHaveProperty("lines");
+    for(const change of [{status:"paid" as const},{customerId:"other"},{asOfDate:"2026-09-01"}])await expect(sdk.queries.getInvoiceRegister({...request,...change,cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    for(const change of [{limit:0},{limit:201},{limit:1.5},{cursor:"invalid"},{cursor:"x".repeat(8193)}])await expect(sdk.queries.getInvoiceRegister({...request,...change})).rejects.toMatchObject({code:"invalid_input"});
+    await expect(sdk.queries.getInvoiceRegister({cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    await expect(createErpFinancialsSdk({...options,tenantId:"foreign"}).queries.getInvoiceRegister({...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    expect(await sdk.queries.getInvoiceRegister({...request,customerId:"other"})).toMatchObject({items:[],summary:{counts:{all:"0"},outstandingAmount:"0.00",draftAmount:"0.00",averageOpenAgeDays:"0"}});
+    expect(await sdk.queries.getInvoiceRegister({...request,status:"receivable"})).toMatchObject({items:[{invoiceId:invoice.documentId}],summary:first.summary});
+    expect(await sdk.queries.getInvoiceRegister({...request,asOfDate:"2026-09-01",status:"overdue"})).toMatchObject({items:[{invoiceId:invoice.documentId}],summary:{counts:{all:"2",overdue:"1"},overdueAmount:"15.00"}});
+    await sdk.invoices.recordDelivery({operation,invoiceDocumentId:invoice.documentId,idempotencyKey:"register:delivery",status:"sent",channel:"email"});
+    await expect(sdk.queries.getInvoiceRegister({...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    const refreshed=await sdk.queries.getInvoiceRegister(request);if(!refreshed.nextCursor)throw Error("Missing refreshed cursor");
+    const client=await pool.connect();try{await client.query("begin");await client.query("update erp_financials.invoice_draft_lines set description='rolled back' where invoice_draft_id=$1",[draft.invoiceDraftId]);await client.query("rollback");}finally{client.release();}
+    expect((await sdk.queries.getInvoiceRegister({...request,cursor:refreshed.nextCursor})).revision).toBe(refreshed.revision);
+    await pool.query("update erp_financials.invoice_draft_lines set description='changed description' where invoice_draft_id=$1",[draft.invoiceDraftId]);
+    await expect(sdk.queries.getInvoiceRegister({...request,cursor:refreshed.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    const changed=await sdk.queries.getInvoiceRegister(request);expect(changed.summary).toEqual(first.summary);
+    await pool.query("update erp_financials.invoice_draft_lines set description=description where invoice_draft_id=$1",[draft.invoiceDraftId]);
+    expect((await sdk.queries.getInvoiceRegister(request)).revision).toBe(changed.revision);
+  });
+
+  it("customer invoice summary batches preserve register settlement without lines or foreign-customer reads",async()=>{
+    const {sdk,options,operation,invoice,command}=await invoiceCorrectionFixture();
+    const draft=await sdk.invoices.createDraft({operation,idempotencyKey:"summary:draft",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},documentDate:"2026-08-03",dueDate:"2026-08-31",revenueLines:[{accountId:"account_income",amount:"5.00"}]});
+    const queries:string[]=[];
+    const reader=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{queries.push(sql);return client.query<Row>(sql,params);}
+    }))}});
+    const input={invoiceIds:[invoice.documentId,"missing",draft.invoiceDraftId],customerId:"customer_1",asOfDate:"2026-08-31"};
+    const rows=await reader.queries.getInvoiceSummariesByIds(input);expect(queries).toHaveLength(2);
+    expect(rows.map(row=>row.invoiceId)).toEqual([invoice.documentId,draft.invoiceDraftId]);
+    expect(rows[0]).toMatchObject({customerId:"customer_1",openAmount:"15.00",settlement:{cashAppliedAmount:"10.00",creditAppliedAmount:"0.00"}});
+    const register=await sdk.queries.getInvoiceRegister({customerId:"customer_1",asOfDate:input.asOfDate});
+    for(const row of rows){const match=register.items.find(item=>item.invoiceId===row.invoiceId);if(!match)throw Error("Missing register row");const expected={...match};delete expected.memo;expect(row).toEqual(expected);expect(row).not.toHaveProperty("lines");expect(row).not.toHaveProperty("lifecycle");}
+    expect(await reader.queries.getInvoiceSummariesByIds({...input,customerId:"foreign"})).toEqual([]);
+    expect(await reader.queries.getInvoiceSummariesByIds({...input,invoiceIds:[]})).toEqual([]);
+    for(const invoiceIds of [[invoice.documentId,invoice.documentId],[""],Array.from({length:201},(_,i)=>`id-${String(i)}`)])await expect(reader.queries.getInvoiceSummariesByIds({...input,invoiceIds})).rejects.toMatchObject({code:"invalid_input"});
+    await expect(reader.queries.getInvoiceSummariesByIds({...input,customerId:""})).rejects.toMatchObject({code:"invalid_input"});
+    await sdk.invoices.recordDelivery({operation,invoiceDocumentId:invoice.documentId,idempotencyKey:"summary:sent",status:"sent",channel:"email"});
+    expect((await reader.queries.getInvoiceSummariesByIds(input))[0]?.settlement).toEqual(rows[0]?.settlement);
+    await sdk.invoices.correctIssued({...command,expectedVersion:(await sdk.queries.getInvoice(invoice.documentId)).version});
+    const cancelled=(await reader.queries.getInvoiceSummariesByIds(input))[0];if(!cancelled)throw Error("Missing cancelled invoice");
+    expect(cancelled.status).toBe("voided");expect(cancelled.settlement.cancellationAmount).toBe("25.00");expect(cancelled.settlement.cashAppliedAmount).toBe("0.00");
+    expect(await reader.queries.getInvoiceSummariesByIds({...input,invoiceIds:[invoice.documentId,...Array.from({length:199},(_,i)=>`missing-${String(i)}`)]})).toHaveLength(1);
+    for(const foreign of [{tenantId:"foreign"},{companyId:"foreign"},{bookId:"foreign"}])await expect(createErpFinancialsSdk({...options,...foreign}).queries.getInvoiceSummariesByIds(input)).rejects.toMatchObject({code:"missing_book"});
+    const racing=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{
+        if(sql.includes("summary_rows as"))await pool.query("update erp_financials.reporting_books set status='archived' where tenant_id=$1 and company_id=$2 and book_id=$3",[options.tenantId,options.companyId,options.bookId]);
+        return client.query<Row>(sql,params);
+      }
+    }))}});
+    try{await expect(racing.queries.getInvoiceSummariesByIds(input)).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});}
+    finally{await pool.query("update erp_financials.reporting_books set status='active' where tenant_id=$1 and company_id=$2 and book_id=$3",[options.tenantId,options.companyId,options.bookId]);}
+
+  });
+
+  it("invoice register page presentation preserves delivery precedence, customer names and all financial status filters",async()=>{
+    const {sdk,operation,invoice}=await invoiceCorrectionFixture();
+    const create=(key:string)=>sdk.commands.invoices.create({operation,idempotencyKey:key,date:"2026-08-03",dueDate:"2026-08-31",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"25.00"}]});
+    const sent=await create("presentation:sent"),paid=await create("presentation:paid"),voided=await create("presentation:void");
+    await sdk.commands.customerPayments.recordAndApply({operation,idempotencyKey:"presentation:payment",invoiceId:paid.documentId,expectedInvoiceVersion:1,customerId:"customer_1",date:"2026-08-03",amount:"25.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    await sdk.invoices.voidIssued({operation,invoiceDocumentId:voided.documentId,expectedVersion:1,idempotencyKey:"presentation:cancel",date:"2026-08-03"});
+    const draft=await sdk.invoices.createDraft({operation,idempotencyKey:"presentation:draft",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},documentDate:"2026-08-03",dueDate:"2026-08-31",revenueLines:[{accountId:"account_income",amount:"5.00"}]});
+    for(const document of [sent,paid,voided,invoice])await sdk.invoices.recordDelivery({operation:{...operation,occurredAt:"2026-08-10T00:00:00Z"},occurredAt:"2026-08-10T00:00:00Z",invoiceDocumentId:document.documentId,idempotencyKey:`presentation:delivery:${document.documentId}`,status:"sent",channel:"email"});
+    const request={asOfDate:"2026-08-31",limit:2};
+    let page=await sdk.queries.getInvoiceRegister(request);const summary=page.summary,items=[...page.items];
+    while(page.nextCursor){page=await sdk.queries.getInvoiceRegister({...request,cursor:page.nextCursor});expect(page.summary).toEqual(summary);items.push(...page.items);}
+    expect(summary).toMatchObject({counts:{all:"5",draft:"1",open:"2",overdue:"0",paid:"1",voided:"1"},outstandingAmount:"40.00",draftAmount:"5.00"});
+    expect(Object.fromEntries(items.map(item=>[item.invoiceId,item.status]))).toEqual({[invoice.documentId]:"partial",[sent.documentId]:"sent",[paid.documentId]:"paid",[voided.documentId]:"voided",[draft.invoiceDraftId]:"draft"});
+    const old=(await sdk.queries.listInvoices({...request,limit:50})).items;
+    for(const item of items){expect(item.customerName).toBeTruthy();const original=old.find(row=>row.invoiceId===item.invoiceId);expect(original).toBeDefined();expect(item).toMatchObject(original ?? {});}
+    for(const [status,count]of [["draft",1],["open",2],["paid",1],["voided",1],["active",4],["receivable",3]] as const){const filtered=await sdk.queries.getInvoiceRegister({...request,status,limit:50});expect(filtered.items).toHaveLength(count);expect(filtered.summary).toEqual(summary);}
+    expect((await sdk.queries.getInvoiceRegister({...request,asOfDate:"2026-09-01",status:"overdue",limit:50})).items.map(item=>item.status)).toEqual(["overdue","overdue"]);
+    await sdk.invoices.recordDelivery({operation:{...operation,occurredAt:"2026-08-11T00:00:00Z"},occurredAt:"2026-08-11T00:00:00Z",invoiceDocumentId:sent.documentId,idempotencyKey:"presentation:failed",status:"failed",channel:"email"});
+    const failed=await sdk.queries.getInvoiceRegister({...request,limit:50});expect(failed.summary).toEqual(summary);expect(failed.items.find(item=>item.invoiceId===sent.documentId)?.status).toBe("open");
+  });
+
+  it("invoice register pages retain one financial snapshot during concurrent application changes",async()=>{
+    const {sdk,options,operation,application,invoice}=await invoiceCorrectionFixture();
+    const extra=await sdk.invoices.createDraft({operation,idempotencyKey:"register:race",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},
+      documentDate:"2026-08-03",dueDate:"2026-08-31",revenueLines:[{accountId:"account_income",amount:"1.00"}]});void extra;
+    const request={asOfDate:"2026-08-31",limit:1},first=await sdk.queries.getInvoiceRegister(request);
+    let captured!:()=>void,release!:()=>void;const ready=new Promise<void>(resolve=>{captured=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+    const observed=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{
+        const rows=await client.query<Row>(sql,params);if(sql.includes("register_rows as")){captured();await gate;}return rows;
+      }
+    }))}});
+    if(!first.nextCursor)throw Error("Missing register continuation");
+    const pending=observed.queries.getInvoiceRegister(request);
+    try{await ready;await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-04"});}finally{release();}
+    expect(await pending).toEqual(first);
+    await expect(sdk.queries.getInvoiceRegister({...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    const fresh=await sdk.queries.getInvoiceRegister({...request,status:"receivable"});
+    expect(fresh).toMatchObject({summary:{outstandingAmount:"25.00"},items:[{invoiceId:invoice.documentId,openAmount:"25.00",settlement:{cashAppliedAmount:"0.00"}}]});
+    expect(fresh.revision).not.toBe(first.revision);
+  });
+
+  it("invoice register pages exceed 200 without loading line history or losing exact summaries",async()=>{
+    const {sdk,options,operation}=await invoiceCorrectionFixture();
+    for(let index=0;index<204;index++)await sdk.invoices.createDraft({operation,idempotencyKey:`register:many:${String(index)}`,customerId:"customer_1",receivableAccount:{accountId:"account_ar"},
+      documentDate:"2026-08-03",dueDate:"2026-08-31",revenueLines:[{accountId:"account_income",amount:"0.01"}]});
+    const first=await sdk.queries.getInvoiceRegister({asOfDate:"2026-08-31",limit:200});
+    expect(first.items).toHaveLength(200);expect(first.summary).toMatchObject({counts:{all:"205",draft:"204",open:"1"},draftAmount:"2.04",outstandingAmount:"15.00"});
+    if(!first.nextCursor)throw Error("Missing register continuation");
+    const last=await sdk.queries.getInvoiceRegister({asOfDate:"2026-08-31",limit:200,cursor:first.nextCursor});
+    expect(last.items).toHaveLength(5);expect(last.nextCursor).toBeUndefined();expect(last.summary).toEqual(first.summary);
+    expect(new Set([...first.items,...last.items].map(row=>row.invoiceId)).size).toBe(205);
+    // Old list API still returns its original shape and bounded behavior.
+    const old=await createErpFinancialsSdk(options).queries.listInvoices({asOfDate:"2026-08-31",limit:200});
+    expect(old.items).toHaveLength(200);expect(old.items[0]).not.toHaveProperty("settlement");
+  },30000);
+
+  it("invoice receipt pages share the invoice snapshot, classify cash and reject stale or cross-scope continuation", async () => {
+    const {sdk,options,invoice,payment,application,operation}=await invoiceCorrectionFixture();
+    const second=await sdk.commands.customerPayments.record({operation,idempotencyKey:"receipt-page:second",date:"2026-08-03",customerId:"customer_1",amount:"5.00",
+      cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"},memo:"Second receipt"});
+    await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"receipt-page:second:apply",applicationType:"customer_payment_to_invoice",sourceDocumentId:second.documentId,
+      targetDocumentId:invoice.documentId,amount:"5.00",applicationDate:"2026-08-03",expectedSourceVersion:1,expectedTargetVersion:2});
+    const credit=await sdk.commands.credits.issue({operation,idempotencyKey:"receipt-page:credit",date:"2026-08-04",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"4.00"}]});
+    await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"receipt-page:credit:apply",applicationType:"credit_to_invoice",sourceDocumentId:credit.documentId,
+      targetDocumentId:invoice.documentId,amount:"4.00",applicationDate:"2026-08-04",expectedSourceVersion:1,expectedTargetVersion:3});
+    const request={asOfDate:"2026-08-31",limit:1};
+    const first=await sdk.queries.getInvoiceReceiptPage(invoice.documentId,request);
+    expect(first).toMatchObject({basis:"current",totalApplicationCount:2,totalAppliedAmount:"15.00",latestReceiptDate:"2026-08-03",latestApplicationDate:"2026-08-03",invoice:{version:4,openAmount:"6.00",settlement:{cashAppliedAmount:"15.00",creditAppliedAmount:"4.00"}},
+      items:[{paymentId:second.documentId,amount:"5.00",paymentDate:"2026-08-03",applicationDate:"2026-08-03",paymentMemo:"Second receipt",paymentTransactionId:second.journal.transactionId,
+        paymentIdempotencyKey:"receipt-page:second",paymentCreationLifecycle:{actorRef:operation.actorRef}}]});
+    if(!first.nextCursor)throw new Error("Expected continuation");
+    const page=await sdk.queries.getInvoiceReceiptPage(invoice.documentId,{...request,cursor:first.nextCursor});
+    expect(page.invoice).toEqual(first.invoice);expect(page.revision).toBe(first.revision);expect(page.items).toHaveLength(1);
+    expect(page.items[0]).toMatchObject({applicationId:application.applicationId,paymentId:payment.documentId,amount:"10.00"});expect(page.nextCursor).toBeUndefined();
+    for(const change of [{limit:0},{limit:201},{limit:1.5},{cursor:"bad"},{cursor:"x".repeat(8193)},{asOfDate:"2026-02-30"}]){
+      await expect(sdk.queries.getInvoiceReceiptPage(invoice.documentId,{...request,...change})).rejects.toMatchObject({code:"invalid_input"});
+    }
+    await expect(sdk.queries.getInvoiceReceiptPage(invoice.documentId,{cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    await expect(sdk.queries.getInvoiceReceiptPage(payment.documentId,{...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    await expect(createErpFinancialsSdk({...options,tenantId:"other"}).queries.getInvoiceReceiptPage(invoice.documentId,{...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"invalid_input"});
+    let captured!:()=>void,release!:()=>void;const ready=new Promise<void>(resolve=>{captured=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+    const observed=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{
+        const rows=await client.query<Row>(sql,params);if(sql.includes("receipt_evidence as")){captured();await gate;}return rows;
+      }
+    }))}});
+    const pending=observed.queries.getInvoiceReceiptPage(invoice.documentId,request);
+    try{
+      await ready;
+      await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-05"});
+      await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"receipt-page:offset",applicationType:"customer_payment_to_invoice",sourceDocumentId:payment.documentId,targetDocumentId:invoice.documentId,
+        amount:"10.00",applicationDate:"2026-08-05",expectedSourceVersion:3,expectedTargetVersion:5});
+    }finally{release();}
+    const old=await pending;expect(old).toEqual(first);
+    const fresh=await sdk.queries.getInvoiceReceiptPage(invoice.documentId,request);
+    expect(fresh.latestReceiptDate).toBe("2026-08-03");expect(fresh.latestApplicationDate).toBe("2026-08-05");
+    expect(fresh.totalAppliedAmount).toBe(first.totalAppliedAmount);expect(fresh.invoice.openAmount).toBe(first.invoice.openAmount);expect(fresh.revision).not.toBe(first.revision);
+    await expect(sdk.queries.getInvoiceReceiptPage(invoice.documentId,{...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+  });
+
+  it.each(["receipt", "invoice", "statement", "register"] as const)("invoice book snapshot rejects archival between preflight and the %s query", async mode => {
+    const {options,invoice}=await invoiceCorrectionFixture();let changed=false;
+    const observed=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{
+        const rows=await client.query<Row>(sql,params);
+        if(!changed&&sql.includes('from "erp_financials"."reporting_books"')){
+          changed=true;await pool.query("update erp_financials.reporting_books set status='archived' where tenant_id='tenant_1' and company_id='company_1' and book_id='invoice_correction'");
+        }
+        return rows;
+      }
+    }))}});
+    const result=mode==="register"?observed.queries.getInvoiceRegister({asOfDate:"2026-08-31"}):mode==="receipt"?observed.queries.getInvoiceReceiptPage(invoice.documentId):mode==="invoice"?observed.queries.getInvoice(invoice.documentId):observed.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-31"});
+    await expect(result).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});expect(changed).toBe(true);
+  });
+
+  it("invoice receipt pages bound many allocations without per-receipt queries or duplicate applications", async()=>{
+    await depositFixture("receipt_page_many");const operation=sdkOperation();
+    const options={database:runner,tenantId:"tenant_1",companyId:"company_1",bookId:"receipt_page_many",writeSourceId:"source_1",currencyCode:"USD"};
+    const sdk=createErpFinancialsSdk(options);
+    const invoice=await sdk.commands.invoices.create({operation,idempotencyKey:"many:invoice",date:"2026-08-01",dueDate:"2026-08-31",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"300.00"}]});
+    const receipt=await sdk.commands.customerPayments.record({operation,idempotencyKey:"many:receipt",date:"2026-08-02",customerId:"customer_1",amount:"300.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    const applications=[];
+    for(let i=0;i<206;i++)applications.push(await sdk.commands.paymentApplications.apply({operation,idempotencyKey:`many:apply:${String(i)}`,applicationType:"customer_payment_to_invoice",sourceDocumentId:receipt.documentId,
+      targetDocumentId:invoice.documentId,amount:"1.00",applicationDate:"2026-08-02",expectedSourceVersion:i+1,expectedTargetVersion:i+1}));
+    const ended=applications[0];if(!ended)throw new Error("Missing application");
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:ended.applicationId,expectedVersion:1,effectiveDate:"2026-08-03"});
+    const queries:string[]=[];
+    const observed=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({
+      async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{queries.push(sql);return client.query<Row>(sql,params);}
+    }))}});
+    const request={asOfDate:"2026-08-31",limit:200};
+    const first=await observed.queries.getInvoiceReceiptPage(invoice.documentId,request);
+    expect(queries).toHaveLength(2);expect(first.items).toHaveLength(200);expect(first.totalApplicationCount).toBe(205);expect(first.totalAppliedAmount).toBe("205.00");
+    if(!first.nextCursor)throw new Error("Expected continuation");
+    const last=await observed.queries.getInvoiceReceiptPage(invoice.documentId,{...request,cursor:first.nextCursor});expect(queries).toHaveLength(4);
+    expect(last.items).toHaveLength(5);expect(last.nextCursor).toBeUndefined();expect(last.revision).toBe(first.revision);
+    const ids=new Set([...first.items,...last.items].map(item=>item.applicationId));expect(ids.size).toBe(205);expect(ids.has(ended.applicationId)).toBe(false);
+    expect([...first.items,...last.items].every(item=>item.paymentId===receipt.documentId)).toBe(true);
+  });
+
+  it("invoice receipt pages handle drafts and cancellations and fail closed for excluded receipt evidence",async()=>{
+    const {sdk,options,operation,invoice,command}=await invoiceCorrectionFixture();
+    const draft=await sdk.invoices.createDraft({operation,idempotencyKey:"receipt-page:draft",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},documentDate:"2026-08-01",dueDate:"2026-08-31",revenueLines:[{accountId:"account_income",amount:"10.00"}]});
+    expect(await sdk.queries.getInvoiceReceiptPage(draft.invoiceDraftId)).toMatchObject({items:[],totalApplicationCount:0,totalAppliedAmount:"0.00",invoice:{sourceProvenance:"draft"}});
+    await expect(sdk.queries.getInvoiceReceiptPage("missing")).rejects.toMatchObject({code:"missing_document"});
+    await expect(createErpFinancialsSdk({...options,companyId:"other"}).queries.getInvoiceReceiptPage(invoice.documentId)).rejects.toMatchObject({code:"missing_book"});
+    await pool.query("update erp_financials.reporting_book_sources set effective_through='2026-08-01' where tenant_id='tenant_1' and company_id='company_1' and book_id='invoice_correction'");
+    await expect(sdk.queries.getInvoiceReceiptPage(invoice.documentId)).rejects.toMatchObject({code:"reconciliation_conflict"});
+    await pool.query("update erp_financials.reporting_book_sources set effective_through=null where tenant_id='tenant_1' and company_id='company_1' and book_id='invoice_correction'");
+    await sdk.invoices.correctIssued(command);
+    expect(await sdk.queries.getInvoiceReceiptPage(invoice.documentId)).toMatchObject({items:[],totalApplicationCount:0,totalAppliedAmount:"0.00",invoice:{status:"voided",settlement:{cashAppliedAmount:"0.00",cancellationAmount:"25.00"}}});
+  });
+
+  const bluInvoicePolicy = { revenueClassifications: ["income"] as const, receivableClassifications: ["asset"] as const };
+  async function invoicePolicyFixture() {
+    await depositFixture("invoice_policy");
+    const options = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_policy", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...options, invoiceAccountPolicy: bluInvoicePolicy }), operation = sdkOperation();
+    const draftInput = { operation, idempotencyKey: "policy:draft", customerId: "customer_1", receivableAccount: { accountId: "account_ar" },
+      documentDate: "2026-08-01", dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "25.00" }] };
+    const directInput = { ...draftInput, idempotencyKey: "policy:direct", date: draftInput.documentDate };
+    return { options, sdk, operation, draftInput, directInput };
+  }
+
+  it("operational party registration preserves accounting identity and inactive state", async () => {
+    const { sdk, options, operation } = await invoicePolicyFixture();
+    const input = { partyId: "operational_customer", sourcePartyId: "operational-customer",
+      partyType: "customer" as const, displayName: "First registered name", operation };
+    expect(await sdk.commands.parties.ensureActive(input)).toEqual({ partyId: input.partyId });
+    const facts = async () => (await pool.query<{ row: unknown }>("select to_jsonb(p) as row from erp_financials.parties p where source_party_id=$1", [input.sourcePartyId])).rows;
+    const original = await facts();
+    expect(await sdk.commands.parties.ensureActive({ ...input, displayName: "Changed operational name",
+      operation: { ...operation, requestId: "another-transport-request" } })).toEqual({ partyId: input.partyId });
+    expect(await facts()).toEqual(original);
+    for (const changed of [{ partyId: "replacement-id" }, { partyType: "vendor" as const }]) {
+      await expect(sdk.commands.parties.ensureActive({ ...input, ...changed })).rejects.toMatchObject({ code: "scope_mismatch" });
+      expect(await facts()).toEqual(original);
+    }
+    await pool.query("update erp_financials.parties set active=false where party_id=$1", [input.partyId]);
+    const inactive = await facts();
+    await expect(sdk.commands.parties.ensureActive(input)).rejects.toMatchObject({ code: "missing_party" });
+    expect(await facts()).toEqual(inactive);
+    expect((await pool.query<{ count: number }>("select count(*)::int as count from erp_financials.financial_lifecycle_events where event_type='party.registered'")).rows[0]?.count).toBe(1);
+    const foreign = createErpFinancialsSdk({ ...options, companyId: "foreign-company" });
+    await expect(foreign.commands.parties.ensureActive(input)).rejects.toMatchObject({ code: "scope_mismatch" });
+  });
+
+  it("operational party registration serializes first creation and rolls back audit failure", async () => {
+    const { sdk, operation } = await invoicePolicyFixture();
+    const input = { partyId: "operational_vendor", sourcePartyId: "operational-vendor",
+      partyType: "vendor" as const, displayName: "Vendor", operation };
+    const results = await Promise.all([sdk.commands.parties.ensureActive(input), sdk.commands.parties.ensureActive(input)]);
+    expect(results).toEqual([{ partyId: input.partyId }, { partyId: input.partyId }]);
+    expect((await pool.query<{ count: number }>("select count(*)::int as count from erp_financials.financial_lifecycle_events where event_type='party.registered'")).rows[0]?.count).toBe(1);
+    await pool.query(`create function public.fail_party_audit() returns trigger language plpgsql as $$
+      begin if new.event_type='party.registered' then raise exception 'injected party audit failure'; end if; return new; end $$;
+      create trigger fail_party_audit before insert on erp_financials.financial_lifecycle_events for each row execute function public.fail_party_audit()`);
+    try {
+      await expect(sdk.commands.parties.ensureActive({ ...input, partyId: "rolled_back_party", sourcePartyId: "rolled-back-party" })).rejects.toThrow("injected party audit failure");
+      expect((await pool.query<{ count: number }>("select count(*)::int as count from erp_financials.parties where party_id='rolled_back_party'")).rows[0]?.count).toBe(0);
+    } finally {
+      await pool.query("drop trigger fail_party_audit on erp_financials.financial_lifecycle_events; drop function public.fail_party_audit()");
+    }
+    await expect(sdk.commands.parties.ensureActive({ ...input, partyId: "rolled_back_party", sourcePartyId: "rolled-back-party" })).resolves.toEqual({ partyId: "rolled_back_party" });
+  });
+
+  it("operational party registration locks active eligibility until the caller transaction ends", async () => {
+    const { sdk, options, operation } = await invoicePolicyFixture();
+    const input = { partyId: "locked_party", sourcePartyId: "locked-party",
+      partyType: "customer" as const, displayName: "Locked customer", operation };
+    await sdk.commands.parties.ensureActive(input);
+    const client = await pool.connect(), contender = await pool.connect();
+    try {
+      await client.query("begin");
+      const transactional = createErpFinancialsSdk({ ...options, database: { transaction: work => work(client) } });
+      await transactional.commands.parties.ensureActive(input);
+      await contender.query("begin");
+      // A non-key state update needs a conflicting row lock. NOWAIT proves
+      // the lock is held without timing guesses or unbounded waiting.
+      await expect(contender.query("select party_id from erp_financials.parties where party_id=$1 for no key update nowait", [input.partyId]))
+        .rejects.toMatchObject({ code: "55P03" });
+      await contender.query("rollback");
+      await client.query("commit");
+      await contender.query("update erp_financials.parties set active=false where party_id=$1", [input.partyId]);
+      await expect(sdk.commands.parties.ensureActive(input)).rejects.toMatchObject({ code: "missing_party" });
+    } finally {
+      await client.query("rollback"); await contender.query("rollback");
+      client.release(); contender.release();
+    }
+  });
+
+  it("native invoice commands lock party eligibility against concurrent deactivation", async () => {
+    const { options, draftInput, directInput } = await invoicePolicyFixture();
+    const client = await pool.connect(), contender = await pool.connect();
+    try {
+      const transactional = createErpFinancialsSdk({ ...options, database: { transaction: work => work(client) } });
+      for (const mode of ["draft", "posted"] as const) {
+        await client.query("begin");
+        if (mode === "draft") await transactional.invoices.createDraft(draftInput);
+        else await transactional.commands.invoices.create(directInput);
+        await contender.query("begin");
+        await expect(contender.query("select party_id from erp_financials.parties where party_id='customer_1' for no key update nowait"))
+          .rejects.toMatchObject({ code: "55P03" });
+        await contender.query("rollback");
+        await client.query("rollback");
+      }
+    } finally {
+      await client.query("rollback"); await contender.query("rollback");
+      client.release(); contender.release();
+    }
+  });
+
+  it("large invoice policy evidence is complete, bounded and atomic across posting retry",async()=>{
+    const {sdk,options,directInput}=await invoicePolicyFixture();
+    const command={...directInput,idempotencyKey:"policy:large",revenueLines:Array.from({length:1002},()=>({accountId:"account_income",amount:"1.00"}))};
+    const before=await depositDatabaseState(pool);
+    await pool.query(`create function erp_financials.reject_policy_chunk() returns trigger language plpgsql as $$begin
+      if NEW.event_type='journal.account_policy.recorded' and (NEW.payload->>'chunkIndex')::int=3 then raise exception 'injected policy chunk failure'; end if;return NEW;end;$$;
+      create trigger reject_policy_chunk before insert on erp_financials.financial_lifecycle_events for each row execute function erp_financials.reject_policy_chunk()`);
+    await expect(sdk.commands.invoices.create(command)).rejects.toThrow("injected policy chunk failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await pool.query('drop trigger reject_policy_chunk on erp_financials.financial_lifecycle_events;drop function erp_financials.reject_policy_chunk()');
+    const posted=await sdk.commands.invoices.create(command);
+    const after=await depositDatabaseState(pool);
+    expect((await sdk.commands.invoices.create(command)).documentId).toBe(posted.documentId);
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    await expect(sdk.commands.invoices.create({...command,revenueLines:command.revenueLines.map((line,index)=>index?line:{...line,amount:"2.00"})})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    const detail=await sdk.queries.getInvoice(posted.documentId);expect(detail.originalAmount).toBe("1002.00");expect(detail.lines).toHaveLength(1002);
+    const audit=(await pool.query<{payload:Record<string,unknown>;bytes:number}>("select payload,octet_length(payload::text) bytes from erp_financials.financial_lifecycle_events where event_id=$1",[posted.journal.lifecycleEventId])).rows[0];
+    expect(audit?.bytes).toBeLessThanOrEqual(8192);
+    const request={sourceId:"source_1",transactionId:posted.journal.transactionId,limit:3};
+    const first=await sdk.queries.getJournalAccountPolicyPage(request);
+    const requirements=[...first.items.flatMap(chunk=>chunk.requirements)];let cursor=first.nextCursor,pages=1;
+    expect(first.requirementCount).toBe(1003);expect(first.items).toHaveLength(3);expect(cursor).toBeDefined();
+    while(cursor){const page=await sdk.queries.getJournalAccountPolicyPage({...request,cursor});expect(page.checksum).toBe(first.checksum);requirements.push(...page.items.flatMap(chunk=>chunk.requirements));cursor=page.nextCursor;pages++;}
+    expect(pages).toBeGreaterThan(1);
+    expect(requirements).toEqual([{accountId:"account_ar",classifications:["asset"]},...Array.from({length:1002},()=>({accountId:"account_income",classifications:["income"]}))]);
+    expect(createHash("sha256").update(JSON.stringify(requirements)).digest("hex")).toBe(first.checksum);
+    expect((await pool.query<{n:number}>("select max(octet_length(payload::text))::int n from erp_financials.financial_lifecycle_events where aggregate_type='journal_account_policy' and aggregate_id=$1",[posted.journal.transactionId])).rows[0]?.n).toBeLessThanOrEqual(8192);
+    await expect(sdk.queries.getJournalAccountPolicyPage({...request,sourceId:"foreign"})).rejects.toMatchObject({code:"missing_document"});
+    await expect(sdk.queries.getJournalAccountPolicyPage({...request,transactionId:"missing"})).rejects.toMatchObject({code:"missing_document"});
+    await expect(createErpFinancialsSdk({...options,companyId:"other"}).queries.getJournalAccountPolicyPage(request)).rejects.toMatchObject({code:"missing_book"});
+    await expect(sdk.queries.getJournalAccountPolicyPage({...request,transactionId:"missing",cursor:requiredComponentFixture(first.nextCursor)})).rejects.toMatchObject({code:"invalid_input"});
+    for(const limit of [0,101,1.5])await expect(sdk.queries.getJournalAccountPolicyPage({...request,limit})).rejects.toMatchObject({code:"invalid_input"});
+    const small=await sdk.commands.invoices.create({...directInput,idempotencyKey:"policy:small"});
+    const smallPage=await sdk.queries.getJournalAccountPolicyPage({...request,transactionId:small.journal.transactionId});
+    expect(smallPage.items.flatMap(chunk=>chunk.requirements)).toEqual(requirements.slice(0,2));expect(smallPage.nextCursor).toBeUndefined();
+    await pool.query("update erp_financials.reporting_book_sources set effective_through='2026-07-31' where book_id='invoice_policy'");
+    await expect(sdk.queries.getJournalAccountPolicyPage(request)).rejects.toMatchObject({code:"missing_document"});
+  });
+
+  it("configured invoice policy enforces original drafts, updates, direct postings and issuance without partial effects", async () => {
+    const { sdk, options, draftInput, directInput } = await invoicePolicyFixture();
+    const before = await depositDatabaseState(pool);
+    for (const changed of [{ revenueLines: [{ accountId: "account_cash", amount: "25.00" }] }, { receivableAccount: { accountId: "account_income" } },
+      { revenueLines: [{ accountId: "foreign-account", amount: "25.00" }] }]) {
+      await expect(sdk.invoices.createDraft({ ...draftInput, ...changed })).rejects.toThrow(/account|classification/i);
+      await expect(sdk.commands.invoices.create({ ...directInput, ...changed })).rejects.toThrow(/account|classification/i);
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+    const draft = await sdk.invoices.createDraft(draftInput);
+    const saved = await depositDatabaseState(pool);
+    await expect(sdk.invoices.updateDraft({ ...draftInput, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1,
+      revenueLines: [{ accountId: "account_cash", amount: "25.00" }] })).rejects.toMatchObject({ code: "invalid_input" });
+    expect(await depositDatabaseState(pool)).toEqual(saved);
+    await pool.query("update erp_financials.accounts set classification='expense' where account_id='account_income'");
+    const reclassified = await depositDatabaseState(pool);
+    const issue = { operation: draftInput.operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1, idempotencyKey: "policy:issue" };
+    await runner.transaction(async client => {
+      const held = createErpFinancialsSdk({ ...options, invoiceAccountPolicy: bluInvoicePolicy, database: { transaction: work => work(client) } });
+      await expect(held.invoices.issue(issue)).rejects.toMatchObject({ code: "invalid_input" });
+    });
+    expect(await depositDatabaseState(pool)).toEqual(reclassified);
+    expect(await sdk.invoices.getDraft(draft.invoiceDraftId)).toMatchObject({ status: "draft", version: 1 });
+    await pool.query("update erp_financials.accounts set classification='income',active=false where account_id='account_income'");
+    const inactive = await depositDatabaseState(pool);
+    await expect(sdk.invoices.issue(issue)).rejects.toThrow(/inactive/);
+    expect(await depositDatabaseState(pool)).toEqual(inactive);
+    await pool.query("update erp_financials.accounts set active=true where account_id='account_income'");
+    const issued = await sdk.invoices.issue(issue);
+    const event = (await pool.query<{payload:{executionAccountRequirements:unknown}}>("select payload from erp_financials.financial_lifecycle_events where aggregate_id=$1 and event_type='subledger.invoice.posted'", [issued.transactionId])).rows[0];
+    expect(event?.payload.executionAccountRequirements).toEqual(expect.arrayContaining([
+      { accountId: "account_ar", classifications: ["asset"] }, { accountId: "account_income", classifications: ["income"] }
+    ]));
+  });
+
+  it("configured invoice policy also constrains replacement commands without a caller policy and rolls back released cash", async () => {
+    const { options, command } = await invoiceCorrectionFixture();
+    const sdk = createErpFinancialsSdk({ ...options, invoiceAccountPolicy: bluInvoicePolicy });
+    const before = await depositDatabaseState(pool);
+    await runner.transaction(async client => {
+      const held = createErpFinancialsSdk({ ...options, invoiceAccountPolicy: bluInvoicePolicy, database: { transaction: work => work(client) } });
+      await expect(held.invoices.correctIssued({ ...command, replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_cash", amount: "20.00" }] } }))
+        .rejects.toMatchObject({ code: "invalid_input" });
+    });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    expect(await sdk.invoices.correctIssued({ ...command, replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }] } })).toMatchObject({ status: "corrected" });
+  });
+
+  it("configured invoice policy preserves old receipts, remains opt-in, and snapshots caller configuration", async () => {
+    const { options, sdk, draftInput, directInput } = await invoicePolicyFixture();
+    const generic = createErpFinancialsSdk(options);
+    const unusual = { ...draftInput, revenueLines: [{ accountId: "account_cash", amount: "25.00" }] };
+    const draft = await generic.invoices.createDraft(unusual);
+    const issue = { operation: draftInput.operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1, idempotencyKey: "policy:old-issue" };
+    await expect(sdk.invoices.issue(issue)).rejects.toMatchObject({ code: "invalid_input" });
+    const posted = await generic.invoices.issue(issue);
+    const direct = await generic.commands.invoices.create({ ...directInput, revenueLines: unusual.revenueLines });
+    const before = await depositDatabaseState(pool);
+    expect(await sdk.invoices.createDraft(unusual)).toMatchObject({ status: "issued" });
+    expect(await sdk.invoices.issue(issue)).toEqual({ ...posted, status: "already_issued" });
+    expect(await sdk.commands.invoices.create({ ...directInput, revenueLines: unusual.revenueLines })).toMatchObject({ status: "already_posted", documentId: direct.documentId });
+    await expect(sdk.invoices.issue({ ...issue, expectedVersion: 2 })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const policy = { revenueClassifications: ["income" as const], receivableClassifications: ["asset" as const] };
+    const frozen = createErpFinancialsSdk({ ...options, invoiceAccountPolicy: policy });
+    policy.revenueClassifications.splice(0);
+    await expect(frozen.commands.invoices.create({ ...directInput, idempotencyKey: "policy:snapshot" })).resolves.toMatchObject({ status: "posted" });
+    for (const value of [null, {}, { revenueClassifications: [], receivableClassifications: ["asset"] }, { ...bluInvoicePolicy, unknown: true }]) {
+      expect(() => createErpFinancialsSdk({ ...options, invoiceAccountPolicy: value } as unknown as Parameters<typeof createErpFinancialsSdk>[0])).toThrow(/policy/);
+    }
+  });
+
+  it.each(["direct", "issue", "draft"] as const)("configured invoice policy holds account edits until %s commits", async mode => {
+    const { options, sdk, draftInput, directInput } = await invoicePolicyFixture();
+    const draft = mode === "issue" ? await sdk.invoices.createDraft(draftInput) : undefined;
+    const writer = await pool.connect(), editor = await pool.connect(); let committed = false;
+    let edit: Promise<unknown> | undefined;
+    try {
+      await writer.query("begin"); const pid = Number((await writer.query<{pid:number}>("select pg_backend_pid() pid")).rows[0]?.pid);
+      const held = createErpFinancialsSdk({ ...options, invoiceAccountPolicy: bluInvoicePolicy, database: { transaction: work => work(writer) } });
+      if (mode === "direct") await held.commands.invoices.create(directInput);
+      else if (mode === "draft") await held.invoices.createDraft(draftInput);
+      else {
+        if (!draft) throw new Error("Missing test draft");
+        await held.invoices.issue({ operation: draftInput.operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1, idempotencyKey: "policy:race-issue" });
+      }
+      const editorPid = Number((await editor.query<{pid:number}>("select pg_backend_pid() pid")).rows[0]?.pid);
+      edit = editor.query("update erp_financials.accounts set classification='expense',active=false where account_id='account_income'");
+      void edit.catch(() => undefined);
+      await expect.poll(async () => (await pool.query<{blocked:boolean}>("select $2::integer=any(pg_blocking_pids($1::integer)) blocked", [editorPid, pid])).rows[0]?.blocked).toBe(true);
+      await writer.query("commit"); committed = true; await edit;
+    } finally { if (!committed) await writer.query("rollback"); await edit; writer.release(); editor.release(); }
+  });
+
+  it.each(["direct", "issue", "draft"] as const)("configured invoice policy observes an earlier account edit before %s", async mode => {
+    const { options, sdk, draftInput, directInput } = await invoicePolicyFixture();
+    const draft = mode === "issue" ? await sdk.invoices.createDraft(draftInput) : undefined;
+    const editor = await pool.connect(); let committed = false, waiterPid: number | undefined;
+    let waiting: Promise<PromiseSettledResult<unknown>> | undefined;
+    try {
+      await editor.query("begin"); const editorPid = Number((await editor.query<{pid:number}>("select pg_backend_pid() pid")).rows[0]?.pid);
+      await editor.query("update erp_financials.accounts set classification='expense' where account_id='account_income'");
+      const blocked = createErpFinancialsSdk({ ...options, invoiceAccountPolicy: bluInvoicePolicy, database: { transaction: work => runner.transaction(async client => {
+        waiterPid = Number((await client.query<{pid:number}>("select pg_backend_pid() pid")).rows[0]?.pid); return work(client);
+      }) } });
+      const attempt = async () => {
+        if (mode === "direct") return blocked.commands.invoices.create(directInput);
+        if (mode === "draft") return blocked.invoices.createDraft(draftInput);
+        if (!draft) throw new Error("Missing test draft");
+        return blocked.invoices.issue({ operation: draftInput.operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1, idempotencyKey: "policy:prior-edit" });
+      };
+      waiting = attempt().then(value => ({ status: "fulfilled" as const, value }), (reason: unknown) => ({ status: "rejected" as const, reason }));
+      await expect.poll(async () => waiterPid !== undefined && (await pool.query<{blocked:boolean}>("select $2::integer=any(pg_blocking_pids($1::integer)) blocked", [waiterPid, editorPid])).rows[0]?.blocked).toBe(true);
+      await editor.query("commit"); committed = true;
+      const before = await depositDatabaseState(pool);
+      expect(await waiting).toMatchObject({ status: "rejected", reason: { code: "invalid_input" } });
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    } finally { if (!committed) await editor.query("rollback"); editor.release(); await waiting; }
+  });
+
+  it("customer statement balances retain pre-invoice cash and credits through refunds with scoped historical controls", async () => {
+    const {sdk,operation,options}=await invoiceCorrectionFixture();
+    const receipt=await sdk.commands.customerPayments.record({operation,idempotencyKey:"statement:before-invoice",date:"2026-08-03",customerId:"customer_2",amount:"20.12",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    await sdk.commands.credits.issue({operation,idempotencyKey:"statement:unapplied-credit",date:"2026-08-03",customerId:"customer_2",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"17.11"}]});
+    await sdk.commands.customerPayments.returnCash({operation,idempotencyKey:"statement:return",externalReturnRef:"fixture:statement:return",paymentId:receipt.documentId,expectedVersion:1,customerId:"customer_2",amount:"5.01",date:"2026-08-04",returnKind:"refund",releases:[]});
+    const before=await depositDatabaseState(pool);
+    for(const [asOfDate,cash,credit,net] of [["2026-08-02","0.00","0.00","0.00"],["2026-08-03","20.12","17.11","-37.23"],["2026-08-04","15.11","17.11","-32.22"]] as const) {
+      const statement=await sdk.queries.getCustomerStatement({customerId:"customer_2",asOfDate,limit:1,includeApplications:false});
+      expect(statement).toMatchObject({customerExists:true,items:[],totals:{invoiceCount:0,outstandingAmount:"0.00"},balance:{invoiceOutstandingAmount:"0.00",unappliedCashAmount:cash,unappliedCreditAmount:credit,netReceivableAmount:net}});
+      const aging=await sdk.queries.getAgingPage({kind:"receivables",asOfDate});
+      expect(aging.rows.find(row=>row.partyId==="customer_2")?.total??"0.00").toBe(net);
+    }
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-04"})).balance).toEqual({invoiceOutstandingAmount:"15.00",unappliedCashAmount:"0.00",unappliedCreditAmount:"0.00",netReceivableAmount:"15.00"});
+    expect(await sdk.queries.getCustomerStatement({customerId:"absent",asOfDate:"2026-08-04"})).toMatchObject({customerExists:false,items:[],balance:{netReceivableAmount:"0.00"}});
+    const ledger=await pool.query<{amount:string}>("select sum(net_amount)::numeric(20,2)::text amount from erp_financials.ledger_postings where tenant_id='tenant_1' and source_id='source_1' and account_id='account_ar' and accounting_basis='accrual' and posting_date<='2026-08-04'");
+    expect(ledger.rows[0]?.amount).toBe("-17.22");
+    await expect(createErpFinancialsSdk({...options,companyId:"foreign"}).queries.getCustomerStatement({customerId:"customer_2",asOfDate:"2026-08-04"})).rejects.toMatchObject({code:"missing_book"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("customer statement balance and invoice pages share one snapshot and invalidate on new unapplied cash",async()=>{
+    const {sdk,operation,options}=await invoiceCorrectionFixture();
+    await sdk.commands.invoices.create({operation,idempotencyKey:"statement:balance:second",date:"2026-08-02",dueDate:"2026-08-31",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"5.00"}]});
+    const request={customerId:"customer_1",asOfDate:"2026-08-04",limit:1,includeApplications:false};
+    const first=await sdk.queries.getCustomerStatement(request);expect(first.balance?.netReceivableAmount).toBe("20.00");
+    if(!first.nextCursor)throw Error("Expected statement continuation");
+    expect((await sdk.queries.getCustomerStatement({...request,cursor:first.nextCursor})).balance).toEqual(first.balance);
+    let captured!:()=>void,release!:()=>void;const ready=new Promise<void>(r=>{captured=r;}),gate=new Promise<void>(r=>{release=r;});let queries=0;
+    const observed=createErpFinancialsSdk({...options,database:{transaction:work=>runner.transaction(client=>work({async query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>>{
+      queries++;const result=await client.query<Row>(sql,params);if(sql.includes("customer_balance as")){captured();await gate;}return result;
+    }}))}});
+    const waiting=observed.queries.getCustomerStatement(request);
+    try{await ready;await sdk.commands.customerPayments.record({operation,idempotencyKey:"statement:new:cash",date:"2026-08-03",customerId:"customer_1",amount:"7.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});}finally{release();}
+    expect(await waiting).toEqual(first);expect(queries).toBe(2);
+    expect((await sdk.queries.getCustomerStatement(request)).balance?.netReceivableAmount).toBe("13.00");
+    await expect(sdk.queries.getCustomerStatement({...request,cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+  });
+
+  it("statement cursors reject offsetting accounting changes and scoped customer metadata changes", async () => {
+    const {sdk,operation,invoice,payment,application}=await invoiceCorrectionFixture();
+    await sdk.commands.invoices.create({operation,idempotencyKey:"statement:page:second",date:"2026-08-02",dueDate:"2026-08-31",customerId:"customer_1",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"5.00"}]});
+    const input={customerId:"customer_1",asOfDate:"2026-08-31",limit:1,includeApplications:false};
+    const first=await sdk.queries.getCustomerStatement(input);
+    if(first.nextCursor===undefined)throw new Error("Missing continuation");
+    const second=await sdk.queries.getCustomerStatement({...input,cursor:first.nextCursor});
+    expect(second.revision).toBe(first.revision);expect(second.items).toHaveLength(1);expect(second.items[0]?.invoiceId).not.toBe(first.items[0]?.invoiceId);
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-03"});
+    await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"statement:page:offset",applicationType:"customer_payment_to_invoice",sourceDocumentId:payment.documentId,targetDocumentId:invoice.documentId,amount:"10.00",applicationDate:"2026-08-03",expectedSourceVersion:3,expectedTargetVersion:3});
+    const fresh=await sdk.queries.getCustomerStatement(input);expect(fresh.totals).toEqual(first.totals);expect(fresh.revision).not.toBe(first.revision);
+    await expect(sdk.queries.getCustomerStatement({...input,cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    if(fresh.nextCursor===undefined)throw new Error("Missing continuation");
+    await pool.query("update erp_financials.parties set display_name='Updated customer name' where tenant_id='tenant_1' and source_id='source_1' and party_id='customer_1' and party_type='customer'");
+    await expect(sdk.queries.getCustomerStatement({...input,cursor:fresh.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    expect((await sdk.queries.getCustomerStatement(input)).items[0]?.customerName).toBe("Updated customer name");
+  });
+
+  it("historical statement settlement classifies cash, credit and write-off using effective application dates", async () => {
+    const {sdk,invoice,operation,application}=await invoiceCorrectionFixture();
+    const credit=await sdk.commands.credits.issue({operation,idempotencyKey:"statement:credit",customerId:"customer_1",date:"2026-08-03",
+      receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"3.00"}]});
+    await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"statement:credit:apply",applicationType:"credit_to_invoice",sourceDocumentId:credit.documentId,
+      targetDocumentId:invoice.documentId,amount:"3.00",applicationDate:"2026-08-03",expectedSourceVersion:1,expectedTargetVersion:2});
+    await sdk.commands.writeOffs.settleInvoice({operation,idempotencyKey:"statement:write-off",date:"2026-08-04",customerId:"customer_1",invoiceId:invoice.documentId,
+      expectedInvoiceVersion:3,amount:"1.00",balanceAccount:{accountId:"account_ar"},writeOffAccount:{accountId:"account_income"},reason:"Reviewed short payment"});
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-05"});
+    const before=await depositDatabaseState(pool);
+    for(const [asOfDate,cash,creditAmount,writeOff,applied,open] of [
+      ["2026-08-01","0.00","0.00","0.00","0.00","25.00"],
+      ["2026-08-02","10.00","0.00","0.00","10.00","15.00"],
+      ["2026-08-03","10.00","3.00","0.00","13.00","12.00"],
+      ["2026-08-04","10.00","3.00","1.00","14.00","11.00"],
+      ["2026-08-05","0.00","3.00","1.00","4.00","21.00"]
+    ] as const){
+      const result=await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate});
+      const settlement={cashAppliedAmount:cash,creditAppliedAmount:creditAmount,writeOffAppliedAmount:writeOff};
+      expect(result.items).toEqual([expect.objectContaining({invoiceId:invoice.documentId,appliedAmount:applied,openBalance:open,settlement})]);
+      expect(result.totals).toMatchObject({settlement,appliedAmount:applied,outstandingAmount:open});
+      expect(result.pageTotals).toEqual(result.totals);
+      const summaryOnly=await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate,includeApplications:false});
+      expect(summaryOnly.applicationsIncluded).toBe(false);
+      expect(summaryOnly.items[0]?.applications).toEqual([]);
+      expect(summaryOnly.totals).toEqual(result.totals);expect(summaryOnly.pageTotals).toEqual(result.pageTotals);
+      expect(summaryOnly.items[0]?.settlement).toEqual(result.items[0]?.settlement);
+    }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("historical statement cancellation follows its accounting date rather than recording time and never duplicates replacements",async()=>{
+    const {sdk,invoice,command}=await invoiceCorrectionFixture();
+    const corrected=await sdk.invoices.correctIssued({...command,releases:command.releases.map(row=>({...row,reapplyAmount:"5.00"})),
+      replacement:{dueDate:"2026-08-31",revenueLines:[{accountId:"account_income",amount:"20.00"}]}});
+    if(!corrected.replacement)throw new Error("Missing replacement");
+    const original=await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-03"});
+    expect(original.items.map(row=>row.invoiceId)).toEqual([invoice.documentId]);
+    expect(original.totals).toMatchObject({invoicedAmount:"25.00",appliedAmount:"10.00",outstandingAmount:"15.00",settlement:{cashAppliedAmount:"10.00",creditAppliedAmount:"0.00",writeOffAppliedAmount:"0.00"}});
+    for(const asOfDate of ["2026-08-04","2026-08-31"]){
+      const replacement=await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate});
+      expect(replacement.items.map(row=>row.invoiceId)).toEqual([corrected.replacement.invoiceDocumentId]);
+      expect(replacement.totals).toMatchObject({invoiceCount:1,invoicedAmount:"20.00",appliedAmount:"5.00",outstandingAmount:"15.00",settlement:{cashAppliedAmount:"5.00",creditAppliedAmount:"0.00",writeOffAppliedAmount:"0.00"}});
+    }
+    const reapplied = corrected.applications[0];
+    if (reapplied === undefined) throw new Error("Missing replacement application");
+    const cancelled=await sdk.invoices.correctIssued({operation:command.operation,invoiceDocumentId:corrected.replacement.invoiceDocumentId,expectedVersion:2,idempotencyKey:"statement:cancel",date:"2026-08-06",
+      releases:[{applicationId:reapplied.applicationId,expectedVersion:1,expectedSourceVersion:4,reapplyAmount:"0.00"}]});
+    expect(cancelled.status).toBe("corrected");
+    const empty=await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-06"});
+    expect(empty.balance).toEqual({invoiceOutstandingAmount:"0.00",unappliedCashAmount:"10.00",unappliedCreditAmount:"0.00",netReceivableAmount:"-10.00"});
+    expect(empty.items).toEqual([]);expect(empty.totals).toMatchObject({invoiceCount:0,invoicedAmount:"0.00",appliedAmount:"0.00",outstandingAmount:"0.00",settlement:{cashAppliedAmount:"0.00",creditAppliedAmount:"0.00",writeOffAppliedAmount:"0.00"}});
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-05"})).totals.outstandingAmount).toBe("15.00");
+  });
+
+  it("invoice settlement summaries separate cash, credit and write-off allocations and exclude ended applications", async () => {
+    const {sdk,invoice,operation,application}=await invoiceCorrectionFixture();
+    const credit=await sdk.commands.credits.issue({operation,idempotencyKey:"settlement:credit",customerId:"customer_1",date:"2026-08-03",
+      receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"3.00"}]});
+    await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"settlement:credit:apply",applicationType:"credit_to_invoice",sourceDocumentId:credit.documentId,
+      targetDocumentId:invoice.documentId,amount:"3.00",applicationDate:"2026-08-03",expectedSourceVersion:1,expectedTargetVersion:2});
+    await sdk.commands.writeOffs.settleInvoice({operation,idempotencyKey:"settlement:write-off",date:"2026-08-04",customerId:"customer_1",invoiceId:invoice.documentId,
+      expectedInvoiceVersion:3,amount:"1.00",balanceAccount:{accountId:"account_ar"},writeOffAccount:{accountId:"account_income"},reason:"Reviewed short payment"});
+    const mixed=await sdk.queries.getInvoice(invoice.documentId);
+    expect(mixed).toMatchObject({openAmount:"11.00",settlement:{basis:"current",cashAppliedAmount:"10.00",creditAppliedAmount:"3.00",writeOffAppliedAmount:"1.00",cancellationAmount:"0.00",unclassifiedAmount:"0.00",balanceReductionAmount:"14.00"}});
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-05"});
+    const released=await sdk.queries.getInvoice(invoice.documentId);
+    expect(released).toMatchObject({openAmount:"21.00",settlement:{cashAppliedAmount:"0.00",creditAppliedAmount:"3.00",writeOffAppliedAmount:"1.00",balanceReductionAmount:"4.00"}});
+    expect((await sdk.queries.getInvoicesByIds([invoice.documentId])).byInvoiceId[invoice.documentId]).toEqual(released);
+  });
+
+  it("invoice settlement summaries distinguish cancellation from cash retained and reapplied to a replacement",async()=>{
+    const {sdk,invoice,payment,command}=await invoiceCorrectionFixture();
+    const result=await sdk.invoices.correctIssued({...command,releases:command.releases.map(row=>({...row,reapplyAmount:"5.00"})),
+      replacement:{dueDate:"2026-08-31",revenueLines:[{accountId:"account_income",amount:"20.00"}]}});
+    if(!result.replacement)throw new Error("Missing replacement");
+    const before=await depositDatabaseState(pool);
+    const originals=await sdk.queries.getInvoicesByIds([invoice.documentId,result.replacement.invoiceDocumentId]);
+    expect(originals.byInvoiceId[invoice.documentId]).toMatchObject({status:"voided",openAmount:"0.00",settlement:{cashAppliedAmount:"0.00",creditAppliedAmount:"0.00",writeOffAppliedAmount:"0.00",cancellationAmount:"25.00",unclassifiedAmount:"0.00",balanceReductionAmount:"25.00"}});
+    expect(originals.byInvoiceId[result.replacement.invoiceDocumentId]).toMatchObject({openAmount:"15.00",settlement:{cashAppliedAmount:"5.00",creditAppliedAmount:"0.00",cancellationAmount:"0.00",unclassifiedAmount:"0.00",balanceReductionAmount:"5.00"}});
+    expect(await sdk.queries.getCustomerPayment(payment.documentId)).toMatchObject({amount:"10.00",unappliedAmount:"5.00"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("invoice settlement summaries share a snapshot with the header during concurrent unapplication",async()=>{
+    const {sdk,invoice,operation,application,options}=await invoiceCorrectionFixture();let changed=false;
+    const database:ErpFinancialsTransactionRunner={transaction:work=>runner.transaction(client=>work({
+      query:async<Row extends Record<string,unknown>>(sql:string,parameters?:readonly unknown[]):Promise<PostgresQueryResult<Row>>=>{
+        const result=await client.query<Row>(sql,parameters);
+        if(!changed&&sql.includes("invoice_detail_rows as")){changed=true;await sdk.commands.paymentApplications.unapply({operation,applicationId:application.applicationId,expectedVersion:1,effectiveDate:"2026-08-03"});}
+        return result;
+      }
+    }))};
+    const snapshot=await createErpFinancialsSdk({...options,database}).queries.getInvoice(invoice.documentId);
+    expect(changed).toBe(true);expect(snapshot).toMatchObject({version:2,openAmount:"15.00",settlement:{cashAppliedAmount:"10.00",balanceReductionAmount:"10.00"}});
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({version:3,openAmount:"25.00",settlement:{cashAppliedAmount:"0.00",balanceReductionAmount:"0.00"}});
+  });
+
+  it("invoice settlement summaries refuse inconsistent evidence instead of attributing a negative residual to cash",async()=>{
+    const {options,invoice}=await invoiceCorrectionFixture();
+    // The real database rejects direct balance corruption. Inject an inconsistent
+    // query result instead, to verify the reader also refuses invalid evidence.
+    await expect(pool.query("update erp_financials.subledger_documents set open_amount=25 where subledger_document_id=$1",[invoice.documentId])).rejects.toThrow(/immutable/);
+    const before=await depositDatabaseState(pool);
+    const database:ErpFinancialsTransactionRunner={transaction:work=>runner.transaction(client=>work({
+      query:async<Row extends Record<string,unknown>>(sql:string,parameters?:readonly unknown[]):Promise<PostgresQueryResult<Row>>=>{
+        const result=await client.query<Row>(sql,parameters);
+        return sql.includes("invoice_detail_rows as")?{...result,rows:result.rows.map(row=>({...row,open_amount:"25.00"}))}:result;
+      }
+    }))};
+    await expect(createErpFinancialsSdk({...options,database}).queries.getInvoice(invoice.documentId)).rejects.toMatchObject({code:"reconciliation_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("overdue invoice drafts retain valid calendar dates through edits, issuance and restatement", async () => {
+    await depositFixture("overdue_draft");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "overdue_draft", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const create = { operation, idempotencyKey: "overdue:draft", customerId: "customer_1", receivableAccount: { accountId: "account_ar" },
+      documentDate: "2026-08-12", dueDate: "2026-07-31", revenueLines: [{ accountId: "account_income", amount: "25.00" }] };
+    const draft = await sdk.invoices.createDraft(create);
+    expect(draft).toMatchObject({ documentDate: create.documentDate, dueDate: create.dueDate, version: 1 });
+    const edited = await sdk.invoices.updateDraft({ ...create, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1, documentDate: "2026-08-13" });
+    const dates = { operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: edited.version, documentDate: "2026-08-14", dueDate: create.dueDate };
+    const dated = await sdk.invoices.updateDraftDates(dates);
+    const before = await depositDatabaseState(pool);
+    for (const bad of ["2026-02-30", "2026-13-01", "infinity", "2026-8-01"]) {
+      await expect(sdk.invoices.createDraft({ ...create, idempotencyKey: `bad:${bad}`, dueDate: bad })).rejects.toThrow();
+      await expect(sdk.invoices.updateDraft({ ...create, invoiceDraftId: draft.invoiceDraftId, expectedVersion: dated.version, dueDate: bad })).rejects.toThrow();
+      await expect(sdk.invoices.updateDraftDates({ ...dates, expectedVersion: dated.version, dueDate: bad })).rejects.toThrow();
+    }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const issued = await sdk.invoices.issue({ operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: dated.version, idempotencyKey: "overdue:issue" });
+    expect(await sdk.queries.getInvoice(issued.invoiceDocumentId)).toMatchObject({ documentDate: "2026-08-14", dueDate: create.dueDate });
+    expect((await sdk.queries.getAging({ kind: "receivables", asOfDate: "2026-08-13" })).totals.total).toBe("0.00");
+    expect((await sdk.queries.getAging({ kind: "receivables", asOfDate: "2026-08-14" })).totals).toMatchObject({ total: "25.00", days1To30: "25.00", current: "0.00" });
+    const correction = { operation, invoiceId: issued.invoiceDocumentId, expectedVersion: 1, idempotencyKey: "overdue:dates", documentDate: "2026-08-15", dueDate: create.dueDate };
+    const corrected = await sdk.commands.invoices.correctDates(correction);
+    expect(corrected).toMatchObject({ documentDate: correction.documentDate, dueDate: create.dueDate, version: 2 });
+    expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-14" })).totals.outstandingAmount).toBe("0.00");
+    expect((await sdk.queries.getAging({ kind: "receivables", asOfDate: "2026-08-15" })).totals.days1To30).toBe("25.00");
+    const after = await depositDatabaseState(pool);
+    await expect(sdk.commands.invoices.correctDates({ ...correction, dueDate: "2026-02-30" })).rejects.toThrow();
+    await expect(sdk.commands.invoices.correctDates({ ...correction, dueDate: "2026-07-30" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await sdk.commands.invoices.correctDates(correction)).toEqual(corrected);
+    await sdk.invoices.createDraft(create);
+    await sdk.invoices.updateDraftDates(dates);
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    await closeDepositPeriod(pool, depositService(runner, { bookId: "overdue_draft" }));
+    const closed = await depositDatabaseState(pool);
+    expect(await sdk.commands.invoices.correctDates(correction)).toEqual(corrected);
+    await expect(sdk.commands.invoices.correctDates({ ...correction, expectedVersion: 2, idempotencyKey: "overdue:closed", documentDate: "2026-08-16" })).rejects.toMatchObject({ code: "fiscal_period_closed" });
+    expect(await depositDatabaseState(pool)).toEqual(closed);
+  });
+
+  it("overdue invoice schema upgrade is atomic and preserves facts and unrelated date guards", async () => {
+    await depositFixture("overdue_upgrade", 40);
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "overdue_upgrade", currencyCode: "USD" });
+    const create = { operation: sdkOperation(), idempotencyKey: "overdue:upgrade-draft", customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, documentDate: "2026-08-12", dueDate: "2026-07-31", revenueLines: [{ accountId: "account_income", amount: "25.00" }] };
+    await expect(sdk.invoices.createDraft(create)).rejects.toMatchObject({ code: "23514", constraint: "invoice_drafts_due_date_check" });
+    const constraints = async () => (await pool.query<{ conname: string; definition: string }>("select conname,pg_get_constraintdef(oid) definition from pg_constraint where connamespace='erp_financials'::regnamespace and conname like '%due_date%' order by conname")).rows;
+    const before = await depositDatabaseState(pool), beforeConstraints = await constraints();
+    await expect(migratePostgresSchema({ transaction: work => runner.transaction(client => work(new FailingMigrationClient(client, 'insert into "erp_financials"."schema_migrations"'))) }, { appliedByRef: "overdue:failed-upgrade" })).rejects.toThrow("injected real migration failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    expect(await constraints()).toEqual(beforeConstraints);
+    const result = await migratePostgresSchema(runner, { appliedByRef: "overdue:upgrade" });
+    expect(result.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48]]);
+    const after = stripNewRecognitionNulls(await depositDatabaseState(pool));
+    for (const [table, rows] of Object.entries(before)) if (!/migration|schema_version/.test(table)) expect(after[table]).toEqual(rows);
+    const retained = await constraints();
+    expect(retained).toHaveLength(1);
+    expect(retained[0]?.definition).toContain("vendor_bill");
+    expect(retained[0]?.definition).toContain("invoice");
+    expect(retained[0]?.definition).toContain("due_date >= document_date");
+    await expect(sdk.invoices.createDraft(create)).resolves.toMatchObject({ dueDate: create.dueDate });
+    expect((await migratePostgresSchema(runner, { appliedByRef: "overdue:upgrade-retry" })).applied).toEqual([]);
+  });
+
+  it("overdue invoice correction preserves contractual terms, historical aging and cash", async () => {
+    const { sdk, invoice, payment, command } = await invoiceCorrectionFixture("10.00", "2026-08-05");
+    const correction = { ...command, date: "2026-08-12", releases: command.releases.map(row => ({ ...row, reapplyAmount: "5.01" })),
+      replacement: { dueDate: "2026-08-05", revenueLines: [{ accountId: "account_income", amount: "20.00" }] } };
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.invoices.correctIssued({ ...correction, replacement: { ...correction.replacement, dueDate: "2026-02-30" } })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const result = await sdk.invoices.correctIssued(correction);
+    if (!result.replacement) throw new Error("Missing replacement invoice");
+    expect(await sdk.queries.getInvoice(result.replacement.invoiceDocumentId)).toMatchObject({ documentDate: "2026-08-12", dueDate: "2026-08-05", openAmount: "14.99" });
+    expect(await sdk.invoices.getDraft(result.replacement.invoiceDraftId)).toMatchObject({ documentDate: "2026-08-12", dueDate: "2026-08-05", status: "issued" });
+    expect(await sdk.queries.getCustomerPayment(payment.documentId)).toMatchObject({ amount: "10.00", unappliedAmount: "4.99" });
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ status: "voided", openAmount: "0.00" });
+    for (const [date, outstanding, net] of [["2026-08-11", "15.00", "15.00"], ["2026-08-12", "14.99", "10.00"]] as const) {
+      expect((await sdk.queries.getAging({ kind: "receivables", asOfDate: date })).totals).toMatchObject({ total: net, days1To30: net });
+      expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: date })).totals.outstandingAmount).toBe(outstanding);
+    }
+    // This date is before the fixture's unrelated deposit, so AR equals open invoices.
+    expect((await pool.query<{ net: string }>("select sum(net_amount)::text net from erp_financials.ledger_postings where account_id='account_ar' and accounting_basis='accrual' and posting_date<='2026-08-09'")).rows[0]?.net).toBe("15.00");
+    const after = await depositDatabaseState(pool);
+    await expect(sdk.invoices.correctIssued(correction)).resolves.toEqual({ ...result, status: "already_corrected" });
+    await expect(sdk.invoices.correctIssued({ ...correction, replacement: { ...correction.replacement, dueDate: "2026-08-06" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("invoice replacement account policy rejects prohibited classification without releasing cash", async () => {
+    const { options, command } = await invoiceCorrectionFixture();
+    const built = await import("../dist/index.js");
+    const sdk = built.createErpFinancialsSdk(options);
+    const before = await depositDatabaseState(pool);
+    const replacement = { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_cash", amount: "20.00" }],
+      accountPolicy: { revenueClassifications: ["income"] as const, receivableClassifications: ["asset"] as const } };
+    await expect(sdk.invoices.correctIssued({ ...command, replacement })).rejects.toMatchObject({ code: "invalid_input" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("invoice replacement account policy validates scope, activity, both classifications and malformed lists", async () => {
+    const { sdk, command } = await invoiceCorrectionFixture();
+    const before = await depositDatabaseState(pool);
+    const replacement = { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }],
+      accountPolicy: { revenueClassifications: ["income"] as const, receivableClassifications: ["asset"] as const } };
+    for (const policy of [null, {}, { revenueClassifications: [], receivableClassifications: ["asset"] },
+      { revenueClassifications: ["invented"], receivableClassifications: ["asset"] }, { ...replacement.accountPolicy, ignoredOverride: true }]) {
+      await expect(sdk.invoices.correctIssued({ ...command, replacement: { ...replacement, accountPolicy: policy } } as unknown as Parameters<typeof sdk.invoices.correctIssued>[0])).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    for (const revenueLines of [undefined, [], [null], [{ accountId: 42, amount: "20.00" }]]) {
+      await expect(sdk.invoices.correctIssued({ ...command, replacement: { ...replacement, revenueLines } } as unknown as Parameters<typeof sdk.invoices.correctIssued>[0])).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    await expect(sdk.invoices.correctIssued({ ...command, replacement: { ...replacement, accountPolicy: { ...replacement.accountPolicy, receivableClassifications: ["liability"] } } })).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(sdk.invoices.correctIssued({ ...command, replacement: { ...replacement, revenueLines: [{ accountId: "foreign-account", amount: "20.00" }] } })).rejects.toMatchObject({ code: "missing_account" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await pool.query("update erp_financials.accounts set active=false where tenant_id='tenant_1' and source_id='source_1' and account_id='account_income'");
+    const inactive = await depositDatabaseState(pool);
+    await expect(sdk.invoices.correctIssued({ ...command, replacement })).rejects.toMatchObject({ code: "missing_account" });
+    expect(await depositDatabaseState(pool)).toEqual(inactive);
+  });
+
+  it("invoice replacement account policy binds the immutable receipt but preserves old unconfigured callers", async () => {
+    const { sdk, command } = await invoiceCorrectionFixture();
+    const input = { ...command, replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }],
+      accountPolicy: { revenueClassifications: ["income"] as const, receivableClassifications: ["asset"] as const } } };
+    const result = await sdk.invoices.correctIssued(input);
+    const evidence = (await pool.query<{ policy: unknown }>("select payload->'accountPolicy' policy from erp_financials.financial_lifecycle_events where event_id=$1", [result.lifecycleEventId])).rows[0];
+    expect(evidence?.policy).toEqual(input.replacement.accountPolicy);
+    await pool.query("update erp_financials.accounts set classification='expense',active=false where tenant_id='tenant_1' and source_id='source_1' and account_id='account_income'");
+    const before = await depositDatabaseState(pool);
+    expect(await sdk.invoices.correctIssued(input)).toEqual({ ...result, status: "already_corrected" });
+    await expect(sdk.invoices.correctIssued({ ...input, replacement: { ...input.replacement, accountPolicy: { ...input.replacement.accountPolicy, revenueClassifications: ["income", "expense"] } } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    const { accountPolicy: _policy, ...noPolicy } = input.replacement; void _policy;
+    await expect(sdk.invoices.correctIssued({ ...input, replacement: noPolicy })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("invoice replacement account policy remains opt-in for existing generic consumers", async () => {
+    const { sdk, command } = await invoiceCorrectionFixture();
+    const input = { ...command, replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_cash", amount: "20.00" }] } };
+    const result = await sdk.invoices.correctIssued(input);
+    expect(result.status).toBe("corrected");
+    expect(await sdk.invoices.correctIssued(input)).toEqual({ ...result, status: "already_corrected" });
+  });
+
+  it.each(["classification", "active"] as const)("invoice replacement account policy holds %s validation through commit", async field => {
+    const { options, command } = await invoiceCorrectionFixture();
+    const first = await pool.connect(), editor = await pool.connect(); let committed = false;
+    let update: Promise<unknown> | undefined;
+    try {
+      await first.query("begin"); const pid = Number((await first.query<{pid:number}>("select pg_backend_pid() pid")).rows[0]?.pid);
+      const held = createErpFinancialsSdk({ ...options, database: { transaction: work => work(first) } });
+      const result = await held.invoices.correctIssued({ ...command, replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }],
+        accountPolicy: { revenueClassifications: ["income"], receivableClassifications: ["asset"] } } });
+      const editorPid = Number((await editor.query<{pid:number}>("select pg_backend_pid() pid")).rows[0]?.pid);
+      update = editor.query(`update erp_financials.accounts set ${field === "classification" ? "classification='expense'" : "active=false"} where tenant_id='tenant_1' and source_id='source_1' and account_id='account_income'`);
+      void update.catch(() => undefined);
+      await expect.poll(async () => (await pool.query<{blocked:boolean}>("select $2::integer=any(pg_blocking_pids($1::integer)) blocked", [editorPid, pid])).rows[0]?.blocked).toBe(true);
+      await first.query("commit"); committed = true; await update;
+      expect(result.status).toBe("corrected");
+    } finally { if (!committed) await first.query("rollback"); await update; first.release(); editor.release(); }
+  });
+
+  it.each(["classification", "active"] as const)("invoice replacement account policy observes prior committed %s edits", async field => {
+    const { sdk, options, invoice, command } = await invoiceCorrectionFixture();
+    const editor = await pool.connect(); let committed = false, secondPid: number | undefined;
+    let waiter: Promise<PromiseSettledResult<unknown>> | undefined;
+    try {
+      await editor.query("begin"); const editorPid = Number((await editor.query<{pid:number}>("select pg_backend_pid() pid")).rows[0]?.pid);
+      await editor.query(`update erp_financials.accounts set ${field === "classification" ? "classification='expense'" : "active=false"} where tenant_id='tenant_1' and source_id='source_1' and account_id='account_income'`);
+      const competing = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+        secondPid = Number((await client.query("select pg_backend_pid() pid")).rows[0]?.pid); return work(client);
+      }) } });
+      waiter = competing.invoices.correctIssued({ ...command, replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }],
+        accountPolicy: { revenueClassifications: ["income"], receivableClassifications: ["asset"] } } }).then(value => ({status:"fulfilled" as const,value}), (reason: unknown) => ({status:"rejected" as const,reason}));
+      await expect.poll(async () => secondPid !== undefined && (await pool.query<{blocked:boolean}>("select $2::integer=any(pg_blocking_pids($1::integer)) blocked", [secondPid, editorPid])).rows[0]?.blocked).toBe(true);
+      await editor.query("commit"); committed = true;
+      const afterEdit = await depositDatabaseState(pool), result = await waiter;
+      expect(result).toMatchObject({status:"rejected",reason:{code:field === "classification" ? "invalid_input" : "missing_account"}});
+      expect(await depositDatabaseState(pool)).toEqual(afterEdit);
+      expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({openAmount:"15.00",version:2});
+    } finally { if (!committed) await editor.query("rollback"); editor.release(); await waiter; }
+  });
+
+  it.each([["10.00", false], ["25.00", false], ["10.00", true], ["25.00", true]] as const)(
+    "invoice economic correction preserves cash with receipt %s and replacement %s", async (amount, replace) => {
+      const { sdk, invoice, payment, command } = await invoiceCorrectionFixture(amount);
+      const input = { ...command, releases: command.releases.map(release => ({ ...release, reapplyAmount: replace ? "10.00" : "0.00" })),
+        ...(replace ? { replacement: { dueDate: "2026-08-31", documentNumber: "CORRECTED", revenueLines: [{ accountId: "account_income", amount: "20.00" }], metadata: { orderId: "correct:order" } } } : {}) };
+      const result = await sdk.invoices.correctIssued(input);
+      expect(result).toMatchObject({ status: "corrected", releasedApplications: [{ status: "unapplied" }] });
+      expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ status: "voided", openAmount: "0.00" });
+      expect(await sdk.queries.getCustomerPayment(payment.documentId)).toMatchObject({ amount, unappliedAmount: replace ? (amount === "25.00" ? "15.00" : "0.00") : amount });
+      const accountNets = await pool.query(`select account_id,sum(debit_amount-credit_amount)::text as net from erp_financials.ledger_postings
+        where accounting_basis='accrual' and tenant_id='tenant_1' and source_id='source_1' and posting_date<='2026-08-04' group by account_id order by account_id`);
+      expect(accountNets.rows).toEqual([
+        { account_id: "account_ar", net: replace ? (amount === "25.00" ? "-5.00" : "10.00") : `-${amount}` },
+        { account_id: "account_cash", net: amount }, { account_id: "account_income", net: replace ? "-20.00" : "0.00" }
+      ]);
+      const cashNets = await pool.query(`select account_id,sum(debit_amount-credit_amount)::text as net from erp_financials.ledger_postings
+        where accounting_basis='cash' and tenant_id='tenant_1' and source_id='source_1' and posting_date<='2026-08-04' group by account_id order by account_id`);
+      expect(cashNets.rows).toEqual([
+        { account_id: "account_ar", net: replace ? (amount === "25.00" ? "-15.00" : "0.00") : `-${amount}` },
+        { account_id: "account_cash", net: amount }, { account_id: "account_income", net: replace ? "-10.00" : "0.00" }
+      ]);
+      expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-03" })).totals.outstandingAmount).toBe(amount === "25.00" ? "0.00" : "15.00");
+      expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-04" })).totals.outstandingAmount).toBe(replace ? "10.00" : "0.00");
+      expect((await sdk.queries.getAging({ kind: "receivables", asOfDate: "2026-08-03" })).totals.total).toBe(amount === "25.00" ? "0.00" : "15.00");
+      expect((await sdk.queries.getAging({ kind: "receivables", asOfDate: "2026-08-04" })).totals.total).toBe(replace ? (amount === "25.00" ? "-5.00" : "10.00") : `-${amount}`);
+      if (replace) {
+        if (!result.replacement) throw new Error("Missing replacement invoice");
+        expect(await sdk.queries.getInvoice(result.replacement.invoiceDocumentId)).toMatchObject({ originalAmount: "20.00", openAmount: "10.00", documentDate: "2026-08-04" });
+        expect((await sdk.invoices.getDraft(result.replacement.invoiceDraftId)).metadata).toEqual({ orderId: "correct:order" });
+        expect(await sdk.queries.getReceivableCollectionPosition({ sourceId: "source_1", customerId: "customer_1", collectionRef: "correct:order", invoiceId: result.replacement.invoiceDocumentId }))
+          .toMatchObject({ openInvoiceAmount: "10.00" });
+      } else expect(result.replacement).toBeUndefined();
+      const before = await depositDatabaseState(pool);
+      await expect(sdk.invoices.correctIssued({ ...input, operation: { ...input.operation, requestId: "transport-retry" } })).resolves.toEqual({ ...result, status: "already_corrected" });
+      for (const changed of [{ memo: "changed" }, { date: "2026-08-05" }, { expectedVersion: 3 }, { invoiceDocumentId: "other" }, { releases: [] }]) {
+        await expect(sdk.invoices.correctIssued({ ...input, ...changed })).rejects.toMatchObject({ code: "idempotency_conflict" });
+      }
+      expect(await depositDatabaseState(pool)).toEqual(before);
+      await expect(sdk.commands.paymentApplications.unapply({ operation: command.operation, applicationId: result.cancellation.applicationId, expectedVersion: 1, effectiveDate: "2026-08-05" }))
+        .rejects.toMatchObject({ code: "terminal_state_conflict" });
+    });
+
+  it("invoice economic correction validates complete releases and native scope without partial writes", async () => {
+    const { sdk, options, command } = await invoiceCorrectionFixture();
+    const before = await depositDatabaseState(pool);
+    for (const invalid of [
+      { releases: [] }, { expectedVersion: 1 }, { releases: [{ ...command.releases[0], applicationId: "unknown" }] },
+      { releases: [{ ...command.releases[0], expectedVersion: 2 }] }, { releases: [{ ...command.releases[0], expectedSourceVersion: 1 }] },
+      { releases: [command.releases[0], command.releases[0]] }, { date: "2026-08-01" },
+      { releases: [{ ...command.releases[0], reapplyAmount: "11.00" }], replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "25.00" }] } },
+      { releases: [{ ...command.releases[0], reapplyAmount: "1.001" }] },
+      { operation: { ...command.operation, approverRef: command.operation.actorRef } }
+    ]) {
+      await expect(sdk.invoices.correctIssued({ ...command, ...invalid })).rejects.toBeDefined();
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+    for (const foreign of [{ tenantId: "foreign" }, { companyId: "foreign" }, { writeSourceId: "foreign" }, { bookId: "foreign" }, { currencyCode: "EUR" }]) {
+      await expect(createErpFinancialsSdk({ ...options, ...foreign }).invoices.correctIssued(command)).rejects.toBeDefined();
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+  });
+
+  it("invoice economic correction serializes exact retries and rejects a changed concurrent plan", async () => {
+    const { sdk, command } = await invoiceCorrectionFixture();
+    const results = await Promise.all([sdk.invoices.correctIssued(command), sdk.invoices.correctIssued(command)]);
+    expect(results.map(result => result.status).sort()).toEqual(["already_corrected", "corrected"]);
+    expect(results[0].cancellation).toEqual(results[1].cancellation);
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.invoices.correctIssued({ ...command, releases: [{ ...command.releases[0], expectedSourceVersion: 3 }] })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["release", "cancel", "replacement", "reapply", "completion", "outbox"] as const)(
+    "invoice economic correction rolls back swallowed %s failure", async stage => {
+      const { options, command } = await invoiceCorrectionFixture();
+      const input = { ...command, releases: command.releases.map(release => ({ ...release, reapplyAmount: "10.00" })),
+        replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }] } };
+      const before = await depositDatabaseState(pool); let injected = false;
+      await runner.transaction(async client => {
+        const database = { transaction: async <Result>(work: (connection: PostgresQueryClient) => Promise<Result>) => work({
+          async query<Row extends Record<string, unknown>>(sql: string, values: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+            const result = await client.query<Row>(sql, values);
+            const includes = (value: string) => values.some(item => typeof item === "string" && item.includes(value));
+            const match = stage === "release" ? sql.includes('update "erp_financials"."subledger_applications"')
+              : stage === "cancel" ? sql.includes('insert into "erp_financials"."invoice_voids"')
+              : stage === "replacement" ? sql.includes('update "erp_financials"."invoice_drafts"') && sql.includes("'issued'")
+              : stage === "reapply" ? sql.includes('insert into "erp_financials"."subledger_applications"') && includes(":apply:")
+              : stage === "completion" ? sql.includes('insert into "erp_financials"."financial_lifecycle_events"') && includes("invoice.corrected")
+              : sql.includes('insert into "erp_financials"."financial_outbox"') && includes("invoice.corrected");
+            if (!injected && match) { injected = true; throw new Error(`injected correction ${stage}`); }
+            return result;
+          }
+        }) };
+        await expect(createErpFinancialsSdk({ ...options, database }).invoices.correctIssued(input)).rejects.toThrow(/injected correction/);
+        // Host swallows the error and commits unrelated work: SDK savepoint must
+        // nevertheless erase every release, credit, replacement and receipt.
+        await client.query("select 1");
+      });
+      expect(injected).toBe(true); expect(await depositDatabaseState(pool)).toEqual(before);
+      await expect(createErpFinancialsSdk(options).invoices.correctIssued(input)).resolves.toMatchObject({ status: "corrected" });
+    });
+
+  it("invoice economic correction releases shared receipts and credits using reviewed initial versions", async () => {
+    const { sdk, operation, invoice, payment, command } = await invoiceCorrectionFixture("10.00");
+    // Free five dollars, then split that same receipt across two applications.
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: command.releases[0].applicationId, expectedVersion: 1, effectiveDate: "2026-08-03" });
+    const a = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "shared:a", applicationType: "customer_payment_to_invoice",
+      sourceDocumentId: payment.documentId, targetDocumentId: invoice.documentId, amount: "5.00", applicationDate: "2026-08-03", expectedSourceVersion: 3, expectedTargetVersion: 3 });
+    const b = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "shared:b", applicationType: "customer_payment_to_invoice",
+      sourceDocumentId: payment.documentId, targetDocumentId: invoice.documentId, amount: "5.00", applicationDate: "2026-08-03", expectedSourceVersion: 4, expectedTargetVersion: 4 });
+    const credit = await sdk.commands.credits.issue({ operation, idempotencyKey: "shared:credit", date: "2026-08-03", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "3.00" }] });
+    const c = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "shared:c", applicationType: "credit_to_invoice",
+      sourceDocumentId: credit.documentId, targetDocumentId: invoice.documentId, amount: "3.00", applicationDate: "2026-08-03", expectedSourceVersion: 1, expectedTargetVersion: 5 });
+    const input = { ...command, expectedVersion: 6, releases: [
+      { applicationId: b.applicationId, expectedVersion: 1, expectedSourceVersion: 5, reapplyAmount: "3.00" },
+      { applicationId: a.applicationId, expectedVersion: 1, expectedSourceVersion: 5, reapplyAmount: "4.00" },
+      { applicationId: c.applicationId, expectedVersion: 1, expectedSourceVersion: 2, reapplyAmount: "2.00" }],
+      replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }] } };
+    const result = await sdk.invoices.correctIssued(input);
+    expect(result.releasedApplications).toHaveLength(3); expect(result.applications).toHaveLength(3);
+    if (!result.replacement) throw new Error("Missing replacement invoice");
+    expect(await sdk.queries.getInvoice(result.replacement.invoiceDocumentId)).toMatchObject({ openAmount: "11.00" });
+    expect(await sdk.queries.getCustomerPayment(payment.documentId)).toMatchObject({ amount: "10.00", unappliedAmount: "3.00", version: 9 });
+    expect(await sdk.queries.getOperationalDocumentSummary(credit.documentId)).toMatchObject({ openAmount: "1.00", version: 4 });
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.invoices.correctIssued({ ...input, releases: [...input.releases].reverse() })).resolves.toMatchObject({ status: "already_corrected" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["correction", "application"] as const)("invoice economic correction and new payment serialize with %s first", async winner => {
+    const { sdk, options, operation, invoice, command } = await invoiceCorrectionFixture();
+    const extra = await sdk.commands.customerPayments.record({ operation, idempotencyKey: "race:extra", date: "2026-08-03", customerId: "customer_1", amount: "5.00",
+      cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const apply = { operation, idempotencyKey: "race:apply", applicationType: "customer_payment_to_invoice" as const,
+      sourceDocumentId: extra.documentId, targetDocumentId: invoice.documentId, amount: "5.00", applicationDate: "2026-08-03", expectedSourceVersion: 1, expectedTargetVersion: 2 };
+    const before = await depositDatabaseState(pool), first = await pool.connect(); let committed = false;
+    let waiter: Promise<PromiseSettledResult<unknown>> | undefined;
+    try {
+      await first.query("begin"); const firstPid = Number((await first.query<{pid:number}>("select pg_backend_pid() pid")).rows[0]?.pid);
+      const held = createErpFinancialsSdk({ ...options, database: { transaction: work => work(first) } });
+      let secondPid: number | undefined;
+      const competing = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+        secondPid = Number((await client.query("select pg_backend_pid() pid")).rows[0]?.pid); return work(client);
+      }) } });
+      if (winner === "correction") await held.invoices.correctIssued(command); else await held.commands.paymentApplications.apply(apply);
+      const pending = winner === "correction" ? competing.commands.paymentApplications.apply(apply) : competing.invoices.correctIssued(command);
+      waiter = pending.then(value => ({ status: "fulfilled" as const, value }), (reason: unknown) => ({ status: "rejected" as const, reason }));
+      await expect.poll(async () => secondPid !== undefined && (await pool.query<{blocked:boolean}>("select $2::integer=any(pg_blocking_pids($1::integer)) blocked", [secondPid, firstPid])).rows[0]?.blocked, {timeout:5000}).toBe(true);
+      expect(await depositDatabaseState(pool)).toEqual(before);
+      await first.query("commit"); committed = true;
+      expect(await waiter).toMatchObject({ status: "rejected", reason: { code: "optimistic_concurrency_conflict" } });
+      expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject(winner === "correction" ? { status: "voided", openAmount: "0.00" } : { openAmount: "10.00", version: 3 });
+      expect(await sdk.queries.getCustomerPayment(extra.documentId)).toMatchObject({ unappliedAmount: winner === "correction" ? "5.00" : "0.00" });
+    } finally { if (!committed) await first.query("rollback"); first.release(); await waiter; }
+  },15000);
+
+  it.each(["correction", "close"] as const)("invoice economic correction and canonical close serialize with %s first", async winner => {
+    const fixture = await invoiceCorrectionFixture();
+    const options = { ...fixture.options, postingPolicy: "legacy_unrestricted" as const }, operation = fixture.operation, invoice = fixture.invoice;
+    const sdk = createErpFinancialsSdk(options);
+    const cancel = { ...fixture.command, replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }] },
+      releases: fixture.command.releases.map(release => ({ ...release, reapplyAmount: "10.00" })) };
+    const period = (await sdk.queries.listFiscalPeriods({ sourceId: "source_1" })).items[0]; if (!period) throw Error("Missing period");
+    // A declared no-activity account isolates lock behavior. This fixture does
+    // not validate a production bank-account/reconciliation policy.
+    const bankAccountIds = ["account_ap"];
+    const readiness = await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, bankAccountIds); expect(readiness.ready).toBe(true);
+    const close = { operation, bookId: options.bookId, fiscalPeriodId: period.fiscalPeriodId, expectedVersion: period.version,
+      expectedApprovalToken: readiness.approvalToken, bankAccountIds, idempotencyKey: "close-race:close" };
+    const before = await depositDatabaseState(pool), first = await pool.connect();
+    let committed = false, waiter: Promise<PromiseSettledResult<unknown>> | undefined;
+    try {
+      await first.query("begin"); const firstPid = Number((await first.query<{pid:number}>("select pg_backend_pid() pid")).rows[0]?.pid);
+      const held = createErpFinancialsSdk({ ...options, database: { transaction: work => work(first) } });
+      let secondPid: number | undefined;
+      const competing = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+        secondPid = Number((await client.query("select pg_backend_pid() pid")).rows[0]?.pid); return work(client);
+      }) } });
+      if (winner === "correction") await held.invoices.correctIssued(cancel); else await held.commands.fiscalPeriods.closeCanonical(close);
+      const pending = winner === "correction" ? competing.commands.fiscalPeriods.closeCanonical(close) : competing.invoices.correctIssued(cancel);
+      waiter = pending.then(value => ({ status: "fulfilled" as const, value }), (reason: unknown) => ({ status: "rejected" as const, reason }));
+      await expect.poll(async () => secondPid !== undefined && (await pool.query<{blocked:boolean}>("select $2::integer=any(pg_blocking_pids($1::integer)) blocked", [secondPid, firstPid])).rows[0]?.blocked, {timeout:5000}).toBe(true);
+      expect(await depositDatabaseState(pool)).toEqual(before);
+      await first.query("commit"); committed = true;
+      expect(await waiter).toMatchObject({ status: "rejected", reason: { code: winner === "correction" ? "optimistic_concurrency_conflict" : "fiscal_period_closed" } });
+      if (winner === "correction") {
+        const current = await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, bankAccountIds);
+        expect(current.ready).toBe(true); expect(current.approvalToken).not.toBe(readiness.approvalToken);
+        await sdk.commands.fiscalPeriods.closeCanonical({ ...close, expectedApprovalToken: current.approvalToken, idempotencyKey: "close-race:refreshed" });
+        const closed = await depositDatabaseState(pool);
+        await sdk.invoices.correctIssued(cancel); expect(await depositDatabaseState(pool)).toEqual(closed);
+        expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ status: "voided", openAmount: "0.00" });
+      } else {
+        const closed = await depositDatabaseState(pool);
+        await expect(sdk.invoices.correctIssued(cancel)).rejects.toMatchObject({code:"fiscal_period_closed"});
+        await sdk.commands.fiscalPeriods.closeCanonical(close); expect(await depositDatabaseState(pool)).toEqual(closed);
+        expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ openAmount: "15.00", version: 2 });
+      }
+    } finally { if (!committed) await first.query("rollback"); first.release(); await waiter; }
+  }, 15000);
+
+  it("invoice economic correction preserves administrator confirmation across nested releases and replacement", async () => {
+    const { options, sdk, command, operation } = await invoiceCorrectionFixture();
+    const input = { ...command, operation: { ...operation, approverRef: operation.actorRef },
+      releases: command.releases.map(release => ({ ...release, reapplyAmount: "10.00" })),
+      replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }] } };
+    const scope = { ...options, sourceId: options.writeSourceId, accountingBasis: "accrual" as const, postingPolicy: "enforce_fiscal_periods" as const };
+    const checksum = createFinancialActionCommandChecksum(scope, "invoices.correctIssued", input);
+    const admin = createErpFinancialsSdk({ ...options, financialApprovalPolicy: { mode: "administrator_direct", actions: ["invoices.correctIssued"],
+      guard: request => Promise.resolve({ ...scope, action: "invoices.correctIssued", actorRef: operation.actorRef, requestId: operation.requestId,
+        commandChecksum: checksum, active: true, administrator: true, confirmed: request.commandChecksum === checksum }) } });
+    const confirmed = { ...input, operation: { ...input.operation, administratorConfirmation: { confirmationRef: "fixture-admin-confirmation", commandChecksum: checksum } } };
+    await expect(sdk.invoices.correctIssued(confirmed)).rejects.toMatchObject({ code: "authorization_context_invalid" });
+    await expect(admin.invoices.correctIssued(confirmed)).resolves.toMatchObject({ status: "corrected" });
+    const before = await depositDatabaseState(pool);
+    await expect(admin.invoices.correctIssued(confirmed)).resolves.toMatchObject({ status: "already_corrected" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const event = (await pool.query<{ actor_ref: string; approver_ref: string; approval: unknown }>("select actor_ref,approver_ref,payload->'financialApproval' as approval from erp_financials.financial_lifecycle_events where event_type='invoice.corrected'")).rows[0];
+    expect(event).toMatchObject({ actor_ref: operation.actorRef, approver_ref: operation.actorRef, approval: { action: "invoices.correctIssued", policy: "administrator_direct" } });
+  });
+
+  it("invoice economic correction rolls back an actual lost PostgreSQL connection and retries cleanly", async () => {
+    const { options, sdk, command } = await invoiceCorrectionFixture();
+    const before = await depositDatabaseState(pool);
+    const connection = await pool.connect();
+    // Only this owned disposable-cluster connection is terminated below.
+    connection.on("error", () => undefined);
+    let release!: () => void; let reached!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const boundary = new Promise<void>(resolve => { reached = resolve; });
+    let intercepted = false;
+    let pending: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      await connection.query("begin");
+      const pid = (await connection.query<{ pid: number }>("select pg_backend_pid() as pid")).rows[0]?.pid;
+      if (!pid) throw new Error("Missing test backend");
+      const scoped = createErpFinancialsSdk({ ...options, database: { transaction: work => work({
+        async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+          const result = await new PgQueryClient(connection).query<Row>(sql, params);
+          if (!intercepted && sql.includes('insert into "erp_financials"."subledger_documents"')) {
+            intercepted = true; reached(); await gate;
+          }
+          return result;
+        }
+      }) } });
+      pending = Promise.allSettled([scoped.invoices.correctIssued(command)]);
+      await Promise.race([boundary, pending.then(() => { throw new Error("Command ended before crash boundary"); })]);
+      expect((await pool.query<{ terminated: boolean }>("select pg_terminate_backend($1) as terminated", [pid])).rows[0]?.terminated).toBe(true);
+      release(); expect((await pending)[0]).toMatchObject({ status: "rejected" });
+    } finally { release(); await pending; connection.release(true); }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(sdk.invoices.correctIssued(command)).resolves.toMatchObject({ status: "corrected" });
+  }, 15000);
+
+  it("invoice economic correction snapshots a mutable command and exports the built public facade", async () => {
+    const { options, command, invoice, sdk } = await invoiceCorrectionFixture();
+    const { createErpFinancialsSdk: createPublicSdk } = await import("@handrail/erp-financials/sdk");
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const candidate = createPublicSdk({ ...options, database: { transaction: async work => { await gate; return runner.transaction(work); } } });
+    const mutableOperation: { -readonly [K in keyof FinancialOperationContext]: FinancialOperationContext[K] } = { ...command.operation };
+    const mutable = { ...command, operation: mutableOperation, releases: command.releases.map(row => ({ ...row, reapplyAmount: "10.00" })),
+      replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }] } };
+    const expected = structuredClone(mutable);
+    const pending = candidate.invoices.correctIssued(mutable);
+    mutable.invoiceDocumentId = "foreign"; mutable.operation.approverRef = mutable.operation.actorRef;
+    mutable.releases.length = 0; mutable.replacement.revenueLines.length = 0;
+    release();
+    const result = await pending;
+    expect(result).toMatchObject({ status: "corrected", cancellation: { invoiceDocumentId: invoice.documentId } });
+    if (!result.replacement) throw Error("Missing replacement invoice");
+    expect(await sdk.queries.getInvoice(result.replacement.invoiceDocumentId)).toMatchObject({ originalAmount: "20.00", openAmount: "10.00" });
+    const before = await depositDatabaseState(pool);
+    await expect(candidate.invoices.correctIssued(expected)).resolves.toMatchObject({ status: "already_corrected" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["correction", "cancellation"] as const)("invoice economic correction refuses independently posted child credit ownership for %s", async mode => {
+    const { sdk, options, operation, command } = await invoiceCorrectionFixture();
+    const { createHash } = await import("node:crypto");
+    const key = "invoice_correction_" + createHash("sha256").update([options.tenantId, options.companyId, options.writeSourceId, options.bookId, command.idempotencyKey].join("\u0000")).digest("hex").slice(0,48);
+    // Independently authorized credit: same customer/economics, but not evidence
+    // that this correction already owns the accounting instruction.
+    await sdk.commands.credits.issue({ operation, idempotencyKey: `${key}:cancel:credit`, date: command.date, customerId: "customer_1",
+      memo: command.memo, receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    if (mode === "cancellation") await sdk.commands.paymentApplications.unapply({ operation, applicationId: command.releases[0].applicationId, expectedVersion: 1, effectiveDate: command.date });
+    const before = await depositDatabaseState(pool);
+    const attempt = mode === "correction" ? sdk.invoices.correctIssued(command)
+      : sdk.invoices.voidIssued({ ...command, expectedVersion: 3, idempotencyKey: `${key}:cancel` });
+    await expect(attempt).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("invoice correction review supplies a scoped read-only command plan", async () => {
+    const { sdk, options, invoice, payment, command } = await invoiceCorrectionFixture("25.00");
+    const reader = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+      await client.query("set transaction read only"); return work(client);
+    }) } });
+    const before = await depositDatabaseState(pool);
+    const request = { sourceId: "source_1", invoiceId: invoice.documentId, limit: 1 };
+    const review = await reader.queries.getInvoiceCorrectionReview(request);
+    expect(review).toMatchObject({ activeApplicationCount: "1", appliedAmount: "25.00", invoice: { invoiceId: invoice.documentId, version: 2, status: "settled", customerId: "customer_1", openAmount: "0.00", originalAmount: "25.00" },
+      items: [{ applicationType: "customer_payment_to_invoice", sourceDocumentId: payment.documentId, sourceDocumentType: "customer_payment", sourceVersion: 2, sourceOriginalAmount: "25.00", sourceOpenAmount: "0.00", version: 1 }] });
+    expect(review.nextCursor).toBeUndefined();
+    for (const changed of [{ sourceId: "foreign" }, { invoiceId: payment.documentId }, { invoiceId: "missing" }, { limit: 201 }, { limit: 0 }, { limit: 1.5 }, { cursor: "invalid" }, { cursor: "x".repeat(4097) }]) {
+      await expect(reader.queries.getInvoiceCorrectionReview({ ...request, ...changed })).rejects.toThrow();
+    }
+    for (const foreign of [{ tenantId: "other" }, { companyId: "other" }, { bookId: "other" }]) {
+      await expect(createErpFinancialsSdk({ ...options, ...foreign }).queries.getInvoiceCorrectionReview(request)).rejects.toMatchObject({ code: "missing_document" });
+    }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const corrected = await sdk.invoices.correctIssued({ ...command, expectedVersion: review.invoice.version,
+      releases: review.items.map(item => ({ applicationId: item.applicationId, expectedVersion: item.version, expectedSourceVersion: item.sourceVersion, reapplyAmount: "10.00" })),
+      replacement: { dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "20.00" }] } });
+    expect(corrected.status).toBe("corrected");
+    await expect(reader.queries.getInvoiceCorrectionReview(request)).rejects.toMatchObject({ code: "terminal_state_conflict" });
+  });
+
+  it("invoice correction review pages beyond 200 and detects shared receipt changes outside the invoice", async () => {
+    const { sdk, operation, invoice, payment, application } = await invoiceCorrectionFixture();
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: application.applicationId, expectedVersion: 1, effectiveDate: "2026-08-03" });
+    const ids: string[] = [];
+    for (let i = 0; i < 205; i++) {
+      const applied = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: `invoice-review:${String(i)}`, applicationType: "customer_payment_to_invoice",
+        sourceDocumentId: payment.documentId, targetDocumentId: invoice.documentId, amount: "0.01", applicationDate: "2026-08-03", expectedSourceVersion: i+3, expectedTargetVersion: i+3 });
+      ids.push(applied.applicationId);
+    }
+    const request = { sourceId: "source_1", invoiceId: invoice.documentId, limit: 200 };
+    const first = await sdk.queries.getInvoiceCorrectionReview(request), cursor = first.nextCursor;
+    expect(first).toMatchObject({ activeApplicationCount: "205", appliedAmount: "2.05", invoice: { version: 208, openAmount: "22.95" } });
+    expect(first.items).toHaveLength(200); if (!cursor) throw Error("Missing review cursor");
+    for (const row of first.items) expect(row).toMatchObject({ sourceVersion: 208, sourceOpenAmount: "7.95", amount: "0.01" });
+    const second = await sdk.queries.getInvoiceCorrectionReview({ ...request, cursor });
+    expect(second.reviewToken).toBe(first.reviewToken); expect(second.items).toHaveLength(5); expect(second.nextCursor).toBeUndefined();
+    expect([...first.items,...second.items].map(row => row.applicationId).sort()).toEqual(ids.sort());
+    for (const changed of [{ sourceId: "other" }, { invoiceId: "other" }]) await expect(sdk.queries.getInvoiceCorrectionReview({ ...request, cursor, ...changed })).rejects.toMatchObject({ code: "invalid_input" });
+    const other = await sdk.commands.invoices.create({ operation, idempotencyKey: "review:other-invoice", customerId: "customer_1", date: "2026-08-01", dueDate: "2026-08-31",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "1.00" }] });
+    expect((await sdk.queries.getInvoiceCorrectionReview({ ...request, cursor })).reviewToken).toBe(first.reviewToken);
+    await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "review:elsewhere", applicationType: "customer_payment_to_invoice", sourceDocumentId: payment.documentId,
+      targetDocumentId: other.documentId, amount: "0.01", applicationDate: "2026-08-03", expectedSourceVersion: 208, expectedTargetVersion: 1 });
+    await expect(sdk.queries.getInvoiceCorrectionReview({ ...request, cursor })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    const ended = ids[0]; if (!ended) throw Error("Missing application");
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: ended, expectedVersion: 1, effectiveDate: "2026-08-04" });
+    const current = await sdk.queries.getInvoiceCorrectionReview(request);
+    expect(current).toMatchObject({ activeApplicationCount: "204", appliedAmount: "2.04", invoice: { version: 209, openAmount: "22.96" } });
+    expect(current.items.some(row => row.applicationId === ended || row.applicationId === application.applicationId)).toBe(false);
+  },60000);
+
+  it("invoice correction review exposes empty and credit plans but refuses unsupported write-off allocations", async () => {
+    const { sdk, invoice, operation, application } = await invoiceCorrectionFixture();
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: application.applicationId, expectedVersion: 1, effectiveDate: "2026-08-03" });
+    const request = { sourceId: "source_1", invoiceId: invoice.documentId };
+    expect(await sdk.queries.getInvoiceCorrectionReview(request)).toMatchObject({ activeApplicationCount: "0", appliedAmount: "0.00", items: [] });
+    const credit = await sdk.commands.credits.issue({ operation, idempotencyKey: "review:credit", customerId: "customer_1", date: "2026-08-03",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "3.00" }] });
+    await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "review:credit:apply", applicationType: "credit_to_invoice", sourceDocumentId: credit.documentId,
+      targetDocumentId: invoice.documentId, amount: "3.00", applicationDate: "2026-08-03", expectedSourceVersion: 1, expectedTargetVersion: 3 });
+    expect(await sdk.queries.getInvoiceCorrectionReview(request)).toMatchObject({ activeApplicationCount: "1", appliedAmount: "3.00",
+      items: [{ applicationType: "credit_to_invoice", sourceDocumentType: "credit_memo", sourceVersion: 2, sourceOpenAmount: "0.00" }] });
+    await sdk.commands.writeOffs.settleInvoice({ operation, idempotencyKey: "review:write-off", date: "2026-08-04", customerId: "customer_1", invoiceId: invoice.documentId,
+      expectedInvoiceVersion: 4, amount: "1.00", balanceAccount: { accountId: "account_ar" }, writeOffAccount: { accountId: "account_income" }, reason: "Approved test write-off" });
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.queries.getInvoiceCorrectionReview(request)).rejects.toMatchObject({ code: "unsupported_operation" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("invoice correction review uses one bounded SQL snapshot during a concurrent unapplication", async () => {
+    const { sdk, options, invoice, application, operation } = await invoiceCorrectionFixture("25.00");
+    let release!: () => void; let selected!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const boundary = new Promise<void>(resolve => { selected = resolve; });
+    let queries = 0;
+    const reader = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({
+      async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        queries++;
+        const result = await client.query<Row>(sql, params);
+        expect(params.at(-1)).toBe(2); // requested one row plus the cursor sentinel
+        selected(); await gate; return result;
+      }
+    })) } });
+    const pending = reader.queries.getInvoiceCorrectionReview({ sourceId: "source_1", invoiceId: invoice.documentId, limit: 1 });
+    const settled = Promise.allSettled([pending]);
+    try {
+      await Promise.race([boundary, settled.then(() => { throw new Error("Read ended before snapshot boundary"); })]);
+      await sdk.commands.paymentApplications.unapply({ operation, applicationId: application.applicationId, expectedVersion: 1, effectiveDate: "2026-08-12" });
+      release();
+      expect(await pending).toMatchObject({ invoice: { version: 2, status: "settled", openAmount: "0.00" }, activeApplicationCount: "1",
+        items: [{ version: 1, sourceVersion: 2, sourceOpenAmount: "0.00" }] });
+      expect(queries).toBe(1);
+      expect(await sdk.queries.getInvoiceCorrectionReview({ sourceId: "source_1", invoiceId: invoice.documentId })).toMatchObject({
+        invoice: { version: 3, status: "open", openAmount: "25.00" }, activeApplicationCount: "0", items: [] });
+    } finally { release(); await settled; }
+  }, 15000);
+
+  it("invoice correction review snapshots requests before awaiting and exports its built public API", async () => {
+    const { options, invoice } = await invoiceCorrectionFixture("25.00");
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const reader = createErpFinancialsSdk({ ...options, database: { transaction: async work => { await gate; return runner.transaction(work); } } });
+    const request = { sourceId: "source_1", invoiceId: invoice.documentId, limit: 1 };
+    const pending = reader.queries.getInvoiceCorrectionReview(request);
+    request.invoiceId = "mutated"; request.sourceId = "source_2"; request.limit = 999;
+    release();
+    const result = await pending;
+    expect(result.invoice.invoiceId).toBe(invoice.documentId);
+    const { createErpFinancialsSdk: createPublicSdk } = await import("@handrail/erp-financials/sdk");
+    const sdk = createPublicSdk(options);
+    expect(await sdk.queries.getInvoiceCorrectionReview({ sourceId: "source_1", invoiceId: invoice.documentId, limit: 1 })).toEqual(result);
+  });
+
+  it("invoice correction review rejects foreign-book receipt provenance without changing money", async () => {
+    const { sdk, options, operation, invoice } = await invoiceCorrectionFixture();
+    const other = createErpFinancialsSdk({ ...options, bookId: "other_receipt_book", postingPolicy: "legacy_unrestricted" });
+    await other.books.define({ operation, bookId: "other_receipt_book", name: "Other", baseCurrencyCode: "USD" });
+    await other.books.bindSource({ operation, bookId: "other_receipt_book", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    const payment = await other.commands.customerPayments.record({ operation, idempotencyKey: "review:foreign-receipt", date: "2026-08-03", customerId: "customer_1", amount: "5.00",
+      cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "review:foreign-apply", applicationType: "customer_payment_to_invoice",
+      sourceDocumentId: payment.documentId, targetDocumentId: invoice.documentId, amount: "5.00", applicationDate: "2026-08-03", expectedSourceVersion: 1, expectedTargetVersion: 2 });
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.queries.getInvoiceCorrectionReview({ sourceId: "source_1", invoiceId: invoice.documentId })).rejects.toMatchObject({ code: "unsupported_operation" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("invoice correction review needs no posting, line or full-history detail access", async () => {
+    const { sdk, options, invoice } = await invoiceCorrectionFixture();
+    const request = { sourceId: "source_1", invoiceId: invoice.documentId, limit: 1 };
+    const expected = await sdk.queries.getInvoiceCorrectionReview(request);
+    await pool.query(`create role invoice_correction_reader;
+      grant usage on schema erp_financials to invoice_correction_reader;
+      grant select on erp_financials.reporting_books,erp_financials.reporting_book_sources,erp_financials.accounting_sources,
+       erp_financials.subledger_documents,erp_financials.subledger_applications,erp_financials.financial_outbox,erp_financials.invoice_voids to invoice_correction_reader;`);
+    try {
+      const database: ErpFinancialsTransactionRunner = { transaction: work => runner.transaction(async client => {
+        await client.query("set local role invoice_correction_reader"); await client.query("set transaction read only"); return work(client);
+      }) };
+      for (const table of ["ledger_postings", "transactions", "subledger_document_lines", "financial_lifecycle_events"]) {
+        await expect(database.transaction(client => client.query(`select * from erp_financials.${table} limit 1`))).rejects.toMatchObject({ code: "42501" });
+      }
+      expect(await createErpFinancialsSdk({ ...options, database }).queries.getInvoiceCorrectionReview(request)).toEqual(expected);
+    } finally { await pool.query("drop owned by invoice_correction_reader; drop role invoice_correction_reader"); }
+  });
+
+  it("invoice cancellation selects original receivable after cash-basis application reversal", async () => {
+    await depositFixture("cancel_account_basis");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "cancel_account_basis", currencyCode: "USD" }), operation = sdkOperation();
+    const key = "basis:invoice:4";
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: key, date: "2026-08-01", dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const payment = await sdk.commands.customerPayments.record({ operation, idempotencyKey: `${key}:receipt`, date: "2026-08-02", customerId: "customer_1", collectionRef: "basis:order", amount: "25.00",
+      cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: `${key}:application`, applicationType: "customer_payment_to_invoice",
+      sourceDocumentId: payment.documentId, targetDocumentId: invoice.documentId, amount: "25.00", applicationDate: "2026-08-02", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: application.applicationId, expectedVersion: 1, effectiveDate: "2026-08-03" });
+    const legacyChoice = (await pool.query<{account_id: string}>(`select account_id from erp_financials.ledger_postings where tenant_id='tenant_1' and source_id='source_1'
+      and transaction_id=(select transaction_id from erp_financials.subledger_documents where subledger_document_id=$1) and debit_amount>0 order by debit_amount desc,posting_id limit 1`, [invoice.documentId])).rows[0]?.account_id;
+    expect(legacyChoice).toBe("account_income");
+    const cancelled = await sdk.invoices.voidIssued({ operation, invoiceDocumentId: invoice.documentId, expectedVersion: 3, idempotencyKey: `${key}:cancel`, date: "2026-08-04" });
+    const controls = await pool.query(`select account_id,sum(debit_amount-credit_amount)::text as net from erp_financials.ledger_postings
+      where accounting_basis='accrual' and tenant_id='tenant_1' and source_id='source_1'
+      and transaction_id in(select transaction_id from erp_financials.subledger_documents where subledger_document_id=any($1::text[])) group by account_id order by account_id`, [[invoice.documentId,cancelled.creditDocumentId]]);
+    expect(controls.rows).toEqual([{ account_id: "account_ar", net: "0.00" }, { account_id: "account_income", net: "0.00" }]);
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ status: "voided", openAmount: "0.00" });
+    expect(await sdk.queries.getCustomerPayment(payment.documentId)).toMatchObject({ amount: "25.00", unappliedAmount: "25.00", version: 3 });
+    expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-01" })).totals.outstandingAmount).toBe("25.00");
+    expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-03" })).totals.outstandingAmount).toBe("25.00");
+    expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-04" })).totals.outstandingAmount).toBe("0.00");
+    expect(await sdk.queries.getReceivableCollectionPosition({ sourceId: "source_1", customerId: "customer_1", collectionRef: "basis:order", invoiceId: invoice.documentId }))
+      .toMatchObject({ basis: "voided", collectionAmount: "0.00", openInvoiceAmount: "0.00", unallocatedCashAmount: "25.00" });
+    const cash = await pool.query(`select account_id,sum(debit_amount-credit_amount)::text as net from erp_financials.ledger_postings
+      where accounting_basis='cash' and tenant_id='tenant_1' and source_id='source_1'
+      and transaction_id=(select transaction_id from erp_financials.subledger_documents where subledger_document_id=$1) group by account_id order by account_id`, [invoice.documentId]);
+    expect(cash.rows).toEqual([{ account_id: "account_ar", net: "0.00" }, { account_id: "account_income", net: "0.00" }]);
+    const bank = await pool.query(`select accounting_basis,sum(debit_amount-credit_amount)::text as net from erp_financials.ledger_postings
+      where tenant_id='tenant_1' and source_id='source_1' and account_id='account_cash' and posting_date<='2026-08-04' group by accounting_basis order by accounting_basis`);
+    expect(bank.rows).toEqual([{ accounting_basis: "accrual", net: "25.00" }, { accounting_basis: "cash", net: "25.00" }]);
+    // Sale cancellation leaves received cash in place. Only explicit cash-return
+    // evidence moves it back; no gateway or bank is contacted by this SDK test.
+    await sdk.commands.customerPayments.returnCash({ operation, paymentId: payment.documentId, customerId: "customer_1", expectedVersion: 3,
+      idempotencyKey: `${key}:refund`, date: "2026-08-05", amount: "25.00", returnKind: "refund", externalReturnRef: "synthetic-bank:refund", releases: [] });
+    expect(await sdk.queries.getCustomerPayment(payment.documentId)).toMatchObject({ unappliedAmount: "0.00" });
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ status: "voided", openAmount: "0.00" });
+    expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-05" })).totals.outstandingAmount).toBe("0.00");
+    const final = await pool.query(`select accounting_basis,account_id,sum(debit_amount-credit_amount)::text as net from erp_financials.ledger_postings
+      where tenant_id='tenant_1' and source_id='source_1' and posting_date<='2026-08-05' group by accounting_basis,account_id order by accounting_basis,account_id`);
+    expect(final.rows).toEqual([
+      { accounting_basis: "accrual", account_id: "account_ar", net: "0.00" }, { accounting_basis: "accrual", account_id: "account_cash", net: "0.00" },
+      { accounting_basis: "accrual", account_id: "account_income", net: "0.00" }, { accounting_basis: "cash", account_id: "account_ar", net: "0.00" },
+      { accounting_basis: "cash", account_id: "account_cash", net: "0.00" }, { accounting_basis: "cash", account_id: "account_income", net: "0.00" }
+    ]);
+  });
+
+  it.each(["missing", "ambiguous", "amount", "currency"] as const)("invoice cancellation fails closed on %s accrual receivable evidence", async fault => {
+    await depositFixture("cancel_account_evidence");
+    const scope = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "cancel_account_evidence", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "evidence:invoice", date: "2026-08-01", dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const before = await depositDatabaseState(pool); let injected = false;
+    // Read fault injection tests rejection without corrupting the actual journal.
+    // Success-path accounting and the transaction boundary use real PostgreSQL.
+    const guarded = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(client => work({
+      query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]): Promise<PostgresQueryResult<Row>> => {
+        const result = await client.query<Row>(sql, values);
+        if (!sql.startsWith('select "account_id", "debit_amount"::text')) return result;
+        injected = true;
+        const original = result.rows[0]; if (!original) throw Error("Missing fixture accrual posting");
+        const rows = fault === "missing" ? [] : fault === "ambiguous" ? [original, original]
+          : [{ ...original, ...(fault === "amount" ? { debit_amount: "24.99" } : { currency_code: "EUR" }) }];
+        return { ...result, rows };
+      }
+    })) } });
+    await expect(guarded.invoices.voidIssued({ operation, invoiceDocumentId: invoice.documentId, expectedVersion: 1, idempotencyKey: "evidence:cancel", date: "2026-08-04" }))
+      .rejects.toMatchObject({ code: "unsupported_operation" });
+    expect(injected).toBe(true); expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["enforce_fiscal_periods", "legacy_unrestricted"] as const)("invoice cancellation respects fiscal close under %s", async postingPolicy => {
+    await depositFixture("cancel_closed");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "cancel_closed", currencyCode: "USD", postingPolicy });
+    const operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "closed:invoice", date: "2026-08-01", dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    await closeDepositPeriod(pool, depositService(runner));
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.invoices.voidIssued({ operation, invoiceDocumentId: invoice.documentId, expectedVersion: 1, idempotencyKey: "closed:cancel", date: "2026-08-04" }))
+      .rejects.toMatchObject({ code: "fiscal_period_closed" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["cancellation", "close"] as const)("invoice cancellation and canonical close serialize with %s first", async winner => {
+    await depositFixture("cancel_close_race");
+    const options = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "cancel_close_race", currencyCode: "USD", postingPolicy: "legacy_unrestricted" as const };
+    const sdk = createErpFinancialsSdk({ ...options, database: runner }), operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "close-race:invoice", date: "2026-08-01", dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const cancel = { operation, invoiceDocumentId: invoice.documentId, expectedVersion: 1, idempotencyKey: "close-race:cancel", date: "2026-08-04" };
+    const period = (await sdk.queries.listFiscalPeriods({ sourceId: "source_1" })).items[0]; if (!period) throw Error("Missing period");
+    // A declared no-activity account isolates lock behavior. This fixture does
+    // not validate a production bank-account/reconciliation policy.
+    const bankAccountIds = ["account_ap"];
+    const readiness = await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, bankAccountIds); expect(readiness.ready).toBe(true);
+    const close = { operation, bookId: options.bookId, fiscalPeriodId: period.fiscalPeriodId, expectedVersion: period.version,
+      expectedApprovalToken: readiness.approvalToken, bankAccountIds, idempotencyKey: "close-race:close" };
+    const before = await depositDatabaseState(pool), first = await pool.connect();
+    let committed = false, waiter: Promise<PromiseSettledResult<unknown>> | undefined;
+    try {
+      await first.query("begin"); const firstPid = Number((await first.query<{pid:number}>("select pg_backend_pid() pid")).rows[0]?.pid);
+      const held = createErpFinancialsSdk({ ...options, database: { transaction: work => work(first) } });
+      let secondPid: number | undefined;
+      const competing = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+        secondPid = Number((await client.query("select pg_backend_pid() pid")).rows[0]?.pid); return work(client);
+      }) } });
+      if (winner === "cancellation") await held.invoices.voidIssued(cancel); else await held.commands.fiscalPeriods.closeCanonical(close);
+      const pending = winner === "cancellation" ? competing.commands.fiscalPeriods.closeCanonical(close) : competing.invoices.voidIssued(cancel);
+      waiter = pending.then(value => ({ status: "fulfilled" as const, value }), (reason: unknown) => ({ status: "rejected" as const, reason }));
+      await expect.poll(async () => secondPid !== undefined && (await pool.query<{blocked:boolean}>("select $2::integer=any(pg_blocking_pids($1::integer)) blocked", [secondPid, firstPid])).rows[0]?.blocked, {timeout:5000}).toBe(true);
+      expect(await depositDatabaseState(pool)).toEqual(before);
+      await first.query("commit"); committed = true;
+      expect(await waiter).toMatchObject({ status: "rejected", reason: { code: winner === "cancellation" ? "optimistic_concurrency_conflict" : "fiscal_period_closed" } });
+      if (winner === "cancellation") {
+        const current = await sdk.queries.getCanonicalFiscalCloseReadiness("source_1", period.fiscalPeriodId, bankAccountIds);
+        expect(current.ready).toBe(true); expect(current.approvalToken).not.toBe(readiness.approvalToken);
+        await sdk.commands.fiscalPeriods.closeCanonical({ ...close, expectedApprovalToken: current.approvalToken, idempotencyKey: "close-race:refreshed" });
+        const closed = await depositDatabaseState(pool);
+        await sdk.invoices.voidIssued(cancel); expect(await depositDatabaseState(pool)).toEqual(closed);
+        expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ status: "voided", openAmount: "0.00" });
+      } else {
+        const closed = await depositDatabaseState(pool);
+        await expect(sdk.invoices.voidIssued(cancel)).rejects.toMatchObject({code:"fiscal_period_closed"});
+        await sdk.commands.fiscalPeriods.closeCanonical(close); expect(await depositDatabaseState(pool)).toEqual(closed);
+        expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ openAmount: "25.00", version: 1 });
+      }
+    } finally { if (!committed) await first.query("rollback"); first.release(); await waiter; }
+  }, 15000);
+
+  it.each(["unapply", "void"] as const)("invoice cancellation cannot be reopened by generic credit %s", async action => {
+    await depositFixture("cancel_terminal");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "cancel_terminal", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "terminal:invoice", date: "2026-08-01", dueDate: "2026-08-31",
+      customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const cancelled = await sdk.invoices.voidIssued({ operation, invoiceDocumentId: invoice.documentId, expectedVersion: 1, idempotencyKey: "terminal:cancel", date: "2026-08-02" });
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.commands.paymentApplications[action]({ operation, applicationId: cancelled.applicationId, expectedVersion: 1, effectiveDate: "2026-08-03" }))
+      .rejects.toMatchObject({ code: "terminal_state_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ status: "voided", openAmount: "0.00" });
+    expect(await sdk.queries.getReceivableCollectionPosition({ sourceId: "source_1", customerId: "customer_1", collectionRef: "terminal:order", invoiceId: invoice.documentId }))
+      .toMatchObject({ basis: "voided", collectionAmount: "0.00", openInvoiceAmount: "0.00" });
+    expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-01" })).totals.outstandingAmount).toBe("25.00");
+    expect((await sdk.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-03" })).totals.outstandingAmount).toBe("0.00");
+    const gl = await sdk.queries.listGeneralLedger({ periodStart: "2026-08-01", periodEnd: "2026-08-03", limit: 50 });
+    expect(gl.items.map(row => row.netAmount).sort()).toEqual(["-25.00", "-25.00", "25.00", "25.00"]);
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["read committed", "repeatable read", "serializable"] as const)("invoice cancellation database invariant rejects older writers at %s", async isolation => {
+    await depositFixture("cancel_fk");
+    const scope = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "cancel_fk", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "fk:invoice", date: "2026-08-01", dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const cancelled = await sdk.invoices.voidIssued({ operation, invoiceDocumentId: invoice.documentId, expectedVersion: 1, idempotencyKey: "fk:cancel", date: "2026-08-02" });
+    const before = await depositDatabaseState(pool);
+    // Model a pre-guard SDK writer. All real mutation SQL and database constraints
+    // remain enabled; only the new friendly command-level check is omitted.
+    const older = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(async client => {
+      await client.query(`set transaction isolation level ${isolation}`);
+      return work({ query: (sql, values) => sql.includes("select invoice_void_id from erp_financials.invoice_voids")
+        ? Promise.resolve({ rows: [] }) : client.query(sql, values) });
+    }) } });
+    await expect(older.commands.paymentApplications.unapply({ operation, applicationId: cancelled.applicationId, expectedVersion: 1, effectiveDate: "2026-08-03" }))
+      .rejects.toMatchObject({ code: "23503", constraint: "invoice_voids_active_application_fk" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each([false, true])("invoice cancellation migration preserves history and refuses detached legacy settlement (detached=%s)", async detached => {
+    await depositFixture("cancel_upgrade", 39);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "cancel_upgrade", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: preComponentFixtureRunner(runner) }), operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "upgrade:invoice", date: "2026-08-01", dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const cancelled = await sdk.invoices.voidIssued({ operation, invoiceDocumentId: invoice.documentId, expectedVersion: 1, idempotencyKey: "upgrade:cancel", date: "2026-08-02" });
+    if (detached) {
+      const older = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(client => work({
+        query: (sql, values) => sql.includes("select invoice_void_id from erp_financials.invoice_voids") ? Promise.resolve({ rows: [] }) : client.query(sql, values)
+      })) } });
+      await older.commands.paymentApplications.unapply({ operation, applicationId: cancelled.applicationId, expectedVersion: 1, effectiveDate: "2026-08-03" });
+      // Inspect the historical format directly; current read APIs require schema46.
+      expect((await pool.query("select d.open_amount::numeric(18,2)::text amount,v.invoice_void_id from erp_financials.subledger_documents d join erp_financials.invoice_voids v on v.invoice_document_id=d.subledger_document_id where d.subledger_document_id=$1",[invoice.documentId])).rows[0]).toMatchObject({amount:"25.00",invoice_void_id:cancelled.invoiceVoidId});
+    }
+    const before = await depositDatabaseState(pool);
+    if (detached) {
+      await expect(migratePostgresSchema(runner, { appliedByRef: "test:cancel-upgrade" })).rejects.toMatchObject({ code: "23503", constraint: "invoice_voids_active_application_fk" });
+      expect(await depositDatabaseState(pool)).toEqual(before);
+      expect((await validatePostgresMigrationHistory(pool)).currentVersion).toBe(39);
+    } else {
+      const result = await migratePostgresSchema(runner, { appliedByRef: "test:cancel-upgrade" });
+      expect(result.applied.map(row => row.toVersion)).toEqual([40, 41, 42, 43, 44, 45, 46, 47, 48]);
+      const after = stripNewComponentNulls(await depositDatabaseState(pool));
+      expect(after.cash_flow_purpose_corrections).toEqual([]); before.cash_flow_purpose_corrections = [];
+      const normalize = (state: Record<string, unknown[]>) => {
+        const copy = structuredClone(state); delete copy.schema_migrations;
+        copy.invoice_voids = (copy.invoice_voids ?? []).map(value => {
+          const row = value as { row: Record<string, unknown> }; delete row.row.application_status; return row;
+        }); return copy;
+      };
+      expect(normalize(after)).toEqual(normalize(before));
+      await expect(createErpFinancialsSdk({...scope,database:runner}).commands.paymentApplications.unapply({ operation, applicationId: cancelled.applicationId, expectedVersion: 1, effectiveDate: "2026-08-03" }))
+        .rejects.toMatchObject({ code: "terminal_state_conflict" });
+      expect(stripNewComponentNulls(await depositDatabaseState(pool))).toEqual(after);
+    }
+  });
+
+  it("invoice cancellation binds retries to the original business command", async () => {
+    await depositFixture("invoice_cancel_replay");
+    const scope = { database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_cancel_replay", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk(scope), operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "cancel:invoice", date: "2026-08-01", dueDate: "2026-08-31",
+      customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const command = { operation, invoiceDocumentId: invoice.documentId, expectedVersion: 1, idempotencyKey: "cancel:command", date: "2026-08-02", memo: "Order cancelled" };
+    const before = await depositDatabaseState(pool);
+    for (const change of [{ idempotencyKey: " " }, { invoiceDocumentId: "" }, { idempotencyKey: "x".repeat(513) }, { memo: "x".repeat(4097) }, { date: "2026-02-30" }]) {
+      await expect(sdk.invoices.voidIssued({ ...command, ...change })).rejects.toMatchObject({ code: "invalid_input" });
+    }
+    await expect(sdk.invoices.voidIssued({ ...command, operation: { ...operation, approverRef: operation.actorRef } })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const result = await sdk.invoices.voidIssued(command);
+    const state = await depositDatabaseState(pool);
+    expect(await sdk.invoices.voidIssued({ ...command, operation: { ...operation, requestId: "retry", correlationId: "retry", occurredAt: "2026-08-13T00:00:00.000Z" } }))
+      .toEqual({ ...result, status: "already_voided" });
+    for (const change of [{ invoiceDocumentId: "another-invoice" }, { date: "2026-08-03" }, { memo: "Different cancellation" }, { expectedVersion: 2 },
+      { operation: { ...operation, actorRef: "another-actor" } }, { operation: { ...operation, approverRef: "another-approver" } },
+      { operation: { ...operation, reasonCode: "another-reason" } }, { operation: { ...operation, reasonDetail: "changed" } }]) {
+      await expect(sdk.invoices.voidIssued({ ...command, ...change })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    expect(await depositDatabaseState(pool)).toEqual(state);
+    await closeDepositPeriod(pool, depositService(runner));
+    const closed = await depositDatabaseState(pool);
+    expect(await sdk.invoices.voidIssued(command)).toEqual({ ...result, status: "already_voided" });
+    expect(await depositDatabaseState(pool)).toEqual(closed);
+  });
+
+  it("invoice cancellation snapshots callers, serializes retries and rolls back interrupted completion", async () => {
+    await depositFixture("invoice_cancel_atomic");
+    const scope = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_cancel_atomic", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner });
+    const operation: FinancialOperationContext = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "cancel:invoice", date: "2026-08-01", dueDate: "2026-08-31",
+      customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const command = { operation: { ...operation }, invoiceDocumentId: invoice.documentId, expectedVersion: 1, idempotencyKey: "cancel:atomic", date: "2026-08-02", memo: "Cancel original" };
+    const original = structuredClone(command), before = await depositDatabaseState(pool);
+    const interrupted = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(client => work({ query: async (sql, values) => {
+      if (sql.includes('insert into "erp_financials"."invoice_voids"')) throw new Error("injected cancellation receipt failure");
+      return client.query(sql, values);
+    } })) } });
+    await expect(interrupted.invoices.voidIssued(command)).rejects.toThrow("injected cancellation receipt failure");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), resume = new Promise<void>(resolve => { release = resolve; });
+    const delayed = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(async client => {
+      entered(); await resume; return work(client);
+    }) } });
+    const pending = delayed.invoices.voidIssued(command); await started;
+    command.invoiceDocumentId = "changed"; command.date = "2026-08-03"; command.memo = "changed"; command.operation.actorRef = "changed";
+    release();
+    const result = await pending;
+    expect(result.invoiceDocumentId).toBe(invoice.documentId);
+    const state = await depositDatabaseState(pool);
+    const retries = await Promise.all([sdk.invoices.voidIssued(original), sdk.invoices.voidIssued({ ...original, operation: { ...operation, requestId: "concurrent-retry" } })]);
+    expect(retries).toEqual([{ ...result, status: "already_voided" }, { ...result, status: "already_voided" }]);
+    expect(await depositDatabaseState(pool)).toEqual(state);
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ status: "voided", openAmount: "0.00" });
+    const fresh = await sdk.commands.invoices.create({ operation, idempotencyKey: "cancel:second", date: "2026-08-01", dueDate: "2026-08-31",
+      customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "30.00" }] });
+    const same = { ...original, invoiceDocumentId: fresh.documentId, idempotencyKey: "cancel:concurrent" };
+    const race = await Promise.all([sdk.invoices.voidIssued(same), sdk.invoices.voidIssued(same)]);
+    expect(race.map(item => item.status).sort()).toEqual(["already_voided", "voided"]);
+    expect(race[0].invoiceVoidId).toBe(race[1].invoiceVoidId);
+    const counts = await pool.query<{ count: number }>("select count(*)::integer as count from erp_financials.invoice_voids");
+    expect(counts.rows[0]?.count).toBe(2);
+  });
+
+  it.each(["credit", "application", "receipt", "outbox"] as const)("invoice cancellation isolates swallowed %s failure from its host transaction", async stage => {
+    await depositFixture("invoice_cancel_savepoint");
+    const scope = { tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_cancel_savepoint", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, database: runner }), operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "isolation:invoice", date: "2026-08-01", dueDate: "2026-08-31",
+      customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const command = { operation, invoiceDocumentId: invoice.documentId, expectedVersion: 1, idempotencyKey: "isolation:cancel", date: "2026-08-02" };
+    const before = await depositDatabaseState(pool); let injected = false;
+    const hostResult = await runner.transaction(async client => {
+      await client.query("create temporary table cancellation_host_marker(value text) on commit drop");
+      await client.query("insert into cancellation_host_marker values ('before')");
+      const broken: PostgresQueryClient = { query: async <Row extends Record<string, unknown>>(sql: string, values?: readonly unknown[]): Promise<PostgresQueryResult<Row>> => {
+        const result = await client.query<Row>(sql, values);
+        const matched = stage === "credit" ? sql.includes('insert into "erp_financials"."subledger_document_lines"')
+          : stage === "application" ? sql.includes('insert into "erp_financials"."subledger_applications"')
+          : stage === "receipt" ? sql.includes('insert into "erp_financials"."invoice_voids"')
+          : sql.includes('insert into "erp_financials"."financial_outbox"') && values?.includes("invoice.voided");
+        if (!injected && matched) { injected = true; throw new Error("injected after successful SQL"); }
+        return result;
+      } };
+      const nested = createErpFinancialsSdk({ ...scope, database: { transaction: work => work(broken) } });
+      await expect(nested.invoices.voidIssued(command)).rejects.toThrow("injected after successful SQL");
+      await client.query("insert into cancellation_host_marker values ('after')");
+      expect((await client.query("select value from cancellation_host_marker order by value")).rows).toEqual([{ value: "after" }, { value: "before" }]);
+      return "host transaction committed";
+    });
+    expect(hostResult).toBe("host transaction committed"); expect(injected).toBe(true);
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const result = await sdk.invoices.voidIssued(command);
+    expect(result.status).toBe("voided");
+    expect(await sdk.invoices.voidIssued(command)).toEqual({ ...result, status: "already_voided" });
+  });
+
+  it("invoice cancellation rejects unprovable historical retry without rewriting its receipt", async () => {
+    await depositFixture("invoice_cancel_legacy");
+    const scope = { tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1", bookId: "invoice_cancel_legacy" };
+    const sdk = createErpFinancialsSdk({ ...scope, writeSourceId: scope.sourceId, currencyCode: "USD", database: runner }), operation = sdkOperation();
+    const invoice = await sdk.commands.invoices.create({ operation, idempotencyKey: "legacy:invoice", date: "2026-08-01", dueDate: "2026-08-31",
+      customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    // Reproduce the pre-checksum command's public credit/application and immutable
+    // receipt shape. No disabling triggers or modifying existing accounting facts.
+    const credit = await sdk.commands.credits.issue({ operation, idempotencyKey: "legacy:cancel:credit", date: "2026-08-02", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
+    const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "legacy:cancel:application", applicationType: "credit_to_invoice",
+      sourceDocumentId: credit.documentId, targetDocumentId: invoice.documentId, amount: "25.00", applicationDate: "2026-08-02", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    await runner.transaction(async client => {
+      const payload = { applicationId: application.applicationId, creditDocumentId: credit.documentId };
+      const event = await appendFinancialLifecycleEvent(client, { ...scope, operation, aggregateType: "invoice", aggregateId: invoice.documentId,
+        eventType: "invoice.voided", idempotencyKey: "invoice:legacy:cancel:voided", recordedAt: operation.occurredAt, payload });
+      await client.query(`insert into erp_financials.invoice_voids(invoice_void_id,tenant_id,company_id,book_id,source_id,invoice_document_id,
+        credit_document_id,application_id,idempotency_key,lifecycle_event_id,created_at) values('legacy-void',$1,$2,$3,$4,$5,$6,$7,'legacy:cancel',$8,$9)`,
+      [scope.tenantId,scope.companyId,scope.bookId,scope.sourceId,invoice.documentId,credit.documentId,application.applicationId,event.eventId,operation.occurredAt]);
+      await appendFinancialOutboxEvent(client, { ...scope, eventType: "invoice.voided", aggregateType: "invoice", aggregateId: invoice.documentId,
+        idempotencyKey: "invoice:legacy:cancel:outbox:voided", payload, availableAt: operation.occurredAt });
+    });
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.invoices.voidIssued({ operation, invoiceDocumentId: invoice.documentId, expectedVersion: 1,
+      idempotencyKey: "legacy:cancel", date: "2026-08-02" })).rejects.toMatchObject({ code: "unsupported_operation" });
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ status: "voided", openAmount: "0.00" });
+    const audit = await sdk.queries.listInvoiceAudit(invoice.documentId);
+    expect(audit.items.some(item => item.eventType === "invoice.voided")).toBe(true);
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("replays invoice draft creation, edits, date changes and issuance without duplicate state", async () => {
+    await depositFixture("draft_replay");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "draft_replay", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const retryOperation = { ...operation, requestId: "retry", correlationId: "retry", occurredAt: "2026-08-14T00:00:00.000Z" };
+    const create = { operation, idempotencyKey: "draft:create", customerId: "customer_1", receivableAccount: { accountId: "account_ar" },
+      documentDate: "2026-08-01", dueDate: "2026-08-31", documentNumber: "INV-DRAFT", memo: "Net 30", metadata: { orderId: "order:1" },
+      revenueLines: [{ accountId: "account_income", amount: "25.00", quantity: "2.5", unitAmount: "10.00" }] };
+    const draft = await sdk.invoices.createDraft(create);
+    const originalState = await depositDatabaseState(pool);
+    expect(await sdk.invoices.createDraft({ ...create, operation: retryOperation })).toEqual(draft);
+    for (const changes of [{ metadata: { orderId: "order:2" } }, { memo: "Changed terms" }, { operation: { ...operation, actorRef: "other" } }]) {
+      await expect(sdk.invoices.createDraft({ ...create, ...changes })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    expect(await depositDatabaseState(pool)).toEqual(originalState);
+    const update = { ...create, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1, memo: "Updated terms" };
+    const edited = await sdk.invoices.updateDraft(update);
+    expect(edited.version).toBe(2);
+    const editedState = await depositDatabaseState(pool);
+    expect(await sdk.invoices.createDraft({ ...create, operation: retryOperation })).toEqual(edited);
+    expect(await sdk.invoices.updateDraft({ ...update, operation: retryOperation })).toEqual(edited);
+    await expect(sdk.invoices.updateDraft({ ...update, dueDate: "2026-09-01" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(editedState);
+    const dates = { operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 2, documentDate: "2026-08-05", dueDate: "2026-09-05" };
+    const dated = await sdk.invoices.updateDraftDates(dates);
+    expect(dated).toMatchObject({ version: 3, documentDate: dates.documentDate, dueDate: dates.dueDate, memo: edited.memo, lines: edited.lines });
+    const issued = await sdk.invoices.issue({ operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 3, idempotencyKey: "draft:issue" });
+    const after = await depositDatabaseState(pool);
+    expect(await sdk.invoices.issue({ operation: retryOperation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 3, idempotencyKey: "draft:issue" })).toEqual({ ...issued, status: "already_issued" });
+    expect(await sdk.invoices.updateDraftDates({ ...dates, operation: retryOperation })).toMatchObject({ status: "issued", version: 4 });
+    expect(await sdk.invoices.createDraft({ ...create, operation: retryOperation })).toMatchObject({ status: "issued", version: 4 });
+    expect(await sdk.invoices.updateDraft({ ...update, operation: retryOperation })).toMatchObject({ status: "issued", version: 4 });
+    await expect(sdk.invoices.updateDraftDates({ ...dates, dueDate: "2026-09-06" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(sdk.invoices.issue({ operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 2, idempotencyKey: "draft:issue" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(sdk.invoices.issue({ operation: { ...operation, actorRef: "other" }, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 3, idempotencyKey: "draft:issue" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    const detail = await sdk.queries.getInvoice(issued.invoiceDocumentId);
+    expect(detail).toMatchObject({ documentDate: dates.documentDate, dueDate: dates.dueDate, originalAmount: "25.00",
+      transactionId: issued.transactionId, idempotencyKey: "draft:issue",
+      creationLifecycle: { actorRef: operation.actorRef, requestId: operation.requestId, reasonCode: operation.reasonCode } });
+    const evidence = await pool.query<{ created_at: Date; updated_at: Date; lifecycle_event_id: string }>(
+      'select created_at,updated_at,lifecycle_event_id from erp_financials.subledger_documents where subledger_document_id=$1', [issued.invoiceDocumentId]);
+    expect(detail.createdAt).toBe(evidence.rows[0]?.created_at.toISOString());
+    expect(detail.updatedAt).toBe(evidence.rows[0]?.updated_at.toISOString());
+    expect(detail.creationLifecycle?.lifecycleEventId).toBe(evidence.rows[0]?.lifecycle_event_id);
+    expect((await sdk.queries.getInvoicesByIds([issued.invoiceDocumentId])).byInvoiceId[issued.invoiceDocumentId]).toEqual(detail);
+    // A different reporting book cannot retrieve the document through its ID.
+    const otherBook = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "other_book", currencyCode: "USD" });
+    await otherBook.books.define({ operation, bookId: "other_book", name: "Unbound invoice book", baseCurrencyCode: "USD" });
+    await expect(otherBook.queries.getInvoice(issued.invoiceDocumentId)).rejects.toMatchObject({ code: "missing_document" });
+  });
+
+  it("isolates invoice draft commands by write source and validates cancellation replay", async () => {
+    await depositFixture("draft_scope");
+    const scope = { database: runner, tenantId: "tenant_1", companyId: "company_1", bookId: "draft_scope", currencyCode: "USD" };
+    const sdk = createErpFinancialsSdk({ ...scope, writeSourceId: "source_1" });
+    const foreign = createErpFinancialsSdk({ ...scope, writeSourceId: "source_2" });
+    const operation = sdkOperation();
+    const create = { operation, idempotencyKey: "scope:draft", customerId: "customer_1", receivableAccount: { accountId: "account_ar" },
+      documentDate: "2026-08-01", dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "25.00" }] };
+    const draft = await sdk.invoices.createDraft(create);
+    const command = { operation, invoiceDraftId: draft.invoiceDraftId, expectedVersion: 1 };
+    const before = await depositDatabaseState(pool);
+    await expect(foreign.invoices.voidDraft(command)).rejects.toMatchObject({ code: "missing_document" });
+    await expect(foreign.invoices.updateDraft({ ...create, ...command })).rejects.toMatchObject({ code: "missing_document" });
+    await expect(foreign.invoices.updateDraftDates({ ...command, documentDate: "2026-08-02", dueDate: "2026-09-01" })).rejects.toMatchObject({ code: "missing_document" });
+    await expect(foreign.invoices.issue({ ...command, idempotencyKey: "scope:issue" })).rejects.toMatchObject({ code: "missing_document" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const cancelled = await sdk.invoices.voidDraft(command);
+    expect(cancelled.status).toBe("voided");
+    expect(await sdk.invoices.voidDraft({ ...command, operation: { ...operation, requestId: "retry", occurredAt: "2026-08-13T00:00:00.000Z" } })).toEqual(cancelled);
+    await expect(sdk.invoices.voidDraft({ ...command, expectedVersion: 2 })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(sdk.invoices.voidDraft({ ...command, operation: { ...operation, actorRef: "other" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+  });
+
+  it("serializes invoice draft create, edit and issue retries", async () => {
+    await depositFixture("draft_race");
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "draft_race", currencyCode: "USD" });
+    const operation = sdkOperation();
+    const create = { operation, idempotencyKey: "race:draft", customerId: "customer_1", receivableAccount: { accountId: "account_ar" },
+      documentDate: "2026-08-01", dueDate: "2026-08-31", revenueLines: [{ accountId: "account_income", amount: "25.00" }] };
+    const [first, second] = await Promise.all([sdk.invoices.createDraft(create), sdk.invoices.createDraft({ ...create, operation: { ...operation, requestId: "retry" } })]);
+    expect(first).toEqual(second);
+    const edits = await Promise.allSettled(["first", "second"].map(memo => sdk.invoices.updateDraft({ ...create, invoiceDraftId: first.invoiceDraftId, expectedVersion: 1, memo })));
+    expect(edits.filter(edit => edit.status === "fulfilled")).toHaveLength(1);
+    expect(edits.find(edit => edit.status === "rejected")?.reason as unknown).toMatchObject({ code: "idempotency_conflict" });
+    const issue = { operation, invoiceDraftId: first.invoiceDraftId, expectedVersion: 2, idempotencyKey: "race:issue" };
+    const issued = await Promise.all([sdk.invoices.issue(issue), sdk.invoices.issue({ ...issue, operation: { ...operation, requestId: "issue-retry" } })]);
+    expect(issued[0].invoiceDocumentId).toBe(issued[1].invoiceDocumentId);
+    expect(issued.map(result => result.status).sort()).toEqual(["already_issued", "issued"]);
+    expect((await pool.query<{ count: number }>("select count(*)::integer as count from erp_financials.subledger_documents where document_type='invoice'")).rows[0]?.count).toBe(1);
+  });
+
+  it("snapshots invoice draft command input before asynchronous database work", async () => {
+    await depositFixture("draft_snapshot");
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    const database: PostgresMigrationTransactionRunner = { transaction: work => runner.transaction(async client => {
+      entered(); await resume; return work(client);
+    }) };
+    const sdk = createErpFinancialsSdk({ database, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "draft_snapshot", currencyCode: "USD" });
+    const operation: Omit<FinancialOperationContext, "actorRef"> & { actorRef: string } = sdkOperation();
+    const create = { operation, idempotencyKey: "snapshot:draft", customerId: "customer_1", receivableAccount: { accountId: "account_ar" },
+      documentDate: "2026-08-01", dueDate: "2026-08-31", metadata: { orderId: "original" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] };
+    const pending = sdk.invoices.createDraft(create);
+    await started;
+    create.customerId = "customer_2"; create.metadata.orderId = "changed"; create.operation.actorRef = "other";
+    const line = create.revenueLines[0];
+    if (!line) throw new Error("Missing fixture line");
+    line.amount = "50.00";
+    release();
+    const draft = await pending;
+    expect(draft).toMatchObject({ customerId: "customer_1", originalAmount: "25.00" });
+    expect((await pool.query<{ metadata: { orderId: string } }>("select metadata from erp_financials.invoice_drafts where invoice_draft_id=$1", [draft.invoiceDraftId])).rows[0]?.metadata.orderId).toBe("original");
+    expect((await pool.query<{ actor_ref: string }>("select actor_ref from erp_financials.financial_lifecycle_events where aggregate_id=$1 and event_type='invoice.draft_created'", [draft.invoiceDraftId])).rows[0]?.actor_ref).toBe(sdkOperation().actorRef);
+  });
+
+  it("keeps contractual invoice dates distinct from recognition across GL, statements, aging and corrections",async()=>{
+    const bookId="separate-invoice-dates";const {financials}=await depositFixture(bookId);
+    const sdk=createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",bookId,writeSourceId:"source_1",currencyCode:"USD"});
+    const operation=sdkOperation(),command={operation,idempotencyKey:"separate:invoice",date:"2026-08-01",recognitionDate:"2026-08-12",dueDate:"2026-08-05",
+      customerId:"customer_1",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"100.00"}]};
+    const invoice=await financials.invoices.create(command);
+    const detail=await sdk.queries.getInvoice(invoice.documentId,"2026-08-20");
+    expect(detail).toMatchObject({documentDate:"2026-08-01",recognitionDate:"2026-08-12",dueDate:"2026-08-05",originalAmount:"100.00"});
+    expect((await sdk.queries.listInvoices({limit:2})).items[0]).toMatchObject({recognitionDate:"2026-08-12"});
+    const ledger=async()=> (await pool.query<{posting_date:string;amount:string}>("select posting_date::text,sum(net_amount)::numeric(18,2)::text amount from erp_financials.ledger_postings where account_id='account_income' and accounting_basis='accrual' group by posting_date order by posting_date")).rows;
+    expect(await ledger()).toEqual([{posting_date:"2026-08-12",amount:"-100.00"}]);
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-11"})).totals.invoiceCount).toBe(0);
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-12"})).totals.outstandingAmount).toBe("100.00");
+    expect((await sdk.queries.getAgingPage({kind:"receivables",asOfDate:"2026-08-11"})).totals.total).toBe("0.00");
+    expect((await sdk.queries.getAgingPage({kind:"receivables",asOfDate:"2026-08-12"})).totals).toMatchObject({total:"100.00",days1To30:"100.00"});
+    expect((await sdk.queries.getInvoiceRegister({asOfDate:"2026-08-20"})).items[0]).toMatchObject({documentDate:"2026-08-01",recognitionDate:"2026-08-12"});
+    // Financial source membership follows recognition, not an earlier contract.
+    await pool.query("update erp_financials.reporting_book_sources set effective_from='2026-08-10' where book_id=$1",[bookId]);
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({recognitionDate:"2026-08-12"});
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-12"})).totals.outstandingAmount).toBe("100.00");
+    expect(await sdk.queries.getReceivableCollectionPosition({sourceId:"source_1",customerId:"customer_1",collectionRef:"separate:order",invoiceId:invoice.documentId})).toMatchObject({basis:"invoice",collectionAmount:"100.00"});
+    expect((await sdk.queries.getDashboardSummary({periodStart:"2026-08-01",asOfDate:"2026-08-11"})).accountsReceivable).toBe("0.00");
+    expect((await sdk.queries.getDashboardSummary({periodStart:"2026-08-01",asOfDate:"2026-08-12"}))).toMatchObject({accountsReceivable:"100.00",revenue:"100.00"});
+    const before=await depositDatabaseState(pool);
+    expect((await financials.invoices.create(command)).documentId).toBe(invoice.documentId);
+    await expect(financials.invoices.create({...command,recognitionDate:"2026-08-13"})).rejects.toMatchObject({code:"idempotency_conflict"});
+    await expect(financials.invoices.create({...command,date:"2026-08-02"})).rejects.toMatchObject({code:"idempotency_conflict"});
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(pool.query("update erp_financials.subledger_documents set recognition_date='2026-08-13' where subledger_document_id=$1",[invoice.documentId])).rejects.toThrow("immutable");
+    await expect(pool.query(`insert into erp_financials.subledger_documents(subledger_document_id,tenant_id,company_id,source_id,document_type,transaction_id,party_id,document_date,recognition_date,due_date,currency_code,original_amount,open_amount,status,version,idempotency_key,lifecycle_event_id,metadata,created_at,updated_at)
+      select 'invalid-recognition',tenant_id,company_id,source_id,document_type,transaction_id,party_id,document_date,'2026-08-13',due_date,currency_code,original_amount,open_amount,status,version,'invalid-recognition',lifecycle_event_id,metadata,created_at,updated_at
+      from erp_financials.subledger_documents where subledger_document_id=$1`,[invoice.documentId])).rejects.toThrow("recognition must match");
+    const correction={operation,idempotencyKey:"separate:contract",invoiceId:invoice.documentId,expectedVersion:1,documentDate:"2026-08-02",recognitionDate:"2026-08-12",dueDate:"2026-08-06"};
+    await expect(financials.invoices.correctDates({operation,idempotencyKey:correction.idempotencyKey,invoiceId:invoice.documentId,expectedVersion:1,documentDate:correction.documentDate,dueDate:correction.dueDate})).rejects.toThrow("explicit recognitionDate");
+    const contract=await financials.invoices.correctDates(correction);
+    expect(contract).toMatchObject({documentDate:"2026-08-02",recognitionDate:"2026-08-12",version:2});expect(contract.reversalTransactionId).toBeUndefined();expect(await ledger()).toEqual([{posting_date:"2026-08-12",amount:"-100.00"}]);
+    const restatement={...correction,idempotencyKey:"separate:recognition",expectedVersion:2,recognitionDate:"2026-08-14"};
+    const result=await financials.invoices.correctDates(restatement);
+    expect(result.reversalTransactionId).toBeTruthy();expect(result.replacementTransactionId).toBeTruthy();
+    expect(await ledger()).toEqual([{posting_date:"2026-08-12",amount:"0.00"},{posting_date:"2026-08-14",amount:"-100.00"}]);
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-13"})).totals.invoiceCount).toBe(0);
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-14"})).totals.outstandingAmount).toBe("100.00");
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({documentDate:"2026-08-02",recognitionDate:"2026-08-14"});
+    const after=await depositDatabaseState(pool);expect(await financials.invoices.correctDates(restatement)).toEqual(result);expect(await financials.invoices.correctDates(correction)).toEqual(contract);
+    expect((await financials.invoices.create(command)).documentId).toBe(invoice.documentId);expect(await depositDatabaseState(pool)).toEqual(after);
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-14"})).items[0]).toMatchObject({documentDate:"2026-08-02",recognitionDate:"2026-08-14"});
+    await expect(sdk.invoices.voidIssued({operation,idempotencyKey:"separate:void",invoiceDocumentId:invoice.documentId,expectedVersion:3,date:"2026-08-13"})).rejects.toThrow("cannot precede recognition");
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    await sdk.invoices.voidIssued({operation,idempotencyKey:"separate:void",invoiceDocumentId:invoice.documentId,expectedVersion:3,date:"2026-08-14"});
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-14"})).totals.outstandingAmount).toBe("0.00");
+    expect((await sdk.queries.getAgingPage({kind:"receivables",asOfDate:"2026-08-14"})).totals.total).toBe("0.00");
+
+  });
+
+  it("economic invoice correction preserves historical recognition and cash across a replacement",async()=>{
+    const bookId="distinct-economic",operation=sdkOperation();
+    await migratePostgresSchema(runner,{appliedByRef:"distinct-economic"});await seedAccountingScope(pool);
+    const sdk=createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",bookId,writeSourceId:"source_1",currencyCode:"USD"});
+    await sdk.books.define({operation,bookId,name:"Distinct recognition correction",baseCurrencyCode:"USD"});
+    await sdk.books.bindSource({operation,bookId,sourceId:"source_1",sourceRole:"active",effectiveFrom:"2026-01-01"});
+    const financials=sdk.commands;
+    await financials.fiscalPeriods.define({operation,fiscalYear:2026,periodNumber:8,periodStart:"2026-08-01",periodEnd:"2026-08-31"});
+    const receipt=await financials.customerPayments.record({operation,idempotencyKey:"distinct-economic:receipt",customerId:"customer_1",date:"2026-08-05",amount:"40.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    const invoice=await financials.invoices.create({operation,idempotencyKey:"distinct-economic:invoice",customerId:"customer_1",date:"2026-08-01",recognitionDate:"2026-08-12",dueDate:"2026-08-05",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"100.00"}]});
+    const allocation=await financials.paymentApplications.apply({operation,idempotencyKey:"distinct-economic:apply",applicationType:"customer_payment_to_invoice",sourceDocumentId:receipt.documentId,targetDocumentId:invoice.documentId,expectedSourceVersion:1,expectedTargetVersion:1,amount:"40.00",applicationDate:"2026-08-12"});
+    const beforeReview=await depositDatabaseState(pool),review=await sdk.queries.getInvoiceCorrectionReview({sourceId:"source_1",invoiceId:invoice.documentId,limit:1});
+    expect(review.invoice).toMatchObject({documentDate:"2026-08-01",recognitionDate:"2026-08-12",dueDate:"2026-08-05",openAmount:"60.00"});
+    expect(await depositDatabaseState(pool)).toEqual(beforeReview);
+    const command={operation,invoiceDocumentId:invoice.documentId,expectedVersion:2,idempotencyKey:"distinct-economic:replace",date:"2026-08-13",
+      releases:[{applicationId:allocation.applicationId,expectedVersion:1,expectedSourceVersion:2,reapplyAmount:"20.00"}],
+      replacement:{dueDate:"2026-08-05",revenueLines:[{accountId:"account_income",amount:"50.00"}]}};
+    await expect(sdk.invoices.correctIssued({...command,date:"2026-08-11"})).rejects.toThrow("cannot precede a released application");
+    expect(await depositDatabaseState(pool)).toEqual(beforeReview);
+    const result=await sdk.invoices.correctIssued(command);
+    if(!result.replacement)throw Error("Expected explicit replacement");
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({status:"voided",recognitionDate:"2026-08-12",documentDate:"2026-08-01",openAmount:"0.00"});
+    expect(await sdk.queries.getInvoice(result.replacement.invoiceDocumentId)).toMatchObject({documentDate:"2026-08-13",dueDate:"2026-08-05",originalAmount:"50.00",openAmount:"30.00"});
+    expect(await sdk.queries.getCustomerPayment(receipt.documentId)).toMatchObject({amount:"40.00",unappliedAmount:"20.00"});
+    for(const [cutoff,net] of [["2026-08-11","-40.00"],["2026-08-12","60.00"],["2026-08-13","10.00"]] as const){
+      expect((await sdk.queries.getAgingPage({kind:"receivables",asOfDate:cutoff})).totals.total).toBe(net);
+      expect((await pool.query<{net:string}>(`select coalesce(sum(net_amount),0)::numeric(18,2)::text net from erp_financials.ledger_postings
+        where tenant_id='tenant_1' and source_id='source_1' and account_id='account_ar' and accounting_basis='accrual' and posting_date<=$1::date`,[cutoff])).rows[0]?.net).toBe(net);
+    }
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-12"})).totals.outstandingAmount).toBe("60.00");
+    expect((await sdk.queries.getCustomerStatement({customerId:"customer_1",asOfDate:"2026-08-13"})).totals.outstandingAmount).toBe("30.00");
+    expect((await pool.query<{net:string}>(`select sum(net_amount)::numeric(18,2)::text net from erp_financials.ledger_postings where tenant_id='tenant_1' and source_id='source_1' and account_id='account_cash' and accounting_basis='accrual'`)).rows[0]?.net).toBe("40.00");
+    const after=await depositDatabaseState(pool);expect(await sdk.invoices.correctIssued(command)).toEqual({...result,status:"already_corrected"});expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("preserves pre-invoice receipts and rejects application or restatement dates that break historical AR",async()=>{
+    const bookId="recognition-applications",{financials}=await depositFixture(bookId),operation=sdkOperation();
+    const sdk=createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",bookId,writeSourceId:"source_1",currencyCode:"USD"});
+    const receipt=await financials.customerPayments.record({operation,idempotencyKey:"recognition:receipt",customerId:"customer_1",date:"2026-08-05",amount:"40.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}});
+    const invoice=await financials.invoices.create({operation,idempotencyKey:"recognition:invoice",customerId:"customer_1",date:"2026-08-01",recognitionDate:"2026-08-12",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"100.00"}]});
+    const apply={operation,idempotencyKey:"recognition:apply",applicationType:"customer_payment_to_invoice" as const,sourceDocumentId:receipt.documentId,targetDocumentId:invoice.documentId,expectedSourceVersion:1,expectedTargetVersion:1,amount:"40.00",applicationDate:"2026-08-11"};
+    const before=await depositDatabaseState(pool);await expect(financials.paymentApplications.apply(apply)).rejects.toThrow("cannot precede recognition");expect(await depositDatabaseState(pool)).toEqual(before);
+    expect((await sdk.queries.getAgingPage({kind:"receivables",asOfDate:"2026-08-11"})).totals.total).toBe("-40.00");
+    const allocation=await financials.paymentApplications.apply({...apply,applicationDate:"2026-08-12"});
+    expect((await sdk.queries.getAgingPage({kind:"receivables",asOfDate:"2026-08-12"})).totals.total).toBe("60.00");
+    const after=await depositDatabaseState(pool);
+    // Bypassing the command API still cannot create an early allocation. The
+    // before-insert guard must reject it before any document balance changes.
+    await expect(pool.query(`insert into erp_financials.subledger_applications
+      select (jsonb_populate_record(null::erp_financials.subledger_applications,
+        to_jsonb(a)||jsonb_build_object('subledger_application_id','early-recognition-clone',
+          'idempotency_key','early-recognition-clone','application_date','2026-08-11'))).*
+      from erp_financials.subledger_applications a where a.subledger_application_id=$1`,[allocation.applicationId])).rejects.toThrow("cannot precede recognition");
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    const correction={operation,idempotencyKey:"recognition:correction",invoiceId:invoice.documentId,expectedVersion:2,documentDate:"2026-08-01",recognitionDate:"2026-08-13",dueDate:"2026-08-31"};
+    await expect(financials.invoices.correctDates(correction)).rejects.toThrow("historical invoice applications");expect(await depositDatabaseState(pool)).toEqual(after);
+    await financials.paymentApplications.unapply({operation,applicationId:allocation.applicationId,expectedVersion:1,effectiveDate:"2026-08-14"});
+    // Ending an application today does not erase its historical accounting.
+    await expect(financials.invoices.correctDates({...correction,expectedVersion:3})).rejects.toThrow("historical invoice applications");
+    expect((await sdk.queries.getAgingPage({kind:"receivables",asOfDate:"2026-08-12"})).totals.total).toBe("60.00");
+  });
+
+  it.each([0, 60, 100])("restates native invoice dates without changing receipts or applications (applied=%s)", async applied => {
+    const { financials } = await depositFixture("invoice_dates");
+    const operation = sdkOperation();
+    const invoice = await financials.invoices.create({ operation, idempotencyKey: "dates:invoice", date: "2026-08-05", dueDate: "2026-08-31",
+      customerId: "customer_1", receivableAccount: { accountId: "account_ar" },
+      revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const payment = await financials.customerPayments.record({ operation, idempotencyKey: "dates:receipt", date: "2026-08-10", customerId: "customer_1", amount: `${String(applied || 60)}.00`,
+      cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" } });
+    if (applied > 0) await financials.paymentApplications.apply({ operation, idempotencyKey: "dates:apply", applicationType: "customer_payment_to_invoice",
+      sourceDocumentId: payment.documentId, targetDocumentId: invoice.documentId, applicationDate: "2026-08-10", amount: `${String(applied)}.00`, expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    const applications = (await pool.query("select * from erp_financials.subledger_applications order by subledger_application_id")).rows;
+    const cash = (await pool.query("select * from erp_financials.ledger_postings where accounting_basis='cash' order by posting_id")).rows;
+    const initialVersion = applied > 0 ? 2 : 1;
+    const openAmount = `${String(100 - applied)}.00`;
+    const command = { operation, invoiceId: invoice.documentId, expectedVersion: initialVersion, idempotencyKey: "dates:correct", documentDate: "2026-08-07", dueDate: "2026-09-06" };
+    const result = await financials.invoices.correctDates(command);
+    expect(result).toMatchObject({ invoiceId: invoice.documentId, version: initialVersion + 1, documentDate: command.documentDate, dueDate: command.dueDate, originalTransactionId: invoice.journal.transactionId });
+    expect(result.reversalTransactionId).toBeTruthy();
+    expect(result.replacementTransactionId).toBeTruthy();
+    expect((await pool.query("select * from erp_financials.subledger_applications order by subledger_application_id")).rows).toEqual(applications);
+    expect((await pool.query("select * from erp_financials.ledger_postings where accounting_basis='cash' order by posting_id")).rows).toEqual(cash);
+    expect((await pool.query("select document_date::text,due_date::text,open_amount::numeric(18,2)::text,version from erp_financials.subledger_documents where subledger_document_id=$1", [invoice.documentId])).rows[0])
+      .toEqual({ document_date: "2026-08-07", due_date: "2026-09-06", open_amount: openAmount, version: initialVersion + 1 });
+    expect((await pool.query("select posting_date::text, sum(net_amount)::numeric(18,2)::text as amount from erp_financials.ledger_postings where accounting_basis='accrual' and account_id='account_income' group by posting_date order by posting_date")).rows)
+      .toEqual([{ posting_date: "2026-08-05", amount: "0.00" }, { posting_date: "2026-08-07", amount: "-100.00" }]);
+    const reads = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "invoice_dates", currencyCode: "USD" });
+    expect(await reads.queries.getInvoice(invoice.documentId, "2026-08-31")).toMatchObject({ documentDate: "2026-08-07", dueDate: "2026-09-06", openAmount, version: initialVersion + 1 });
+    expect((await reads.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-06" })).totals.invoiceCount).toBe(0);
+    expect((await reads.queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-07" })).totals.outstandingAmount).toBe("100.00");
+    expect((await financials.invoices.create({ operation, idempotencyKey: "dates:invoice", date: "2026-08-05", dueDate: "2026-08-31",
+      customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] })).documentId).toBe(invoice.documentId);
+    const before = await depositDatabaseState(pool);
+    expect(await financials.invoices.correctDates({ ...command, operation: { ...operation, requestId: "retry", occurredAt: "2026-08-16T00:00:00.000Z" } })).toEqual(result);
+    for (const change of [{ dueDate: "2026-09-07" }, { documentDate: "2026-08-08" }, { expectedVersion: initialVersion + 1 }, { operation: { ...operation, actorRef: "other" } }]) {
+      await expect(financials.invoices.correctDates({ ...command, ...change })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(pool.query("update erp_financials.subledger_documents set document_date='2026-08-08' where subledger_document_id=$1", [invoice.documentId])).rejects.toThrow("immutable");
+    const dueOnly = await financials.invoices.correctDates({ ...command, expectedVersion: initialVersion + 1, idempotencyKey: "dates:due-only", dueDate: "2026-09-10" });
+    expect(dueOnly.version).toBe(initialVersion + 2); expect(dueOnly.reversalTransactionId).toBeUndefined();
+    await closeDepositPeriod(pool, financials);
+    expect(await financials.invoices.correctDates(command)).toEqual(result);
+    await expect(financials.invoices.correctDates({ ...command, expectedVersion: initialVersion + 2, idempotencyKey: "dates:closed", documentDate: "2026-08-08" })).rejects.toMatchObject({ code: "fiscal_period_closed" });
+  });
+
+  it.each(["second-journal", "lifecycle", "document", "outbox"] as const)("rejects an incomplete invoice date correction even if host swallows %s failure", async stage => {
+    const { financials } = await depositFixture();
+    const invoice = await financials.invoices.create({ operation: sdkOperation(), idempotencyKey: "crash:invoice", date: "2026-08-05", dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const before = await depositDatabaseState(pool);
+    let interrupted = false;
+    let journals = 0;
+    await expect(runner.transaction(async client => {
+      const broken: PostgresQueryClient = { async query(sql, values) {
+        if (sql.includes('insert into "erp_financials"."transactions"') && values?.includes("Subledger:invoice_date_correction")) journals++;
+        const event = values?.includes("subledger.invoice.dates_corrected");
+        if ((stage === "second-journal" && journals === 2) ||
+            (stage === "lifecycle" && event && sql.includes('insert into "erp_financials"."financial_lifecycle_events"')) ||
+            (stage === "document" && sql.includes('set "document_date"=$5')) ||
+            (stage === "outbox" && event && sql.includes('insert into "erp_financials"."financial_outbox"'))) {
+          interrupted = true; throw new Error("synthetic interruption");
+        }
+        return client.query(sql, values);
+      } };
+      try {
+        await depositService({ transaction: work => work(broken) }).invoices.correctDates({ operation: sdkOperation(), invoiceId: invoice.documentId, expectedVersion: 1,
+          idempotencyKey: "crash:dates", documentDate: "2026-08-07", dueDate: "2026-09-01" });
+      } catch (error) { expect(String(error)).toContain("synthetic interruption"); }
+    })).rejects.toThrow(/invoice date correction/);
+    expect(interrupted).toBe(true);
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("rejects two correction completions claiming one invoice version after a swallowed failure", async () => {
+    const { financials } = await depositFixture();
+    const invoice = await financials.invoices.create({ operation: sdkOperation(), idempotencyKey: "twice:invoice", date: "2026-08-05", dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const before = await depositDatabaseState(pool);
+    const command = { operation: sdkOperation(), invoiceId: invoice.documentId, expectedVersion: 1, idempotencyKey: "twice:first", documentDate: "2026-08-07", dueDate: "2026-09-01" };
+    await expect(runner.transaction(async client => {
+      let interrupted = false;
+      const broken: PostgresQueryClient = { async query(sql, values) {
+        if (!interrupted && sql.includes('set "document_date"=$5')) { interrupted = true; throw new Error("synthetic interruption"); }
+        return client.query(sql, values);
+      } };
+      try { await depositService({ transaction: work => work(broken) }).invoices.correctDates(command); }
+      catch (error) { expect(String(error)).toContain("synthetic interruption"); }
+      expect(interrupted).toBe(true);
+      await depositService({ transaction: work => work(client) }).invoices.correctDates({ ...command, idempotencyKey: "twice:second" });
+    })).rejects.toThrow("invoice date correction requires its outbox event");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("serializes competing invoice date corrections and rejects missing approval", async () => {
+    const { financials } = await depositFixture();
+    const invoice = await financials.invoices.create({ operation: sdkOperation(), idempotencyKey: "race:invoice", date: "2026-08-05", dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const command = { operation: sdkOperation(), invoiceId: invoice.documentId, expectedVersion: 1, idempotencyKey: "race:dates", documentDate: "2026-08-07", dueDate: "2026-09-01" };
+    const before = await depositDatabaseState(pool);
+    await expect(financials.invoices.correctDates({ ...command, operation: { ...command.operation, approverRef: command.operation.actorRef } })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const results = await Promise.allSettled([
+      financials.invoices.correctDates(command),
+      depositService(runner).invoices.correctDates({ ...command, idempotencyKey: "race:other", documentDate: "2026-08-08" })
+    ]);
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.find(result => result.status === "rejected");
+    expect(rejected?.reason as unknown).toMatchObject({ code: "optimistic_concurrency_conflict" });
+    expect((await pool.query<{ count: number }>("select count(*)::integer as count from erp_financials.financial_lifecycle_events where event_type='subledger.invoice.dates_corrected'")).rows[0]?.count).toBe(1);
+  });
+
+  it("preserves journal origin and original audit across transport retries", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:journal-origin" });
+    await seedAccountingScope(pool);
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "journal_origin", currencyCode: "USD" });
+    const operation = sdkOperation();
+    await sdk.books.define({ operation, bookId: "journal_origin", name: "Journal origin", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation, bookId: "journal_origin", sourceId: "source_1", sourceRole: "active" });
+    await sdk.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const command = { operation, idempotencyKey: "journal:origin", date: "2026-08-05", memo: "Payroll accrual",
+      origin: { module: "Payroll", reference: "pay-run:2026-08-05" },
+      lines: [{ accountId: "account_cash", debit: "10.00" }, { accountId: "account_income", credit: "10.00" }]
+    };
+    const posted = await sdk.commands.journalEntries.post(command);
+    expect(await sdk.queries.getJournalEntry(posted.transactionId)).toMatchObject({ sourceProvenance: { origin: command.origin } });
+    const before = await depositDatabaseState(pool);
+    const replay = await sdk.commands.journalEntries.post({ ...command,
+      operation: { ...operation, requestId: "retry-request", correlationId: "retry-correlation", occurredAt: "2026-08-13T12:00:00.000Z" }
+    });
+    expect(replay).toMatchObject({ status: "already_posted", transactionId: posted.transactionId, lifecycleEventId: posted.lifecycleEventId });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    for (const changed of [
+      { origin: { ...command.origin, reference: "another-pay-run" } },
+      { origin: { ...command.origin, module: "Manual" } },
+      { operation: { ...operation, actorRef: "another-user" } },
+      { operation: { ...operation, approverRef: "another-approver" } },
+      { operation: { ...operation, reasonCode: "another_reason" } }
+    ]) {
+      await expect(sdk.commands.journalEntries.post({ ...command, ...changed })).rejects.toMatchObject({ code: "idempotency_conflict" });
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+    await expect(sdk.commands.journalEntries.post({ ...command, idempotencyKey: "invalid:origin", origin: { module: "x".repeat(81) } })).rejects.toMatchObject({ code: "invalid_input" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["posting-lock", "begin-close"] as const)("serializes in-flight posting against %s including the first book lock", async (action) => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:posting-close-race" });
+    await seedAccountingScope(pool);
+    const operation = sdkOperation();
+    const period = await depositService(runner).fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    let releasePosting!: () => void;
+    const hold = new Promise<void>(resolve => { releasePosting = resolve; });
+    let paused = false;
+    const postingRunner: PostgresMigrationTransactionRunner = {
+      transaction: work => runner.transaction(client => work({
+        async query<Row extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: readonly unknown[]) {
+          const result = await client.query<Row>(sql, params);
+          if (!paused && sql.includes("insert into") && sql.includes('"ledger_postings"')) {
+            paused = true;
+            await hold;
+          }
+          return result;
+        }
+      }))
+    };
+    const posting = depositService(postingRunner).journalEntries.post({
+      operation, idempotencyKey: "posting:race", date: "2026-08-05",
+      lines: [{ accountId: "account_cash", debit: "10.00" }, { accountId: "account_income", credit: "10.00" }]
+    });
+    let closure: Promise<unknown> | undefined;
+    let closeBackend: number | undefined;
+    let closeFinished = false;
+    try {
+      await expect.poll(() => paused).toBe(true);
+      const closing = depositService({
+        transaction: work => runner.transaction(async client => {
+          closeBackend = Number((await client.query("select pg_backend_pid() as pid")).rows[0]?.pid);
+          return work(client);
+        })
+      });
+      closure = (action === "posting-lock"
+        ? closing.fiscalPeriods.setPostingLockDate({ operation, postingLockDate: "2026-08-31", expectedVersion: 0 })
+        : closing.fiscalPeriods.beginClose({ operation, fiscalPeriodId: period.fiscalPeriodId, expectedVersion: period.version })
+      ).then(result => { closeFinished = true; return result; });
+      await expect.poll(async () => {
+        if (!closeBackend || closeFinished) return "not-blocked";
+        return (await pool.query<{ wait_event: string | null }>("select wait_event from pg_stat_activity where pid=$1", [closeBackend])).rows[0]?.wait_event;
+      }).toBe("advisory");
+    } finally {
+      releasePosting();
+      await Promise.allSettled([posting, ...(closure ? [closure] : [])]);
+    }
+    await expect(posting).resolves.toMatchObject({ status: "posted" });
+    expect(closeFinished).toBe(true);
+    const before = await depositDatabaseState(pool);
+    await expect(depositService(runner).journalEntries.post({ operation, idempotencyKey: "posting:after-close", date: "2026-08-05",
+      lines: [{ accountId: "account_cash", debit: "10.00" }, { accountId: "account_income", credit: "10.00" }]
+    })).rejects.toMatchObject({ code: action === "posting-lock" ? "fiscal_period_closed" : "fiscal_period_closing" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["unapply", "void"] as const)("rejects changed %s replay dates and versions without altering accounting", async (action) => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:application-end-replay" });
+    await seedAccountingScope(pool);
+    const financials = createErpFinancials({ database: runner, tenantId: "tenant_1", companyId: "company_1",
+      sourceId: "source_1", currencyCode: "USD", postingPolicy: "legacy_unrestricted" });
+    const invoice = await financials.invoices.create({ operation: sdkOperation(), idempotencyKey: "replay:invoice",
+      date: "2026-08-01", dueDate: "2026-08-31", customerId: "customer_1",
+      receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "100.00" }] });
+    const receipt = await financials.customerPayments.record({ operation: sdkOperation(), idempotencyKey: "replay:receipt",
+      date: "2026-08-02", customerId: "customer_1", amount: "40.00",
+      receivableAccount: { accountId: "account_ar" }, cashAccount: { accountId: "account_cash" } });
+    const application = await financials.paymentApplications.apply({ operation: sdkOperation(), idempotencyKey: "replay:apply",
+      applicationType: "customer_payment_to_invoice", sourceDocumentId: receipt.documentId, targetDocumentId: invoice.documentId,
+      amount: "40.00", applicationDate: "2026-08-02", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    const command = { operation: sdkOperation(), applicationId: application.applicationId, effectiveDate: "2026-08-03", expectedVersion: 1 };
+    const ended = await financials.paymentApplications[action](command);
+    const snapshot = async () => {
+      const result: Record<string, unknown> = {};
+      for (const table of ["subledger_documents", "subledger_applications", "ledger_postings", "financial_lifecycle_events"]) {
+        result[table] = (await pool.query(`select row_to_json(t)::text as row from erp_financials.${table} t order by row_to_json(t)::text`)).rows;
+      }
+      return result;
+    };
+    const before = await snapshot();
+    await expect(financials.paymentApplications[action]({ ...command, operation: { ...sdkOperation(), requestId: "retry" } })).resolves.toEqual(ended);
+    for (const changed of [{ effectiveDate: "2026-08-04" }, { expectedVersion: 2 }]) {
+      await expect(financials.paymentApplications[action]({ ...command, ...changed })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
+    expect(await snapshot()).toEqual(before);
   });
 
   it("atomically settles invoice write-offs and rejects locked application transitions", async () => {
@@ -2460,6 +11153,780 @@ where application.subledger_application_id = $1`,
         settlement.application.applicationId
       ])
     ).resolves.toMatchObject({ rows: [{ status: "applied", version: 1 }] });
+  });
+
+  it.each(["voided", "replaced"] as const)("posted vendor bill corrections require the originating book and currency before writes or replay: %s", async outcome => {
+    const { sdk, options, operation, bill } = await paymentHoldFixture();
+    const other = createErpFinancialsSdk({ ...options, bookId: "other_correction_book" });
+    await other.books.define({ operation, bookId: "other_correction_book", name: "Other correction book", baseCurrencyCode: "USD" });
+    await other.books.bindSource({ operation, bookId: "other_correction_book", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    await other.commands.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const command = { operation, vendorBillId: bill.documentId, expectedVersion: 1, idempotencyKey: "bill-correction-scope", date: "2026-08-12", replacement: { idempotencyKey: "scope-replacement-bill", date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "90.00" }] } };
+    const execute = (scope: ErpFinancialsSdk) => outcome === "voided" ? scope.commands.vendorBills.voidPosted(command) : scope.commands.vendorBills.replacePosted(command);
+    const before = await depositDatabaseState(pool);
+    await expect(execute(other)).rejects.toMatchObject({ code: "scope_mismatch" });
+    await expect(execute(createErpFinancialsSdk({ ...options, currencyCode: "EUR" }))).rejects.toMatchObject({ code: "currency_not_supported" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(execute(sdk)).resolves.toMatchObject({ status: outcome });
+    const after = await depositDatabaseState(pool);
+    await expect(execute(other)).rejects.toMatchObject({ code: "scope_mismatch" });
+    await expect(execute(sdk)).resolves.toMatchObject({ status: "already_" + outcome });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it.each(["20.00", "100.00"])("posted vendor bill corrections reject active applications and preserve unapplied cash: %s", async amount => {
+    const { sdk, operation, bill, payment } = await paymentHoldFixture();
+    const cash = await sdk.commands.billPayments.record({ ...payment, idempotencyKey: "correction:cash", amount });
+    const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "correction:application", applicationType: "bill_payment_to_bill",
+      sourceDocumentId: cash.documentId, targetDocumentId: bill.documentId, amount, applicationDate: "2026-08-10", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    const command = { operation, vendorBillId: bill.documentId, expectedVersion: 2, idempotencyKey: "correct:applied-bill", date: "2026-08-12",
+      replacement: { idempotencyKey: "correct:applied-replacement", date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "90.00" }] } };
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.voidPosted(command)).rejects.toMatchObject({ code: "terminal_state_conflict" });
+    await expect(sdk.commands.vendorBills.replacePosted(command)).rejects.toMatchObject({ code: "terminal_state_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: application.applicationId, expectedVersion: 1, effectiveDate: "2026-08-12" });
+    const cashFacts = (await pool.query("select to_jsonb(p) row from erp_financials.ledger_postings p where accounting_basis='cash' order by posting_id")).rows;
+    const corrected = await sdk.commands.vendorBills.replacePosted({ ...command, expectedVersion: 3 });
+    expect(corrected).toMatchObject({ status: "replaced", originalVersion: 4, replacement: { originalAmount: "90.00", openAmount: "90.00" } });
+    expect(await sdk.queries.getOperationalDocumentSummary(cash.documentId)).toMatchObject({ documentType: "bill_payment", originalAmount: amount, openAmount: amount, status: "open" });
+    expect((await pool.query("select to_jsonb(p) row from erp_financials.ledger_postings p where accounting_basis='cash' order by posting_id")).rows).toEqual(cashFacts);
+    const compensated = await pool.query<{ account_id: string; balanced: boolean }>("select account_id,sum(net_amount)=0 as balanced from erp_financials.ledger_postings where transaction_id=any($1::text[]) and accounting_basis='accrual' group by account_id", [[bill.journal.transactionId, corrected.reversal.transactionId]]);
+    expect(compensated.rows).toHaveLength(2); expect(compensated.rows.every(row => row.balanced)).toBe(true);
+    const after = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.replacePosted({ ...command, expectedVersion: 3, operation: { ...operation, requestId: "retry-applied-correction" } })).resolves.toMatchObject({ status: "already_replaced" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it.each((["voided", "replaced"] as const).flatMap(outcome =>
+    (["correction", "payment"] as const).map(winner => ({ outcome, winner }))))(
+    "posted vendor bill corrections serialize with payment: $outcome, $winner first", async ({ outcome, winner }) => {
+      const { options, sdk, operation, bill, payment } = await paymentHoldFixture();
+      const command = { operation, vendorBillId: bill.documentId, expectedVersion: 1,
+        idempotencyKey: "correction-race", date: "2026-08-12", memo: "Approved supplier correction",
+        replacement: { idempotencyKey: "correction-race:replacement", date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1",
+          payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "90.00" }] } };
+      const correct = (actor: ErpFinancialsSdk) => outcome === "voided"
+        ? actor.commands.vendorBills.voidPosted(command) : actor.commands.vendorBills.replacePosted(command);
+      const first = await pool.connect();
+      let committed = false;
+      let waiter: Promise<PromiseSettledResult<unknown>> | undefined;
+      try {
+        await first.query("begin");
+        const firstPid = (await first.query<{ pid: number }>("select pg_backend_pid() as pid")).rows[0]?.pid;
+        const firstSdk = createErpFinancialsSdk({ ...options, database: { transaction: work => work(first) } });
+        let secondPid: number | undefined;
+        const secondSdk = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+          secondPid = Number((await client.query("select pg_backend_pid() as pid")).rows[0]?.pid);
+          return work(client);
+        }) } });
+        if (winner === "correction") await correct(firstSdk);
+        else await firstSdk.commands.billPayments.recordAndApply(payment);
+        const pending = winner === "correction" ? secondSdk.commands.billPayments.recordAndApply(payment) : correct(secondSdk);
+        waiter = pending.then(value => ({ status: "fulfilled", value }), (reason: unknown) => ({ status: "rejected", reason }));
+        await expect.poll(async () => {
+          if (firstPid === undefined || secondPid === undefined) return false;
+          return (await pool.query<{ blocked: boolean }>(
+            "select $2::integer=any(pg_blocking_pids($1::integer)) as blocked", [secondPid, firstPid])).rows[0]?.blocked;
+        }, { timeout: 5000 }).toBe(true);
+        // Readers see only the old committed bill while the winner is pending.
+        expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ version: 1, status: "open", openAmount: "100.00" });
+        await first.query("commit"); committed = true;
+        expect(await waiter).toMatchObject({ status: "rejected" });
+        expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({
+          version: 2, status: winner === "correction" ? "voided" : "partially_applied", openAmount: winner === "correction" ? "0.00" : "80.00"
+        });
+        const after = await depositDatabaseState(pool);
+        if (winner === "correction") {
+          await expect(correct(sdk)).resolves.toMatchObject({ status: `already_${outcome}` });
+          expect((await pool.query("select 1 from erp_financials.bill_payment_disbursements where idempotency_key=$1", [payment.idempotencyKey])).rows).toHaveLength(0);
+        } else {
+          await expect(sdk.commands.billPayments.recordAndApply(payment)).resolves.toMatchObject({ status: "already_cleared" });
+          expect((await pool.query("select 1 from erp_financials.subledger_documents where idempotency_key=$1", [command.replacement.idempotencyKey])).rows).toHaveLength(0);
+          await expect(correct(sdk)).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+        }
+        expect(await depositDatabaseState(pool)).toEqual(after);
+      } finally {
+        if (!committed) await first.query("rollback");
+        first.release();
+        // Always release the winner and drain the contender before schema cleanup.
+        await waiter;
+      }
+    }, 15000);
+
+  it.each(["voided", "replaced"] as const)("posted vendor bill corrections avoid a payment lock inversion: %s", async outcome => {
+    const { options, operation, bill, sdk } = await paymentHoldFixture();
+    const receipt = await sdk.commands.billPayments.record({ operation, idempotencyKey: "lock-order:payment", date: "2026-08-10", vendorId: "vendor_1", amount: "20.00",
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" } });
+    let release!: () => void; let locked!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const boundary = new Promise<void>(resolve => { locked = resolve; });
+    let firstPid: number | undefined; let secondPid: number | undefined; let intercepted = false;
+    const firstSdk = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+      firstPid = Number((await client.query("select pg_backend_pid() as pid")).rows[0]?.pid);
+      return work({ async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        const result = await client.query<Row>(sql, params);
+        if (!intercepted && sql.includes('from "erp_financials"."subledger_documents"') && sql.includes("for update") && params[3] === bill.documentId) {
+          intercepted = true; locked(); await gate;
+        }
+        return result;
+      } });
+    }) } });
+    const secondSdk = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+      secondPid = Number((await client.query("select pg_backend_pid() as pid")).rows[0]?.pid); return work(client);
+    }) } });
+    const command = { operation, vendorBillId: bill.documentId, expectedVersion: 1, idempotencyKey: "lock-order:correct", date: "2026-08-12",
+      replacement: { idempotencyKey: "lock-order:replacement", date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1",
+        payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "90.00" }] } };
+    const firstResult = Promise.allSettled([outcome === "voided" ? firstSdk.commands.vendorBills.voidPosted(command) : firstSdk.commands.vendorBills.replacePosted(command)]);
+    let secondResult: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      await Promise.race([boundary, firstResult.then(() => { throw new Error("Correction ended before lock boundary"); })]);
+      secondResult = Promise.allSettled([secondSdk.commands.paymentApplications.apply({ operation, idempotencyKey: "lock-order:apply", applicationType: "bill_payment_to_bill",
+        sourceDocumentId: receipt.documentId, targetDocumentId: bill.documentId, amount: "20.00", applicationDate: "2026-08-12", expectedSourceVersion: 1, expectedTargetVersion: 1 })]);
+      await expect.poll(async () => {
+        if (firstPid === undefined || secondPid === undefined) return false;
+        return (await pool.query<{ blocked: boolean }>("select $2::integer=any(pg_blocking_pids($1::integer)) as blocked", [secondPid, firstPid])).rows[0]?.blocked;
+      }, { timeout: 5000 }).toBe(true);
+      release();
+      expect((await firstResult)[0]).toMatchObject({ status: "fulfilled" });
+      const second = (await secondResult)[0];
+      expect(second).toMatchObject({ status: "rejected" });
+      if (second?.status === "rejected") expect(second.reason).toMatchObject({ code: "optimistic_concurrency_conflict" });
+      expect(await sdk.queries.getOperationalDocumentSummary(receipt.documentId)).toMatchObject({ version: 1, openAmount: "20.00" });
+    } finally { release(); await firstResult; await secondResult; }
+  }, 15000);
+
+  it.each(["hold", "payment"] as const)("posted vendor bill corrections respect an in-flight %s writer", async winner => {
+    const { options, operation, bill, hold, payment, sdk } = await paymentHoldFixture();
+    let release!: () => void; let locked!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const boundary = new Promise<void>(resolve => { locked = resolve; });
+    let firstPid: number | undefined; let secondPid: number | undefined; let intercepted = false;
+    const firstSdk = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+      firstPid = Number((await client.query("select pg_backend_pid() as pid")).rows[0]?.pid);
+      return work({ async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        const result = await client.query<Row>(sql, params);
+        const match = winner === "hold" ? sql.includes("for update of document") : sql.includes('"subledger_document_id" = any($4::text[])');
+        if (!intercepted && match) { intercepted = true; locked(); await gate; }
+        return result;
+      } });
+    }) } });
+    const secondSdk = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+      secondPid = Number((await client.query("select pg_backend_pid() as pid")).rows[0]?.pid); return work(client);
+    }) } });
+    const firstResult = Promise.allSettled([winner === "hold" ? firstSdk.commands.vendorBills.setPaymentHold(hold) : firstSdk.commands.billPayments.recordAndApply(payment)]);
+    let secondResult: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      await Promise.race([boundary, firstResult.then(() => { throw new Error("Writer ended before lock boundary"); })]);
+      secondResult = Promise.allSettled([secondSdk.commands.vendorBills.voidPosted({ operation, vendorBillId: bill.documentId, expectedVersion: 1, idempotencyKey: "writer-first:correct", date: "2026-08-12" })]);
+      await expect.poll(async () => {
+        if (firstPid === undefined || secondPid === undefined) return false;
+        return (await pool.query<{ blocked: boolean }>("select $2::integer=any(pg_blocking_pids($1::integer)) as blocked", [secondPid, firstPid])).rows[0]?.blocked;
+      }, { timeout: 5000 }).toBe(true);
+      release();
+      expect((await firstResult)[0]).toMatchObject({ status: "fulfilled" });
+      expect((await secondResult)[0]).toMatchObject({ status: "rejected", reason: { code: "optimistic_concurrency_conflict" } });
+      expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ version: 2, paymentHold: winner === "hold", openAmount: winner === "hold" ? "100.00" : "80.00" });
+    } finally { release(); await firstResult; await secondResult; }
+  }, 15000);
+
+  it("posted vendor bill corrections roll back a rejected replacement even when the host catches it", async () => {
+    const { options, operation, bill } = await paymentHoldFixture();
+    const before = await depositDatabaseState(pool);
+    await runner.transaction(async client => {
+      const scoped = createErpFinancialsSdk({ ...options, database: { transaction: work => work(client) } });
+      await expect(scoped.commands.vendorBills.replacePosted({ operation, vendorBillId: bill.documentId, expectedVersion: 1,
+        idempotencyKey: "invalid-replacement", date: "2026-08-12", replacement: { idempotencyKey: "invalid-replacement:bill", date: "2026-08-12", dueDate: "2026-08-31", vendorId: "wrong-vendor",
+          payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "90.00" }] } })).rejects.toMatchObject({ code: "scope_mismatch" });
+    });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["reversal-link", "original", "replacement", "lifecycle", "outbox", "sql-error"] as const)(
+    "posted vendor bill corrections recover all writes after a caught %s failure", async stage => {
+      const { options, operation, bill, sdk } = await paymentHoldFixture();
+      const before = await depositDatabaseState(pool);
+      let interrupted = false;
+      const command = { operation, vendorBillId: bill.documentId, expectedVersion: 1,
+        idempotencyKey: "caught-correction", date: "2026-08-12", replacement: { idempotencyKey: "caught-correction:bill", date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1",
+          payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "90.00" }] } };
+      await runner.transaction(async client => {
+        await client.query("select set_config('test.host_work', 'preserved', true)");
+        const broken: PostgresQueryClient = { async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+          const result = await client.query<Row>(sql, params);
+          const match = stage === "reversal-link" ? sql.includes('insert into "erp_financials"."journal_entry_links"')
+            : stage === "original" || stage === "sql-error" ? sql.includes(`set "open_amount" = 0, "status" = 'voided'`)
+            : stage === "replacement" ? sql.includes('insert into "erp_financials"."subledger_documents"') && params.includes(command.replacement.idempotencyKey)
+            : stage === "lifecycle" ? sql.includes('insert into "erp_financials"."financial_lifecycle_events"') && params.includes("vendor_bill.replaced")
+            : sql.includes('insert into "erp_financials"."financial_outbox"') && params.includes("vendor_bill.replaced");
+          if (!interrupted && match) {
+            interrupted = true;
+            if (stage === "sql-error") await client.query("select 1/0");
+            throw new Error("injected caught correction failure");
+          }
+          return result;
+        } };
+        const scoped = createErpFinancialsSdk({ ...options, database: { transaction: work => work(broken) } });
+        await expect(scoped.commands.vendorBills.replacePosted(command)).rejects.toThrow();
+        expect(interrupted).toBe(true);
+        expect((await client.query("select current_setting('test.host_work') as marker")).rows[0]?.marker).toBe("preserved");
+      });
+      expect(await depositDatabaseState(pool)).toEqual(before);
+      await expect(sdk.commands.vendorBills.replacePosted(command)).resolves.toMatchObject({ status: "replaced" });
+      const after = await depositDatabaseState(pool);
+      await expect(sdk.commands.vendorBills.replacePosted(command)).resolves.toMatchObject({ status: "already_replaced" });
+      expect(await depositDatabaseState(pool)).toEqual(after);
+    });
+
+  async function appliedBillCorrectionFixture(amount = "100.00", reapplyAmount = "80.00", dueDate = "2026-08-31") {
+    const fixture = await paymentHoldFixture(dueDate);
+    const { sdk, operation, bill } = fixture;
+    const payment = await sdk.commands.billPayments.record({ operation, idempotencyKey: "composite:cash", date: "2026-08-10", vendorId: "vendor_1", amount,
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" } });
+    const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "composite:original-apply", applicationType: "bill_payment_to_bill",
+      sourceDocumentId: payment.documentId, targetDocumentId: bill.documentId, amount, applicationDate: "2026-08-10", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    const command = { operation, vendorBillId: bill.documentId, expectedVersion: 2, idempotencyKey: "composite:correction", date: "2026-08-12",
+      releases: [{ applicationId: application.applicationId, expectedVersion: 1, expectedSourceVersion: 2, reapplyAmount }],
+      replacement: { date: "2026-08-12", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "90.00" }] } };
+    return { ...fixture, cash: payment, application, command };
+  }
+
+  it.each(["2026-08-01", "2026-08-12"])("bill correction preserves contractual due dates with replacement posting on %s", async replacementDate => {
+    const { sdk, bill, cash, command } = await appliedBillCorrectionFixture("40.00", "30.01", "2026-08-05");
+    const before = await depositDatabaseState(pool);
+    const correction = { ...command, replacement: { ...command.replacement, date: replacementDate, dueDate: "2026-08-05" } };
+    await expect(sdk.commands.vendorBills.correctPosted({ ...correction, replacement: { ...correction.replacement, dueDate: "2026-02-30" } })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const result = await sdk.commands.vendorBills.correctPosted(correction);
+    const replacementId = result.replacementPosition?.documentId;
+    if (!replacementId) throw new Error("Missing replacement");
+    const review = await sdk.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: replacementId });
+    expect(review.bill).toMatchObject({ documentDate: replacementDate, dueDate: "2026-08-05", originalAmount: "90.00", openAmount: "59.99" });
+    // Separate-date SDK behavior remains explicit and compatible. BLU must use
+    // the correction date to avoid recognizing both bills before the reversal.
+    for (const [date, gross, control] of [
+      ["2026-08-09", replacementDate === "2026-08-01" ? "190.00" : "100.00", replacementDate === "2026-08-01" ? "-190.00" : "-100.00"],
+      ["2026-08-11", replacementDate === "2026-08-01" ? "150.00" : "60.00", replacementDate === "2026-08-01" ? "-150.00" : "-60.00"],
+      ["2026-08-12", "59.99", "-50.00"]
+    ] as const) {
+      const aging = await sdk.queries.getAging({ kind: "payables", asOfDate: date });
+      expect((await sdk.queries.getAgingPage({kind:"payables",asOfDate:date,limit:1})).totals).toEqual(aging.totals);
+      expect(aging.totals).toMatchObject({ total: gross, days1To30: gross, current: "0.00" });
+      expect((await sdk.queries.getVendorBillRegister({ asOfDate: date })).summary.outstandingAmount).toBe(gross);
+      expect((await pool.query<{ balance: string }>("select sum(net_amount)::numeric(18,2)::text balance from erp_financials.ledger_postings where account_id='account_ap' and accounting_basis='accrual' and posting_date<=$1::date", [date])).rows[0]?.balance).toBe(control);
+    }
+    expect((await sdk.queries.getOperationalDocumentSummary(cash.documentId)).openAmount).toBe("9.99");
+    expect((await sdk.queries.getOperationalDocumentSummary(bill.documentId)).status).toBe("voided");
+    const after = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.correctPosted(correction)).resolves.toEqual({ ...result, status: "already_corrected" });
+    await expect(sdk.commands.vendorBills.correctPosted({ ...correction, replacement: { ...correction.replacement, dueDate: "2026-08-06" } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(after);
+  });
+
+  it("overdue recognition supports invoices and vendor bills and the v38 upgrade preserves existing facts", async () => {
+    await depositFixture("overdue_creation", 38);
+    const before = await depositDatabaseState(pool);
+    const migrated = await migratePostgresSchema(runner, { appliedByRef: "overdue:v39" });
+    expect(migrated.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48]]);
+    // Migration evidence changes; no business facts are rewritten.
+    const after = stripNewRecognitionNulls(await depositDatabaseState(pool));
+    for (const [table, rows] of Object.entries(before)) if (!/migration|schema_version/.test(table)) expect(after[table]).toEqual(rows);
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_1", companyId: "company_1", writeSourceId: "source_1", bookId: "overdue_creation", currencyCode: "USD" });
+    const operation = sdkOperation(), base = { operation, idempotencyKey: "late:bill", date: "2026-08-12", dueDate: "2026-08-05" };
+    const invoice = await sdk.commands.invoices.create({ ...base, idempotencyKey: "late:invoice", customerId: "customer_1", receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "10.00" }] });
+    expect(await sdk.queries.getInvoice(invoice.documentId)).toMatchObject({ documentDate: base.date, dueDate: base.dueDate });
+    expect((await sdk.queries.getAging({ kind: "receivables", asOfDate: "2026-08-11" })).totals.total).toBe("0.00");
+    expect((await sdk.queries.getAging({ kind: "receivables", asOfDate: "2026-08-12" })).totals.days1To30).toBe("10.00");
+    const result = await sdk.commands.vendorBills.create({ ...base, vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "10.00" }] });
+    expect((await sdk.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: result.documentId })).bill).toMatchObject({ documentDate: "2026-08-12", dueDate: "2026-08-05" });
+    expect((await sdk.queries.getAging({ kind: "payables", asOfDate: "2026-08-11" })).totals.total).toBe("0.00");
+    expect((await sdk.queries.getAging({ kind: "payables", asOfDate: "2026-08-12" })).totals.days1To30).toBe("10.00");
+  });
+
+  it("payable aging preserves effective history through payment, correction and later void", async () => {
+    const { sdk, bill, command, operation } = await appliedBillCorrectionFixture("40.00", "30.01");
+    const aging = async (date: string) => {
+      const legacy=await sdk.queries.getAging({kind:"payables",asOfDate:date});
+      const page=await sdk.queries.getAgingPage({kind:"payables",asOfDate:date,limit:1});
+      expect(page.totals).toEqual(legacy.totals);return page;
+    };
+    expect((await aging("2026-08-09")).totals.total).toBe("100.00");
+    expect((await aging("2026-08-11")).totals.total).toBe("60.00");
+    const result = await sdk.commands.vendorBills.correctPosted(command);
+    const replacementId = result.replacementPosition?.documentId;
+    if (!replacementId) throw new Error("Missing replacement");
+    for (const [date, amount] of [["2026-08-09", "100.00"], ["2026-08-11", "60.00"], ["2026-08-12", "59.99"]] as const) {
+      expect((await aging(date)).totals.total).toBe(amount);
+      expect((await sdk.queries.getVendorBillRegister({ asOfDate: date })).summary.outstandingAmount).toBe(amount);
+    }
+    const review = await sdk.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: replacementId });
+    await sdk.commands.vendorBills.correctPosted({ operation, vendorBillId: replacementId, expectedVersion: review.bill.version,
+      idempotencyKey: "aging:later-void", date: "2026-08-15", releases: review.items.map(item => ({ applicationId: item.applicationId,
+        expectedVersion: item.version, expectedSourceVersion: item.sourceVersion, reapplyAmount: "0.00" })) });
+    const beforeReads = await depositDatabaseState(pool);
+    for (const [date, amount] of [["2026-08-09", "100.00"], ["2026-08-11", "60.00"], ["2026-08-12", "59.99"], ["2026-08-14", "59.99"], ["2026-08-15", "0.00"]] as const) {
+      expect((await aging(date)).totals.total).toBe(amount);
+      expect((await sdk.queries.getVendorBillRegister({ asOfDate: date })).summary.outstandingAmount).toBe(amount);
+    }
+    expect(await depositDatabaseState(pool)).toEqual(beforeReads);
+    expect((await sdk.queries.getOperationalDocumentSummary(bill.documentId)).status).toBe("voided");
+  });
+
+  it("payable aging uses historical due buckets and book source scope without netting unapplied funds", async () => {
+    const { sdk, command, options } = await appliedBillCorrectionFixture("40.00", "30.01");
+    await sdk.commands.vendorBills.correctPosted(command);
+    for (const [date, bucket] of [["2026-08-31", "current"], ["2026-09-01", "days1To30"], ["2026-09-30", "days1To30"],
+      ["2026-10-01", "days31To60"], ["2026-10-30", "days31To60"], ["2026-10-31", "days61To90"], ["2026-11-29", "days61To90"], ["2026-11-30", "daysOver90"]] as const) {
+      const report = await sdk.queries.getAging({ kind: "payables", asOfDate: date });
+      expect((await sdk.queries.getAgingPage({kind:"payables",asOfDate:date,limit:1})).totals).toEqual(report.totals);
+      expect(report.totals.total).toBe("59.99"); expect(report.totals[bucket]).toBe("59.99");
+      expect(Object.entries(report.totals).filter(([key]) => key !== "total" && key !== bucket).every(([, amount]) => amount === "0.00")).toBe(true);
+    }
+    const excluded = await pool.query("update erp_financials.reporting_book_sources set effective_through='2026-07-31' where book_id=$1 and source_id=$2", [options.bookId, options.writeSourceId]);
+    expect(excluded.rowCount).toBe(1);
+    expect((await sdk.queries.getAging({ kind: "payables", asOfDate: "2026-08-11" })).totals.total).toBe("0.00");
+    expect((await sdk.queries.getAging({ kind: "payables", asOfDate: "2026-08-12" })).totals.total).toBe("0.00");
+    expect(await sdk.queries.getAgingPage({kind:"payables",asOfDate:"2026-08-12"})).toMatchObject({rows:[],partyCount:"0",totals:{total:"0.00"}});
+  });
+
+  it.each([["20.00", "10.00", "80.00"], ["100.00", "80.00", "10.00"]])(
+    "atomic vendor bill correction releases %s and explicitly reapplies %s", async (amount, reapply, remaining) => {
+      const { sdk, cash, bill, command } = await appliedBillCorrectionFixture(amount, reapply);
+      const cashBefore = (await pool.query("select to_jsonb(p) row from erp_financials.ledger_postings p where transaction_id=$1 order by posting_id", [cash.journal.transactionId])).rows;
+      const result = await sdk.commands.vendorBills.correctPosted(command);
+      expect(result).toMatchObject({ status: "corrected", correction: { originalVersion: 4, outcome: "replaced" },
+        releasedApplications: [{ status: "unapplied", version: 2 }], applications: [{ status: "applied", appliedAmount: reapply }],
+        replacementPosition: { version: 2, openAmount: remaining, documentStatus: "partially_applied" } });
+      expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ status: "voided", openAmount: "0.00", version: 4 });
+      expect(await sdk.queries.getOperationalDocumentSummary(cash.documentId)).toMatchObject({ version: 4, originalAmount: amount, openAmount: amount === "20.00" ? "10.00" : "20.00" });
+      expect((await pool.query("select to_jsonb(p) row from erp_financials.ledger_postings p where transaction_id=$1 order by posting_id", [cash.journal.transactionId])).rows).toEqual(cashBefore);
+      expect((await sdk.queries.getVendorBillRegister({ asOfDate: "2026-08-12" })).summary).toMatchObject({ outstandingAmount: remaining, outstandingBillCount: "1", counts: { replaced: "1" } });
+      expect((await sdk.queries.getAging({ kind: "payables", asOfDate: "2026-08-12" })).totals.total).toBe(remaining);
+      // AP control equals outstanding bills less unapplied payment, with debit
+      // positive. Gross bill aging intentionally does not net available cash.
+      expect((await pool.query<{ balance: string }>("select sum(net_amount)::numeric(18,2)::text as balance from erp_financials.ledger_postings where account_id='account_ap' and accounting_basis='accrual'")).rows[0]?.balance).toBe(amount === "20.00" ? "-70.00" : "10.00");
+      const before = await depositDatabaseState(pool);
+      await expect(sdk.commands.vendorBills.correctPosted({ ...command, operation: { ...command.operation, requestId: "new-request", occurredAt: "2026-08-13T00:00:00.000Z" } })).resolves.toEqual({ ...result, status: "already_corrected" });
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    });
+
+  it("atomic vendor bill correction void preserves funds and replaces held bills without releasing their hold", async () => {
+    const { sdk, cash, bill, command, operation } = await appliedBillCorrectionFixture();
+    const voidCommand = { ...command, releases: command.releases.map(release => ({ ...release, reapplyAmount: "0.00" })) };
+    const { replacement: _replacement, ...voidOnly } = voidCommand; void _replacement;
+    await expect(sdk.commands.vendorBills.correctPosted(voidOnly)).resolves.toMatchObject({ status: "corrected", correction: { outcome: "voided" }, applications: [] });
+    expect(await sdk.queries.getOperationalDocumentSummary(cash.documentId)).toMatchObject({ status: "open", openAmount: "100.00", version: 3 });
+    expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ status: "voided" });
+    const held = await sdk.commands.vendorBills.create({ ...command.replacement, operation, idempotencyKey: "composite:held" });
+    await sdk.commands.vendorBills.setPaymentHold({ operation, idempotencyKey: "composite:hold", vendorBillId: held.documentId, expectedVersion: 1, paymentHold: true, reason: "Supplier dispute" });
+    const corrected = await sdk.commands.vendorBills.correctPosted({ ...command, idempotencyKey: "composite:held-correction", vendorBillId: held.documentId, expectedVersion: 2, releases: [] });
+    const replacement = corrected.replacementPosition;
+    if (!replacement) throw new Error("Missing replacement");
+    expect(replacement).toMatchObject({ version: 2, openAmount: "90.00" });
+    expect(await sdk.queries.getOperationalDocumentSummary(replacement.documentId)).toMatchObject({ paymentHold: true, paymentHoldReason: "Supplier dispute" });
+  });
+
+  it("atomic vendor bill correction rejects stale, incomplete, changed and unauthorized plans without writes", async () => {
+    const { sdk, options, command, bill, operation } = await appliedBillCorrectionFixture();
+    const before = await depositDatabaseState(pool);
+    const release = command.releases[0]; if (!release) throw new Error("Missing release");
+    for (const changed of [
+      { releases: [] }, { releases: [release, release] }, { releases: [{ ...release, applicationId: "missing" }] },
+      { releases: [{ ...release, expectedVersion: 999 }] }, { releases: [{ ...release, expectedSourceVersion: 999 }] },
+      { releases: [{ ...release, reapplyAmount: "100.00" }] }, { expectedVersion: 999 }, { date: "2026-08-09" },
+      { replacement: { ...command.replacement, vendorId: "wrong-vendor" } }, { operation: { ...operation, approverRef: operation.actorRef } }
+    ]) {
+      await expect(sdk.commands.vendorBills.correctPosted({ ...command, ...changed })).rejects.toThrow();
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+    for (const scope of [{ bookId: "other-book" }, { currencyCode: "EUR" }, { companyId: "foreign-company" }]) {
+      await expect(createErpFinancialsSdk({ ...options, ...scope }).commands.vendorBills.correctPosted(command)).rejects.toThrow();
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+    const receipt = await sdk.commands.vendorBills.correctPosted(command);
+    const after = await depositDatabaseState(pool);
+    for (const changed of [{ expectedVersion: 3 }, { memo: "different" }, { releases: [{ ...release, reapplyAmount: "79.00" }] },
+      { operation: { ...operation, actorRef: "another" } }, { operation: { ...operation, approverRef: "another" } }, { operation: { ...operation, reasonCode: "another" } }]) {
+      await expect(sdk.commands.vendorBills.correctPosted({ ...command, ...changed })).rejects.toMatchObject({ code: "idempotency_conflict" });
+      expect(await depositDatabaseState(pool)).toEqual(after);
+    }
+    // Receipt replay survives later operations on the replacement and payment.
+    const applied = receipt.applications[0]; if (!applied) throw new Error("Missing new application");
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: applied.applicationId, expectedVersion: 1, effectiveDate: "2026-08-13" });
+    const advanced = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.correctPosted(command)).resolves.toEqual({ ...receipt, status: "already_corrected" });
+    expect(await depositDatabaseState(pool)).toEqual(advanced);
+    expect(await sdk.queries.getOperationalDocumentSummary(bill.documentId)).toMatchObject({ version: 4, status: "voided" });
+  });
+
+  it.each(["release", "replacement", "reapply", "receipt", "outbox"] as const)("atomic vendor bill correction rolls back a caught %s interruption", async stage => {
+    const { sdk, options, command } = await appliedBillCorrectionFixture();
+    const before = await depositDatabaseState(pool); let interrupted = false;
+    await runner.transaction(async client => {
+      const broken: PostgresQueryClient = { async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        const result = await client.query<Row>(sql, params);
+        const match = stage === "release" ? sql.includes('update "erp_financials"."subledger_applications"')
+          : stage === "replacement" ? sql.includes('insert into "erp_financials"."subledger_documents"')
+          : stage === "reapply" ? sql.includes('insert into "erp_financials"."subledger_applications"')
+          : stage === "receipt" ? sql.includes('insert into "erp_financials"."financial_lifecycle_events"') && params.includes("vendor_bill.corrected")
+          : sql.includes('insert into "erp_financials"."financial_outbox"') && params.includes("vendor_bill.corrected");
+        if (!interrupted && match) { interrupted = true; throw new Error("interrupted composite correction"); }
+        return result;
+      } };
+      const scoped = createErpFinancialsSdk({ ...options, database: { transaction: work => work(broken) } });
+      await expect(scoped.commands.vendorBills.correctPosted(command)).rejects.toThrow("interrupted composite correction");
+      expect(interrupted).toBe(true);
+    });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(sdk.commands.vendorBills.correctPosted(command)).resolves.toMatchObject({ status: "corrected" });
+  });
+
+  it("atomic vendor bill correction releases repeated payment sources and serializes identical retries", async () => {
+    const { sdk, command, cash, bill, operation } = await appliedBillCorrectionFixture("20.00", "10.00");
+    const extra = await sdk.commands.billPayments.record({ operation, idempotencyKey: "composite:extra", date: "2026-08-10", vendorId: "vendor_1", amount: "50.00",
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" } });
+    const first = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "composite:extra-one", applicationType: "bill_payment_to_bill", sourceDocumentId: extra.documentId,
+      targetDocumentId: bill.documentId, amount: "20.00", applicationDate: "2026-08-10", expectedSourceVersion: 1, expectedTargetVersion: 2 });
+    const second = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "composite:extra-two", applicationType: "bill_payment_to_bill", sourceDocumentId: extra.documentId,
+      targetDocumentId: bill.documentId, amount: "30.00", applicationDate: "2026-08-10", expectedSourceVersion: 2, expectedTargetVersion: 3 });
+    const complete = { ...command, expectedVersion: 4, releases: [...command.releases,
+      { applicationId: first.applicationId, expectedVersion: 1, expectedSourceVersion: 3, reapplyAmount: "10.00" },
+      { applicationId: second.applicationId, expectedVersion: 1, expectedSourceVersion: 3, reapplyAmount: "20.00" }] };
+    const results = await Promise.all([sdk.commands.vendorBills.correctPosted(complete), sdk.commands.vendorBills.correctPosted({ ...complete, releases: [...complete.releases].reverse() })]);
+    expect(results.map(result => result.status).sort()).toEqual(["already_corrected", "corrected"]);
+    expect(results[0].replacementPosition).toMatchObject({ openAmount: "50.00", version: 4 });
+    expect(results[0].correction).toMatchObject({ originalVersion: 8 });
+    expect(await sdk.queries.getOperationalDocumentSummary(extra.documentId)).toMatchObject({ openAmount: "20.00", version: 7 });
+    expect(await sdk.queries.getOperationalDocumentSummary(cash.documentId)).toMatchObject({ openAmount: "10.00", version: 4 });
+  });
+
+  it("atomic vendor bill correction rolls back an actual lost PostgreSQL connection and retries cleanly", async () => {
+    const { options, sdk, command } = await appliedBillCorrectionFixture();
+    const before = await depositDatabaseState(pool);
+    const connection = await pool.connect();
+    // Only this owned disposable-cluster connection is terminated below.
+    connection.on("error", () => undefined);
+    let release!: () => void; let reached!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const boundary = new Promise<void>(resolve => { reached = resolve; });
+    let intercepted = false;
+    let pending: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      await connection.query("begin");
+      const pid = (await connection.query<{ pid: number }>("select pg_backend_pid() as pid")).rows[0]?.pid;
+      if (!pid) throw new Error("Missing test backend");
+      const scoped = createErpFinancialsSdk({ ...options, database: { transaction: work => work({
+        async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+          const result = await new PgQueryClient(connection).query<Row>(sql, params);
+          if (!intercepted && sql.includes('insert into "erp_financials"."subledger_documents"')) {
+            intercepted = true; reached(); await gate;
+          }
+          return result;
+        }
+      }) } });
+      pending = Promise.allSettled([scoped.commands.vendorBills.correctPosted(command)]);
+      await Promise.race([boundary, pending.then(() => { throw new Error("Command ended before crash boundary"); })]);
+      expect((await pool.query<{ terminated: boolean }>("select pg_terminate_backend($1) as terminated", [pid])).rows[0]?.terminated).toBe(true);
+      release(); expect((await pending)[0]).toMatchObject({ status: "rejected" });
+    } finally { release(); await pending; connection.release(true); }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(sdk.commands.vendorBills.correctPosted(command)).resolves.toMatchObject({ status: "corrected" });
+  }, 15000);
+
+  it("atomic vendor bill correction honors a closed fiscal period and can replay after close", async () => {
+    const { options, sdk, command } = await appliedBillCorrectionFixture();
+    const completed = await sdk.commands.vendorBills.correctPosted(command);
+    await closeDepositPeriod(pool, createErpFinancials({ database: runner, tenantId: options.tenantId, companyId: options.companyId, sourceId: options.writeSourceId, bookId: options.bookId, currencyCode: options.currencyCode }));
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.correctPosted(command)).resolves.toEqual({ ...completed, status: "already_corrected" });
+    const applied = completed.applications[0]; const replacement = completed.replacementPosition;
+    if (!applied || !replacement) throw new Error("Missing replacement application");
+    await expect(sdk.commands.vendorBills.correctPosted({ ...command, vendorBillId: replacement.documentId, expectedVersion: replacement.version,
+      idempotencyKey: "composite:closed", releases: [{ applicationId: applied.applicationId, expectedVersion: 1, expectedSourceVersion: 4, reapplyAmount: "80.00" }] })).rejects.toMatchObject({ code: "fiscal_period_closed" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it("atomic vendor bill correction snapshots approval and rejects independently created replacement keys", async () => {
+    const { sdk, options, operation, command } = await appliedBillCorrectionFixture();
+    await sdk.commands.vendorBills.create({ ...command.replacement, operation, idempotencyKey: "vendor-bill-correction:composite:correction:replacement" });
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.correctPosted(command)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const delayed = createErpFinancialsSdk({ ...options, database: { transaction: async work => { await gate; return runner.transaction(work); } } });
+    const mutable = structuredClone({ ...command, idempotencyKey: "composite:snapshot" });
+    const original = structuredClone(mutable);
+    const pending = delayed.commands.vendorBills.correctPosted(mutable);
+    const releaseInput = mutable.releases[0], lineInput = mutable.replacement.expenseLines[0];
+    if (!releaseInput || !lineInput) throw new Error("Missing mutable fixture input");
+    releaseInput.reapplyAmount = "1.00"; Object.assign(mutable.operation, { actorRef: "mutated" }); lineInput.amount = "1.00";
+    release();
+    const result = await pending;
+    expect(result.replacementPosition).toMatchObject({ openAmount: "10.00" });
+    await expect(sdk.commands.vendorBills.correctPosted(original)).resolves.toEqual({ ...result, status: "already_corrected" });
+  });
+
+  it("atomic vendor bill correction rejects a payment from another book before releasing it", async () => {
+    const { sdk, options, operation, bill } = await paymentHoldFixture();
+    const other = createErpFinancialsSdk({ ...options, bookId: "other_payment_book", postingPolicy: "legacy_unrestricted" });
+    await other.books.define({ operation, bookId: "other_payment_book", name: "Other", baseCurrencyCode: "USD" });
+    await other.books.bindSource({ operation, bookId: "other_payment_book", sourceId: "source_1", sourceRole: "active", effectiveFrom: "2026-01-01" });
+    const payment = await other.commands.billPayments.record({ operation, idempotencyKey: "foreign-book:payment", date: "2026-08-10", vendorId: "vendor_1", amount: "20.00",
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" } });
+    const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "foreign-book:apply", applicationType: "bill_payment_to_bill",
+      sourceDocumentId: payment.documentId, targetDocumentId: bill.documentId, amount: "20.00", applicationDate: "2026-08-10", expectedSourceVersion: 1, expectedTargetVersion: 1 });
+    const before = await depositDatabaseState(pool);
+    await expect(sdk.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: bill.documentId })).rejects.toMatchObject({ code: "unsupported_operation" });
+    await expect(sdk.commands.vendorBills.correctPosted({ operation, vendorBillId: bill.documentId, expectedVersion: 2, idempotencyKey: "foreign-book:correction", date: "2026-08-12",
+      releases: [{ applicationId: application.applicationId, expectedVersion: 1, expectedSourceVersion: 2, reapplyAmount: "0.00" }] })).rejects.toMatchObject({ code: "scope_mismatch" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
+  it.each(["correction", "application"] as const)("atomic vendor bill correction respects committed %s winner", async winner => {
+    const { sdk, options, command, cash, operation } = await appliedBillCorrectionFixture("20.00", "10.00");
+    const receipt = await sdk.commands.billPayments.record({ operation, idempotencyKey: "composite:contender-payment", date: "2026-08-10", vendorId: "vendor_1", amount: "10.00",
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" } });
+    const apply = (actor: ErpFinancialsSdk) => actor.commands.paymentApplications.apply({ operation, idempotencyKey: "composite:contender-apply", applicationType: "bill_payment_to_bill",
+      sourceDocumentId: receipt.documentId, targetDocumentId: command.vendorBillId, amount: "10.00", applicationDate: "2026-08-12", expectedSourceVersion: 1, expectedTargetVersion: 2 });
+    const first = await pool.connect(); let committed = false; let waiter: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    try {
+      await first.query("begin");
+      const firstPid = (await first.query<{ pid: number }>("select pg_backend_pid() as pid")).rows[0]?.pid;
+      const firstSdk = createErpFinancialsSdk({ ...options, database: { transaction: work => work(first) } });
+      let secondPid: number | undefined;
+      const secondSdk = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(async client => {
+        secondPid = Number((await client.query("select pg_backend_pid() as pid")).rows[0]?.pid); return work(client);
+      }) } });
+      if (winner === "correction") await firstSdk.commands.vendorBills.correctPosted(command); else await apply(firstSdk);
+      waiter = Promise.allSettled([winner === "correction" ? apply(secondSdk) : secondSdk.commands.vendorBills.correctPosted(command)]);
+      await expect.poll(async () => {
+        if (firstPid === undefined || secondPid === undefined) return false;
+        return (await pool.query<{ blocked: boolean }>("select $2::integer=any(pg_blocking_pids($1::integer)) as blocked", [secondPid, firstPid])).rows[0]?.blocked;
+      }, { timeout: 5000 }).toBe(true);
+      await first.query("commit"); committed = true;
+      expect((await waiter)[0]).toMatchObject({ status: "rejected", reason: { code: "optimistic_concurrency_conflict" } });
+      expect(await sdk.queries.getOperationalDocumentSummary(cash.documentId)).toMatchObject({ version: winner === "correction" ? 4 : 2 });
+    } finally { if (!committed) await first.query("rollback"); first.release(); await waiter; }
+  }, 15000);
+
+  it("atomic vendor bill correction preserves administrator confirmation across nested releases and replacement", async () => {
+    const { options, sdk, command, operation } = await appliedBillCorrectionFixture();
+    const input = { ...command, operation: { ...operation, approverRef: operation.actorRef } };
+    const scope = { ...options, sourceId: options.writeSourceId, accountingBasis: "accrual" as const, postingPolicy: "enforce_fiscal_periods" as const };
+    const checksum = createFinancialActionCommandChecksum(scope, "vendorBills.correctPosted", input);
+    const admin = createErpFinancialsSdk({ ...options, financialApprovalPolicy: { mode: "administrator_direct", actions: ["vendorBills.correctPosted"],
+      guard: request => Promise.resolve({ ...scope, action: "vendorBills.correctPosted", actorRef: operation.actorRef, requestId: operation.requestId,
+        commandChecksum: checksum, active: true, administrator: true, confirmed: request.commandChecksum === checksum }) } });
+    const confirmed = { ...input, operation: { ...input.operation, administratorConfirmation: { confirmationRef: "fixture-admin-confirmation", commandChecksum: checksum } } };
+    await expect(sdk.commands.vendorBills.correctPosted(confirmed)).rejects.toMatchObject({ code: "authorization_context_invalid" });
+    await expect(admin.commands.vendorBills.correctPosted(confirmed)).resolves.toMatchObject({ status: "corrected" });
+    const before = await depositDatabaseState(pool);
+    await expect(admin.commands.vendorBills.correctPosted(confirmed)).resolves.toMatchObject({ status: "already_corrected" });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const event = (await pool.query<{ actor_ref: string; approver_ref: string; approval: unknown }>("select actor_ref,approver_ref,payload->'financialApproval' as approval from erp_financials.financial_lifecycle_events where event_type='vendor_bill.corrected'")).rows[0];
+    expect(event).toMatchObject({ actor_ref: operation.actorRef, approver_ref: operation.actorRef, approval: { action: "vendorBills.correctPosted", policy: "administrator_direct" } });
+  });
+
+  it("atomic vendor bill correction is available through the built public SDK facade", async () => {
+    const { options, command } = await appliedBillCorrectionFixture();
+    const { createErpFinancialsSdk: createPublicSdk } = await import("@handrail/erp-financials/sdk");
+    const sdk = createPublicSdk(options);
+    const result = await sdk.commands.vendorBills.correctPosted(command);
+    expect(result).toMatchObject({ status: "corrected", replacementPosition: { openAmount: "10.00", version: 2 } });
+    await expect(sdk.commands.vendorBills.correctPosted(command)).resolves.toEqual({ ...result, status: "already_corrected" });
+  });
+
+  it("vendor bill correction review pages active evidence beyond 200 without collecting ended history", async () => {
+    const { sdk, bill, operation } = await paymentHoldFixture();
+    const payment = await sdk.commands.billPayments.record({ operation, idempotencyKey: "review:cash", date: "2026-08-10", vendorId: "vendor_1", amount: "100.00",
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" } });
+    const ids: string[] = [];
+    for (let i = 0; i < 205; i++) {
+      const application = await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: `review:apply:${String(i)}`, applicationType: "bill_payment_to_bill",
+        sourceDocumentId: payment.documentId, targetDocumentId: bill.documentId, amount: "0.01", applicationDate: "2026-08-10", expectedSourceVersion: i + 1, expectedTargetVersion: i + 1 });
+      ids.push(application.applicationId);
+    }
+    const request = { sourceId: "source_1", billId: bill.documentId, limit: 200 };
+    const first = await sdk.queries.getVendorBillCorrectionReview(request);
+    expect(first).toMatchObject({ activeApplicationCount: "205", appliedAmount: "2.05", bill: { version: 206, openAmount: "97.95", paymentHold: false } });
+    expect(first.items).toHaveLength(200); expect(first.nextCursor).toBeDefined();
+    for (const item of first.items) expect(item).toMatchObject({ sourceDocumentId: payment.documentId, sourceVersion: 206, sourceOpenAmount: "97.95", amount: "0.01" });
+    const cursor = first.nextCursor; if (!cursor) throw new Error("Missing page cursor");
+    const second = await sdk.queries.getVendorBillCorrectionReview({ ...request, cursor });
+    expect(second.reviewToken).toBe(first.reviewToken); expect(second.items).toHaveLength(5); expect(second.nextCursor).toBeUndefined();
+    expect([...first.items, ...second.items].map(row => row.applicationId).sort()).toEqual(ids.sort());
+    // Unrelated posting does not invalidate this bill/source review.
+    const other = await sdk.commands.vendorBills.create({ operation, idempotencyKey: "review:other", vendorId: "vendor_1", date: "2026-08-01", dueDate: "2026-08-31",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "1.00" }] });
+    expect((await sdk.queries.getVendorBillCorrectionReview({ ...request, cursor })).reviewToken).toBe(first.reviewToken);
+    // Payment changed elsewhere; original bill version did not. Cursor still expires.
+    await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: "review:elsewhere", applicationType: "bill_payment_to_bill", sourceDocumentId: payment.documentId,
+      targetDocumentId: other.documentId, amount: "0.01", applicationDate: "2026-08-11", expectedSourceVersion: 206, expectedTargetVersion: 1 });
+    await expect(sdk.queries.getVendorBillCorrectionReview({ ...request, cursor })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    const originalApplication = ids[0]; if (!originalApplication) throw new Error("Missing application");
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: originalApplication, expectedVersion: 1, effectiveDate: "2026-08-12" });
+    const current = await sdk.queries.getVendorBillCorrectionReview({ ...request, limit: 200 });
+    expect(current).toMatchObject({ activeApplicationCount: "204", appliedAmount: "2.04", bill: { version: 207, openAmount: "97.96" } });
+    expect(current.items.some(row => row.applicationId === originalApplication)).toBe(false);
+  }, 60000);
+
+  it("vendor bill correction review is scoped, read-only and provides a complete public command plan", async () => {
+    const { sdk, options, command, cash, bill } = await appliedBillCorrectionFixture();
+    const before = await depositDatabaseState(pool);
+    const review = await sdk.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: bill.documentId });
+    expect(review).toMatchObject({ activeApplicationCount: "1", appliedAmount: "100.00", bill: { version: 2, status: "settled" },
+      items: [{ sourceDocumentId: cash.documentId, sourceVersion: 2, sourceOriginalAmount: "100.00", sourceOpenAmount: "0.00", version: 1 }] });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    for (const changed of [{ sourceId: "source_2" }, { billId: cash.documentId }, { billId: "missing" }, { limit: 201 }, { limit: 0 }, { cursor: "invalid" }]) {
+      await expect(sdk.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: bill.documentId, ...changed })).rejects.toThrow();
+    }
+    for (const changed of [{ tenantId: "foreign" }, { companyId: "foreign" }, { bookId: "foreign" }]) {
+      await expect(createErpFinancialsSdk({ ...options, ...changed }).queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: bill.documentId })).rejects.toMatchObject({ code: "missing_document" });
+    }
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(sdk.commands.vendorBills.correctPosted({ ...command, expectedVersion: review.bill.version, releases: review.items.map(item => ({
+      applicationId: item.applicationId, expectedVersion: item.version, expectedSourceVersion: item.sourceVersion, reapplyAmount: "80.00"
+    })) })).resolves.toMatchObject({ status: "corrected", replacementPosition: { openAmount: "10.00" } });
+    await expect(sdk.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: bill.documentId })).rejects.toMatchObject({ code: "terminal_state_conflict" });
+  });
+
+  it("vendor bill correction review returns an empty plan and detects bill hold changes between pages", async () => {
+    const { sdk, operation, bill, hold } = await paymentHoldFixture();
+    const request = { sourceId: "source_1", billId: bill.documentId, limit: 1 };
+    const empty = await sdk.queries.getVendorBillCorrectionReview(request);
+    expect(empty).toMatchObject({ activeApplicationCount: "0", appliedAmount: "0.00", items: [] }); expect(empty.nextCursor).toBeUndefined();
+    const payment = await sdk.commands.billPayments.record({ operation, idempotencyKey: "review:hold:cash", date: "2026-08-10", vendorId: "vendor_1", amount: "20.00",
+      payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" } });
+    for (let i = 0; i < 2; i++) await sdk.commands.paymentApplications.apply({ operation, idempotencyKey: `review:hold:apply:${String(i)}`, applicationType: "bill_payment_to_bill",
+      sourceDocumentId: payment.documentId, targetDocumentId: bill.documentId, amount: "1.00", applicationDate: "2026-08-10", expectedSourceVersion: i + 1, expectedTargetVersion: i + 1 });
+    const before = await sdk.queries.getVendorBillCorrectionReview(request); const cursor = before.nextCursor; if (!cursor) throw new Error("Missing cursor");
+    for (const changed of [{ sourceId: "source_2" }, { billId: "other" }]) await expect(sdk.queries.getVendorBillCorrectionReview({ ...request, ...changed, cursor })).rejects.toMatchObject({ code: "invalid_input" });
+    await sdk.commands.vendorBills.setPaymentHold({ ...hold, expectedVersion: 3 });
+    await expect(sdk.queries.getVendorBillCorrectionReview({ ...request, cursor })).rejects.toMatchObject({ code: "optimistic_concurrency_conflict" });
+    expect((await sdk.queries.getVendorBillCorrectionReview(request)).bill).toMatchObject({ version: 4, paymentHold: true, paymentHoldReason: hold.reason });
+  });
+
+  it("vendor bill correction review uses one bounded SQL snapshot during a concurrent unapplication", async () => {
+    const { sdk, options, bill, application, operation } = await appliedBillCorrectionFixture();
+    let release!: () => void; let selected!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const boundary = new Promise<void>(resolve => { selected = resolve; });
+    let queries = 0;
+    const reader = createErpFinancialsSdk({ ...options, database: { transaction: work => runner.transaction(client => work({
+      async query<Row extends Record<string, unknown>>(sql: string, params: readonly unknown[] = []): Promise<PostgresQueryResult<Row>> {
+        queries++;
+        const result = await client.query<Row>(sql, params);
+        expect(params.at(-1)).toBe(2); // requested one row plus the cursor sentinel
+        selected(); await gate; return result;
+      }
+    })) } });
+    const pending = reader.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: bill.documentId, limit: 1 });
+    const settled = Promise.allSettled([pending]);
+    try {
+      await Promise.race([boundary, settled.then(() => { throw new Error("Read ended before snapshot boundary"); })]);
+      await sdk.commands.paymentApplications.unapply({ operation, applicationId: application.applicationId, expectedVersion: 1, effectiveDate: "2026-08-12" });
+      release();
+      expect(await pending).toMatchObject({ bill: { version: 2, status: "settled", openAmount: "0.00" }, activeApplicationCount: "1",
+        items: [{ version: 1, sourceVersion: 2, sourceOpenAmount: "0.00" }] });
+      expect(queries).toBe(1);
+      expect(await sdk.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: bill.documentId })).toMatchObject({
+        bill: { version: 3, status: "open", openAmount: "100.00" }, activeApplicationCount: "0", items: [] });
+    } finally { release(); await settled; }
+  }, 15000);
+
+  it("vendor bill correction review snapshots requests before awaiting and exports its built public API", async () => {
+    const { options, bill } = await appliedBillCorrectionFixture();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const reader = createErpFinancialsSdk({ ...options, database: { transaction: async work => { await gate; return runner.transaction(work); } } });
+    const request = { sourceId: "source_1", billId: bill.documentId, limit: 1 };
+    const pending = reader.queries.getVendorBillCorrectionReview(request);
+    request.billId = "mutated"; request.sourceId = "source_2"; request.limit = 999;
+    release();
+    const result = await pending;
+    expect(result.bill.billId).toBe(bill.documentId);
+    const { createErpFinancialsSdk: createPublicSdk } = await import("@handrail/erp-financials/sdk");
+    const sdk = createPublicSdk(options);
+    expect(await sdk.queries.getVendorBillCorrectionReview({ sourceId: "source_1", billId: bill.documentId, limit: 1 })).toEqual(result);
+  });
+
+  it("posted vendor bill corrections reject changed replay versions and preserve original commands", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:vendor-bill-correction-replay" });
+    await seedAccountingScope(pool);
+    const scope = { database: runner, tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1", currencyCode: "USD", postingPolicy: "legacy_unrestricted" as const };
+    const financials = createErpFinancials(scope); const operation: FinancialOperationContext = sdkOperation();
+    const creation = { operation, idempotencyKey: "correction-replay-bill", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "10.01" }] };
+    const counts = async () => (await pool.query<Record<string, string>>(`select
+      (select count(*) from erp_financials.ledger_postings)::text as postings,
+      (select count(*) from erp_financials.financial_lifecycle_events)::text as events,
+      (select count(*) from erp_financials.financial_outbox)::text as outbox`)).rows;
+    for (const outcome of ["voided", "replaced"] as const) {
+      const bill = await financials.vendorBills.create({ ...creation, idempotencyKey: creation.idempotencyKey + outcome });
+      let expectedVersion = 1;
+      if (outcome === "replaced") {
+        await financials.vendorBills.setPaymentHold({ operation, vendorBillId: bill.documentId, expectedVersion: 1, idempotencyKey: "pre-correction-hold", paymentHold: true, reason: "Investigate supplier correction" });
+        await financials.vendorBills.setPaymentHold({ operation, vendorBillId: bill.documentId, expectedVersion: 2, idempotencyKey: "pre-correction-release", paymentHold: false });
+        expectedVersion = 3;
+      }
+      const command = { operation, vendorBillId: bill.documentId, expectedVersion, idempotencyKey: "correct-bill-" + outcome, date: "2026-08-12", memo: "Correct supplier evidence",
+        replacement: { ...creation, idempotencyKey: "replacement-bill-" + outcome } };
+      const execute = (input: typeof command) => outcome === "voided" ? financials.vendorBills.voidPosted(input) : financials.vendorBills.replacePosted(input);
+      await expect(execute(command)).resolves.toMatchObject({ status: outcome, originalVersion: expectedVersion + 1 });
+      const after = await counts();
+      const auditBefore = (await pool.query("select event_id,request_id,correlation_id,occurred_at from erp_financials.financial_lifecycle_events order by event_id")).rows;
+      for (const changedVersion of [expectedVersion + 1, 999]) await expect(execute({ ...command, expectedVersion: changedVersion })).rejects.toMatchObject({ code: "idempotency_conflict" });
+      await expect(execute({ ...command, operation: { ...operation, requestId: "fresh-transport-request", correlationId: "fresh-correlation", occurredAt: "2026-08-13T12:00:00.000Z" } })).resolves.toMatchObject({ status: "already_" + outcome });
+      for (const changed of [{ actorRef: "other-actor" }, { approverRef: "other-approver" }, { reasonCode: "other-reason" }, { reasonDetail: "other-detail" }]) {
+        await expect(execute({ ...command, operation: { ...operation, ...changed } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+      }
+      for (const changed of [{ date: "2026-08-13" }, { memo: "Different correction" }]) await expect(execute({ ...command, ...changed })).rejects.toMatchObject({ code: "idempotency_conflict" });
+      if (outcome === "replaced") await expect(execute({ ...command, replacement: { ...command.replacement, expenseLines: [{ accountId: "account_cash", amount: "11.00" }] } })).rejects.toMatchObject({ code: "idempotency_conflict" });
+      expect(await counts()).toEqual(after);
+      expect((await pool.query("select event_id,request_id,correlation_id,occurred_at from erp_financials.financial_lifecycle_events order by event_id")).rows).toEqual(auditBefore);
+    }
+  });
+
+  it("posted vendor bill correction snapshots preserve a scoped administrator grant and its audit", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:vendor-bill-admin-snapshot" });
+    await seedAccountingScope(pool);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1", currencyCode: "USD", postingPolicy: "legacy_unrestricted" as const };
+    const ordinary = createErpFinancials({ ...scope, database: runner }), operation = sdkOperation();
+    const bill = await ordinary.vendorBills.create({ operation, idempotencyKey: "admin-snapshot-bill", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "10.01" }] });
+    const command = { operation: { ...operation, approverRef: operation.actorRef }, vendorBillId: bill.documentId, expectedVersion: 1, idempotencyKey: "admin-snapshot-void", date: "2026-08-12" };
+    const checksum = createFinancialActionCommandChecksum(scope, "vendorBills.voidIssued", command);
+    // Synthetic trusted server evidence; real membership/confirmation locking is
+    // exercised by the public-package administrator fixtures separately.
+    const admin = createErpFinancials({ ...scope, database: runner, financialApprovalPolicy: { mode: "administrator_direct", actions: ["vendorBills.voidIssued"], guard: input => Promise.resolve({ ...scope,
+      actorRef: operation.actorRef, requestId: operation.requestId, action: "vendorBills.voidIssued", commandChecksum: checksum,
+      active: true, administrator: true, confirmed: input.commandChecksum === checksum && input.command.operation.administratorConfirmation?.confirmationRef === "fixture-confirmation" }) } });
+    const confirmed = { ...command, operation: { ...command.operation, administratorConfirmation: { confirmationRef: "fixture-confirmation", commandChecksum: checksum } } };
+    await expect(admin.vendorBills.voidPosted(confirmed)).resolves.toMatchObject({ status: "voided" });
+    await expect(admin.vendorBills.voidPosted(confirmed)).resolves.toMatchObject({ status: "already_voided" });
+    await expect(ordinary.vendorBills.voidPosted(confirmed)).rejects.toMatchObject({ code: "authorization_context_invalid" });
+    const events = (await pool.query(`select actor_ref,approver_ref,payload->'financialApproval' as audit from erp_financials.financial_lifecycle_events where event_type='vendor_bill.voided'`)).rows;
+    expect(events.length).toBeGreaterThan(0);
+    for (const event of events) expect(event).toMatchObject({ actor_ref: operation.actorRef, approver_ref: operation.actorRef, audit: { policy: "administrator_direct", action: "vendorBills.voidIssued", commandChecksum: checksum } });
+  });
+
+  it("posted vendor bill corrections snapshot independent commands before waiting for a transaction", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:vendor-bill-correction-snapshot" });
+    await seedAccountingScope(pool);
+    const scope = { tenantId: "tenant_1", companyId: "company_1", sourceId: "source_1", currencyCode: "USD", postingPolicy: "legacy_unrestricted" as const };
+    const financials = createErpFinancials({ ...scope, database: runner }); const operation: FinancialOperationContext = sdkOperation();
+    const bill = await financials.vendorBills.create({ operation, idempotencyKey: "snapshot-bill", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "10.01" }] });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const delayed = createErpFinancials({ ...scope, database: { transaction: async work => { await gate; return runner.transaction(work); } } });
+    const input = { operation: { ...operation }, vendorBillId: bill.documentId, expectedVersion: 1, idempotencyKey: "snapshot-void-bill", date: "2026-08-12", memo: "Original approved correction" };
+    const original = structuredClone(input);
+    const pending = delayed.vendorBills.voidPosted(input);
+    input.expectedVersion = 999; input.date = "2026-09-12"; input.memo = "Changed after invocation"; input.operation.actorRef = "mutated-actor";
+    release();
+    await expect(pending).resolves.toMatchObject({ status: "voided", originalVersion: 2 });
+    await expect(financials.vendorBills.voidPosted(original)).resolves.toMatchObject({ status: "already_voided" });
+    expect((await pool.query(`select memo from erp_financials.transactions where memo = 'Changed after invocation'`)).rows).toEqual([]);
   });
 
   it("voids and reloads a canonical bill payment through real PostgreSQL", async () => {
@@ -2865,7 +12332,7 @@ where subledger_document_id = $1`, [original.documentId]);
         expectedVersion: 1 })).rejects.toThrow("must remain an active posting account");
       const upgraded = await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade" });
       expect(upgraded.currentVersion).toBe(upgrade);
-      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 26, toVersion: 27 });
+      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 44, toVersion: 45 });
       expect(await history()).toEqual(before);
       expect((await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade-replay" })).applied).toEqual([]);
     }
@@ -3503,6 +12970,18 @@ class FailingMigrationClient implements PostgresQueryClient {
   ): Promise<PostgresQueryResult<Row>> {
     if (sql.includes(this.failingSqlFragment)) {
       return Promise.reject(new Error("injected real migration failure"));
+    }
+    return this.client.query<Row>(sql, params);
+  }
+}
+
+class FailingReceiptSettlementClient implements PostgresQueryClient {
+  constructor(private readonly client: PostgresQueryClient) {}
+  query<Row extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string, params: readonly unknown[] = []
+  ): Promise<PostgresQueryResult<Row>> {
+    if (sql.includes('insert into "erp_financials"."subledger_applications"') && params[4] === "customer_payment_to_refund") {
+      return Promise.reject(new Error("interrupted before receipt settlement"));
     }
     return this.client.query<Row>(sql, params);
   }
@@ -4219,4 +13698,47 @@ async function creditOwnershipState(pool: Pool) {
     events: (await pool.query(`select * from erp_financials.financial_lifecycle_events order by event_id`)).rows,
     postings: (await pool.query(`select * from erp_financials.ledger_postings order by posting_id`)).rows
   };
+}
+
+function registerValue<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("Missing expected account register fixture value");
+  return value;
+}
+
+function requiredComponentFixture<T>(value:T|undefined):T { if(value===undefined)throw Error("Missing invoice component fixture");return value; }
+
+/** Historical fixture construction only: emit the pre-schema43 SQL shape.
+ * No query results or accounting facts are mocked; every statement reaches PG.
+ * This is not a runtime compatibility adapter or proof of an old SDK binary.
+ * The adapter refuses explicit components because those did not exist then. */
+function preComponentFixtureRunner(database:ErpFinancialsTransactionRunner):ErpFinancialsTransactionRunner {
+  return {transaction:work=>database.transaction(client=>work({
+    query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
+      if(sql.includes('insert into "erp_financials"."subledger_document_lines"')){
+        if(params.length!==22||params[20]!==undefined||params[21]!==undefined)throw Error("Historical fixture cannot contain component accounts");
+        return client.query<Row>(sql.replace(', "tax_account_id", "discount_account_id"','').replace(', $21, $22',''),params.slice(0,20));
+      }
+      // Pre-component cancellation inferred its sole AR debit. Optional line
+      // reads likewise had no component columns; NULL retains that old shape.
+      const historicalSql=sql.replace(/(?:(?:"?[a-z_]+"?)\.)?"?(?:tax_account_id|discount_account_id)"?/gu,'null::text');
+      return client.query<Row>(historicalSql,params);
+    }
+  }))};
+}
+function stripNewRecognitionNulls(state:Record<string,unknown[]>):Record<string,unknown[]> {
+  const result=structuredClone(state);
+  for(const entry of result.subledger_documents??[]){
+    const row=(entry as {row:Record<string,unknown>}).row;
+    expect(row.recognition_date).toBeNull();delete row.recognition_date;
+  }
+  return result;
+}
+function stripNewComponentNulls(state:Record<string,unknown[]>):Record<string,unknown[]> {
+  const result=stripNewRecognitionNulls(state);
+  for(const table of ["invoice_draft_lines","subledger_document_lines"])for(const entry of result[table]??[]){
+    const row=(entry as {row:Record<string,unknown>}).row;
+    expect(row.tax_account_id).toBeNull();expect(row.discount_account_id).toBeNull();
+    delete row.tax_account_id;delete row.discount_account_id;
+  }
+  return result;
 }

@@ -1,0 +1,57 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-2jIKFS/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (337 tests | 292 skipped) 57358ms
+   ✓ ERP Financials real PostgreSQL > vendor bill register pages and exact global totals agree across payments, holds and corrections  1148ms
+   ✓ ERP Financials real PostgreSQL > vendor bill register preserves replacement history and aggregates beyond safe integer cents  852ms
+   ✓ ERP Financials real PostgreSQL > vendor bill register keeps page and totals consistent when a payment commits before the response  891ms
+   ✓ ERP Financials real PostgreSQL > vendor bill register includes imported vendor credits without counting them as cash payments  872ms
+   ✓ ERP Financials real PostgreSQL > vendor bill register scopes cursors, snapshots requests and needs no posting or detail-table access  824ms
+   ✓ ERP Financials real PostgreSQL > payment holds have one versioned authority, payload-bound retries and current public reads  828ms
+   ✓ ERP Financials real PostgreSQL > payment holds block scheduling, clearing, immediate payments and generic or raw applications without partial money  1023ms
+   ✓ ERP Financials real PostgreSQL > payment holds allow exact completed-payment replay and corrective unapplication  880ms
+   ✓ ERP Financials real PostgreSQL > payment holds reject direct writes and roll back an interrupted lifecycle even if a host catches the failure  925ms
+   ✓ ERP Financials real PostgreSQL > payment holds serialize competing versions and race safely with payment posting  839ms
+   ✓ ERP Financials real PostgreSQL > payment holds upgrade schema 31 without rewriting existing financial facts  800ms
+   ✓ ERP Financials real PostgreSQL > payment holds enforce the committed winner when hold takes the row lock first  831ms
+   ✓ ERP Financials real PostgreSQL > payment holds enforce the committed winner when payment takes the row lock first  827ms
+   ✓ ERP Financials real PostgreSQL > payment holds reject invalid actors, foreign scopes and provider ownership without writes  856ms
+   ✓ ERP Financials real PostgreSQL > payment holds preserve input snapshots and support multiple complete transitions in one transaction  956ms
+   ✓ ERP Financials real PostgreSQL > enforces vendor bill account policy before writes and binds it to issuance replay  1203ms
+   ✓ ERP Financials real PostgreSQL > vendor bill account policy serializes when post acquires the account lock first  987ms
+   ✓ ERP Financials real PostgreSQL > vendor bill account policy serializes when reclassify acquires the account lock first  804ms
+   ✓ ERP Financials real PostgreSQL > pages vendor bill audit across posting, holds, scheduled cancellation and settlement without unrelated evidence  1211ms
+   ✓ ERP Financials real PostgreSQL > vendor bill audit index upgrades schema 32 without changing accounting data  1128ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections require the originating book and currency before writes or replay: voided  1107ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections require the originating book and currency before writes or replay: replaced  1163ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject active applications and preserve unapplied cash: 20.00  1266ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject active applications and preserve unapplied cash: 100.00  1252ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'voided', 'correction' first  1287ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'voided', 'payment' first  1415ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'replaced', 'correction' first  1318ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections serialize with payment: 'replaced', 'payment' first  1312ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections avoid a payment lock inversion: voided  1323ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections avoid a payment lock inversion: replaced  959ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections respect an in-flight hold writer  1338ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections respect an in-flight payment writer  1017ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections roll back a rejected replacement even when the host catches it  1346ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught reversal-link failure  1443ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught original failure  1498ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught replacement failure  1664ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught lifecycle failure  1656ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught outbox failure  1701ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections recover all writes after a caught sql-error failure  1965ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections reject changed replay versions and preserve original commands  2203ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill correction snapshots preserve a scoped administrator grant and its audit  1843ms
+   ✓ ERP Financials real PostgreSQL > posted vendor bill corrections snapshot independent commands before waiting for a transaction  1945ms
+   ✓ ERP Financials real PostgreSQL > retains native bill-line customers through reads, replay, replacement, and void  2087ms
+   ✓ ERP Financials real PostgreSQL > validates native bill-line customer identity and scope and rolls back failed replacements  2020ms
+   ✓ ERP Financials real PostgreSQL > atomically clears ordered vendor bills, exposes provenance and summary, and compensates applications  2040ms
+
+ Test Files  1 passed (1)
+      Tests  45 passed | 292 skipped (337)
+   Start at  15:47:44
+   Duration  59.61s (transform 1.57s, setup 0ms, collect 2.01s, tests 57.36s, environment 0ms, prepare 69ms)
+
+EPHEMERAL POSTGRES REMOVED

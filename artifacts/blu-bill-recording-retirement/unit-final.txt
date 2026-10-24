@@ -1,0 +1,10 @@
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/erp-financials-service.test.ts (37 tests | 30 skipped) 81ms
+
+ Test Files  1 passed (1)
+      Tests  7 passed | 30 skipped (37)
+   Start at  18:21:47
+   Duration  2.27s (transform 1.47s, setup 0ms, collect 1.87s, tests 81ms, environment 0ms, prepare 95ms)
+

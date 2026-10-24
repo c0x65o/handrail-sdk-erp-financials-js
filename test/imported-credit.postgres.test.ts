@@ -30,12 +30,14 @@ suite('importer-generated imported credit public package PostgreSQL',()=>{
     }
     return state;
   }
-  async function waitForBlockedWriter() {
-    for(let attempt=0;attempt<200;attempt++) {
-      if((await pool.query("select 1 from pg_locks where locktype='advisory' and not granted")).rows.length) return;
-      await setTimeout(5);
+  async function waitForBlockedWriter(pid?: number) {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if((await pool.query("select 1 from pg_locks where locktype='advisory' and not granted and ($1::int is null or pid=$1)", [pid ?? null])).rows.length) return;
+      await setTimeout(10);
     }
-    throw Error('Expected writer to wait for transaction lock');
+    const activity = (await pool.query("select pid,state,wait_event_type,wait_event,left(query,200) as query,pg_blocking_pids(pid) as blockers from pg_stat_activity where datname=current_database() and pid<>pg_backend_pid() order by pid")).rows;
+    throw Error('Expected writer to wait for transaction lock: ' + JSON.stringify(activity));
   }
   async function fixture() {
     await migratePostgresSchema(runner,{appliedByRef:'synthetic:credit'});
@@ -162,7 +164,9 @@ suite('importer-generated imported credit public package PostgreSQL',()=>{
     const state=await dbState();await f.admin.bankReconciliation.ignore(command);expect(await dbState()).toEqual(state);
     const reopen=await f.confirm('bankReconciliation.unignore',{...command,expectedVersion:2,operation:{...f.adminOperation,requestId:'admin:reopen'}});
     expect(await f.admin.bankReconciliation.unignore(reopen)).toMatchObject({status:'unmatched',version:3});
+    const reopened=await dbState();
     await expect(f.admin.bankReconciliation.ignore(command)).rejects.toMatchObject({code:'idempotency_conflict'});
+    expect(await dbState()).toEqual(reopened);
   });
   it('administrator policy supports nested native adjustment/reversal, transfer approval and fiscal controls',async()=>{
     const f=await administratorFixture();
@@ -402,11 +406,23 @@ suite('importer-generated imported credit public package PostgreSQL',()=>{
       entered();await held;
     });
     await ready;
-    const second=winner==='application'?f.sdk.commands.customerPayments.voidAndUnapply(input):f.sdk.commands.paymentApplications.apply(apply);
-    try {await waitForBlockedWriter();} finally {release();}
-    await first;await expect(second).rejects.toThrow();
+    let started!: (pid: number) => void;
+    const contenderStarted = new Promise<number>(resolve => { started = resolve; });
+    const contender = f.makeSdk({ transaction: work => runner.transaction(async client => {
+      const pid = Number(required((await client.query("select pg_backend_pid() as pid")).rows[0]).pid);
+      started(pid);
+      return work(client);
+    }) });
+    const second=winner==='application'?contender.commands.customerPayments.voidAndUnapply(input):contender.commands.paymentApplications.apply(apply);
+    // Attach handlers immediately, and drain both commands even if observing
+    // the wait fails. Schema cleanup must never race an abandoned writer.
+    const settled = Promise.allSettled([first, second]);
+    try { await waitForBlockedWriter(await contenderStarted); }
+    finally { release(); await settled; }
+    const outcomes = await settled;
+    expect(outcomes[0].status).toBe('fulfilled'); expect(outcomes[1].status).toBe('rejected');
     expect(await f.document('synthetic-credit')).toMatchObject(winner==='application'?{open_amount:'57.25',status:'partially_applied'}:{open_amount:'0',status:'voided'});
-  });
+  }, 15000);
 
   it('replays both public import paths after application without resetting balances or cash recognition',async()=>{
     const f=await fixture();const input=await f.approve();await f.sdk.commands.customerPayments.voidAndUnapply(input);

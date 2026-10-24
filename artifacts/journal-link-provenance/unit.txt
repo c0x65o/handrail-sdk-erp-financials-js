@@ -1,0 +1,9 @@
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/accounting-controls-read-models.test.ts (4 tests) 11ms
+
+ Test Files  1 passed (1)
+      Tests  4 passed (4)
+   Start at  23:02:51
+   Duration  1.91s (transform 1.33s, setup 0ms, collect 1.70s, tests 11ms, environment 0ms, prepare 55ms)

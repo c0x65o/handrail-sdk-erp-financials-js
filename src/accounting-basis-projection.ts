@@ -18,6 +18,10 @@ export type CashBasisApplicationProjectionInput = {
   readonly effectiveDate: IsoDate;
   readonly importBatchId: string;
   readonly accrualPostings: readonly LedgerPosting[];
+  /** Explicit receivable/payable control for journals with contra components.
+   * Caller supplies the remaining unrecognized journal for a new allocation,
+   * or the exact original allocation for reversal. */
+  readonly controlAccountId?: string;
 };
 
 /**
@@ -42,8 +46,31 @@ export function projectCashBasisApplication(input: CashBasisApplicationProjectio
   const applied = moneyMinor(input.appliedAmount);
   if (applied <= 0n || applied > debit) throw new Error("Applied amount must be positive and no greater than the source journal total");
 
-  const debitAllocations = allocate(postings.map((posting) => moneyMinor(posting.debitAmount)), applied, debit);
-  const creditAllocations = allocate(postings.map((posting) => moneyMinor(posting.creditAmount)), applied, credit);
+  let debitAllocations: readonly bigint[], creditAllocations: readonly bigint[];
+  if (input.controlAccountId === undefined) {
+    debitAllocations = allocate(postings.map(posting=>moneyMinor(posting.debitAmount)),applied,debit);
+    creditAllocations = allocate(postings.map(posting=>moneyMinor(posting.creditAmount)),applied,credit);
+  } else {
+    const controlIsDebit = input.applicationType !== "bill_payment_to_bill";
+    const matches=postings.flatMap((posting,index)=>posting.accountId===input.controlAccountId?[index]:[]);
+    if(matches.length!==1)throw new Error("Cash-basis projection requires one explicit control posting");
+    const controlIndex=matches[0];
+    if(controlIndex===undefined)throw new Error("Missing control index");
+    const control=postings[controlIndex];
+    if(control===undefined)throw new Error("Missing control posting");
+    const controlAmount=moneyMinor(controlIsDebit?control.debitAmount:control.creditAmount);
+    if(controlAmount<=0n || moneyMinor(controlIsDebit?control.creditAmount:control.debitAmount)!==0n || applied>controlAmount
+      || postings.some(posting=>moneyMinor(posting.debitAmount)<0n||moneyMinor(posting.creditAmount)<0n)) {
+      throw new Error("Applied amount must be positive and no greater than the control balance");
+    }
+    const sameSide=postings.map((posting,index)=>index===controlIndex?0n:moneyMinor(controlIsDebit?posting.debitAmount:posting.creditAmount));
+    const contraTotal=sameSide.reduce((sum,value)=>sum+value,0n);
+    const contraShare=(contraTotal*applied*2n+controlAmount)/(controlAmount*2n);
+    const controlled=contraTotal===0n?postings.map(()=>0n):[...allocate(sameSide,contraShare,contraTotal)];
+    controlled[controlIndex]=applied;
+    const opposite=allocate(postings.map(posting=>moneyMinor(controlIsDebit?posting.creditAmount:posting.debitAmount)),applied+contraShare,debit);
+    [debitAllocations,creditAllocations]=controlIsDebit?[controlled,opposite]:[opposite,controlled];
+  }
   return postings.flatMap((posting, index) => {
     let projectedDebit = debitAllocations[index] ?? 0n;
     let projectedCredit = creditAllocations[index] ?? 0n;

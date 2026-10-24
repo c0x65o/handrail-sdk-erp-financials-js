@@ -1,0 +1,21 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-financials-goal-tests/epg-F5kyGH/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (505 tests | 496 skipped) 9982ms
+   ✓ ERP Financials real PostgreSQL > payment holds upgrade schema 31 without rewriting existing financial facts  831ms
+   ✓ ERP Financials real PostgreSQL > payment correction upgrades v26 guards without changing existing correction evidence  923ms
+   ✓ ERP Financials real PostgreSQL > vendor bill audit index upgrades schema 32 without changing accounting data  905ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation migration preserves history and refuses detached legacy settlement (detached=false)  1042ms
+   ✓ ERP Financials real PostgreSQL > invoice cancellation migration preserves history and refuses detached legacy settlement (detached=true)  1068ms
+   ✓ ERP Financials real PostgreSQL > overdue recognition supports invoices and vendor bills and the v38 upgrade preserves existing facts  1164ms
+   ✓ ERP Financials real PostgreSQL > retains inactive mapped account history and posting eligibility (from version=0)  1305ms
+   ✓ ERP Financials real PostgreSQL > retains inactive mapped account history and posting eligibility (from version=16)  1375ms
+   ✓ ERP Financials real PostgreSQL > retains inactive mapped account history and posting eligibility (from version=24)  1240ms
+
+ Test Files  1 passed (1)
+      Tests  9 passed | 496 skipped (505)
+   Start at  03:51:45
+   Duration  12.91s (transform 2.07s, setup 0ms, collect 2.65s, tests 9.98s, environment 0ms, prepare 83ms)
+
+EPHEMERAL POSTGRES REMOVED

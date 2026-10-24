@@ -88,6 +88,10 @@ class HierarchyReadClient implements PostgresQueryClient {
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
     sql: string
   ): Promise<PostgresQueryResult<Row>> {
+    if (sql.includes("/* financial_statement_snapshot */")) {
+      this.statementSql = sql;
+      return rows([{ ordinal: 0, base_currency_code: "USD", accounting_basis: "accrual", status: "active", statement_lines: statementRows(), defined_lines: [], earnings: null }] as unknown as Row[]);
+    }
     if (sql.includes('from "erp_financials"."reporting_books"')) {
       return rows([{ base_currency_code: "USD", accounting_basis: "accrual", status: "active" }] as unknown as Row[]);
     }

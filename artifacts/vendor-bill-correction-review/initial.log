@@ -1,0 +1,15 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-l9rlr0/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (358 tests | 355 skipped) 5725ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review pages active evidence beyond 200 without collecting ended history  3713ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review is scoped, read-only and provides a complete public command plan  977ms
+   ✓ ERP Financials real PostgreSQL > vendor bill correction review returns an empty plan and detects bill hold changes between pages  940ms
+
+ Test Files  1 passed (1)
+      Tests  3 passed | 355 skipped (358)
+   Start at  16:12:54
+   Duration  8.33s (transform 1.82s, setup 0ms, collect 2.33s, tests 5.72s, environment 0ms, prepare 80ms)
+
+EPHEMERAL POSTGRES REMOVED

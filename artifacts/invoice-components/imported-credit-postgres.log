@@ -1,0 +1,66 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-financials-goal-tests/epg-HFumlS/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/imported-credit.postgres.test.ts (54 tests) 118587ms
+   ✓ importer-generated imported credit public package PostgreSQL > administrator direct correction confirms the real actor, replays concurrently once and retains accounting parity  1077ms
+   ✓ importer-generated imported credit public package PostgreSQL > administrator ignore/reopen is versioned, audit truthful, concurrent ignore exactly once; default and unlisted actions stay independent  1079ms
+   ✓ importer-generated imported credit public package PostgreSQL > administrator policy supports nested native adjustment/reversal, transfer approval and fiscal controls  1158ms
+   ✓ importer-generated imported credit public package PostgreSQL > administrator execution rolls back authorization, history and accounting with its caller transaction  1080ms
+   ✓ importer-generated imported credit public package PostgreSQL > denies administrator correction without writes: nonadmin  1057ms
+   ✓ importer-generated imported credit public package PostgreSQL > denies administrator correction without writes: inactive  1069ms
+   ✓ importer-generated imported credit public package PostgreSQL > denies administrator correction without writes: othercompany  1152ms
+   ✓ importer-generated imported credit public package PostgreSQL > denies administrator correction without writes: otheractor  1143ms
+   ✓ importer-generated imported credit public package PostgreSQL > denies administrator correction without writes: missing-confirmation  1190ms
+   ✓ importer-generated imported credit public package PostgreSQL > denies administrator correction without writes: changed-command  1181ms
+   ✓ importer-generated imported credit public package PostgreSQL > denies administrator correction without writes: untrusted-guard  1240ms
+   ✓ importer-generated imported credit public package PostgreSQL > denies administrator correction without writes: missing-guard  1290ms
+   ✓ importer-generated imported credit public package PostgreSQL > denies administrator correction without writes: wrong-action  1331ms
+   ✓ importer-generated imported credit public package PostgreSQL > denies administrator correction without writes: old-pending  1387ms
+   ✓ importer-generated imported credit public package PostgreSQL > administrator correction retains stale and safety checks: application  1405ms
+   ✓ importer-generated imported credit public package PostgreSQL > administrator correction retains stale and safety checks: authority  1558ms
+   ✓ importer-generated imported credit public package PostgreSQL > administrator correction retains stale and safety checks: deposit  1454ms
+   ✓ importer-generated imported credit public package PostgreSQL > administrator correction retains stale and safety checks: refund  1554ms
+   ✓ importer-generated imported credit public package PostgreSQL > administrator correction retains stale and safety checks: fiscal  1567ms
+   ✓ importer-generated imported credit public package PostgreSQL > administrator bank ignore rejects stale versions and cross-company lines without writes  1558ms
+   ✓ importer-generated imported credit public package PostgreSQL > corrects phantom then applies 27.56 from imported PAYMENT 330.72 / remaining 84.81  1661ms
+   ✓ importer-generated imported credit public package PostgreSQL > accepts older importer basis headers with exact identity and unanimous posting parties  1814ms
+   ✓ importer-generated imported credit public package PostgreSQL > requires independent approval even for preview: self  1670ms
+   ✓ importer-generated imported credit public package PostgreSQL > requires independent approval even for preview: missing  1853ms
+   ✓ importer-generated imported credit public package PostgreSQL > locks and enforces real app-owned authorization evidence  1911ms
+   ✓ importer-generated imported credit public package PostgreSQL > locks and enforces real app-owned approval evidence  1923ms
+   ✓ importer-generated imported credit public package PostgreSQL > locks and enforces real app-owned approver evidence  1984ms
+   ✓ importer-generated imported credit public package PostgreSQL > locks and enforces real app-owned scope evidence  2253ms
+   ✓ importer-generated imported credit public package PostgreSQL > locks and enforces real app-owned version evidence  2249ms
+   ✓ importer-generated imported credit public package PostgreSQL > locks and enforces real app-owned deposited evidence  2330ms
+   ✓ importer-generated imported credit public package PostgreSQL > locks and enforces real app-owned reconciled evidence  2314ms
+   ✓ importer-generated imported credit public package PostgreSQL > locks and enforces real app-owned refunded evidence  2153ms
+   ✓ importer-generated imported credit public package PostgreSQL > rejects stale application source version with complete rollback  2322ms
+   ✓ importer-generated imported credit public package PostgreSQL > rejects stale application target version with complete rollback  2368ms
+   ✓ importer-generated imported credit public package PostgreSQL > fails closed on missing invoice basis provenance  2925ms
+   ✓ importer-generated imported credit public package PostgreSQL > fails closed on foreign invoice basis provenance  2892ms
+   ✓ importer-generated imported credit public package PostgreSQL > fails closed on incomplete invoice basis provenance  2761ms
+   ✓ importer-generated imported credit public package PostgreSQL > fails closed on duplicate invoice basis provenance  3149ms
+   ✓ importer-generated imported credit public package PostgreSQL > fails closed on party invoice basis provenance  3090ms
+   ✓ importer-generated imported credit public package PostgreSQL > fails closed on currency invoice basis provenance  3075ms
+   ✓ importer-generated imported credit public package PostgreSQL > fails closed on reversed invoice basis provenance  3339ms
+   ✓ importer-generated imported credit public package PostgreSQL > rejects a closed period for correction  3356ms
+   ✓ importer-generated imported credit public package PostgreSQL > rejects a closed period for application  3195ms
+   ✓ importer-generated imported credit public package PostgreSQL > serializes two conflicting existing-credit applications and preserves exact balances  3451ms
+   ✓ importer-generated imported credit public package PostgreSQL > holds the correction lock through commit and revalidates a waiting application  1008ms
+   ✓ importer-generated imported credit public package PostgreSQL > supports same-transaction approval prerequisites (caller rollback=false)  3533ms
+   ✓ importer-generated imported credit public package PostgreSQL > supports same-transaction approval prerequisites (caller rollback=true)  3534ms
+   ✓ importer-generated imported credit public package PostgreSQL > preserves canonical provenance and reverses only the native cash recognition on unapply  3684ms
+   ✓ importer-generated imported credit public package PostgreSQL > retains both invoice basis facts and native applications through omitted full/range replays  3634ms
+   ✓ importer-generated imported credit public package PostgreSQL > refuses imported credit with missing-cash accounting evidence  3884ms
+   ✓ importer-generated imported credit public package PostgreSQL > refuses imported credit with already-recognized accounting evidence  3746ms
+   ✓ importer-generated imported credit public package PostgreSQL > serializes competing application/correction of existing credit: application wins  3889ms
+   ✓ importer-generated imported credit public package PostgreSQL > serializes competing application/correction of existing credit: correction wins  939ms
+   ✓ importer-generated imported credit public package PostgreSQL > replays both public import paths after application without resetting balances or cash recognition  3955ms
+
+ Test Files  1 passed (1)
+      Tests  54 passed (54)
+   Start at  03:54:32
+   Duration  120.61s (transform 1.31s, setup 0ms, collect 1.75s, tests 118.59s, environment 0ms, prepare 87ms)
+
+EPHEMERAL POSTGRES REMOVED

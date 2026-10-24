@@ -1,8 +1,13 @@
-import { assertFinancialApproval, runFinancialAction, type FinancialApprovalPolicy } from "./financial-approval-policy.js";
+import { lockCustomerPaymentCorrectionSource } from "./customer-payment-correction.js";
+import { canonicalCloseChecksum, recordCanonicalCloseCertificate, type CanonicalFiscalCloseResult } from "./fiscal-close-certificates.js";
+import { readCanonicalFiscalCloseReadiness, readFiscalCloseDiagnostics } from "./fiscal-close-diagnostics.js";
+import { assertFinancialApproval, copyFinancialOperation, financialApprovalAudit, runFinancialAction, type FinancialApprovalPolicy } from "./financial-approval-policy.js";
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   appendFinancialLifecycleEvent,
+  FinancialLifecycleIdempotencyConflictError,
   assertFinancialOperationContext,
 } from "./financial-lifecycle.js";
 import { ErpFinancialsError } from "./sdk-errors.js";
@@ -24,6 +29,7 @@ export type FiscalPeriodTransactionRunner = {
 };
 
 export type FiscalPeriodServiceContext = FiscalPeriodScope & {
+  readonly bookId?: string;
   readonly financialApprovalPolicy?: FinancialApprovalPolicy;
   readonly database: FiscalPeriodTransactionRunner;
   readonly now: () => IsoDateTime;
@@ -52,6 +58,13 @@ export type CloseFiscalPeriodInput = {
   readonly expectedVersion: number;
   readonly evidence: FiscalCloseEvidence;
   readonly operation: FinancialOperationContext;
+};
+
+export type CloseCanonicalFiscalPeriodInput = {
+  readonly expectedApprovalToken: string;
+  readonly fiscalPeriodId: string; readonly expectedVersion: number; readonly idempotencyKey: string;
+  /** Trusted server configuration, never end-user account exclusions. */
+  readonly bookId: string; readonly bankAccountIds: readonly string[]; readonly operation: FinancialOperationContext;
 };
 
 export type BeginFiscalPeriodCloseInput = {
@@ -101,6 +114,7 @@ export type FiscalPeriodService = {
   define(input: DefineFiscalPeriodInput): Promise<FiscalPeriodResult>;
   beginClose(input: BeginFiscalPeriodCloseInput): Promise<FiscalPeriodResult>;
   close(input: CloseFiscalPeriodInput): Promise<FiscalPeriodResult>;
+  closeCanonical(input: CloseCanonicalFiscalPeriodInput): Promise<CanonicalFiscalCloseResult>;
   reopen(input: ReopenFiscalPeriodInput): Promise<FiscalPeriodResult>;
   setPostingLockDate(input: SetPostingLockDateInput): Promise<PostingLockDateResult>;
 };
@@ -154,6 +168,9 @@ export function createFiscalPeriodService(context: FiscalPeriodServiceContext): 
     beginClose(input) {
       return beginFiscalPeriodClose(context, input);
     },
+    closeCanonical(input) {
+      return runFinancialAction(context, "fiscalPeriods.close", input, closeCanonicalFiscalPeriod);
+    },
     close(input) {
       return runFinancialAction(context, "fiscalPeriods.close", input, closeFiscalPeriod);
     },
@@ -184,6 +201,7 @@ async function beginFiscalPeriodClose(
   context: FiscalPeriodServiceContext,
   input: BeginFiscalPeriodCloseInput
 ): Promise<FiscalPeriodResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialOperationContext(input.operation);
   assertExpectedVersion(input.expectedVersion);
 
@@ -193,7 +211,10 @@ async function beginFiscalPeriodClose(
     const version = requiredInteger(period.version, "version");
     const status = requiredStatus(period.status);
     if (status === "closing") {
-      return periodResult(period, await latestPeriodEventId(client, context, input.fiscalPeriodId), "already_closing");
+      const eventId = await assertFiscalReplay(client, context, input, "begin-close", "fiscal_period.closing_started",
+        { priorStatus: "open", priorVersion: input.expectedVersion });
+      if (version !== input.expectedVersion + 1) throw new FiscalPeriodConcurrencyError("Close preparation has advanced beyond this command");
+      return periodResult(period, eventId, "already_closing");
     }
     if (status !== "open") {
       throw new FiscalPeriodValidationError(
@@ -219,7 +240,7 @@ async function beginFiscalPeriodClose(
       `update "erp_financials"."fiscal_periods"
 set "status" = 'closing', "version" = "version" + 1, "updated_at" = $5
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "fiscal_period_id" = $4 and "version" = $6
-returning *`,
+returning *, "period_start"::text as "period_start", "period_end"::text as "period_end"`,
       [context.tenantId, context.companyId, context.sourceId, input.fiscalPeriodId, context.now(), version]
     );
     const row = updated.rows[0];
@@ -240,8 +261,14 @@ export async function assertPostingDateAllowed(
 ): Promise<void> {
   assertScope(scope);
   assertIsoDate(postingDate, "postingDate");
+  // Hold the scope until posting commits, including when no book-control row
+  // exists yet. Row locks alone cannot exclude insertion of the first lock.
+  // Posting transactions share this lock; fiscal mutations take it exclusively.
+  await client.query("select pg_advisory_xact_lock_shared(hashtextextended($1, 0))", [
+    `fiscal-period:${scope.tenantId}:${scope.companyId}:${scope.sourceId}`
+  ]);
   const lock = await client.query(
-    `select "posting_lock_date"
+    `select "posting_lock_date"::text as "posting_lock_date"
 from "erp_financials"."accounting_book_controls"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
 for key share`,
@@ -309,7 +336,7 @@ async function defineFiscalPeriod(
   "period_start", "period_end", "status", "version", "created_at", "updated_at"
 ) values ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, $9, $9)
 on conflict ("tenant_id", "company_id", "source_id", "fiscal_year", "period_number") do nothing
-returning *`,
+returning *, "period_start"::text as "period_start", "period_end"::text as "period_end"`,
       [
         fiscalPeriodId,
         context.tenantId,
@@ -339,10 +366,64 @@ returning *`,
   });
 }
 
+async function closeCanonicalFiscalPeriod(context: FiscalPeriodServiceContext, raw: CloseCanonicalFiscalPeriodInput): Promise<CanonicalFiscalCloseResult> {
+  const input = { ...structuredClone(raw), operation: copyFinancialOperation(raw.operation) };
+  assertFinancialApproval(context, input.operation); assertExpectedVersion(input.expectedVersion);
+  assertNonEmpty(input.bookId, "bookId"); assertNonEmpty(input.idempotencyKey, "idempotencyKey");
+  if (input.idempotencyKey.length > 1000 || input.bookId.length > 1000 || !Array.isArray(input.bankAccountIds)
+    || input.bankAccountIds.length > 200 || new Set(input.bankAccountIds).size !== input.bankAccountIds.length
+    || input.bankAccountIds.some((id: unknown) => typeof id !== "string" || !id.trim() || id.length > 1000)) throw new FiscalPeriodValidationError("Invalid canonical close configuration");
+  if (context.bookId !== undefined && context.bookId !== input.bookId) throw new ErpFinancialsError("scope_mismatch", "Canonical close book differs from the factory scope");
+  if (typeof input.expectedApprovalToken !== "string" || !/^[a-f0-9]{64}$/.test(input.expectedApprovalToken)) throw new FiscalPeriodValidationError("A canonical approval token is required");
+  const key = `canonical-close:${input.idempotencyKey}`;
+  const commandChecksum = canonicalCloseChecksum({ ...scopeOf(context), fiscalPeriodId: input.fiscalPeriodId, expectedVersion: input.expectedVersion,
+    expectedApprovalToken: input.expectedApprovalToken, bookId: input.bookId, bankAccountIds: (input.bankAccountIds as readonly string[]).slice().sort(), actorRef: input.operation.actorRef,
+    approverRef: input.operation.approverRef, reasonCode: input.operation.reasonCode, reasonDetail: input.operation.reasonDetail });
+  return context.database.transaction(async client => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    await lockFiscalScope(client, context);
+    const period = await loadPeriodForUpdate(client, context, input.fiscalPeriodId);
+    const old = (await client.query(`select command_checksum,result from erp_financials.fiscal_close_certificates
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+    [context.tenantId, context.companyId, context.sourceId, key])).rows[0];
+    if (old) {
+      const saved = old.result as CanonicalFiscalCloseResult;
+      if (old.command_checksum !== commandChecksum || period.status !== "closed" || period.version !== saved.version || period.close_event_id !== saved.lifecycleEventId)
+        throw new FinancialLifecycleIdempotencyConflictError(key);
+      return { ...saved, outcome: "already_closed" };
+    }
+    const version = requiredInteger(period.version, "version"), status = requiredStatus(period.status);
+    if (version !== input.expectedVersion) throw new FiscalPeriodConcurrencyError("Canonical close expected version is stale");
+    if (status !== "open" && status !== "closing") throw new FiscalPeriodValidationError("Only an open or closing period can close");
+    const book = (await client.query(`select book_id from erp_financials.reporting_books where tenant_id=$1 and company_id=$2 and book_id=$3 and status='active' for share`,
+      [context.tenantId, context.companyId, input.bookId])).rows[0];
+    if (!book) throw new ErpFinancialsError("missing_book", "Canonical close book does not exist in this scope");
+    const readiness = await readCanonicalFiscalCloseReadiness(client, { ...scopeOf(context), bookId: input.bookId, fiscalPeriodId: input.fiscalPeriodId, bankAccountIds: input.bankAccountIds });
+    if (readiness.approvalToken !== input.expectedApprovalToken) throw new FiscalPeriodConcurrencyError("Reviewed accounting facts changed; request fresh approval");
+    if (readiness.diagnostics.unbalancedPostingGroupCount !== "0") throw new ErpFinancialsError("posting_unbalanced", "Canonical ledger is not balanced");
+    if (readiness.diagnostics.draftTransactionCount !== "0" || readiness.diagnostics.draftInvoiceCount !== "0") throw new FiscalPeriodValidationError("Canonical drafts remain in the period");
+    if (!readiness.ready) throw new ErpFinancialsError("reconciliation_conflict", "Canonical bank evidence does not satisfy the period cutoff");
+    const certificateId = `close_certificate_${canonicalCloseChecksum([context.tenantId, context.companyId, context.sourceId, key])}`;
+    const capturedAt = context.now();
+    const event = await appendFinancialLifecycleEvent(client, { ...scopeOf(context), aggregateType: "fiscal_period", aggregateId: input.fiscalPeriodId,
+      eventType: "fiscal_period.closed", idempotencyKey: key, operation: input.operation, recordedAt: capturedAt,
+      payload: { canonicalCloseCertificateId: certificateId, commandChecksum, priorStatus: status, priorVersion: version } });
+    const updated = (await client.query<FiscalPeriodRow>(`update erp_financials.fiscal_periods set status='closed',version=version+1,close_event_id=$5,updated_at=$6
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and fiscal_period_id=$4 and version=$7
+      returning *,period_start::text,period_end::text`, [context.tenantId, context.companyId, context.sourceId, input.fiscalPeriodId, event.eventId, capturedAt, version])).rows[0];
+    if (!updated) throw new FiscalPeriodConcurrencyError("Fiscal period changed during canonical close");
+    await advanceBookLock(client, context, requiredDate(period.period_end, "period_end"), event.eventId);
+    const result: CanonicalFiscalCloseResult = { ...periodResult(updated, event.eventId, "closed"), certificateId };
+    await recordCanonicalCloseCertificate(client, context, { bookId: input.bookId, idempotencyKey: key, commandChecksum, expectedVersion: version, capturedAt, readiness, result });
+    return result;
+  });
+}
+
 async function closeFiscalPeriod(
   context: FiscalPeriodServiceContext,
   input: CloseFiscalPeriodInput
 ): Promise<FiscalPeriodResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialApproval(context, input.operation);
   assertExpectedVersion(input.expectedVersion);
   assertCloseEvidence(input.evidence);
@@ -354,6 +435,9 @@ async function closeFiscalPeriod(
     const status = requiredStatus(period.status);
     if (status === "closed") {
       const closeEventId = requiredString(period.close_event_id, "close_event_id");
+      await assertFiscalReplay(client, context, input, "close", "fiscal_period.closed",
+        closeEvidencePayload(input.evidence, input.expectedVersion), closeEventId);
+      if (version !== input.expectedVersion + 1) throw new FiscalPeriodConcurrencyError("Fiscal close has advanced beyond this command");
       return periodResult(period, closeEventId, "already_closed");
     }
     if (version !== input.expectedVersion) {
@@ -366,15 +450,12 @@ async function closeFiscalPeriod(
         `Fiscal period ${input.fiscalPeriodId} must be closing before it can close`
       );
     }
-    const pending = await client.query(
-      `select count(*)::integer as "pending_count"
-from "erp_financials"."transactions"
-where "tenant_id" = $1 and "source_id" = $2 and "status" = 'draft'
-  and "transaction_date" between $3::date and $4::date`,
-      [context.tenantId, context.sourceId, requiredDate(period.period_start, "period_start"), requiredDate(period.period_end, "period_end")]
-    );
-    if (requiredInteger(pending.rows[0]?.pending_count ?? 0, "pending_count") > 0) {
+    const diagnostics = await readFiscalCloseDiagnostics(client, { ...context, fiscalPeriodId: input.fiscalPeriodId });
+    if (diagnostics.draftTransactionCount !== "0") {
       throw new FiscalPeriodValidationError("Fiscal period cannot close while draft transactions remain");
+    }
+    if (diagnostics.unbalancedPostingGroupCount !== "0") {
+      throw new ErpFinancialsError("posting_unbalanced", "Fiscal period cannot close with unbalanced ledger postings");
     }
     const lifecycle = await appendFinancialLifecycleEvent(client, {
       ...scopeOf(context),
@@ -390,7 +471,7 @@ where "tenant_id" = $1 and "source_id" = $2 and "status" = 'draft'
       `update "erp_financials"."fiscal_periods"
 set "status" = 'closed', "version" = "version" + 1, "close_event_id" = $5, "updated_at" = $6
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "fiscal_period_id" = $4 and "version" = $7
-returning *`,
+returning *, "period_start"::text as "period_start", "period_end"::text as "period_end"`,
       [
         context.tenantId,
         context.companyId,
@@ -414,12 +495,20 @@ async function reopenFiscalPeriod(
   context: FiscalPeriodServiceContext,
   input: ReopenFiscalPeriodInput
 ): Promise<FiscalPeriodResult> {
+  input = { ...structuredClone(input), operation: copyFinancialOperation(input.operation) };
   assertFinancialApproval(context, input.operation);
   assertExpectedVersion(input.expectedVersion);
   return context.database.transaction(async (client) => {
     await lockFiscalScope(client, context);
     const period = await loadPeriodForUpdate(client, context, input.fiscalPeriodId);
     const version = requiredInteger(period.version, "version");
+    if (requiredStatus(period.status) === "open" && period.reopen_event_id) {
+      const eventId = requiredString(period.reopen_event_id, "reopen_event_id");
+      await assertFiscalReplay(client, context, input, "reopen", "fiscal_period.reopened",
+        { priorCloseEventId: requiredString(period.close_event_id, "close_event_id"), priorVersion: input.expectedVersion }, eventId);
+      if (version !== input.expectedVersion + 1) throw new FiscalPeriodConcurrencyError("Fiscal reopen has advanced beyond this command");
+      return periodResult(period, eventId, "reopened");
+    }
     if (version !== input.expectedVersion) {
       throw new FiscalPeriodConcurrencyError(
         `Fiscal period ${input.fiscalPeriodId} expected version ${String(input.expectedVersion)}, found ${String(version)}`
@@ -444,7 +533,7 @@ async function reopenFiscalPeriod(
       `update "erp_financials"."fiscal_periods"
 set "status" = 'open', "version" = "version" + 1, "reopen_event_id" = $5, "updated_at" = $6
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "fiscal_period_id" = $4 and "version" = $7
-returning *`,
+returning *, "period_start"::text as "period_start", "period_end"::text as "period_end"`,
       [
         context.tenantId,
         context.companyId,
@@ -490,14 +579,17 @@ async function setPostingLockDate(
     const result = await client.query(
       `insert into "erp_financials"."accounting_book_controls" (
   "book_control_id", "tenant_id", "company_id", "source_id", "posting_lock_date", "version", "last_event_id", "created_at", "updated_at"
-) select $1, $2, $3, $4, $5, 1, $6, $7, $7 where $8 = 0
+) select $1, $2, $3, $4, $5, 1, $6, $7, $7 where $8 = 0 or exists (
+  select 1 from "erp_financials"."accounting_book_controls" existing
+  where existing."tenant_id"=$2 and existing."company_id"=$3 and existing."source_id"=$4 and existing."version"=$8
+)
 on conflict ("tenant_id", "company_id", "source_id") do update
 set "posting_lock_date" = excluded."posting_lock_date",
     "version" = "accounting_book_controls"."version" + 1,
     "last_event_id" = excluded."last_event_id",
     "updated_at" = excluded."updated_at"
 where "accounting_book_controls"."version" = $8
-returning "posting_lock_date", "version"`,
+returning "posting_lock_date"::text as "posting_lock_date", "version"`,
       [
         bookControlId(context),
         context.tenantId,
@@ -567,7 +659,7 @@ async function loadPeriodForUpdate(
 ): Promise<FiscalPeriodRow> {
   assertNonEmpty(fiscalPeriodId, "fiscalPeriodId");
   const result = await client.query<FiscalPeriodRow>(
-    `select * from "erp_financials"."fiscal_periods"
+    `select *, "period_start"::text as "period_start", "period_end"::text as "period_end" from "erp_financials"."fiscal_periods"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "fiscal_period_id" = $4
 for update`,
     [context.tenantId, context.companyId, context.sourceId, fiscalPeriodId]
@@ -586,7 +678,7 @@ async function loadPeriodByIdentity(
   periodNumber: number
 ): Promise<FiscalPeriodRow | undefined> {
   const result = await client.query<FiscalPeriodRow>(
-    `select * from "erp_financials"."fiscal_periods"
+    `select *, "period_start"::text as "period_start", "period_end"::text as "period_end" from "erp_financials"."fiscal_periods"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "fiscal_year" = $4 and "period_number" = $5
 for key share`,
     [context.tenantId, context.companyId, context.sourceId, fiscalYear, periodNumber]
@@ -594,21 +686,43 @@ for key share`,
   return result.rows[0];
 }
 
-async function latestPeriodEventId(
-  client: PostgresQueryClient,
-  context: FiscalPeriodScope,
-  fiscalPeriodId: string
+/** Replays bind the prior state, business evidence and authorization. Transport
+ * request/correlation/time may change under independent approval; recorded audit
+ * and administrator confirmations remain immutable. No lifecycle row is written. */
+async function assertFiscalReplay(
+  client: PostgresQueryClient, context: FiscalPeriodScope,
+  input: { readonly fiscalPeriodId: string; readonly expectedVersion: number; readonly operation: FinancialOperationContext },
+  action: "begin-close" | "close" | "reopen", eventType: string, expectedPayload: JsonValue, expectedEventId?: string
 ): Promise<string> {
-  const result = await client.query(
-    `select "event_id"
+  const key = `fiscal-period:${input.fiscalPeriodId}:${action}:v${String(input.expectedVersion)}`;
+  const row = (await client.query(
+    `select "event_id", "aggregate_type", "aggregate_id", "event_type", "actor_ref", "approver_ref", "reason_code", "reason_detail", "payload"
 from "erp_financials"."financial_lifecycle_events"
-where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
-  and "aggregate_type" = 'fiscal_period' and "aggregate_id" = $4
-order by "occurred_at" desc, "recorded_at" desc, "event_id" desc
-limit 1`,
-    [context.tenantId, context.companyId, context.sourceId, fiscalPeriodId]
-  );
-  return requiredString(result.rows[0]?.event_id, "event_id");
+where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "idempotency_key" = $4
+for key share`, [context.tenantId, context.companyId, context.sourceId, key]
+  )).rows[0];
+  const conflict = () => new FinancialLifecycleIdempotencyConflictError(key);
+  if (!row || row.aggregate_type !== "fiscal_period" || row.aggregate_id !== input.fiscalPeriodId || row.event_type !== eventType
+    || (expectedEventId !== undefined && row.event_id !== expectedEventId)
+    || row.actor_ref !== input.operation.actorRef || (row.approver_ref ?? null) !== (input.operation.approverRef ?? null)
+    || row.reason_code !== input.operation.reasonCode || (row.reason_detail ?? null) !== (input.operation.reasonDetail ?? null)) throw conflict();
+  let stored: unknown = row.payload;
+  try { if (typeof stored === "string") stored = JSON.parse(stored); } catch { throw conflict(); }
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) throw conflict();
+  const actual = { ...stored } as Record<string, unknown>;
+  const expected = { ...(expectedPayload as Record<string, JsonValue>) } as Record<string, unknown>;
+  const audit = financialApprovalAudit(client, context, input.operation);
+  if (audit !== undefined) expected.financialApproval = audit;
+  // Close evidence treats this field as an instant, just like its public checksum.
+  for (const payload of [actual, expected]) {
+    if (typeof payload.postingMaxUpdatedAt === "string") {
+      const date = new Date(payload.postingMaxUpdatedAt);
+      if (Number.isNaN(date.getTime())) throw conflict();
+      payload.postingMaxUpdatedAt = date.toISOString();
+    }
+  }
+  if (!isDeepStrictEqual(actual, expected)) throw conflict();
+  return requiredString(row.event_id, "event_id");
 }
 
 async function lockFiscalScope(client: PostgresQueryClient, context: FiscalPeriodScope): Promise<void> {

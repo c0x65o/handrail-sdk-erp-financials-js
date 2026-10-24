@@ -1,0 +1,69 @@
+{
+  "phase": 259,
+  "classification": "progress",
+  "goalComplete": false,
+  "launchReady": false,
+  "baseCommit": "0d88e6bcb8d80fc12e15814072e7979ee5744acb",
+  "version": "0.3.184",
+  "schemaVersion": 49,
+  "cause": "Both default SDK pool adapters lacked checked-out connection error tracking, returned failed clients without discard, and allowed rollback failure to mask the original command or uncertain-commit error. Five focused pre-fix unit failures establish these SDK defects separately from the previously repaired BLU adapter.",
+  "changes": [
+    "Consolidate direct SDK pool handling on createPostgresTransactionRunner, already shared by createErpFinancials.",
+    "Track asynchronous error events on standard PostgreSQL clients, reject around command/commit when a connection fails, preserve original errors across asynchronous or synchronous rollback failure, discard failed/begin-failed connections and remove only the temporary listener after release.",
+    "No automatic command retries. An uncertain commit must be resolved with original immutable payload/key.",
+    "Extend pool-client protocol with optional on/off hooks and release(error) hint; query/release-only clients and caller-owned runners remain supported. Caller-owned runners still own transaction safety; documented custom release/discard obligations."
+  ],
+  "validation": {
+    "before": {
+      "passed": 2,
+      "failed": 5,
+      "evidence": "unit-before.txt"
+    },
+    "unit": {
+      "passed": 10,
+      "failed": 0,
+      "intentionallyUnselected": 36,
+      "seconds": 2.33,
+      "evidence": "unit-final.txt",
+      "coverage": [
+        "original failure preserved through rollback failure",
+        "checked-out error rejected before commit even if work returns",
+        "connection error during commit treated as uncertain",
+        "no automatic replay",
+        "failed begin invokes no work and discards client",
+        "healthy release preserves preexisting listener",
+        "query/release-only compatibility",
+        "custom synchronous rollback throw",
+        "direct pool facade uses shared boundary",
+        "existing standard pool commit/rollback contract"
+      ]
+    },
+    "postgres": {
+      "passed": 4,
+      "failed": 0,
+      "intentionallyUnselected": 673,
+      "seconds": 6.07,
+      "evidence": "postgres-verified.txt",
+      "coverage": [
+        "actual backend termination after retirement event insert through direct SDK pool and exported runner; snapshot rollback, client discarded and retry succeeds",
+        "actual statement commit followed by lost acknowledgement and rollback transport error through both entries; original error retained, one commit, client discarded, exact retry unchanged state and one statement"
+      ]
+    },
+    "database": "Disposable socket-only PostgreSQL15.19; isolation verified and removed",
+    "build": "normal TypeScript build passed",
+    "types": "scoped source/PostgreSQL/unit and BLU/Core/Future public consumer typechecks passed with4GiB heap",
+    "lint": "explicit changed source/test selection passed",
+    "intermediate": "Initial PG test wrapper syntax error prevented execution; corrected. Typed wrappers replaced unsafe test reflection and callback-state checks were made lint-safe; final checks above executed on final implementation.",
+    "limitations": "No full-suite, production, provider, deployment or browser proof. No UI changed. Existing BLU custom transaction wrappers remain caller-owned and were separately tested in prior phases."
+  },
+  "next": "Integrate SDK183 statement retirement/public immutable receipts into BLU strict actor/scope adapter and durable browser recovery, keeping exact original payloads, independent context and retirement mode across reloads. Account identity remains immutable; current statement dates/versions must not block recovery of an accepted historical command. Then remaining AP approval/hold recovery, scale admission/measurement, production migration/custody/ownership and shared-consumer/Ship/live proof remain. SDK publication403 and production PostgreSQL provisioning dependencies remain unresolved; no rejected operation retried.",
+  "evidenceSha256": {
+    "unit-before.txt": "d4d526c91bfb1cbe96329d6a8b59ebd98a7b47bb222d9e21d98f9e0b9e646fa3",
+    "unit-final.txt": "d1930c1bf377f11293a64bbe515cf88052f1ff79d1f7a279adc4fd72d0857aff",
+    "postgres-verified.txt": "022babec4bde050da4ff52ea11f3642db0771fb0e66b5263c2a578ff67af9b0d",
+    "build-verified.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "types-verified.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "lint-verified.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tsconfig.json": "836280d0e429fd90cab8d94bb05076cded4ac527369a80e660fd47134da19ea6"
+  }
+}

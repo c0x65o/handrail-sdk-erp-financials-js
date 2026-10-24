@@ -1,0 +1,51 @@
+{
+  "phase": 243,
+  "classification": "progress",
+  "goalComplete": false,
+  "launchReady": false,
+  "version": "0.3.181",
+  "schemaVersion": 49,
+  "baseCommit": "4864cad5d93629cc9a8b64ec36286f439347daf4",
+  "cause": "Existing receipt application recovery needs a terminal SDK outcome; missing lookup alone cannot fence a delayed apply. Existing apply retries correctly reject an application later unapplied, so recovery must report that recorded history without reapplying.",
+  "changes": [
+    "Public paymentApplications.retireReceiptAttempt accepts exact original native customer_payment_to_invoice command plus same-actor audited retirement operation.",
+    "Same source/application locks serialize retirement versus apply; immutable retirement uses original applied event slot and rejects later SDK apply with that key.",
+    "Recorded allocation returns original application identity and current applied/unapplied/voided state; no cash, balance, period, hold or application mutation.",
+    "Absent allocation requires native receipt/invoice provenance for same customer/currency/book/source; stale original versions remain checksum inputs without becoming current balance decisions.",
+    "Payload/reason-bound retirement replay, lost acknowledgement recovery and historical missing-evidence rejection. Other application types are outside this new API. Existing apply contract remains unchanged."
+  ],
+  "validation": {
+    "postgres": {
+      "passed": 12,
+      "notSelected": 626,
+      "total": 638,
+      "runnerSeconds": 13.15,
+      "database": "disposable socket-only PostgreSQL15.19 removed",
+      "coverage": [
+        "retire replay and changed payload/reason",
+        "recorded and later unapplied after close",
+        "wrong actor/book",
+        "rollback/lost commit acknowledgement",
+        "apply/retire races both start orders",
+        "historical missing immutable evidence",
+        "existing actor/approver/reason/versions replay contracts",
+        "existing receipt application date/storage guard"
+      ]
+    },
+    "types": "passed scoped source plus BLU/Core/Future consumer type fixtures",
+    "build": "passed normal SDK build",
+    "lint": "passed after removing unnecessary tuple-presence check in new test",
+    "bluIntegration": "BLU extended native invoice/receipt PostgreSQL integration passed against candidate181; separate BLU checkpoint captures adapter changes."
+  },
+  "limitations": [
+    "No schema migration or public publication/full-SHA consumer pin change.",
+    "No browser recovery, live production accounting or provider effects in this phase.",
+    "No full suite/large-scale/shared-consumer runtime/deploy claim; full saved goal remains incomplete."
+  ],
+  "evidenceSha256": {
+    "postgres.txt": "dd8ed8354f29f6616455cf88627d93fc3eb064f82c9aaef5f9b84bd9df1c8628",
+    "types.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "build.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "lint-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

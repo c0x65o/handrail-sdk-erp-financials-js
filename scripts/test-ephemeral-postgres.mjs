@@ -13,11 +13,16 @@ await mkdir(root, { recursive: true });
 const directory = await mkdtemp(join(root, 'epg-'));
 const bin = process.env.ERP_FINANCIALS_POSTGRES_BIN ?? '/usr/lib/postgresql/15/bin';
 const data = join(directory, 'data');
-const init = spawnSync(join(bin, 'initdb'), ['-D', data, '-A', 'trust', '--no-locale'], { encoding: 'utf8' });
+// Do not inherit libpq/app connection settings from a deployment workspace.
+// Explicit socket, role and database below are the only test connection target.
+const testEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+  !key.startsWith('PG') && key !== 'DATABASE_URL' && key !== 'ERP_FINANCIALS_TEST_DATABASE_URL'));
+const user = 'erp_financials_test';
+const init = spawnSync(join(bin, 'initdb'), ['-D', data, '-U', user, '-A', 'trust', '--no-locale'], { encoding: 'utf8', env: testEnv });
 if (init.status !== 0) throw Error(init.stderr);
-const server = spawn(join(bin, 'postgres'), ['-D', data, '-k', directory, '-p', '55439', '-c', "listen_addresses="], { stdio: ['ignore', 'ignore', 'pipe'] });
+const server = spawn(join(bin, 'postgres'), ['-D', data, '-k', directory, '-p', '55439', '-c', "listen_addresses="], { stdio: ['ignore', 'ignore', 'pipe'], env: testEnv });
 let serverLog = ''; server.stderr.on('data', b => { serverLog += b; });
-const pool = new Pool({host:directory,port:55439,database:'postgres',max:1});
+const pool = new Pool({host:directory,port:55439,user,password:'',database:'postgres',max:1});
 try {
   let ready = false;
   for (let i=0;i<100;i++) { try { await pool.query('select 1'); ready=true; break; } catch { await new Promise(r=>setTimeout(r,50)); } }
@@ -26,9 +31,9 @@ try {
   if (proof.data_directory !== data || proof.listen_addresses !== '' || proof.network_address !== null) throw Error('Isolation proof failed');
   console.log('ISOLATION VERIFIED', JSON.stringify(proof));
   await pool.query('create database erp_financials_test_correction');
-  const url = new URL('postgresql:///erp_financials_test_correction'); url.searchParams.set('host', directory); url.searchParams.set('port','55439');
+  const url = new URL(`postgresql://${user}@localhost/erp_financials_test_correction`); url.searchParams.set('host', directory); url.searchParams.set('port','55439');
   const args = process.argv.slice(2);
-  const child = spawn(resolve('node_modules/.bin/vitest'), ['run', ...(args.length ? args : ['test/postgres.integration.test.ts', 'test/imported-credit.postgres.test.ts']), '--maxWorkers=1', '--no-file-parallelism'], { stdio:'inherit', env:{...process.env, ERP_FINANCIALS_TEST_DATABASE_URL:url.href} });
+  const child = spawn(resolve('node_modules/.bin/vitest'), ['run', ...(args.length ? args : ['test/postgres.integration.test.ts', 'test/imported-credit.postgres.test.ts']), '--maxWorkers=1', '--no-file-parallelism'], { stdio:'inherit', env:{...testEnv, ERP_FINANCIALS_TEST_DATABASE_URL:url.href} });
   process.exitCode = await new Promise(r=>child.once('exit', code=>r(code ?? 1)));
 } finally {
   await pool.end();

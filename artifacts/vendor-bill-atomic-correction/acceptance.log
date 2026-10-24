@@ -1,0 +1,29 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/erp-financials-goal-tests/epg-QpKKfB/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (354 tests | 337 skipped) 19306ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases 20.00 and explicitly reapplies 10.00  1000ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases 100.00 and explicitly reapplies 80.00  1042ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction void preserves funds and replaces held bills without releasing their hold  1070ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rejects stale, incomplete, changed and unauthorized plans without writes  1414ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught release interruption  886ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught replacement interruption  940ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught reapply interruption  1034ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught receipt interruption  969ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back a caught outbox interruption  1043ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction releases repeated payment sources and serializes identical retries  1102ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rolls back an actual lost PostgreSQL connection and retries cleanly  874ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction honors a closed fiscal period and can replay after close  1097ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction snapshots approval and rejects independently created replacement keys  1128ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction rejects a payment from another book before releasing it  1244ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction respects committed correction winner  1445ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction respects committed application winner  1490ms
+   ✓ ERP Financials real PostgreSQL > atomic vendor bill correction preserves administrator confirmation across nested releases and replacement  1259ms
+
+ Test Files  1 passed (1)
+      Tests  17 passed | 337 skipped (354)
+   Start at  15:59:21
+   Duration  21.85s (transform 1.76s, setup 0ms, collect 2.29s, tests 19.31s, environment 0ms, prepare 62ms)
+
+EPHEMERAL POSTGRES REMOVED

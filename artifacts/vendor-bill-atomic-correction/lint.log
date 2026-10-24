@@ -1,0 +1,49 @@
+
+> @handrail/erp-financials@0.3.109 lint
+> eslint . --max-warnings=0
+
+
+/opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal/src/erp-financials-service.ts
+  4195:20   error  Unsafe argument of type `any` assigned to a parameter of type `string`  @typescript-eslint/no-unsafe-argument
+  4195:28   error  Unsafe member access .applicationId on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4196:36   error  Unsafe argument of type `any` assigned to a parameter of type `number`  @typescript-eslint/no-unsafe-argument
+  4196:44   error  Unsafe member access .expectedVersion on an `any` value                 @typescript-eslint/no-unsafe-member-access
+  4197:36   error  Unsafe argument of type `any` assigned to a parameter of type `number`  @typescript-eslint/no-unsafe-argument
+  4197:44   error  Unsafe member access .expectedSourceVersion on an `any` value           @typescript-eslint/no-unsafe-member-access
+  4198:72   error  Unsafe member access .reapplyAmount on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4200:5    error  Unsafe return of a value of type `any`                                  @typescript-eslint/no-unsafe-return
+  4201:21   error  Unsafe return of a value of type `any`                                  @typescript-eslint/no-unsafe-return
+  4201:21   error  Unsafe call of an `any` typed value                                     @typescript-eslint/no-unsafe-call
+  4201:23   error  Unsafe member access .applicationId on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4201:53   error  Unsafe member access .applicationId on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4202:39   error  Unsafe return of a value of type `any`                                  @typescript-eslint/no-unsafe-return
+  4202:47   error  Unsafe member access .applicationId on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4227:66   error  Unsafe member access .reapplyAmount on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4234:81   error  Unsafe argument of type `any` assigned to a parameter of type `string`  @typescript-eslint/no-unsafe-argument
+  4234:89   error  Unsafe member access .applicationId on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4237:28   error  Unsafe argument of type `any` assigned to a parameter of type `string`  @typescript-eslint/no-unsafe-argument
+  4237:36   error  Unsafe member access .applicationId on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4240:73   error  Unsafe member access .expectedVersion on an `any` value                 @typescript-eslint/no-unsafe-member-access
+  4243:71   error  Unsafe member access .expectedSourceVersion on an `any` value           @typescript-eslint/no-unsafe-member-access
+  4257:18   error  Unsafe assignment of an `any` value                                     @typescript-eslint/no-unsafe-assignment
+  4257:41   error  Unsafe member access .applicationId on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4257:56   error  Unsafe assignment of an `any` value                                     @typescript-eslint/no-unsafe-assignment
+  4257:81   error  Unsafe member access .expectedVersion on an `any` value                 @typescript-eslint/no-unsafe-member-access
+  4271:21   error  Unsafe member access .reapplyAmount on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4272:30   error  Unsafe argument of type `any` assigned to a parameter of type `string`  @typescript-eslint/no-unsafe-argument
+  4272:38   error  Unsafe member access .applicationId on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4276:108  error  Invalid type "any" of template literal expression                       @typescript-eslint/restrict-template-expressions
+  4276:116  error  Unsafe member access .applicationId on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4278:72   error  Unsafe assignment of an `any` value                                     @typescript-eslint/no-unsafe-assignment
+  4278:88   error  Unsafe member access .reapplyAmount on an `any` value                   @typescript-eslint/no-unsafe-member-access
+  4282:11   error  Unnecessary conditional, value is always falsy                          @typescript-eslint/no-unnecessary-condition
+
+/opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal/test/postgres.integration.test.ts
+  6464:22  error  Unnecessary optional chain on a non-nullish value  @typescript-eslint/no-unnecessary-condition
+  6465:22  error  Unnecessary optional chain on a non-nullish value  @typescript-eslint/no-unnecessary-condition
+  6528:5   error  Forbidden non-null assertion                       @typescript-eslint/no-non-null-assertion
+  6528:90  error  Forbidden non-null assertion                       @typescript-eslint/no-non-null-assertion
+  6591:11  error  Unsafe assignment of an `any` value                @typescript-eslint/no-unsafe-assignment
+
+✖ 38 problems (38 errors, 0 warnings)
+

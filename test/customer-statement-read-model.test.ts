@@ -26,6 +26,7 @@ describe("customer statement read model", () => {
       asOfDate: "2026-08-31",
       currencyCode: "USD",
       totals: {
+        settlement: { cashAppliedAmount: "90.00", creditAppliedAmount: "0.00", writeOffAppliedAmount: "0.00" },
         invoiceCount: 2,
         invoicedAmount: "150.00",
         appliedAmount: "90.00",
@@ -73,6 +74,7 @@ describe("customer statement read model", () => {
     expect(second.items.map((item) => item.invoiceId)).toEqual(["invoice_2"]);
     expect(second.nextCursor).toBeUndefined();
     expect(second.pageTotals).toEqual({
+      settlement: { cashAppliedAmount: "50.00", creditAppliedAmount: "0.00", writeOffAppliedAmount: "0.00" },
       invoiceCount: 1,
       invoicedAmount: "50.00",
       appliedAmount: "50.00",
@@ -83,14 +85,21 @@ describe("customer statement read model", () => {
     expect(client.statementSql).toContain('book_source."book_id" = $3');
     expect(client.statementSql).toContain('document."party_id" = $4');
     expect(client.statementSql).toContain('document."document_date" <= $6::date');
-    expect(client.statementSql).toContain('ended_event."occurred_at" >= ($6::date + interval \'1 day\')');
+    expect(client.statementSql).toContain(`coalesce((ended_event."payload"->>'effectiveDate')::date, (ended_event."occurred_at" at time zone 'UTC')::date) >= ($6::date + interval '1 day')`);
     expect(client.statementSql).not.toContain('document."open_amount"');
     expect(client.statementParameters[0]).toEqual([
-      "tenant_1", "company_1", "book_1", "customer_1", "USD", "2026-08-31", undefined, undefined, 2
+      "tenant_1", "company_1", "book_1", "customer_1", "USD", "2026-08-31", undefined, undefined, 2, true
     ]);
     expect(client.statementParameters[1]?.slice(0, 6)).toEqual([
       "tenant_1", "company_1", "book_1", "customer_1", "USD", "2026-08-31"
     ]);
+  });
+
+  it("rejects inconsistent settlement classification and any overapplied invoice before returning a page", async () => {
+    for (const mode of ["classification", "overapplied"] as const) {
+      const queries = statement(new CustomerStatementClient(row => mode === "classification" ? { ...row, cash_applied_amount: "0" } : { ...row, invalid_balance: true }));
+      await expect(queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-31", limit: 1 })).rejects.toMatchObject({ code: "reconciliation_conflict" });
+    }
   });
 
   it("rejects invalid required fields, limits, and cross-request cursors", async () => {
@@ -104,6 +113,7 @@ describe("customer statement read model", () => {
 
     const first = await queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-31", limit: 1 });
     if (first.nextCursor === undefined) throw new Error("Expected a customer statement cursor");
+    await expect(queries.getCustomerStatement({ customerId: "customer_1", asOfDate: "2026-08-31", includeApplications: false, cursor: first.nextCursor })).rejects.toMatchObject({ code: "invalid_input" });
     await expect(queries.getCustomerStatement({
       customerId: "customer_2",
       asOfDate: "2026-08-31",
@@ -114,6 +124,7 @@ describe("customer statement read model", () => {
 });
 
 class CustomerStatementClient implements PostgresQueryClient {
+  constructor(private readonly transform: (row: Record<string, unknown>) => Record<string, unknown> = row => row) {}
   statementSql = "";
   readonly statementParameters: (readonly unknown[])[] = [];
 
@@ -127,7 +138,7 @@ class CustomerStatementClient implements PostgresQueryClient {
     if (sql.includes("with scoped_invoices as")) {
       this.statementSql = sql;
       this.statementParameters.push(parameters);
-      return rows<Row>(parameters[6] === undefined ? [invoiceOne(), invoiceTwo()] : [invoiceTwo()]);
+      return rows<Row>((parameters[6] === undefined ? [invoiceOne(), invoiceTwo()] : [invoiceTwo()]).map(this.transform));
     }
     throw new Error(`Unexpected customer statement query: ${sql}`);
   }
@@ -135,10 +146,13 @@ class CustomerStatementClient implements PostgresQueryClient {
 
 function invoiceOne(): Record<string, unknown> {
   return {
+    revision: "a".repeat(64), current_book: {currency:"USD",basis:"accrual",status:"active"},
     invoice_id: "invoice_1", source_id: "source_1", transaction_id: "transaction_invoice_1",
     customer_id: "customer_1", customer_name: "Acme", document_number: "INV-1",
     document_date: "2026-08-01", due_date: "2026-08-31", currency_code: "USD",
     original_amount: "100", applied_amount: "40", open_balance: "60",
+    cash_applied_amount: "40", credit_applied_amount: "0", write_off_applied_amount: "0",
+    total_cash_applied_amount: "90", total_credit_applied_amount: "0", total_write_off_applied_amount: "0", invalid_balance: false,
     source_system: "native_erp", provider_environment: "test",
     source_transaction_id: "source_invoice_1", source_transaction_type: "Invoice",
     applications: [{
@@ -159,7 +173,7 @@ function invoiceTwo(): Record<string, unknown> {
   return {
     ...invoiceOne(),
     invoice_id: "invoice_2", transaction_id: "transaction_invoice_2", document_number: "INV-2",
-    document_date: "2026-08-20", original_amount: "50", applied_amount: "50", open_balance: "0",
+    document_date: "2026-08-20", original_amount: "50", applied_amount: "50", open_balance: "0", cash_applied_amount: "50",
     source_transaction_id: "source_invoice_2",
     applications: [{
       ...(invoiceOne().applications as Record<string, unknown>[])[0],

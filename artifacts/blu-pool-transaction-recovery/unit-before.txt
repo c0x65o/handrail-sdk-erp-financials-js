@@ -1,0 +1,128 @@
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ❯ test/postgres-transaction-runner.test.ts (7 tests | 5 failed) 19ms
+   × default PostgreSQL transaction boundary > preserves original work failure when rollback fails and discards the connection 10ms
+     → expected Error: rollback connection failure to be Error: original command failure // Object.is equality
+   × default PostgreSQL transaction boundary > handles checked-out connection errors and refuses to commit swallowed failures 1ms
+     → expected +0 to be 1 // Object.is equality
+   × default PostgreSQL transaction boundary > does not mask or automatically retry an uncertain commit 1ms
+     → expected Error: connection unavailable to be Error: commit acknowledgement lost // Object.is equality
+   × default PostgreSQL transaction boundary > discards a connection if begin fails without invoking user work 2ms
+     → expected [ undefined ] to deeply equal [ true ]
+   ✓ default PostgreSQL transaction boundary > returns a healthy client once and removes only its own error listener 1ms
+   ✓ default PostgreSQL transaction boundary > retains compatibility with query/release clients without event hooks 1ms
+   × default PostgreSQL transaction boundary > uses the same failure boundary when the SDK facade receives a pool directly 3ms
+     → expected Error: rollback lost to be Error: statement read failed // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 5 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/postgres-transaction-runner.test.ts > default PostgreSQL transaction boundary > preserves original work failure when rollback fails and discards the connection
+AssertionError: expected Error: rollback connection failure to be Error: original command failure // Object.is equality
+
+- Expected
++ Received
+
+  Error {
+-   "message": "original command failure",
++   "message": "rollback connection failure",
+  }
+
+ ❯ test/postgres-transaction-runner.test.ts:18:5
+     16|     const client = new Client(), original = Error("original command fa…
+     17|     client.before = sql => { if (sql === "rollback") throw Error("roll…
+     18|     await expect(createPostgresTransactionRunner({ connect: async () =…
+       |     ^
+     19|     expect(client.calls).toEqual(["begin", "rollback"]); expect(client…
+     20|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/5]⎯
+
+ FAIL  test/postgres-transaction-runner.test.ts > default PostgreSQL transaction boundary > handles checked-out connection errors and refuses to commit swallowed failures
+AssertionError: expected +0 to be 1 // Object.is equality
+
+- Expected
++ Received
+
+- 1
++ 0
+
+ ❯ test/postgres-transaction-runner.test.ts:26:68
+     24|       observed = client.listenerCount("error"); client.emit("error", o…
+     25|     });
+     26|     await expect(pending).rejects.toBe(original); expect(observed).toB…
+       |                                                                    ^
+     27|     expect(client.calls).toEqual(["begin", "rollback"]); expect(client…
+     28|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/5]⎯
+
+ FAIL  test/postgres-transaction-runner.test.ts > default PostgreSQL transaction boundary > does not mask or automatically retry an uncertain commit
+AssertionError: expected Error: connection unavailable to be Error: commit acknowledgement lost // Object.is equality
+
+- Expected
++ Received
+
+  Error {
+-   "message": "commit acknowledgement lost",
++   "message": "connection unavailable",
+  }
+
+ ❯ test/postgres-transaction-runner.test.ts:32:5
+     30|     const client = new Client(), original = Error("commit acknowledgem…
+     31|     client.before = sql => { if (sql === "commit") throw original; if …
+     32|     await expect(createPostgresTransactionRunner({ connect: async () =…
+       |     ^
+     33|     expect(calls).toBe(1); expect(client.calls).toEqual(["begin", "com…
+     34|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/5]⎯
+
+ FAIL  test/postgres-transaction-runner.test.ts > default PostgreSQL transaction boundary > discards a connection if begin fails without invoking user work
+AssertionError: expected [ undefined ] to deeply equal [ true ]
+
+- Expected
++ Received
+
+  [
+-   true,
++   undefined,
+  ]
+
+ ❯ test/postgres-transaction-runner.test.ts:39:93
+     37|     client.before = sql => { if (sql === "begin") throw original; };
+     38|     await expect(createPostgresTransactionRunner({ connect: async () =…
+     39|     expect(calls).toBe(0); expect(client.calls).toEqual(["begin"]); ex…
+       |                                                                                             ^
+     40|   });
+     41|   it("returns a healthy client once and removes only its own error lis…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/5]⎯
+
+ FAIL  test/postgres-transaction-runner.test.ts > default PostgreSQL transaction boundary > uses the same failure boundary when the SDK facade receives a pool directly
+AssertionError: expected Error: rollback lost to be Error: statement read failed // Object.is equality
+
+- Expected
++ Received
+
+  Error {
+-   "message": "statement read failed",
++   "message": "rollback lost",
+  }
+
+ ❯ test/postgres-transaction-runner.test.ts:59:5
+     57|     client.before = sql => { if (sql.includes("from erp_financials.ban…
+     58|     const sdk = createErpFinancialsSdk({ database: { connect: async ()…
+     59|     await expect(sdk.bankStatements.find("statement")).rejects.toBe(or…
+       |     ^
+     60|     expect(client.released).toEqual([true]); expect(client.calls.filte…
+     61|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/5]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  5 failed | 2 passed (7)
+   Start at  19:45:29
+   Duration  1.72s (transform 1.18s, setup 0ms, collect 1.51s, tests 19ms, environment 0ms, prepare 53ms)
+

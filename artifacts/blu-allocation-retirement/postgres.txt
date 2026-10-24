@@ -1,0 +1,24 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/blu-sdk243/epg-U3lxKt/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (638 tests | 626 skipped) 10631ms
+   ✓ ERP Financials real PostgreSQL > application replay rejects changed actor while identical retries keep one receipt  792ms
+   ✓ ERP Financials real PostgreSQL > application replay rejects changed approver while identical retries keep one receipt  895ms
+   ✓ ERP Financials real PostgreSQL > application replay rejects changed reason while identical retries keep one receipt  868ms
+   ✓ ERP Financials real PostgreSQL > application replay rejects changed source-version while identical retries keep one receipt  853ms
+   ✓ ERP Financials real PostgreSQL > application replay rejects changed target-version while identical retries keep one receipt  892ms
+   ✓ ERP Financials real PostgreSQL > rejects allocating existing customer cash before it was received through API and storage  929ms
+   ✓ ERP Financials real PostgreSQL > receipt allocation retirement fences delayed apply and binds payload without changing money  808ms
+   ✓ ERP Financials real PostgreSQL > receipt allocation retirement returns recorded then unapplied outcome after close without reapplying  884ms
+   ✓ ERP Financials real PostgreSQL > receipt allocation retirement proves native book scope and rolls back or recovers lost commit acknowledgement  978ms
+   ✓ ERP Financials real PostgreSQL > receipt allocation retirement serializes with apply starting first  825ms
+   ✓ ERP Financials real PostgreSQL > receipt allocation retirement serializes with retire starting first  805ms
+   ✓ ERP Financials real PostgreSQL > receipt allocation retirement rejects historical missing command evidence instead of inventing it  990ms
+
+ Test Files  1 passed (1)
+      Tests  12 passed | 626 skipped (638)
+   Start at  17:15:40
+   Duration  13.15s (transform 1.86s, setup 0ms, collect 2.31s, tests 10.63s, environment 0ms, prepare 56ms)
+
+EPHEMERAL POSTGRES REMOVED

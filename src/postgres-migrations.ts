@@ -95,6 +95,19 @@ export class PostgresMigrationError extends Error {
 const namespace = POSTGRES_CANONICAL_SCHEMA_MANIFEST.namespace;
 const migrationLockKey = `${namespace}:schema-migrations`;
 const migrationFiles = {
+  accountingAccessV49: new URL("../migrations/future-erp/20261023040000_add_accounting_access_control.sql",import.meta.url),
+  paymentPagesV48: new URL("../migrations/future-erp/20261023030000_add_payment_page_indexes.sql",import.meta.url),
+  receiptApplicationDatesV47: new URL("../migrations/future-erp/20261023020000_guard_receipt_application_dates.sql",import.meta.url),
+  invoiceRecognitionV46: new URL("../migrations/future-erp/20261023010000_separate_invoice_recognition_dates.sql",import.meta.url),
+  cashTransactionIndexV45: new URL("../migrations/future-erp/20261022070000_add_cash_transaction_lookup.sql",import.meta.url),
+  cashFlowPurposeV44: new URL("../migrations/future-erp/20261022060000_add_cash_flow_purpose_corrections.sql",import.meta.url),
+  invoiceComponentAccountsV43: new URL("../migrations/future-erp/20261022050000_add_invoice_component_accounts.sql",import.meta.url),
+  invoiceReadRevisionsV42: new URL("../migrations/future-erp/20261022040000_track_invoice_read_revisions.sql", import.meta.url),
+  overdueInvoicesV41: new URL("../migrations/future-erp/20261022030000_allow_overdue_invoice_recognition.sql", import.meta.url),
+  invoiceCancellationV40: new URL("../migrations/future-erp/20261022020000_preserve_invoice_cancellation_applications.sql", import.meta.url),
+  overdueVendorBillsV39: new URL("../migrations/future-erp/20261022010000_allow_overdue_vendor_bill_recognition.sql", import.meta.url),
+  journalPostingReadV38: new URL("../migrations/future-erp/20261021070000_add_journal_posting_read_index.sql", import.meta.url),
+  sourceRevisionsV37: new URL("../migrations/future-erp/20261021060000_add_accounting_source_revisions.sql", import.meta.url),
   bootstrapV6: new URL(
     "../migrations/future-erp/20260620000000_create_erp_financials_canonical_schema.sql",
     import.meta.url
@@ -160,6 +173,15 @@ const migrationFiles = {
     "../migrations/future-erp/20260825010000_add_bank_statement_line_unignore.sql",
     import.meta.url
   ),
+  closeCertificatesV36: new URL("../migrations/future-erp/20261021050000_add_canonical_close_certificates.sql", import.meta.url),
+  bankStatementsV35: new URL("../migrations/future-erp/20261021040000_add_bank_statement_lifecycle.sql", import.meta.url),
+  fiscalDiagnosticsV34: new URL("../migrations/future-erp/20261021030000_add_fiscal_diagnostic_indexes.sql", import.meta.url),
+  vendorBillAuditV33: new URL("../migrations/future-erp/20261021020000_add_vendor_bill_audit_index.sql", import.meta.url),
+  vendorBillPaymentHoldsV32: new URL("../migrations/future-erp/20261021010000_add_vendor_bill_payment_holds.sql", import.meta.url),
+  receiptCollectionLookupV31: new URL("../migrations/future-erp/20261020040000_add_receipt_collection_lookup.sql", import.meta.url),
+  invoiceAuditReadsV30: new URL("../migrations/future-erp/20261020030000_add_invoice_audit_read_indexes.sql", import.meta.url),
+  invoiceDateCorrectionsV29: new URL("../migrations/future-erp/20261020020000_add_invoice_date_corrections.sql", import.meta.url),
+  nativeCustomerPaymentReturnsV28: new URL("../migrations/future-erp/20261020010000_add_native_customer_payment_returns.sql", import.meta.url),
   customerPaymentCorrectionReplayV27: new URL("../migrations/future-erp/20261003020000_scope_customer_payment_correction_replay.sql", import.meta.url),
   customerPaymentCorrectionsV26: new URL("../migrations/future-erp/20261003010000_add_customer_payment_corrections.sql", import.meta.url),
   inactiveMappedAccountsV25: new URL("../migrations/future-erp/20260915010000_allow_inactive_mapped_accounts.sql", import.meta.url),
@@ -318,7 +340,29 @@ export const POSTGRES_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
   migration("20260911010000_commercial_document_detail", "Preserve signed commercial detail and provider precision", 23, 24, migrationFiles.commercialDocumentDetailV24),
   migration("20260915010000_allow_inactive_mapped_accounts", "Retain inactive reporting-book account mappings", 24, 25, migrationFiles.inactiveMappedAccountsV25),
   migration("20261003010000_add_customer_payment_corrections", "Atomic imported customer payment correction and replay tombstones", 25, 26, migrationFiles.customerPaymentCorrectionsV26),
-  migration("20261003020000_scope_customer_payment_correction_replay", "Scope payment correction replay to immutable affected records", 26, 27, migrationFiles.customerPaymentCorrectionReplayV27)
+  migration("20261003020000_scope_customer_payment_correction_replay", "Scope payment correction replay to immutable affected records", 26, 27, migrationFiles.customerPaymentCorrectionReplayV27),
+  migration("20261020010000_add_native_customer_payment_returns", "Atomic native receipt return settlements", 27, 28, migrationFiles.nativeCustomerPaymentReturnsV28),
+  migration("20261020020000_add_invoice_date_corrections", "Audited native invoice date restatement", 28, 29, migrationFiles.invoiceDateCorrectionsV29),
+  migration("20261020030000_add_invoice_audit_read_indexes", "Scoped invoice lifecycle audit pagination indexes", 29, 30, migrationFiles.invoiceAuditReadsV30),
+  migration("20261020040000_add_receipt_collection_lookup", "Scoped native receipt collection reference lookup", 30, 31, migrationFiles.receiptCollectionLookupV31),
+  migration("20261021010000_add_vendor_bill_payment_holds", "Canonical vendor bill payment holds", 31, 32, migrationFiles.vendorBillPaymentHoldsV32),
+  migration("20261021020000_add_vendor_bill_audit_index", "Indexed vendor bill payment audit lookup", 32, 33, migrationFiles.vendorBillAuditV33),
+  migration("20261021030000_add_fiscal_diagnostic_indexes", "Indexed source fiscal diagnostics", 33, 34, migrationFiles.fiscalDiagnosticsV34),
+  migration("20261021040000_add_bank_statement_lifecycle", "Canonical manual statement lifecycle and clearing evidence", 34, 35, migrationFiles.bankStatementsV35),
+  migration("20261021050000_add_canonical_close_certificates", "Immutable canonical fiscal close certificates and control totals", 35, 36, migrationFiles.closeCertificatesV36),
+  migration("20261021060000_add_accounting_source_revisions", "Database-managed accounting approval freshness", 36, 37, migrationFiles.sourceRevisionsV37),
+  migration("20261021070000_add_journal_posting_read_index", "Indexed canonical journal posting detail", 37, 38, migrationFiles.journalPostingReadV38),
+  migration("20261022010000_allow_overdue_vendor_bill_recognition", "Preserve contractual due dates for late vendor bill recognition", 38, 39, migrationFiles.overdueVendorBillsV39),
+  migration("20261022020000_preserve_invoice_cancellation_applications", "Keep cancellation credit applications attached to their invoices", 39, 40, migrationFiles.invoiceCancellationV40),
+  migration("20261022030000_allow_overdue_invoice_recognition", "Preserve contractual invoice due dates independently of posting dates", 40, 41, migrationFiles.overdueInvoicesV41),
+  migration("20261022040000_track_invoice_read_revisions", "Invalidate invoice read cursors on draft lines and delivery changes", 41, 42, migrationFiles.invoiceReadRevisionsV42),
+  migration("20261022050000_add_invoice_component_accounts","Retain explicit invoice tax and discount posting accounts",42,43,migrationFiles.invoiceComponentAccountsV43),
+  migration("20261022060000_add_cash_flow_purpose_corrections","Audited native cash purpose restatement",43,44,migrationFiles.cashFlowPurposeV44),
+  migration("20261022070000_add_cash_transaction_lookup","Scoped cash transaction document lookup",44,45,migrationFiles.cashTransactionIndexV45),
+  migration("20261023010000_separate_invoice_recognition_dates","Separate contractual invoice dates and accrual recognition",45,46,migrationFiles.invoiceRecognitionV46),
+  migration("20261023020000_guard_receipt_application_dates","Prevent allocations before cash receipt",46,47,migrationFiles.receiptApplicationDatesV47),
+  migration("20261023030000_add_payment_page_indexes","Ordered payment page membership",47,48,migrationFiles.paymentPagesV48),
+  migration("20261023040000_add_accounting_access_control","Durable database-wide accounting maintenance",48,49,migrationFiles.accountingAccessV49)
 ] as const;
 
 export async function planPostgresMigrations(

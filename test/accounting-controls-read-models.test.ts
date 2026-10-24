@@ -33,7 +33,7 @@ describe("accounting-control public read models", () => {
     expect(typeof cursor).toBe("string");
     if (cursor === undefined) throw new Error("Expected a next journal cursor");
     expect(client.journalListSql).toContain('join "erp_financials"."reporting_book_sources"');
-    expect(client.journalListSql).toContain('order by "transaction_date" desc, "journal_entry_id" desc');
+    expect(client.journalListSql).toContain('order by journal."transaction_date" desc, "journal_entry_id" desc');
     expect(client.journalListParams.slice(0, 12)).toEqual([
       "tenant_1", "company_1", "book_1", "accrual", "USD", "source_1", "corrected",
       "2026-08-01", "2026-08-31", undefined, "user:preparer", undefined

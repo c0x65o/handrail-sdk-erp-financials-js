@@ -1,0 +1,78 @@
+{
+  "checkpoint": "Posted vendor bill correction atomicity and contention",
+  "sdkBaseCommit": "7dc0f5d5df1c968f373340026953dab8405be433",
+  "sdkVersion": "0.3.109",
+  "schemaVersion": 38,
+  "status": "locally verified SDK; unpublished and undeployed",
+  "observedDefects": [
+    {
+      "evidence": "before.log",
+      "finding": "Generic payment application/correction opposing source/row lock order reproduced PostgreSQL 40P01 for void and replacement."
+    },
+    {
+      "evidence": "before.log",
+      "finding": "A host catching invalid replacement vendor left committed reversal and voided original bill before savepoint fix."
+    },
+    {
+      "evidence": "writer-before.log",
+      "finding": "An in-flight payment hold or recordAndApply writer and correction also reproduced 40P01 before those writers took source lock first."
+    }
+  ],
+  "changes": [
+    "Posted bill void/replacement savepoint rolls back complete command on caught validation or SQL error while preserving prior host transaction work.",
+    "Correction, payment hold and immediate recordAndApply take existing source correction lock before bill rows.",
+    "No API or schema change."
+  ],
+  "executed": {
+    "postgres": {
+      "passed": 45,
+      "unselected": 292,
+      "total": 337,
+      "log": "postgres.log",
+      "engine": "PostgreSQL15.19",
+      "isolation": "Disposable Unix socket cluster; data_directory verified; no network listener; cluster removed"
+    },
+    "unit": {
+      "passed": 37,
+      "log": "unit.log"
+    },
+    "typecheck": {
+      "result": "passed",
+      "log": "typecheck.log"
+    },
+    "lint": {
+      "result": "passed",
+      "log": "lint.log"
+    },
+    "build": {
+      "result": "passed",
+      "log": "build.log"
+    },
+    "consumerImports": {
+      "result": "BLU, CoreERP, FutureERP passed",
+      "logs": [
+        "blu-imports.log",
+        "core-imports.log",
+        "future-imports.log"
+      ]
+    }
+  },
+  "coverage": [
+    "Both completed-command winner orders for void/replacement versus immediate payment; loser cannot leak a payment instruction or replacement.",
+    "In-flight generic application/correction and hold/immediate payment/correction blocking verified with backend PIDs and pg_blocking_pids, then stale command rejection without deadlock.",
+    "Caught failures after reversal link, original bill, replacement, lifecycle and outbox; database division-by-zero; exact SDK table snapshot restored.",
+    "Pre-command host transaction setting preserved, clean retry succeeds, exact replay adds no financial facts.",
+    "Book/currency/provenance, previous applied bill cash preservation, independent/admin approval snapshots, holds, register and bill line regression."
+  ],
+  "fixtureCorrections": [
+    "initial.log: two assertions expected open rather than actual correct partially_applied status; corrected test expectation before defect reproduction."
+  ],
+  "limitations": [
+    "Selected tests only; no full SDK/application regression claim.",
+    "Public consumer import checks are not complete shared-consumer app regressions.",
+    "No million-entry benchmark rerun; existing source-wide lock now acquired earlier, contention/throughput acceptance remains outstanding.",
+    "Scheduled payment clear/cancel/compensation, remaining writers, host lock ordering and complete close/post races require independent validation.",
+    "No atomic applied-bill unapply/replace/reapply API or BLU posted-correction approval/operator workflow yet.",
+    "No migration/archive/restore/cutover, publication, dependency upgrade, production SQL, deploy or live proof."
+  ]
+}

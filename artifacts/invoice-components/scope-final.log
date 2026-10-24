@@ -1,0 +1,13 @@
+ISOLATION VERIFIED {"data_directory":"/tmp/sdk-financials-goal-tests/epg-hDevFT/data","listen_addresses":"","network_address":null,"version":"PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"}
+
+ RUN  v3.2.6 /opt/handrail/repos/handrail/erp-financials/erp-financials-blu-goal
+
+ ✓ test/postgres.integration.test.ts (505 tests | 504 skipped) 1186ms
+   ✓ ERP Financials real PostgreSQL > invoice component policies reject missing, inactive, wrong-role and foreign accounts atomically and retain exact historical replay  1066ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 504 skipped (505)
+   Start at  03:57:08
+   Duration  3.88s (transform 2.01s, setup 0ms, collect 2.45s, tests 1.19s, environment 0ms, prepare 74ms)
+
+EPHEMERAL POSTGRES REMOVED
