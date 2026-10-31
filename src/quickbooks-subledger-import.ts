@@ -145,6 +145,7 @@ export async function persistQuickBooksSubledgerResources(
     input.facts.transactions.map((transaction) => [transaction.sourceTransactionId, transaction])
   );
   const documentIdBySourceId = new Map<string, string>();
+  const documentDates = new Map<string, { date: string; recognitionDate: string | null; type: string }>();
   const accountIdBySourceId = new Map(input.facts.accounts.map((account) => [account.sourceAccountId, account.accountId]));
   const itemBySourceId = new Map(input.facts.items.map((item) => [item.sourceItemId, item]));
   const partyIdBySourceId = new Map(input.facts.parties.map((party) => [party.sourcePartyId, party.partyId]));
@@ -177,8 +178,12 @@ export async function persistQuickBooksSubledgerResources(
     subledger_document_id: string;
     status: string;
     party_id: string | null;
+    document_date: string;
+    recognition_date: string | null;
+    document_type: string;
   }>(
-    `select "metadata" ->> 'sourceTransactionId' as "source_transaction_id", "subledger_document_id", "status", "party_id"
+    `select "metadata" ->> 'sourceTransactionId' as "source_transaction_id", "subledger_document_id", "status", "party_id",
+  "document_date"::text, (to_jsonb("subledger_documents")->>'recognition_date') as "recognition_date", "document_type"
 from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   and "metadata" ->> 'provider' = 'quickbooks'`,
@@ -187,8 +192,26 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   for (const row of existingDocuments.rows) {
     if (row.source_transaction_id && row.subledger_document_id) {
       documentIdBySourceId.set(row.source_transaction_id, row.subledger_document_id);
+      documentDates.set(row.source_transaction_id, { date: row.document_date, recognitionDate: row.recognition_date, type: row.document_type });
     }
   }
+  for (const row of operationalDocuments) {
+    if (["voided", "deleted", "skipped"].includes(row.syncAction ?? "")) continue;
+    const type = importedDocumentType(row.resource.sourceTransactionType);
+    if (type !== undefined) documentDates.set(row.resource.sourceTransactionId, {
+      date: row.resource.transactionDate,
+      recognitionDate: documentDates.get(row.resource.sourceTransactionId)?.recognitionDate ?? null,
+      type
+    });
+  }
+  // Accounting dates are independent of provider update/import timestamps.
+  // Each allocation waits for its own invoice, never the latest invoice in a receipt.
+  const applicationDate = (date: string, sourceId: string, targetId: string): string => {
+    const source = documentDates.get(sourceId), target = documentDates.get(targetId);
+    if (target?.type !== "invoice") return date;
+    if (!source?.date || !target.date) throw new Error("Imported application requires retained document dates");
+    return [source.date, target.recognitionDate ?? target.date].reduce((latest, value) => value > latest ? value : latest, date);
+  };
   const projectableDocumentSourceIds = new Set(
     existingDocuments.rows
       .filter((row) => row.status !== "voided")
@@ -715,7 +738,9 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
         const applicationId = stableId("qbo_application", sourceDocumentId, targetDocumentId, line.sourceLineId ?? String(line.lineNumber));
         const eventId = stableId("qbo_event", applicationId, "applied");
         const idempotencyKey = `quickbooks:application:${input.facts.source.sourceId}:${source.sourceTransactionId}:${linked.sourceTransactionId}:${line.sourceLineId ?? String(line.lineNumber)}`;
+        const effectiveDate = applicationDate(source.transactionDate, source.sourceTransactionId, linked.sourceTransactionId);
         const payload: JsonValue = {
+          applicationDate: effectiveDate,
           provider: "quickbooks",
           sourceTransactionId: source.sourceTransactionId,
           targetSourceTransactionId: linked.sourceTransactionId,
@@ -758,7 +783,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
             targetDocumentId,
             amount,
             source.currencyCode ?? input.facts.company.baseCurrencyCode,
-            source.transactionDate,
+            effectiveDate,
             idempotencyKey,
             eventId,
             input.importedAt
@@ -853,7 +878,9 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       );
       const eventId = stableId("qbo_event", applicationId, "applied");
       const idempotencyKey = `quickbooks:${projection.projectionKind.replaceAll("_", "-")}:${input.facts.source.sourceId}:${sourceTransactionId}:${allocation.sourceDocumentSourceTransactionId}:${allocation.targetDocumentSourceTransactionId}:${String(index + 1)}`;
+      const effectiveDate = applicationDate(projection.transactionDate, allocation.sourceDocumentSourceTransactionId, allocation.targetDocumentSourceTransactionId);
       const payload: JsonValue = {
+        applicationDate: effectiveDate,
         provider: "quickbooks",
         sourceTransactionId,
         sourceTransactionType: projection.sourceTransactionType,
@@ -915,7 +942,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
           targetDocumentId,
           allocation.amount,
           projection.currencyCode ?? input.facts.company.baseCurrencyCode,
-          projection.transactionDate,
+          effectiveDate,
           idempotencyKey,
           eventId,
           input.importedAt
@@ -1950,6 +1977,17 @@ async function insertLifecycleEvent(client: PostgresQueryClient, input: {
   readonly payload: JsonValue;
 }): Promise<void> {
   const payload = JSON.stringify(input.payload);
+  const datedPayload = input.payload !== null && typeof input.payload === "object" && !Array.isArray(input.payload)
+    ? input.payload as Readonly<Record<string, JsonValue>> : undefined;
+  if (typeof datedPayload?.applicationDate === "string") {
+    const retained = await client.query<{ application_date: string | null }>(
+      `select payload->>'applicationDate' as application_date from erp_financials.financial_lifecycle_events
+       where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+      [input.tenantId, input.companyId, input.sourceId, input.idempotencyKey]);
+    if (retained.rows[0]?.application_date != null && retained.rows[0].application_date !== datedPayload.applicationDate) {
+      throw new Error("Changed imported application accounting date requires a reviewed correction; immutable date evidence was retained");
+    }
+  }
   await client.query(
     `insert into "erp_financials"."financial_lifecycle_events" (
       "event_id", "tenant_id", "company_id", "source_id", "aggregate_type", "aggregate_id",

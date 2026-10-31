@@ -178,3 +178,19 @@ No other app paths were inspected; no app files were changed. Real PostgreSQL
 SDK public-consumer validation substitutes for missing app evidence, not for an
 actual Spartan gateway run. Parent must rerun that app gateway after pinning the
 reviewed resulting Git SHA. See imported-invoice-credit-test-receipt.txt for checks.
+
+Imported application dates (0.3.188)
+
+New QuickBooks application events retain payload.applicationDate independently
+of provider sourceUpdatedAt/import timestamps. Customer allocations use the
+latest of the receipt date, wrapper date (when present), and that allocation's
+invoice recognition/document date. Receipt headers remain on their actual dates;
+payment-only replay resolves retained invoice dates. One split receipt does not
+wait for the latest date among unrelated target invoices.
+
+A replay conflicting with an explicit retained applicationDate requires reviewed
+correction and rolls back with the caller's transaction. Legacy events without
+this payload field are not rewritten or backfilled. No migration, ledger posting,
+source-window relaxation, party merge, or cross-source settlement is introduced.
+Use the public importer; adapters should not rewrite provider timestamps or patch
+SDK-owned document/application dates.

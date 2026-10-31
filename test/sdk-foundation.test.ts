@@ -795,7 +795,7 @@ class BillPaymentClient implements PostgresQueryClient {
         rows: [{ base_currency_code: "USD", accounting_basis: "accrual", status: "active" } as unknown as Row]
       });
     }
-    if (sql.includes("with payment_rows as")) {
+    if (sql.includes("with payment_page as materialized")) {
       this.paymentListParams = params;
       return Promise.resolve({ rows: [{
         payment_id: "payment_1",
@@ -816,7 +816,7 @@ class BillPaymentClient implements PostgresQueryClient {
         application_count: 0
       }] as unknown as Row[] });
     }
-    if (sql.includes("with canonical_bill_payments as") && sql.includes("from filtered")) {
+    if (sql.includes("canonical_bill_payments as") && sql.includes("from filtered")) {
       return Promise.resolve({ rows: [{
         scheduled_amount: "30",
         scheduled_count: 1,
@@ -828,7 +828,7 @@ class BillPaymentClient implements PostgresQueryClient {
         total_count: 3
       }] as unknown as Row[] });
     }
-    if (sql.includes("with canonical_bill_payments as")) {
+    if (sql.includes("canonical_bill_payments as")) {
       return Promise.resolve({ rows: [{
         payment_id: "payment_1",
         source_id: "source_1",

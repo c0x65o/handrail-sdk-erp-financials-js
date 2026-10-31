@@ -25,6 +25,7 @@ describe("customer statement read model", () => {
       customerId: "customer_1",
       asOfDate: "2026-08-31",
       currencyCode: "USD",
+      balance: {invoiceOutstandingAmount:"60.00",unappliedCashAmount:"0.00",unappliedCreditAmount:"0.00",netReceivableAmount:"60.00"},
       totals: {
         settlement: { cashAppliedAmount: "90.00", creditAppliedAmount: "0.00", writeOffAppliedAmount: "0.00" },
         invoiceCount: 2,
@@ -84,9 +85,9 @@ describe("customer statement read model", () => {
     expect(client.statementSql).toContain('document."tenant_id" = $1 and document."company_id" = $2');
     expect(client.statementSql).toContain('book_source."book_id" = $3');
     expect(client.statementSql).toContain('document."party_id" = $4');
-    expect(client.statementSql).toContain('document."document_date" <= $6::date');
+    expect(client.statementSql).toContain('coalesce(document."recognition_date",document."document_date") <= $6::date');
     expect(client.statementSql).toContain(`coalesce((ended_event."payload"->>'effectiveDate')::date, (ended_event."occurred_at" at time zone 'UTC')::date) >= ($6::date + interval '1 day')`);
-    expect(client.statementSql).not.toContain('document."open_amount"');
+    expect(client.statementSql).toContain('else greatest(document."original_amount" - coalesce(applied."amount", 0), 0)');
     expect(client.statementParameters[0]).toEqual([
       "tenant_1", "company_1", "book_1", "customer_1", "USD", "2026-08-31", undefined, undefined, 2, true
     ]);
@@ -165,7 +166,8 @@ function invoiceOne(): Record<string, unknown> {
       appliedLifecycleEventId: "event_applied", endedLifecycleEventId: "event_unapplied_later"
     }],
     total_invoice_count: 2, total_invoiced_amount: "150", total_applied_amount: "90",
-    total_outstanding_amount: "60"
+    total_outstanding_amount: "60",
+    balance_invoice: "60", balance_cash: "0", balance_credit: "0", balance_net: "60"
   };
 }
 

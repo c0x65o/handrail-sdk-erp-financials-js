@@ -88,8 +88,8 @@ describe("Future ERP app-owned storage and reporting boundary audit", () => {
     expect(jsonColumns.length).toBeGreaterThanOrEqual(14);
     expect(jsonColumns.every((column) => column.maxBytes !== undefined)).toBe(true);
     for (const column of jsonColumns) {
-      expect(FUTURE_ERP_CANONICAL_SCHEMA_MIGRATION_SQL.replace(/\s+/g, " ").replace(/\(\s+/g, "(").replace(/\s+\)/g, ")")).toContain(
-        `"${column.tableName}_${column.columnName}_bounded_json_check" check (octet_length(coalesce("${column.columnName}"::text, '')) <= ${String(column.maxBytes ?? DEFAULT_JSON_REF_MAX_BYTES)})`
+      expect(FUTURE_ERP_CANONICAL_SCHEMA_MIGRATION_SQL.replace(/[\s"]/gu, "").toLowerCase()).toContain(
+        `${column.tableName}_${column.columnName}_bounded_json_check check (octet_length(coalesce(${column.columnName}::text, '')) <= ${String(column.maxBytes ?? DEFAULT_JSON_REF_MAX_BYTES)})`.replace(/\s/gu, "").toLowerCase()
       );
     }
   });
@@ -274,7 +274,7 @@ function reportTotals(report: BuiltReport): Readonly<Record<string, string>> {
 
 function parseMigrationTables(sql: string): readonly MigrationTable[] {
   const tables: MigrationTable[] = [];
-  const tablePattern = /create table(?: if not exists)? "erp_financials"\."([^"]+)" \(([\s\S]*?)\n\);/g;
+  const tablePattern = /create table(?: if not exists)? "?erp_financials"?\."?([a-z_]+)"? \(([\s\S]*?)\n\);/gi;
   let match: RegExpExecArray | null;
 
   while ((match = tablePattern.exec(sql)) !== null) {
@@ -286,8 +286,8 @@ function parseMigrationTables(sql: string): readonly MigrationTable[] {
     tables.push({
       name,
       columns: body
-        .split("\n")
-        .map((line) => /^\s+"([^"]+)"\s+/.exec(line)?.[1])
+        .split(/[\n,]/u)
+        .map((line) => /^\s*"?([a-z_]+)"?\s+(?:text|integer|bigint|numeric|boolean|jsonb|date|timestamp|timestamptz)\b/iu.exec(line)?.[1])
         .filter((column): column is string => column !== undefined)
     });
   }

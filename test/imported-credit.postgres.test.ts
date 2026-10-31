@@ -4,6 +4,7 @@ import { Pool } from 'pg';
 // Intentionally consume the built public package, including its /sdk facade.
 import { createPostgresStorageAdapter, persistCanonicalFacts, persistQuickBooksSubledgerResources,
   createPostgresQuickBooksDualBasisBackfillPersistence, migratePostgresSchema, persistImportedCustomerPaymentEvidence,
+  mapHandrailQuickBooksSdkResourcesToCanonicalFacts,
   lockCustomerPaymentCorrectionSource, createFiscalCloseEvidenceChecksum, createFinancialActionCommandChecksum, createTransferReversalApprovalChecksum } from '@handrail/erp-financials';
 import { createErpFinancialsSdk } from '@handrail/erp-financials/sdk';
 import type { ErpFinancialsTransactionRunner, CustomerPaymentCorrectionGuard, CustomerPaymentCorrectionRequest, FinancialApprovalPolicy, FinancialAction, FinancialOperationContext, AdministratorFinancialGuard } from '@handrail/erp-financials';
@@ -21,6 +22,47 @@ suite('importer-generated imported credit public package PostgreSQL',()=>{
   }};
   beforeEach(async()=>{await pool.query<Record<string, unknown>>('drop schema if exists erp_financials cascade; drop schema if exists credit_test_app cascade');});
   afterAll(async()=>{await pool.query<Record<string, unknown>>('drop schema if exists erp_financials cascade; drop schema if exists credit_test_app cascade');await pool.end();});
+  it.each([false,true])("uses per-invoice accounting dates with provider timestamps intact (split receipt=%s)", async(split)=>{
+    await migratePostgresSchema(runner,{appliedByRef:'synthetic:application-dates'});
+    const fixture=importedCreditFixture();
+    const operationalDocuments=required(fixture.resources.operationalDocuments).filter(row=>!split || row.resource.sourceTransactionId!=="synthetic-phantom").map(row=>({...row,resource:{...row.resource,
+      ...(split && row.resource.sourceTransactionId==="synthetic-credit"?{unappliedAmount:"57.25",lines:[...row.resource.lines,{...required(row.resource.lines[0]),sourceLineId:"second-invoice",lineNumber:2,sourceAmount:"27.56",linkedTransactions:[{sourceTransactionId:"synthetic-invoice",sourceTransactionType:"Invoice",amount:"27.56"}]}]}:{}),
+      ...(row.resource.sourceTransactionId==='synthetic-invoice'?{transactionDate:'2025-07-04'}:{}),
+      ...(row.resource.sourceTransactionId==='synthetic-prior-invoice'?{transactionDate:'2025-07-06'}:{})
+    }}));
+    const resources={...fixture.resources,operationalDocuments,
+      ledgerTransactions:operationalDocuments.map(row=>({...row,resource:{...row.resource,lines:[]}}))};
+    const facts=mapHandrailQuickBooksSdkResourcesToCanonicalFacts({resources,context:{...scope,realmId:'synthetic-realm',providerEnvironment:'sandbox',
+      accountingBasis:'accrual',defaultCurrencyCode:'USD',importBatchId:'date-batch',checkpointId:'date-checkpoint',importedAt:now}});
+    const persist=async(documents=operationalDocuments)=>runner.transaction(async client=>{
+      await persistCanonicalFacts(createPostgresStorageAdapter(client),facts);
+      return persistQuickBooksSubledgerResources({client,facts,companyId:scope.companyId,importedAt:now,resources:{...resources,operationalDocuments:documents}});
+    });
+    expect((await persist()).unresolvedApplications).toEqual([]);
+    const dates=async()=> (await pool.query<Record<string, unknown>>(`select s.document_date::text receipt_date,a.application_date::text,
+      e.payload->>'applicationDate' event_date,to_char(e.occurred_at at time zone 'UTC','YYYY-MM-DD HH24:MI:SS') provider_updated_at
+      from erp_financials.subledger_applications a
+      join erp_financials.subledger_documents s on s.subledger_document_id=a.source_document_id
+      join erp_financials.financial_lifecycle_events e on e.event_id=a.applied_event_id order by a.application_date`)).rows;
+    const expected=[{receipt_date:split?'2025-07-02':'2025-07-03',application_date:'2025-07-04',event_date:'2025-07-04',provider_updated_at:'2025-07-05 12:00:00'},
+      {receipt_date:'2025-07-02',application_date:'2025-07-06',event_date:'2025-07-06',provider_updated_at:'2025-07-05 12:00:00'}];
+    expect(await dates()).toEqual(expected);
+    expect((await persist(operationalDocuments.filter(row=>row.resource.sourceTransactionType==='Payment'))).applications).toBe(0);
+    expect(await dates()).toEqual(expected);
+    const before=await dbState();
+    await expect(persist(operationalDocuments.map(row=>row.resource.sourceTransactionId==='synthetic-invoice'
+      ? {...row,resource:{...row.resource,transactionDate:'2025-07-03'}} : row))).rejects.toThrow('requires a reviewed correction');
+    expect(await dbState()).toEqual(before);
+    const sdk=createErpFinancialsSdk({database:runner,...scope,writeSourceId:scope.sourceId,bookId:'dates-book',currencyCode:'USD'});
+    await sdk.books.define({operation,bookId:'dates-book',name:'Dates',baseCurrencyCode:'USD'});
+    await sdk.books.bindSource({operation,bookId:'dates-book',sourceId:scope.sourceId,sourceRole:'historical'});
+    const customerId=required(facts.parties[0]).partyId;
+    expect((await sdk.queries.getCustomerStatement({customerId,asOfDate:'2025-07-03'})).balance)
+      .toMatchObject({invoiceOutstandingAmount:'0.00',unappliedCashAmount:split?'330.72':'358.28',netReceivableAmount:split?'-330.72':'-358.28'});
+    expect((await sdk.queries.getCustomerStatement({customerId,asOfDate:'2025-07-04'})).balance)
+      .toMatchObject({invoiceOutstandingAmount:'0.00',unappliedCashAmount:split?'303.16':'330.72',netReceivableAmount:split?'-303.16':'-330.72'});
+    expect((await pool.query('select count(*)::int as n from erp_financials.ledger_postings')).rows).toEqual([{n:0}]);
+  });
   async function dbState() {
     const tables=await pool.query<{table_schema:string;table_name:string}>(`select table_schema,table_name from information_schema.tables where table_schema in ('erp_financials','credit_test_app') and table_type='BASE TABLE' order by 1,2`);
     const state:unknown[]=[];
