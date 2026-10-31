@@ -1,6 +1,6 @@
 # Reviewed customer settlement across the cutover boundary
 
-Version 0.3.190 adds an opt-in `crossSource` contract to
+Version 0.3.191 adds an opt-in `crossSource` contract to
 `commands.paymentApplications.apply` for a native customer receipt applied to an
 otherwise unpaid historical QuickBooks invoice. The ordinary same-source command
 and checksum remain unchanged.

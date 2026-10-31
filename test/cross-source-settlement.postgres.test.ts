@@ -110,6 +110,25 @@ suite('reviewed native receipt → historical invoice settlement', () => {
     expect((await sdk.queries.getCustomerStatement({ customerId, asOfDate: '2025-08-03' })).balance?.unappliedCashAmount).toBe('27.56');
     expect((await sdk.queries.getCustomerStatement({ customerId: historicalCustomerId, asOfDate: '2025-08-03' })).balance?.invoiceOutstandingAmount).toBe('27.56');
   });
+  it('serializes undo with a historical-source collection reader', async() => {
+    const { sdk, command, historicalCustomerId } = await fixture();
+    const result = await sdk.commands.paymentApplications.apply(command);
+    let release!: () => void, entered!: () => void;
+    const holding = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const guard = sdk.queries.withLockedReceivableCollectionPositions({ requests: [{ sourceId: scope.sourceId,
+      customerId: historicalCustomerId, collectionRef: 'historical-invoice', invoiceId: command.targetDocumentId }] }, async ({ positions }) => {
+      expect(positions[0]?.openInvoiceAmount).toBe('0.00'); entered(); await holding;
+    });
+    await ready;
+    let finished = false;
+    const undo = sdk.commands.paymentApplications.unapply({ operation, applicationId: result.applicationId,
+      expectedVersion: result.version, effectiveDate: '2025-08-03' }).then(value => { finished = true; return value; });
+    try { await new Promise(resolve => setTimeout(resolve, 80)); expect(finished).toBe(false); }
+    finally { release(); }
+    await guard; await undo;
+    expect((await sdk.queries.getOperationalDocument(command.targetDocumentId)).openAmount).toBe('27.56');
+  });
   it('rejects unreviewed, mismapped, foreign identity and stale allocations atomically', async() => {
     const { sdk, command } = await fixture();
     for (const invalid of [

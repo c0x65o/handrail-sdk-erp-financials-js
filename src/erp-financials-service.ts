@@ -3987,7 +3987,12 @@ async function endSubledgerApplication(
   assertIsoDate(input.effectiveDate, "effectiveDate");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
   return context.database.transaction(async (client) => {
-    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    const coordinate = (await client.query(`select target_document_source_id from erp_financials.subledger_applications
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_application_id=$4`,
+      [context.tenantId, context.companyId, context.sourceId, input.applicationId])).rows[0];
+    const targetSource = storedOptionalString(coordinate?.target_document_source_id);
+    for (const sourceId of unique([context.sourceId, ...(targetSource ? [targetSource] : [])]).sort())
+      await lockCustomerPaymentCorrectionSource(client, context.tenantId, sourceId);
     await acquireTransactionLock(
       client,
       `subledger-application:${context.tenantId}:${context.companyId}:${context.sourceId}:${input.applicationId}`
@@ -4005,6 +4010,12 @@ for update`,
         "missing_document",
         { applicationId: input.applicationId }
       );
+    }
+    if (current.target_document_source_id != null && current.target_document_source_id !== context.sourceId) {
+      if (!input.operation.approverRef || input.operation.approverRef === input.operation.actorRef)
+        throw new ErpFinancialsValidationError("Cross-source settlement undo requires independent approval");
+      if (current.target_document_source_id !== targetSource)
+        throw new ErpFinancialsError("optimistic_concurrency_conflict", "Settlement source coordinates changed before locking", { retryable: true });
     }
     if (current.application_type === "customer_payment_to_refund") {
       throw new ErpFinancialsError("terminal_state_conflict", "Cash return settlements cannot be detached from their refund");
