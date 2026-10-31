@@ -442,3 +442,25 @@ commands until a compatible application is restored. Do not rewrite due dates
 or reverse valid post-cutover facts to make an older binary run. Validate the
 constraint scan and lock duration on the representative migration dataset before
 production cutover.
+
+## Signed expense lines (0.3.189)
+
+`vendorBills.create` accepts signed expense lines with a strictly positive net
+payable. A $100 expense and a -$20 supplier credit remain two commercial lines
+and post $100 expense debit, $20 expense credit and $80 AP credit. Negative
+lines use positive quantity and negative unit amount; their tax and discount
+components must be zero. A negative/zero net bill, inconsistent arithmetic or
+an expense using the bill's payable control account fails before writes.
+
+Cash-basis bill-payment applications allocate the remaining signed journal,
+including prior reversals, so cent-sized installments cannot over-recognize a
+credit. Unapplication reverses the exact original allocation on its effective
+date. Immutable source lines, idempotency fingerprints and existing source,
+period, account and independent-approval controls remain in force. No schema
+migration or consumer postinstall patch is needed.
+
+This does not add negative tax/discount component posting or settlement across
+historical and native sources. PostgreSQL integration tests exercise positive
+net signed bills, exact installments, replay/conflict, dated reversal, historical
+balances and invalid-input rollback. Consumer apps must also permit signed line
+storage and maintain their own review and approval workflow.

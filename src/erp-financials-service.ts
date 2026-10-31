@@ -2094,8 +2094,15 @@ async function createVendorBill(
   input: CreateVendorBillInput
 ): Promise<SubledgerDocumentResult> {
   input = structuredClone(input);
-  const expenseLines = normalizeSubledgerLines(input.expenseLines, "expenseLines");
-  const amount = sumSubledgerLines(expenseLines, "expenseLines");
+  const expenseLines = normalizeVendorBillLines(input.expenseLines);
+  const amount = normalizedPositiveMoney(formatMoney(expenseLines.reduce((sum, line) =>
+    sum + (line.amount.startsWith("-") ? -parsePositiveMoney(line.amount.slice(1), "expenseLines.amount")
+      : parsePositiveMoney(line.amount, "expenseLines.amount")), 0n)), "net bill total");
+  const signed = expenseLines.some(line => line.amount.startsWith("-"));
+  const payableAccountId = resolveAccountId(context, input.payableAccount);
+  if (signed && expenseLines.some(line => resolveAccountId(context, line) === payableAccountId)) {
+    throw new ErpFinancialsValidationError("Signed bill expense accounts must differ from its payable control");
+  }
   const policyValue: unknown = input.accountPolicy;
   if (policyValue !== undefined && (policyValue === null || typeof policyValue !== "object")) {
     throw new ErpFinancialsValidationError("Vendor bill account policy must be an object");
@@ -2117,7 +2124,8 @@ async function createVendorBill(
   };
   return createSubledgerDocument(context, {
     ...commonSubledgerDocument(context, input, "vendor_bill", amount, true,
-      normalizedPolicy === undefined ? {} : { accountPolicy: normalizedPolicy }),
+      { ...(normalizedPolicy === undefined ? {} : { accountPolicy: normalizedPolicy }),
+        ...(signed ? { vendorBillCredit: { amount, payableAccountId } } : {}) }),
     ...(normalizedPolicy === undefined ? {} : { accountRequirements: [
       ...expenseLines.map(line => ({ accountId: resolveAccountId(context, line), classifications: normalizedPolicy.expenseClassifications })),
       { accountId: resolveAccountId(context, input.payableAccount), classifications: normalizedPolicy.payableClassifications }
@@ -2127,7 +2135,7 @@ async function createVendorBill(
     journalLines: [
       ...expenseLines.map((line) => ({
         ...accountReferenceOnly(line),
-        debit: line.amount,
+        ...(line.amount.startsWith("-") ? { credit: line.amount.slice(1) } : { debit: line.amount }),
         partyId: input.vendorId,
         ...(line.itemId === undefined ? {} : { itemId: line.itemId }),
         ...(line.description === undefined ? {} : { description: line.description }),
@@ -4106,6 +4114,59 @@ for key share`,
     await assertImportedPaymentCashCredit(client, context, input.sourceDocument);
   }
   let controlAccountId: string | undefined;
+  // A positive-only bill has one credit: its payable control. Avoid adding
+  // metadata queries to the existing high-volume positive-bill path.
+  if (input.applicationType === "bill_payment_to_bill"
+    && accrualPostings.filter(posting => parsePositiveOrZeroMoney(posting.creditAmount, "credit") > 0n).length > 1) {
+    const bill = (await client.query(`select subledger_document_id, metadata, original_amount::text
+      from erp_financials.subledger_documents where tenant_id=$1 and company_id=$2 and source_id=$3
+      and transaction_id=$4 and document_type='vendor_bill'`,
+    [context.tenantId, context.companyId, context.sourceId, input.targetTransactionId])).rows[0];
+    const metadata = storedJson(bill?.metadata) as { vendorBillCredit?: { amount?: unknown; payableAccountId?: unknown } } | undefined;
+    const credit = metadata?.vendorBillCredit;
+    if (credit !== undefined) {
+      const payable = accrualPostings.filter(posting => posting.accountId === credit.payableAccountId);
+      if (!bill || payable.length !== 1 || payable[0]?.debitAmount !== "0.00"
+        || payable[0].creditAmount !== storedMoney(bill.original_amount, "original_amount")
+        || credit.amount !== payable[0].creditAmount) {
+        throw new ErpFinancialsValidationError("Credited bill cash projection requires its exact net payable account");
+      }
+      controlAccountId = payable[0].accountId;
+      // Allocate the remaining journal, including prior reversals. Independent
+      // percentage rounding on each installment can otherwise over-recognize
+      // a small credit. End operations reverse the exact original allocation.
+      const identities = accrualPostings.map(posting => posting.sourcePostingId);
+      if (input.action === "recognize") {
+        const recognized = (await client.query(`with origins as (select jsonb_array_elements_text($5::jsonb) id)
+          select o.id,trunc(coalesce(sum(p.debit_amount-p.credit_amount),0)*100)::text as net_minor
+          from origins o left join erp_financials.subledger_applications a
+            on a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3 and a.target_document_id=$4
+            and a.application_type='bill_payment_to_bill'
+            and ($7::text is null or a.subledger_application_id<>$7)
+          left join erp_financials.ledger_postings p on p.tenant_id=$1 and p.source_id=$3 and p.accounting_basis='cash'
+            and p.transaction_id=$6 and p.source_posting_id in ('cash-application:'||a.subledger_application_id||':recognize:'||o.id,'cash-application:'||a.subledger_application_id||':reverse:'||o.id)
+          group by o.id`, [context.tenantId, context.companyId, context.sourceId, bill.subledger_document_id,
+          JSON.stringify(identities), input.targetTransactionId, input.previewReleasedApplicationId ?? null])).rows;
+        const used = new Map(recognized.map(row => [storedString(row.id, "id"), BigInt(storedString(row.net_minor, "net_minor"))]));
+        accrualPostings = accrualPostings.map(posting => {
+          const debit = parsePositiveOrZeroMoney(posting.debitAmount, "debit"), credit = parsePositiveOrZeroMoney(posting.creditAmount, "credit"), net = used.get(posting.sourcePostingId) ?? 0n;
+          const remainingDebit = debit > 0n ? debit - net : 0n, remainingCredit = credit > 0n ? credit + net : 0n;
+          if (remainingDebit < 0n || remainingCredit < 0n || remainingDebit > debit || remainingCredit > credit) throw new ErpFinancialsValidationError("Bill allocations exceed their original journal");
+          return { ...posting, debitAmount: formatMoney(remainingDebit), creditAmount: formatMoney(remainingCredit), netAmount: formatMoney(remainingDebit - remainingCredit) };
+        });
+      } else {
+        const prefix = `cash-application:${input.applicationId}:recognize:`;
+        const allocated = (await client.query(`select source_posting_id,debit_amount::text,credit_amount::text from erp_financials.ledger_postings
+          where tenant_id=$1 and source_id=$2 and transaction_id=$3 and accounting_basis='cash' and source_posting_id=any($4::text[])`,
+        [context.tenantId, context.sourceId, input.targetTransactionId, identities.map(id => prefix + id)])).rows;
+        const byOrigin = new Map(allocated.map(row => [storedString(row.source_posting_id, "source_posting_id").slice(prefix.length), row]));
+        accrualPostings = accrualPostings.map(posting => {
+          const prior = byOrigin.get(posting.sourcePostingId), debit = prior ? storedMoney(prior.debit_amount, "debit_amount") : "0.00", credit = prior ? storedMoney(prior.credit_amount, "credit_amount") : "0.00";
+          return { ...posting, debitAmount: debit, creditAmount: credit, netAmount: formatMoney(parsePositiveOrZeroMoney(debit, "debit") - parsePositiveOrZeroMoney(credit, "credit")) };
+        });
+      }
+    }
+  }
   if(input.applicationType !== "bill_payment_to_bill") {
     const components=(await client.query(`select distinct d.subledger_document_id,d.original_amount::text,l.discount_account_id
       from erp_financials.subledger_documents d join erp_financials.subledger_document_lines l
@@ -4800,6 +4861,32 @@ function normalizeSubledgerLines(
   return lines.map((line, index) => {
     if (line.taxAccount !== undefined || line.discountAccount !== undefined) throw new ErpFinancialsValidationError("Invoice component accounts are unsupported for this document type");
     return {...accountReferenceOnly(line),...normalizeCommercialDocumentLine(line, `${field}[${String(index)}]`)};
+  });
+}
+
+/** Vendor invoice credits retain their signed commercial line, not a second
+ * liability or a collapsed net expense. Component tax/discount semantics for
+ * negative lines are deliberately rejected until their own posting contract. */
+function normalizeVendorBillLines(lines: readonly VendorBillExpenseLine[]) {
+  if (!Array.isArray(lines) || !lines.length) throw new ErpFinancialsValidationError("expenseLines must contain at least one line");
+  return lines.map((line: VendorBillExpenseLine, index: number) => {
+    const field = `expenseLines[${String(index)}]`;
+    if (line.taxAccount !== undefined || line.discountAccount !== undefined) throw new ErpFinancialsValidationError("Invoice component accounts are unsupported for this document type");
+    if (typeof line.amount !== "string" || !line.amount.startsWith("-")) {
+      const normalized = normalizeSubledgerLines([line], field)[0];
+      if (!normalized) throw new ErpFinancialsValidationError("Missing vendor bill line");
+      return normalized;
+    }
+    if ((line.taxAmount !== undefined && parsePositiveOrZeroMoney(line.taxAmount, `${field}.taxAmount`) !== 0n)
+      || (line.discountAmount !== undefined && parsePositiveOrZeroMoney(line.discountAmount, `${field}.discountAmount`) !== 0n)) {
+      throw new ErpFinancialsValidationError("Signed vendor bill lines require zero tax and discount components");
+    }
+    if (line.unitAmount !== undefined && (typeof line.unitAmount !== "string" || !line.unitAmount.startsWith("-"))) {
+      throw new ErpFinancialsValidationError(`${field}.unitAmount must be negative for a bill credit`);
+    }
+    const normalized = normalizeCommercialDocumentLine({ ...line, amount: line.amount.slice(1),
+      ...(line.unitAmount === undefined ? {} : { unitAmount: line.unitAmount.slice(1) }) }, field);
+    return { ...accountReferenceOnly(line), ...normalized, amount: `-${normalized.amount}`, unitAmount: `-${normalized.unitAmount}` };
   });
 }
 

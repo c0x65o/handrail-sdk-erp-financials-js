@@ -1,0 +1,440 @@
+{
+  "version": "0.3.189",
+  "sourceRunId": "3f163371-2be9-4767-bde8-40f4dbaafcb9",
+  "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+  "counts": {
+    "passed": 1291,
+    "failed": 0,
+    "skipped": 8
+  },
+  "testFiles": 73,
+  "initialUnaffectedBatches": [
+    {
+      "batch": 1,
+      "files": [
+        "test/account-hierarchy-persistence.test.ts",
+        "test/account-hierarchy-rollup-lines.test.ts",
+        "test/account-register-scale.postgres.test.ts",
+        "test/accounting-basis-projection.test.ts",
+        "test/accounting-controls-read-models.test.ts",
+        "test/canonical-schema-manifest.test.ts",
+        "test/cash-flow-scale.postgres.test.ts",
+        "test/cash-flow-summary.test.ts",
+        "test/collection-position-input.test.ts",
+        "test/company-scope.postgres.test.ts",
+        "test/core-erp-persistence-evidence.test.ts",
+        "test/core-erp-reporting-read-model.test.ts",
+        "test/customer-statement-read-model.test.ts",
+        "test/erp-financials-service.test.ts",
+        "test/financial-lifecycle.test.ts",
+        "test/financial-statement-snapshot.test.ts"
+      ],
+      "exitCode": 0,
+      "seconds": 10.46,
+      "passed": 121,
+      "failed": 0,
+      "skipped": 2,
+      "success": true
+    },
+    {
+      "batch": 2,
+      "files": [
+        "test/financial-statements-scale.postgres.test.ts",
+        "test/fiscal-close-totals-verification.test.ts",
+        "test/fiscal-diagnostics-scale.postgres.test.ts",
+        "test/fiscal-periods.test.ts",
+        "test/fixture-smoke-health.test.ts",
+        "test/freshness-drilldown-health.test.ts",
+        "test/future-erp-app-owned-boundary-audit.test.ts",
+        "test/future-erp-canonical-import-smoke.test.ts",
+        "test/future-erp-install-health-preflight.test.ts",
+        "test/future-erp-persistence.test.ts",
+        "test/future-erp-preflight.test.ts",
+        "test/future-erp-quickbooks-full-sync.test.ts",
+        "test/future-erp-quickbooks-incremental-sync.test.ts",
+        "test/future-erp-reporting-read-model.test.ts",
+        "test/future-erp-rollup-workers.test.ts",
+        "test/future-erp-sandbox-replay.test.ts"
+      ],
+      "exitCode": 0,
+      "seconds": 10.79,
+      "passed": 79,
+      "failed": 0,
+      "skipped": 2,
+      "success": true
+    },
+    {
+      "batch": 3,
+      "files": [
+        "test/future-erp-sandbox-sync-worker.test.ts",
+        "test/future-erp-snapshot-workers.test.ts",
+        "test/general-ledger-contract.test.ts",
+        "test/health-contract.test.ts",
+        "test/imported-credit.postgres.test.ts",
+        "test/income-attribution-scale.postgres.test.ts",
+        "test/install-health.test.ts",
+        "test/invoice-components.test.ts",
+        "test/journal-mixed-scale.postgres.test.ts",
+        "test/normalized-quickbooks-contract-compatibility.test.ts",
+        "test/normalized-quickbooks-contract-smoke.test.ts",
+        "test/normalized-quickbooks-sync-fixtures.test.ts",
+        "test/package-boundary.test.ts",
+        "test/payment-pages-scale.postgres.test.ts",
+        "test/postgres-migrations.test.ts",
+        "test/postgres-storage.test.ts"
+      ],
+      "exitCode": 0,
+      "seconds": 153.35,
+      "passed": 136,
+      "failed": 0,
+      "skipped": 3,
+      "success": true
+    }
+  ],
+  "affectedAndFinalBatches": [
+    {
+      "batch": 0,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 38.66,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "ac32ce75b38f65d23e291048aef80c153449807fed29585c3a88df874c98aed4"
+    },
+    {
+      "batch": 1,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 40.28,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "7f9e38c942841c4f9321a934ce5d7184c7e23763584067bb66d2dbcdca1cdaed"
+    },
+    {
+      "batch": 2,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 35.42,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "ae6bd204e7562e87735fd6f88e4ae2adaa95daf30688a834066f0b1e62d8a862"
+    },
+    {
+      "batch": 3,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 32.31,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "b8eda95bd4b3532f4b40fc7aa2ac0cd32a77950c31d68a2ee84d2ba413a14900"
+    },
+    {
+      "batch": 4,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 29.31,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "7597c8d875ae70d7922cea469a523aa1caf7b81b191461927786a0d525a88e99"
+    },
+    {
+      "batch": 5,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 39.84,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "242cccce4b65d531fb7d0fb353176d7f5e91166bcc209ad38065839874b681c0"
+    },
+    {
+      "batch": 6,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 46.23,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "6f242c03fb8db1f7aa5cc00c83d1578b093cc714ee7f9fbca0ca9fb947ddf3bf"
+    },
+    {
+      "batch": 7,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 45.71,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "c13e3b085c3ee73dbef6bd0577d2436969b57c089b134916a194da34d98b0917"
+    },
+    {
+      "batch": 8,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 45.86,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "434da4195294555d3f1c75f13b3ebc5644c3bad03a491731407a745cf7f0a22d"
+    },
+    {
+      "batch": 9,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 34.88,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "97338c18c59fd1c82c2178472750773fe028df877f234a770d3cef17ee1d9472"
+    },
+    {
+      "batch": 10,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 44.92,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "44353c2fe6ab8073aeb13ed14e4ee4eda8ad6505b030fda181599c228248a1a4"
+    },
+    {
+      "batch": 11,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 36.72,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "d9663f9606abbe6d8262b96e639d1927b36c7e85457b09b74c5cbc5e764d8122"
+    },
+    {
+      "batch": 12,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 37.1,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "11bed35dead64bb598f25e8b49ed94066d237e7ea5095385ac7b97bdb0063941"
+    },
+    {
+      "batch": 13,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 31.65,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "3c00b61b51a29baa39eb8f1d5230b00e91c5faa080203bd2a020f2699d612ff1"
+    },
+    {
+      "batch": 14,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 55.89,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "14d0cabbd4694c1e280fc779251cacfdf3a7e2c5c1b86ed262be39e3479d4c31"
+    },
+    {
+      "batch": 15,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 43.74,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "e9763c45677f1c807318e88df9185f63c767b216a01cbdeca80624c749af0255"
+    },
+    {
+      "batch": 16,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 50.55,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "57b1b309d5c09962662f2756a35925c45f250b06cf8037f323f09006f00e76fc"
+    },
+    {
+      "batch": 17,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 45.98,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "9ba7228cb00a11a6cbc6a1c539ca4034776a54852b985fcf5858da5dd0bd281d"
+    },
+    {
+      "batch": 18,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 53.28,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "2c7a28ae88a2b8b5157e784e15486c1faa7159ca0b725a0c24159067d93a744e"
+    },
+    {
+      "batch": 19,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 37.88,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "361dcbd65714044e66ec5ad6905831037d32b2eb767ad24b75b14113eeffb59c"
+    },
+    {
+      "batch": 20,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 54.37,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "74b37f9d5625acd30f87713e547899ce0661a8440ef1baebf9fb251af534bc4a"
+    },
+    {
+      "batch": 21,
+      "files": [
+        "test/postgres.integration.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 31.84,
+      "passed": 22,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "0eae2d821a2bd9ca7eecc3ff3ec863546e2a31564121111cab9ebc3375516e7c"
+    },
+    {
+      "batch": 22,
+      "files": [
+        "test/postgres-transaction-runner.test.ts",
+        "test/quickbooks-commercial-detail.test.ts",
+        "test/quickbooks-dual-basis-backfill.test.ts",
+        "test/quickbooks-full-sync-replace.test.ts",
+        "test/quickbooks-provider-report-parity.test.ts",
+        "test/quickbooks-sdk-envelope-adapter.test.ts",
+        "test/quickbooks-sync-service.test.ts",
+        "test/quickbooks-sync-workers.test.ts",
+        "test/receivables-provenance.test.ts",
+        "test/receivables-register-read-models.test.ts",
+        "test/receivables-scale.postgres.test.ts",
+        "test/recurring-financials.test.ts",
+        "test/release-publication.test.ts",
+        "test/report-builders-fixtures.test.ts",
+        "test/report-controls.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 9.19,
+      "passed": 163,
+      "failed": 0,
+      "skipped": 1,
+      "reportSha256": "d38e9361f9596f67c483ddd26a1ee7f1b4b7585f275db6a4fc9f45b8114d63a1"
+    },
+    {
+      "batch": 23,
+      "files": [
+        "test/reporting-calendar.test.ts",
+        "test/review-surface.test.ts",
+        "test/rollup-jobs.test.ts",
+        "test/sdk-account-hierarchy-read-model.test.ts",
+        "test/sdk-foundation.test.ts",
+        "test/serialized-evidence-boundary.test.ts",
+        "test/source-adapters.test.ts",
+        "test/source-record-dispositions.test.ts",
+        "test/transaction-matching.test.ts"
+      ],
+      "sourceSha256": "505c513b5318ec0d1a33cb8d36e98f6ec05a1eb0ef8a080473241ff9ebe617f3",
+      "exitCode": 0,
+      "seconds": 6.43,
+      "passed": 98,
+      "failed": 0,
+      "skipped": 0,
+      "reportSha256": "30f19026a1f0bba9a18200d578377ac56f00c0520bc6337e96fa7a95de2fb182"
+    }
+  ],
+  "originalFailure": "First large integration batch: paging case failed at 6.57s with a generic runner stack, consistent with the default timeout; the next setup deadlocked. Remove the added metadata query from positive-only bills (one payable credit). Five focused signed/paging/correction tests passed; rerun the entire affected batch in 32-case selections and complete the final batch. No baseline failure waived.",
+  "skips": "Eight existing opt-in scale tests remain unverified. Pattern-excluded cases are not counted as skips.",
+  "validationAuthorization": {
+    "source_run_id": "3f163371-2be9-4767-bde8-40f4dbaafcb9",
+    "allow_expensive": true,
+    "decision": "user_requested",
+    "evidence_quote": "Under the standing approval, deploy each batch to Hitcents ERP production once lint, typecheck and the full suite pass",
+    "scope": "Shared SDK signed vendor bill implementation and consumer validation, sequential short file batches"
+  },
+  "rawReceipts": "/opt/handrail/repos/handrail/erp-financials/handrail-sdk-erp-financials-js/.test-artifacts/3f163371"
+}

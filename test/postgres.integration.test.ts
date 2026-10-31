@@ -3351,6 +3351,72 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     return { sdk, options, operation, bill, hold, payment };
   }
 
+  it.each([
+    { gross: "100.00", credit: "20.00", net: "80.00", installment: "40.00", count: 2 },
+    { gross: "0.04", credit: "0.01", net: "0.03", installment: "0.01", count: 3 }
+  ])("signed vendor bill $net retains commercial lines, exact installment cash and dated reversal", async fixture => {
+    const { sdk, operation } = await paymentHoldFixture();
+    const account = await sdk.commands.accounts.upsertTree({ operation, parent: { accountKey: "signed-expense", name: "Signed expense", classification: "expense", type: "Expense" } });
+    void account;
+    const command = { operation, idempotencyKey: "signed:bill", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: [
+        { accountKey: "signed-expense", amount: fixture.gross, quantity: "1", unitAmount: fixture.gross, description: "Original charge" },
+        { accountKey: "signed-expense", amount: `-${fixture.credit}`, quantity: "1", unitAmount: `-${fixture.credit}`, description: "Supplier credit" }
+      ] };
+    const bill = await sdk.commands.vendorBills.create(command);
+    expect((await sdk.queries.getVendorBill(bill.documentId)).lines.map(line => ({ amount: line.amount, unitAmount: line.unitAmount, description: line.description })))
+      .toEqual(command.expenseLines.map(line => ({ amount: line.amount, unitAmount: line.unitAmount, description: line.description })));
+    expect(await sdk.queries.getVendorBill(bill.documentId)).toMatchObject({ originalAmount: fixture.net, openAmount: fixture.net });
+    const journal = async (basis: string) => (await pool.query<Record<string, unknown>>(`select p.source_posting_id,p.account_id,p.debit_amount::text,p.credit_amount::text,p.posting_date::text
+      from erp_financials.ledger_postings p where p.transaction_id=$1 and p.accounting_basis=$2 order by p.source_posting_id`, [bill.journal.transactionId, basis])).rows;
+    const accrual = await journal("accrual");
+    expect(accrual.map(row => row.credit_amount)).toContain(fixture.credit);
+    const applications: { applicationId: string; version: number }[] = [];
+    for (let i = 0; i < fixture.count; i++) {
+      const payment = await sdk.commands.billPayments.recordAndApply({ operation, idempotencyKey: `signed:payment:${String(i)}`, date: `2026-08-${String(10+i)}`, vendorId: "vendor_1", amount: fixture.installment,
+        paymentMethod: "ach", payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" },
+        allocations: [{ billId: bill.documentId, amount: fixture.installment, expectedBillVersion: i + 1 }] });
+      const review = await sdk.queries.getBillPaymentCorrectionReview({ sourceId: "source_1", paymentId: payment.billPaymentId, limit: 10 });
+      const application = review.items[0]; if (!application) throw Error("Missing signed bill application");
+      applications.push(application);
+    }
+    const summed = async () => (await pool.query<Record<string, unknown>>(`select account_id,sum(debit_amount)::text as debit,sum(credit_amount)::text as credit
+      from erp_financials.ledger_postings where transaction_id=$1 and accounting_basis='cash' group by account_id order by account_id`, [bill.journal.transactionId])).rows;
+    const recognized = await summed();
+    const expected = (await pool.query<Record<string, unknown>>(`select account_id,sum(debit_amount)::text as debit,sum(credit_amount)::text as credit
+      from erp_financials.ledger_postings where transaction_id=$1 and accounting_basis='accrual' group by account_id order by account_id`, [bill.journal.transactionId])).rows;
+    expect(recognized).toEqual(expected);
+    expect(await sdk.queries.getVendorBill(bill.documentId)).toMatchObject({ openAmount: "0.00" });
+    const beforeReplay = await depositDatabaseState(pool);
+    await sdk.commands.vendorBills.create(command);
+    expect(await depositDatabaseState(pool)).toEqual(beforeReplay);
+    await expect(sdk.commands.vendorBills.create({ ...command, expenseLines: [...command.expenseLines].reverse() })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    const first = applications[0]; if (!first) throw Error("Missing application");
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: first.applicationId, expectedVersion: first.version, effectiveDate: "2026-08-20" });
+    const cash = await journal("cash"), original = cash.filter(row => String(row.source_posting_id).startsWith(`cash-application:${first.applicationId}:recognize:`)), reversal = cash.filter(row => String(row.source_posting_id).startsWith(`cash-application:${first.applicationId}:reverse:`));
+    expect(reversal).toHaveLength(original.length);
+    for (const row of original) expect(reversal).toContainEqual({ ...row, source_posting_id: String(row.source_posting_id).replace(":recognize:", ":reverse:"), debit_amount: row.credit_amount, credit_amount: row.debit_amount, posting_date: "2026-08-20" });
+    expect(await sdk.queries.getVendorBill(bill.documentId, "2026-08-19")).toMatchObject({ openAmount: "0.00" });
+    expect(await sdk.queries.getVendorBill(bill.documentId, "2026-08-20")).toMatchObject({ openAmount: fixture.installment });
+    expect(await journal("accrual")).toEqual(accrual);
+  });
+
+  it("signed vendor bills reject invalid net, components, controls and arithmetic before writes", async () => {
+    const { sdk, operation } = await paymentHoldFixture();
+    const base = { operation, idempotencyKey: "signed:invalid", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" } };
+    const before = await depositDatabaseState(pool);
+    for (const expenseLines of [
+      [{ accountId: "account_cash", amount: "-1.00" }],
+      [{ accountId: "account_cash", amount: "1.00" }, { accountId: "account_cash", amount: "-1.00" }],
+      [{ accountId: "account_cash", amount: "10.00" }, { accountId: "account_cash", amount: "-1.00", quantity: "1", unitAmount: "1.00" }],
+      [{ accountId: "account_cash", amount: "10.00" }, { accountId: "account_cash", amount: "-1.00", quantity: "2", unitAmount: "-1.00" }],
+      [{ accountId: "account_cash", amount: "10.00" }, { accountId: "account_ap", amount: "-1.00" }],
+      [{ accountId: "account_cash", amount: "10.00" }, { accountId: "account_cash", amount: "-1.00", taxAmount: "0.01" }],
+      [{ accountId: "account_cash", amount: "10.00" }, { accountId: "account_cash", amount: "-1.00", discountAmount: "0.01" }]
+    ]) await expect(sdk.commands.vendorBills.create({ ...base, expenseLines })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(before);
+  });
+
   it("bill recording retirement fences delayed immediate, raw and scheduled payment commands after close", async () => {
     const {sdk,options,operation,hold,payment}=await paymentHoldFixture();
     await sdk.commands.vendorBills.setPaymentHold(hold);
