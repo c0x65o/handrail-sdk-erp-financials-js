@@ -12425,7 +12425,7 @@ where subledger_document_id = $1`, [original.documentId]);
         expectedVersion: 1 })).rejects.toThrow("must remain an active posting account");
       const upgraded = await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade" });
       expect(upgraded.currentVersion).toBe(upgrade);
-      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 48, toVersion: 49 });
+      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 50, toVersion: 51 });
       expect(await history()).toEqual(before);
       expect((await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade-replay" })).applied).toEqual([]);
     }
