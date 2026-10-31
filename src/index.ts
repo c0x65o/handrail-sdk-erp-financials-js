@@ -756,6 +756,7 @@ export type {
   PreviewCustomerPaymentCashReturnResult,
   ReturnCustomerPaymentCashResult,
   ApplySubledgerPaymentInput,
+  CrossSourceCustomerSettlement,
   RetireBillPaymentRecordingInput,
   RetireBillPaymentRecordingResult,
   RetireReceiptApplicationInput,

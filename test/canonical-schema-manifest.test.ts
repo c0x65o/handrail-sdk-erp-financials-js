@@ -52,8 +52,8 @@ describe("canonical schema manifest", () => {
   });
 
   it("is versioned and covers the documented canonical entities", () => {
-    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.manifestVersion).toBe("2026-10-23.accounting-access-control");
-    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion).toBe(49);
+    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.manifestVersion).toBe("2026-10-31.cross-source-customer-settlement");
+    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion).toBe(50);
 
     const tableNames = POSTGRES_CANONICAL_SCHEMA_MANIFEST.tables.map((table) => table.name);
 
@@ -299,7 +299,7 @@ describe("canonical schema manifest", () => {
       [34, 35],
       [35, 36],
       [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42],
-      [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]
+      [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50]
     ]);
     expect(renderPostgresSchemaSql()).toContain('create table if not exists "erp_financials"."schema_migrations"');
     expect(FUTURE_ERP_CANONICAL_SCHEMA_MIGRATION_SQL).not.toMatch(

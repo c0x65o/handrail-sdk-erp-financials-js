@@ -1026,8 +1026,8 @@ from (select coalesce(sum(a.applied_amount),0) as applied_amount
   from erp_financials.subledger_applications a
   join erp_financials.financial_lifecycle_events e on e.tenant_id=a.tenant_id and e.company_id=a.company_id
     and e.source_id=a.source_id and e.event_id=a.applied_event_id
-  where a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3
-    and (a.source_document_id=$4 or a.target_document_id=$4) and a.status='applied'
+  where a.tenant_id=$1 and a.company_id=$2
+    and ((a.source_id=$3 and a.source_document_id=$4) or (coalesce(a.target_document_source_id,a.source_id)=$3 and a.target_document_id=$4)) and a.status='applied'
     and e.event_type='subledger_application.applied') native_overlay
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   and "subledger_document_id" = $4 and "open_amount" is distinct from ($5::numeric - native_overlay.applied_amount)`,

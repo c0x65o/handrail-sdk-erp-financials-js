@@ -61,8 +61,8 @@ export type PostgresTableManifest = {
 };
 
 export type PostgresSchemaManifest = {
-  readonly manifestVersion: "2026-10-23.accounting-access-control";
-  readonly schemaVersion: 49;
+  readonly manifestVersion: "2026-10-31.cross-source-customer-settlement";
+  readonly schemaVersion: 50;
   readonly dialect: "postgres";
   readonly namespace: "erp_financials";
   readonly requiredTriggers: readonly PostgresTriggerManifest[];
@@ -152,11 +152,14 @@ const table = (
 });
 
 export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
-  manifestVersion: "2026-10-23.accounting-access-control",
-  schemaVersion: 49,
+  manifestVersion: "2026-10-31.cross-source-customer-settlement",
+  schemaVersion: 50,
   dialect: "postgres",
   namespace: "erp_financials",
   requiredTriggers: [
+    { name: "cross_source_invoice_facts_guard", table: "subledger_documents", timing: "before", events: ["update", "delete"], functionName: "guard_cross_source_invoice_facts" },
+    { name: "cross_source_invoice_balance_guard", table: "subledger_documents", timing: "after", events: ["update"], functionName: "check_cross_source_invoice_balance", deferredConstraint: true },
+    ...["transactions", "ledger_postings", "transaction_lines"].map(table => ({ name: "cross_source_historical_journal_guard", table, timing: "before" as const, events: ["insert", "update", "delete"] as const, functionName: "guard_cross_source_historical_journal" })),
     ...ACCOUNTING_ACCESS_GUARDED_TABLES.map(table=>({name:'accounting_access_guard',table,timing:'before' as const,events:['insert','update','delete','truncate'] as const,functionName:'guard_accounting_access',level:'statement' as const})),
     {name:'accounting_access_control_command',table:'accounting_access_control',timing:'before',events:['insert','update','delete'],functionName:'guard_accounting_access_control'},
     {name:'accounting_access_control_no_truncate',table:'accounting_access_control',timing:'before',events:['truncate'],functionName:'preserve_accounting_access_evidence',level:'statement'},
@@ -1343,6 +1346,7 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
         text("application_type"),
         text("source_document_id"),
         text("target_document_id"),
+        text("target_document_source_id", true),
         numeric("applied_amount"),
         text("currency_code"),
         date("application_date"),
@@ -1408,7 +1412,7 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
         ),
         foreignKey(
           "subledger_applications_target_document_scope_fk",
-          ["tenant_id", "company_id", "source_id", "target_document_id"],
+          ["tenant_id", "company_id", "target_document_source_id", "target_document_id"],
           "subledger_documents",
           ["tenant_id", "company_id", "source_id", "subledger_document_id"]
         ),

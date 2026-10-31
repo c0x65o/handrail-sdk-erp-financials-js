@@ -268,6 +268,8 @@ function correctionService(context: Context, post: (client: PostgresQueryClient,
     for (const a of applications) {
       if (a.application_type !== "customer_payment_to_invoice" || a.source_document_id !== request.paymentId)
         fail("Unsupported payment application");
+      if (a.target_document_source_id != null && a.target_document_source_id !== context.sourceId)
+        fail("Cross-source applications require independent settlement undo before payment correction");
       const invoice = (await client.query(`select * from erp_financials.subledger_documents where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_document_id=$4 for update`, [...scope, a.target_document_id])).rows[0];
       if (!invoice || invoice.document_type !== "invoice" || invoice.status === "voided" || invoice.currency_code !== payment.currency_code || invoice.party_id !== payment.party_id)
         fail("Invalid linked invoice");

@@ -648,6 +648,7 @@ export type PaymentApplicationListItem = {
   readonly applicationDate: IsoDate;
   readonly sourcePaymentId: string;
   readonly targetDocumentId: string;
+  readonly targetDocumentSourceId?: string;
   readonly amount: DecimalString;
   readonly currencyCode: IsoCurrencyCode;
   readonly appliedLifecycleEventId: string;
@@ -2709,7 +2710,7 @@ left join lateral (
     sum(applied_amount) filter(where application_type='write_off_to_invoice') write_off_applied_amount,
     sum(applied_amount) filter(where subledger_application_id=v.application_id) cancellation_amount
   from erp_financials.subledger_applications a where p.provenance='posted' and a.tenant_id=$1 and a.company_id=$2
-    and a.source_id=p.source_id and a.target_document_id=p.invoice_id and a.currency_code=p.currency_code and a.status='applied'
+    and coalesce(a.target_document_source_id,a.source_id)=p.source_id and a.target_document_id=p.invoice_id and a.currency_code=p.currency_code and a.status='applied'
 ) a on true`;
 
 async function getInvoiceSummariesByIds(scope: Scope, request: { readonly invoiceIds: readonly string[]; readonly customerId: string; readonly asOfDate?: IsoDate }): Promise<readonly InvoiceRegisterItem[]> {
@@ -2827,14 +2828,14 @@ const INVOICE_RECEIPT_PAGE_CTES = `, receipt_evidence as (
     p.created_at payment_created_at,p.idempotency_key payment_idempotency_key,p.transaction_id payment_transaction_id,
     t.memo payment_memo,e.event_id lifecycle_event_id,e.actor_ref,e.approver_ref,e.request_id,e.reason_code,
     (p.subledger_document_id is null or p.document_type<>'customer_payment' or p.status='voided'
-      or p.party_id is distinct from i.party_id or p.currency_code<>a.currency_code or t.transaction_id is null
+      or (p.party_id is distinct from i.party_id and coalesce(a.target_document_source_id,a.source_id)=a.source_id) or p.currency_code<>a.currency_code or t.transaction_id is null
       or not exists(select 1 from erp_financials.reporting_book_sources bs
         where bs.tenant_id=$1 and bs.company_id=$2 and bs.book_id=$3 and bs.source_id=p.source_id
           and (bs.effective_from is null or bs.effective_from<=p.document_date)
           and (bs.effective_through is null or bs.effective_through>=p.document_date))) invalid
   from erp_financials.subledger_applications a
   join (select distinct invoice_id,source_id,party_id from invoice_detail_rows where provenance='posted') i
-    on i.invoice_id=a.target_document_id and i.source_id=a.source_id
+    on i.invoice_id=a.target_document_id and i.source_id=coalesce(a.target_document_source_id,a.source_id)
   left join erp_financials.subledger_documents p on p.tenant_id=a.tenant_id and p.company_id=a.company_id
     and p.source_id=a.source_id and p.subledger_document_id=a.source_document_id
   left join erp_financials.transactions t on t.tenant_id=p.tenant_id and t.source_id=p.source_id and t.transaction_id=p.transaction_id
@@ -3019,7 +3020,7 @@ async function getInvoicesByIds(
       coalesce(sum(a.applied_amount) filter(where a.application_type='write_off_to_invoice'),0) as write_off_applied_amount,
       coalesce(sum(a.applied_amount) filter(where a.subledger_application_id=void.application_id),0) as cancellation_amount
     from erp_financials.subledger_applications a
-    where a.tenant_id=document.tenant_id and a.company_id=document.company_id and a.source_id=document.source_id
+    where a.tenant_id=document.tenant_id and a.company_id=document.company_id and coalesce(a.target_document_source_id,a.source_id)=document.source_id
       and a.target_document_id=document.subledger_document_id and a.currency_code=document.currency_code and a.status='applied'
   ) settlement on true
   left join lateral (
@@ -3195,7 +3196,7 @@ async function listInvoiceAudit(scope: Scope, invoiceId: string, input: PageRequ
      and draft."issued_document_id"=anchor."invoice_id"
   union select application."source_id",'subledger_application',application."subledger_application_id"
     from anchor join "erp_financials"."subledger_applications" application
-      on application."tenant_id"=$1 and application."company_id"=$2 and application."source_id"=anchor."source_id"
+      on application."tenant_id"=$1 and application."company_id"=$2 and coalesce(application."target_document_source_id",application."source_id")=anchor."source_id"
      and application."target_document_id"=anchor."invoice_id"
 ), evidence as (
   select event.* from related
@@ -3473,7 +3474,7 @@ async function getCustomerStatement(
     application_source."provider_environment", application."applied_event_id", application."ended_event_id"
   from "erp_financials"."subledger_applications" application
   join scoped_invoices invoice
-    on invoice."source_id" = application."source_id" and invoice."invoice_id" = application."target_document_id"
+    on invoice."source_id" = coalesce(application."target_document_source_id",application."source_id") and invoice."invoice_id" = application."target_document_id"
   join "erp_financials"."financial_lifecycle_events" applied_event
     on applied_event."tenant_id" = application."tenant_id" and applied_event."company_id" = application."company_id"
    and applied_event."source_id" = application."source_id" and applied_event."event_id" = application."applied_event_id"
@@ -3659,7 +3660,7 @@ function vendorBillRowsSql(billIdParameter = 10, currency = "$5", vendor = "$6",
       on ended_event."tenant_id" = application."tenant_id" and ended_event."company_id" = application."company_id"
      and ended_event."source_id" = application."source_id" and ended_event."event_id" = application."ended_event_id"
     where application."tenant_id" = document."tenant_id" and application."company_id" = document."company_id"
-      and application."source_id" = document."source_id" and application."target_document_id" = document."subledger_document_id"
+      and coalesce(application."target_document_source_id",application."source_id") = document."source_id" and application."target_document_id" = document."subledger_document_id"
       and application."application_type" in ('bill_payment_to_bill', 'vendor_credit_to_bill')
       and application."application_date" <= $4::date
       and coalesce((applied_event."payload"->>'applicationDate')::date, (applied_event."occurred_at" at time zone 'UTC')::date) < ($4::date + interval '1 day')
@@ -4215,7 +4216,7 @@ async function getVendorBillSummary(
       on ended_event."tenant_id" = application."tenant_id" and ended_event."company_id" = application."company_id"
      and ended_event."source_id" = application."source_id" and ended_event."event_id" = application."ended_event_id"
     where application."tenant_id" = document."tenant_id" and application."company_id" = document."company_id"
-      and application."source_id" = document."source_id" and application."target_document_id" = document."subledger_document_id"
+      and coalesce(application."target_document_source_id",application."source_id") = document."source_id" and application."target_document_id" = document."subledger_document_id"
       and application."application_type" in ('bill_payment_to_bill', 'vendor_credit_to_bill')
       and application."application_date" <= $4::date
       and coalesce((applied_event."payload"->>'applicationDate')::date, (applied_event."occurred_at" at time zone 'UTC')::date) < ($4::date + interval '1 day')
@@ -4231,7 +4232,7 @@ async function getVendorBillSummary(
       on ended_event."tenant_id" = application."tenant_id" and ended_event."company_id" = application."company_id"
      and ended_event."source_id" = application."source_id" and ended_event."event_id" = application."ended_event_id"
     where application."tenant_id" = document."tenant_id" and application."company_id" = document."company_id"
-      and application."source_id" = document."source_id" and application."target_document_id" = document."subledger_document_id"
+      and coalesce(application."target_document_source_id",application."source_id") = document."source_id" and application."target_document_id" = document."subledger_document_id"
       and application."application_type" = 'bill_payment_to_bill'
       and application."application_date" between $7::date and $8::date
       and coalesce((applied_event."payload"->>'applicationDate')::date, (applied_event."occurred_at" at time zone 'UTC')::date) < ($4::date + interval '1 day')
@@ -4400,7 +4401,7 @@ async function listCustomerPaymentRegister(
      and (application_source."effective_through" is null or application_source."effective_through" >= application."application_date")
     join "erp_financials"."subledger_documents" invoice
       on invoice."tenant_id" = application."tenant_id" and invoice."company_id" = application."company_id"
-     and invoice."source_id" = application."source_id" and invoice."subledger_document_id" = application."target_document_id"
+     and invoice."source_id" = coalesce(application."target_document_source_id",application."source_id") and invoice."subledger_document_id" = application."target_document_id"
      and invoice."document_type" in ('invoice', 'refund') and invoice."currency_code" = $4
     where application."tenant_id" = document."tenant_id" and application."company_id" = document."company_id"
       and application."source_id" = document."source_id"
@@ -4433,7 +4434,7 @@ limit $${String(parameters.length)}`,
       : (await client.query(
         `select application."subledger_application_id" as "application_id", application."source_id",
   application."application_type", application."status", application."version", application."application_date"::text as "application_date",
-  application."source_document_id" as "source_payment_id", application."target_document_id",
+  application."source_document_id" as "source_payment_id", application."target_document_id", application."target_document_source_id",
   application."applied_amount", application."currency_code", application."applied_event_id", application."ended_event_id",
   application."match_candidate_id", application."match_decision_id", application."match_method", application."match_score",
   application."match_evidence", invoice."document_number" as "target_document_number",
@@ -4446,7 +4447,7 @@ join "erp_financials"."reporting_book_sources" source
  and (source."effective_through" is null or source."effective_through" >= application."application_date")
 join "erp_financials"."subledger_documents" invoice
   on invoice."tenant_id" = application."tenant_id" and invoice."company_id" = application."company_id"
- and invoice."source_id" = application."source_id" and invoice."subledger_document_id" = application."target_document_id"
+ and invoice."source_id" = coalesce(application."target_document_source_id",application."source_id") and invoice."subledger_document_id" = application."target_document_id"
  and invoice."document_type" = 'invoice' and invoice."currency_code" = $4
 where application."tenant_id" = $1 and application."company_id" = $2
   and application."application_type" = 'customer_payment_to_invoice' and application."status" = 'applied'
@@ -5559,7 +5560,7 @@ async function queryPaymentApplications(
   const result = await client.query(
     `select application."subledger_application_id" as "application_id", application."source_id",
   application."application_type", application."status", application."version", application."application_date"::text as "application_date",
-  application."source_document_id" as "source_payment_id", application."target_document_id",
+  application."source_document_id" as "source_payment_id", application."target_document_id", application."target_document_source_id",
   application."applied_amount", application."currency_code", application."applied_event_id", application."ended_event_id",
   application."match_candidate_id", application."match_decision_id", application."match_method", application."match_score",
   application."match_evidence"
@@ -5569,7 +5570,7 @@ join "erp_financials"."subledger_documents" source_document
  and source_document."source_id" = application."source_id" and source_document."subledger_document_id" = application."source_document_id"
 join "erp_financials"."subledger_documents" target_document
   on target_document."tenant_id" = application."tenant_id" and target_document."company_id" = application."company_id"
- and target_document."source_id" = application."source_id" and target_document."subledger_document_id" = application."target_document_id"
+ and target_document."source_id" = coalesce(application."target_document_source_id",application."source_id") and target_document."subledger_document_id" = application."target_document_id"
 join "erp_financials"."reporting_book_sources" source
   on source."tenant_id" = application."tenant_id" and source."company_id" = application."company_id"
  and source."book_id" = $3 and source."source_id" = application."source_id"
@@ -5658,7 +5659,7 @@ async function listAdjustmentRegister(
    and (application_source."effective_through" is null or application_source."effective_through" >= application."application_date")
   join "erp_financials"."subledger_documents" invoice
     on invoice."tenant_id" = application."tenant_id" and invoice."company_id" = application."company_id"
-   and invoice."source_id" = application."source_id" and invoice."subledger_document_id" = application."target_document_id"
+   and invoice."source_id" = coalesce(application."target_document_source_id",application."source_id") and invoice."subledger_document_id" = application."target_document_id"
    and invoice."document_type" = 'invoice' and invoice."currency_code" = $4
   join "erp_financials"."reporting_book_sources" invoice_source
     on invoice_source."tenant_id" = invoice."tenant_id" and invoice_source."company_id" = invoice."company_id"
@@ -7547,7 +7548,7 @@ order by "account_number" nulls last, "name", "book_account_key"`,
 // never caller-provided values; reporting inputs remain bound parameters.
 function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType = "$4", offsetTypes = "$7", party?: string): string {
   return `with effective_applications as materialized (
-  select application."source_id",application."target_document_id",application."source_document_id",
+  select application."source_id",coalesce(application."target_document_source_id",application."source_id") as target_source_id,application."target_document_id",application."source_document_id",
     application."application_type",application."applied_amount"
   from "erp_financials"."subledger_applications" application
   join "erp_financials"."reporting_book_sources" source
@@ -7562,7 +7563,8 @@ function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType 
   where application."tenant_id" = $1 and application."company_id" = $2 and application."currency_code" = ${currency}
     ${party === undefined ? "" : `and exists(select 1 from erp_financials.subledger_documents customer_document
       where customer_document.tenant_id=application.tenant_id and customer_document.company_id=application.company_id
-        and customer_document.source_id=application.source_id and customer_document.subledger_document_id=application.source_document_id
+        and ((customer_document.source_id=application.source_id and customer_document.subledger_document_id=application.source_document_id)
+          or (customer_document.source_id=coalesce(application.target_document_source_id,application.source_id) and customer_document.subledger_document_id=application.target_document_id))
         and customer_document.party_id=${party})`}
     and application."application_type" in ('customer_payment_to_invoice','credit_to_invoice','write_off_to_invoice','customer_payment_to_refund')
     and application."application_date" <= ${asOf}::date
@@ -7570,7 +7572,7 @@ function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType 
     and (ended_event."event_id" is null or coalesce((ended_event."payload"->>'effectiveDate')::date, (ended_event."occurred_at" at time zone 'UTC')::date) > ${asOf}::date)
 ), applied_documents as (
   select source_id, document_id, document_type, sum(applied_amount) amount from (
-    select source_id,target_document_id document_id,'invoice'::text document_type,applied_amount
+    select target_source_id as source_id,target_document_id document_id,'invoice'::text document_type,applied_amount
     from effective_applications where application_type in ('customer_payment_to_invoice','credit_to_invoice','write_off_to_invoice')
     union all
     select source_id,source_document_id,
@@ -8743,6 +8745,7 @@ function paymentApplicationFromRow(row: Readonly<Record<string, unknown>>): Paym
     applicationDate: date(row.application_date, "application_date"),
     sourcePaymentId: string(row.source_payment_id, "source_payment_id"),
     targetDocumentId: string(row.target_document_id, "target_document_id"),
+    ...(row.target_document_source_id == null ? {} : { targetDocumentSourceId: string(row.target_document_source_id, "target_document_source_id") }),
     amount: money(row.applied_amount, "applied_amount"),
     currencyCode: string(row.currency_code, "currency_code"),
     appliedLifecycleEventId: string(row.applied_event_id, "applied_event_id"),
@@ -9826,11 +9829,15 @@ async function getReceivableCollectionPositions(scope: Scope, input: ReceivableC
 ), applied as (
  select i.request_index,coalesce(sum(a.applied_amount),0) as amount from invoice i
  join sources s on s.request_index=i.request_index
- join erp_financials.subledger_applications a on a.tenant_id=$1 and a.company_id=$2 and a.source_id=s.source_id and a.target_document_id=i.id
+ join erp_financials.subledger_applications a on a.tenant_id=$1 and a.company_id=$2 and coalesce(a.target_document_source_id,a.source_id)=s.source_id and a.target_document_id=i.id
  join erp_financials.subledger_documents p on p.tenant_id=a.tenant_id and p.company_id=a.company_id and p.source_id=a.source_id and p.subledger_document_id=a.source_document_id
- where (s.effective_from is null or s.effective_from<=p.document_date) and (s.effective_through is null or s.effective_through>=p.document_date)
+ join erp_financials.reporting_book_sources payment_source on payment_source.tenant_id=$1 and payment_source.company_id=$2
+ and payment_source.book_id=$3 and payment_source.source_id=p.source_id
+ where (payment_source.effective_from is null or payment_source.effective_from<=p.document_date)
+ and (payment_source.effective_through is null or payment_source.effective_through>=p.document_date)
  and i.basis='invoice' and a.status='applied' and a.application_type='customer_payment_to_invoice'
- and p.document_type='customer_payment' and p.party_id=s.customer_id and p.currency_code=$5 and p.status not in ('voided','replaced')
+ and p.document_type='customer_payment' and (p.party_id=s.customer_id or a.target_document_source_id is distinct from a.source_id and a.target_document_source_id is not null)
+ and p.currency_code=$5 and p.status not in ('voided','replaced')
  group by i.request_index
 )
 select s.request_index,s.source_bound,(select count(*)::integer from invoice where request_index=s.request_index) as invoice_count,
@@ -9878,29 +9885,32 @@ async function getReceivableCollectionCoverageHistory(scope: Scope, input: Recei
  select r.*,s.effective_from,s.effective_through from requested r
  join erp_financials.reporting_book_sources s on s.tenant_id=$1 and s.company_id=$2 and s.book_id=$3 and s.source_id=r.source_id
 ), payments as materialized (
- select r.request_index,r.invoice_id,p.*,p.metadata->>'collectionRef'=r.collection_ref as in_collection,
+ select r.request_index,r.invoice_id,r.source_id as invoice_source_id,p.*,(p.source_id=r.source_id and p.metadata->>'collectionRef'=r.collection_ref) as in_collection,
    v.effective_date as void_date
  from scoped r join lateral (
-   select d.subledger_document_id as payment_id from erp_financials.subledger_documents d
+   select d.subledger_document_id as payment_id,d.source_id from erp_financials.subledger_documents d
    where d.tenant_id=$1 and d.company_id=$2 and d.source_id=r.source_id and d.party_id=r.customer_id
      and d.document_type='customer_payment' and d.metadata->>'collectionRef'=r.collection_ref
    union
-   select a.source_document_id from erp_financials.subledger_applications a
-   where a.tenant_id=$1 and a.company_id=$2 and a.source_id=r.source_id
+   select a.source_document_id,a.source_id from erp_financials.subledger_applications a
+   where a.tenant_id=$1 and a.company_id=$2 and coalesce(a.target_document_source_id,a.source_id)=r.source_id
      and a.target_document_id=r.invoice_id and a.application_type='customer_payment_to_invoice'
  ) identity on true
- join erp_financials.subledger_documents p on p.tenant_id=$1 and p.company_id=$2 and p.source_id=r.source_id
-   and p.subledger_document_id=identity.payment_id and p.party_id=r.customer_id and p.document_type='customer_payment' and p.currency_code=$5
+ join erp_financials.subledger_documents p on p.tenant_id=$1 and p.company_id=$2 and p.source_id=identity.source_id
+   and p.subledger_document_id=identity.payment_id and (p.party_id=r.customer_id or p.source_id<>r.source_id) and p.document_type='customer_payment' and p.currency_code=$5
  left join lateral (
    select (e.payload->>'effectiveDate')::date as effective_date from erp_financials.customer_payment_corrections c
    join erp_financials.financial_lifecycle_events e on e.tenant_id=c.tenant_id and e.company_id=c.company_id and e.source_id=c.source_id and e.event_id=c.lifecycle_event_id
    where c.tenant_id=p.tenant_id and c.company_id=p.company_id and c.source_id=p.source_id and c.payment_id=p.subledger_document_id
  ) v on true
- where (r.effective_from is null or r.effective_from<=p.document_date) and (r.effective_through is null or r.effective_through>=p.document_date)
+ join erp_financials.reporting_book_sources payment_source on payment_source.tenant_id=$1 and payment_source.company_id=$2
+ and payment_source.book_id=$3 and payment_source.source_id=p.source_id
+ where (payment_source.effective_from is null or payment_source.effective_from<=p.document_date)
+ and (payment_source.effective_through is null or payment_source.effective_through>=p.document_date)
 ), applications as materialized (
  select p.request_index,a.application_date,a.applied_amount,a.status,ae.event_id as applied_event_id,ee.event_id as ended_event_id,
    coalesce((ee.payload->>'effectiveDate')::date,(ee.occurred_at at time zone 'UTC')::date) as ended_date,
-   (case when a.application_type='customer_payment_to_invoice' and a.target_document_id=p.invoice_id then 1 else 0 end
+   (case when a.application_type='customer_payment_to_invoice' and coalesce(a.target_document_source_id,a.source_id)=p.invoice_source_id and a.target_document_id=p.invoice_id then 1 else 0 end
     -case when p.in_collection then 1 else 0 end) as direction
  from payments p join erp_financials.subledger_applications a on a.tenant_id=p.tenant_id and a.company_id=p.company_id and a.source_id=p.source_id
    and a.source_document_id=p.subledger_document_id and a.currency_code=$5

@@ -95,6 +95,7 @@ export class PostgresMigrationError extends Error {
 const namespace = POSTGRES_CANONICAL_SCHEMA_MANIFEST.namespace;
 const migrationLockKey = `${namespace}:schema-migrations`;
 const migrationFiles = {
+  crossSourceSettlementV50: new URL("../migrations/future-erp/20261031010000_add_cross_source_customer_settlement.sql",import.meta.url),
   accountingAccessV49: new URL("../migrations/future-erp/20261023040000_add_accounting_access_control.sql",import.meta.url),
   paymentPagesV48: new URL("../migrations/future-erp/20261023030000_add_payment_page_indexes.sql",import.meta.url),
   receiptApplicationDatesV47: new URL("../migrations/future-erp/20261023020000_guard_receipt_application_dates.sql",import.meta.url),
@@ -362,7 +363,8 @@ export const POSTGRES_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
   migration("20261023010000_separate_invoice_recognition_dates","Separate contractual invoice dates and accrual recognition",45,46,migrationFiles.invoiceRecognitionV46),
   migration("20261023020000_guard_receipt_application_dates","Prevent allocations before cash receipt",46,47,migrationFiles.receiptApplicationDatesV47),
   migration("20261023030000_add_payment_page_indexes","Ordered payment page membership",47,48,migrationFiles.paymentPagesV48),
-  migration("20261023040000_add_accounting_access_control","Durable database-wide accounting maintenance",48,49,migrationFiles.accountingAccessV49)
+  migration("20261023040000_add_accounting_access_control","Durable database-wide accounting maintenance",48,49,migrationFiles.accountingAccessV49),
+  migration("20261031010000_add_cross_source_customer_settlement","Reviewed native receipt settlement of historical invoices",49,50,migrationFiles.crossSourceSettlementV50)
 ] as const;
 
 export async function planPostgresMigrations(
