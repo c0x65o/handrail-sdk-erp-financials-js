@@ -4364,7 +4364,8 @@ async function assertImportedPaymentCashCredit(
 
 /** Resolve only exact imported object identities, never amount/date/number matches. */
 async function loadImportedDocumentAccrualPostings(
-  client: PostgresQueryClient, context: ServiceContext, headerTransactionId: string
+  client: PostgresQueryClient, context: ServiceContext, headerTransactionId: string,
+  allowSignedVendorBill = false
 ): Promise<readonly Record<string, unknown>[]> {
   const header = (await client.query(`select t.*, d.original_amount, d.document_type, d.metadata
     from erp_financials.transactions t
@@ -4389,13 +4390,18 @@ async function loadImportedDocumentAccrualPostings(
     order by posting_id for share`, [context.tenantId,context.sourceId,transactions.map(t=>t.transaction_id)])).rows;
   const ids = unique(rows.map(r=>String(r.transaction_id)));
   const transaction = transactions.find(t=>t.transaction_id===ids[0]);
+  const debit = rows.reduce((sum,r)=>sum+parsePositiveOrZeroMoney(r.debit_amount,'debit_amount'),0n);
+  const credit = rows.reduce((sum,r)=>sum+parsePositiveOrZeroMoney(r.credit_amount,'credit_amount'),0n);
+  const original = parsePositiveMoney(header.original_amount,'original_amount');
+  // Only the reviewed cross-source vendor path supplies an explicit payable
+  // control to the cash allocator. Other callers keep their original contract.
+  const signedBill = allowSignedVendorBill && header.document_type === 'vendor_bill';
   // One complete journal is supported. Duplicate/split/ambiguous basis journals
   // must be reconciled by the importer rather than summed or guessed here.
   if (ids.length !== 1 || !transaction || transaction.status !== 'posted' || transaction.currency_code !== header.currency_code ||
       (transaction.party_id !== null && transaction.party_id !== header.party_id) ||
       rows.some(r=>r.currency_code !== header.currency_code || r.party_id !== header.party_id) ||
-      rows.reduce((sum,r)=>sum+parsePositiveOrZeroMoney(r.debit_amount,'debit_amount'),0n) !== parsePositiveMoney(header.original_amount,'original_amount') ||
-      rows.reduce((sum,r)=>sum+parsePositiveOrZeroMoney(r.credit_amount,'credit_amount'),0n) !== parsePositiveMoney(header.original_amount,'original_amount')) {
+      debit !== credit || (signedBill ? debit < original : debit !== original)) {
     throw new ErpFinancialsValidationError('Incomplete or ambiguous imported document accrual provenance');
   }
   const reversed = await client.query(`select 1 from erp_financials.journal_entry_links
@@ -7537,11 +7543,18 @@ async function prepareCrossSourceSettlement(
   if (parsePositiveOrZeroMoney(target.open_amount, "open_amount") + applied !== parsePositiveMoney(target.original_amount, "original_amount"))
     throw new ErpFinancialsValidationError("Historical provider balance lacks complete settlement evidence");
   const historicalContext = { ...context, sourceId: bridge.targetSourceId };
-  const originals = (await loadImportedDocumentAccrualPostings(client, historicalContext, storedString(target.transaction_id, "transaction_id"))).map(storedLedgerPosting);
+  const originals = (await loadImportedDocumentAccrualPostings(client, historicalContext, storedString(target.transaction_id, "transaction_id"), payable)).map(storedLedgerPosting);
   if (originals.some(posting => posting.itemId !== undefined || posting.dimensionRefs.length > 0))
     throw new ErpFinancialsValidationError("Cross-source settlement requires explicit item and dimension mappings for dimensional invoices");
-  const controls = originals.filter(posting => parsePositiveOrZeroMoney(posting[controlSide], "control") > 0n);
-  if (controls.length !== 1 || controls[0]?.[controlSide] !== storedMoney(target.original_amount, "original_amount"))
+  const historicalAccounts = payable ? (await client.query(`select account_id,type,classification from erp_financials.accounts
+    where tenant_id=$1 and source_id=$2 and account_id=any($3::text[]) for share`,
+    [context.tenantId, bridge.targetSourceId, unique(originals.map(posting => posting.accountId))])).rows : [];
+  const controls = originals.filter(posting => parsePositiveOrZeroMoney(posting[controlSide], "control") > 0n
+    && (!payable || historicalAccounts.some(account => account.account_id === posting.accountId
+      && account.type === "AccountsPayable" && account.classification === "liability")));
+  if (controls.length !== 1 || controls[0]?.[controlSide] !== storedMoney(target.original_amount, "original_amount")
+    || originals.filter(posting => posting.accountId === controls[0]?.accountId).length !== 1
+    || (payable && controls[0].debitAmount !== "0.00"))
     throw new ErpFinancialsValidationError("Cross-source settlement requires one unambiguous receivable/payable control");
   const mapping = new Map(bridge.accountMappings.map(row => [row.historicalAccountId, row.nativeAccountId]));
   const historicalIds = unique(originals.map(posting => posting.accountId));
@@ -7584,7 +7597,8 @@ async function prepareCrossSourceSettlement(
     return { ...posting, debitAmount: formatMoney(remainingDebit), creditAmount: formatMoney(remainingCredit), netAmount: formatMoney(remainingDebit - remainingCredit) };
   });
   const postings = projectCashBasisApplication({ applicationId, applicationType: payable ? "bill_payment_to_bill" : "customer_payment_to_invoice", action: "recognize",
-    appliedAmount: amount, effectiveDate: input.applicationDate, importBatchId: scopedRecordId(context, "import_batch", `cross-source-settlement:${applicationId}:recognize`), accrualPostings: remaining });
+    appliedAmount: amount, effectiveDate: input.applicationDate, importBatchId: scopedRecordId(context, "import_batch", `cross-source-settlement:${applicationId}:recognize`), accrualPostings: remaining,
+    ...(payable ? { controlAccountId: controls[0].accountId } : {}) });
   await assertPostingAccountEligibility(client, context, [...mapping.values()]);
   return postings.map(posting => {
     const accountId = mapping.get(posting.accountId);
