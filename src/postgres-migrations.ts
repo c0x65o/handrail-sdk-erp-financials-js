@@ -95,6 +95,7 @@ export class PostgresMigrationError extends Error {
 const namespace = POSTGRES_CANONICAL_SCHEMA_MANIFEST.namespace;
 const migrationLockKey = `${namespace}:schema-migrations`;
 const migrationFiles = {
+  crossSourceVendorV52: new URL("../migrations/future-erp/20261031030000_add_cross_source_vendor_settlement.sql", import.meta.url),
   providerApplicationRefreshV51: new URL("../migrations/future-erp/20261031020000_preserve_provider_application_refresh.sql",import.meta.url),
   crossSourceSettlementV50: new URL("../migrations/future-erp/20261031010000_add_cross_source_customer_settlement.sql",import.meta.url),
   accountingAccessV49: new URL("../migrations/future-erp/20261023040000_add_accounting_access_control.sql",import.meta.url),
@@ -366,7 +367,8 @@ export const POSTGRES_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
   migration("20261023030000_add_payment_page_indexes","Ordered payment page membership",47,48,migrationFiles.paymentPagesV48),
   migration("20261023040000_add_accounting_access_control","Durable database-wide accounting maintenance",48,49,migrationFiles.accountingAccessV49),
   migration("20261031010000_add_cross_source_customer_settlement","Reviewed native receipt settlement of historical invoices",49,50,migrationFiles.crossSourceSettlementV50),
-  migration("20261031020000_preserve_provider_application_refresh","Preserve provider application refresh balance deltas",50,51,migrationFiles.providerApplicationRefreshV51)
+  migration("20261031020000_preserve_provider_application_refresh","Preserve provider application refresh balance deltas",50,51,migrationFiles.providerApplicationRefreshV51),
+  migration("20261031030000_add_cross_source_vendor_settlement", "Reviewed native payment settlement of historical vendor bills", 51, 52, migrationFiles.crossSourceVendorV52)
 ] as const;
 
 export async function planPostgresMigrations(

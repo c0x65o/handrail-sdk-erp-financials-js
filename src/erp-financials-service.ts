@@ -767,16 +767,19 @@ export type SubledgerApplicationType =
   | "write_off_to_invoice"
   | "customer_payment_to_refund";
 
-/** Reviewed bridge between an active native source and an imported historical invoice.
+/** Reviewed bridge from an active native payment to a historical invoice or vendor bill.
  * The host must bind reviewRef to its immutable approval receipt. Names/provider IDs
  * are never identity evidence. The operation requires an independent approver. */
-export type CrossSourceCustomerSettlement = {
+export type CrossSourceSettlement = {
   readonly targetSourceId: string;
   readonly nativePartyId: string;
   readonly historicalPartyId: string;
   readonly reviewRef: string;
   readonly accountMappings: readonly { readonly historicalAccountId: string; readonly nativeAccountId: string }[];
 };
+
+/** Backward-compatible name for the original customer-only bridge. */
+export type CrossSourceCustomerSettlement = CrossSourceSettlement;
 
 export type ApplySubledgerPaymentInput = {
   readonly operation: FinancialOperationContext;
@@ -788,7 +791,7 @@ export type ApplySubledgerPaymentInput = {
   readonly applicationDate: IsoDate;
   readonly expectedSourceVersion: number;
   readonly expectedTargetVersion: number;
-  readonly crossSource?: CrossSourceCustomerSettlement;
+  readonly crossSource?: CrossSourceSettlement;
   readonly match?: {
     readonly matchCandidateId: string;
     readonly matchDecisionId: string;
@@ -3803,9 +3806,9 @@ async function applySubledgerPayment(
     assertFinancialApproval(context, input.operation);
     if (!input.operation.approverRef || input.operation.approverRef === input.operation.actorRef)
       throw new ErpFinancialsValidationError("Cross-source settlement requires independent approval");
-    if (input.applicationType !== "customer_payment_to_invoice" || input.match || retirementInput
+    if (!["customer_payment_to_invoice", "bill_payment_to_bill"].includes(input.applicationType) || input.match || retirementInput
       || !context.bookId || input.crossSource.targetSourceId === context.sourceId)
-      throw new ErpFinancialsValidationError("Cross-source settlement supports reviewed native receipts and historical invoices only");
+      throw new ErpFinancialsValidationError("Cross-source settlement supports reviewed native payments and historical invoices or bills only");
     for (const key of ["targetSourceId", "nativePartyId", "historicalPartyId", "reviewRef"] as const) assertNonEmpty(input.crossSource[key], `crossSource.${key}`);
     if (!input.crossSource.accountMappings.length) throw new ErpFinancialsValidationError("Cross-source settlement requires complete account mappings");
   }
@@ -3877,7 +3880,7 @@ async function applySubledgerPayment(
       input.sourceDocumentId,
       input.targetDocumentId
     ], input.crossSource?.targetSourceId);
-    const crossSourcePlan = input.crossSource === undefined ? undefined : await prepareCrossSourceCustomerSettlement(client, context, input, source, target, amount, applicationId);
+    const crossSourcePlan = input.crossSource === undefined ? undefined : await prepareCrossSourceSettlement(client, context, input, source, target, amount, applicationId);
     if (input.applicationType === "bill_payment_to_bill" && target.payment_hold === true) throw new ErpFinancialsError("terminal_state_conflict", "Vendor bill is on payment hold");
     assertSubledgerApplicationDocuments(input, source,
       crossSourcePlan ? { ...target, party_id: source.party_id } : target, amount);
@@ -7487,15 +7490,20 @@ function stableJson(value: unknown): string {
 
 /** Cash recognition belongs to the active source, not the historical invoice's
  * expired reporting window. The original document and journal remain untouched. */
-async function prepareCrossSourceCustomerSettlement(
+async function prepareCrossSourceSettlement(
   client: PostgresQueryClient, context: ServiceContext, input: ApplySubledgerPaymentInput,
   source: Record<string, unknown>, target: Record<string, unknown>, amount: string, applicationId: string
 ): Promise<readonly LedgerPosting[]> {
   const bridge = input.crossSource;
+  const payable = input.applicationType === "bill_payment_to_bill";
+  const sourceType = payable ? "bill_payment" : "customer_payment";
+  const targetType = payable ? "vendor_bill" : "invoice";
+  const controlSide = payable ? "creditAmount" : "debitAmount";
+  const fundingSide = payable ? "debit_amount" : "credit_amount";
   if (!bridge) throw new ErpFinancialsValidationError("Missing settlement review");
   if (source.party_id !== bridge.nativePartyId || target.party_id !== bridge.historicalPartyId
     || source.currency_code !== context.currencyCode || target.currency_code !== context.currencyCode
-    || source.document_type !== "customer_payment" || target.document_type !== "invoice"
+    || source.document_type !== sourceType || target.document_type !== targetType
     || [source.status, target.status].some(status => status === "voided" || status === "replaced"))
     throw new ErpFinancialsValidationError("Settlement review does not match the document identities and currency");
   const bindings = (await client.query(`select b.*,s.source_system from erp_financials.reporting_book_sources b
@@ -7513,8 +7521,8 @@ async function prepareCrossSourceCustomerSettlement(
   const receipt = (await client.query(`select t.* from erp_financials.transactions t
     join erp_financials.financial_outbox o on o.tenant_id=t.tenant_id and o.source_id=t.source_id and o.aggregate_id=t.transaction_id
     where t.tenant_id=$1 and t.source_id=$2 and t.transaction_id=$3 and o.company_id=$4 and o.book_id=$5
-      and o.event_type='ledger.posted' and t.source_transaction_type='Subledger:customer_payment' and t.status='posted'
-    for share of t,o`, [context.tenantId, context.sourceId, source.transaction_id, context.companyId, context.bookId])).rows;
+      and o.event_type='ledger.posted' and t.source_transaction_type=$6 and t.status='posted'
+    for share of t,o`, [context.tenantId, context.sourceId, source.transaction_id, context.companyId, context.bookId, `Subledger:${sourceType}`])).rows;
   if (receipt.length !== 1) throw new ErpFinancialsValidationError("Cross-source settlement requires an original native receipt in this book");
   const prior = (await client.query(`select a.*,e.payload from erp_financials.subledger_applications a
     join erp_financials.financial_lifecycle_events e on e.tenant_id=a.tenant_id and e.company_id=a.company_id
@@ -7522,7 +7530,7 @@ async function prepareCrossSourceCustomerSettlement(
     where a.tenant_id=$1 and a.company_id=$2 and coalesce(a.target_document_source_id,a.source_id)=$3
       and a.target_document_id=$4 order by a.subledger_application_id for share of a,e`,
     [context.tenantId, context.companyId, bridge.targetSourceId, input.targetDocumentId])).rows;
-  if (prior.some(row => row.application_type !== "customer_payment_to_invoice" || row.source_id !== context.sourceId
+  if (prior.some(row => row.application_type !== input.applicationType || row.source_id !== context.sourceId
     || row.target_document_source_id !== bridge.targetSourceId))
     throw new ErpFinancialsValidationError("Historical invoice already has unsupported provider or other-source settlement");
   const applied = prior.filter(row => row.status === "applied").reduce((sum, row) => sum + parsePositiveMoney(row.applied_amount, "applied_amount"), 0n);
@@ -7532,9 +7540,9 @@ async function prepareCrossSourceCustomerSettlement(
   const originals = (await loadImportedDocumentAccrualPostings(client, historicalContext, storedString(target.transaction_id, "transaction_id"))).map(storedLedgerPosting);
   if (originals.some(posting => posting.itemId !== undefined || posting.dimensionRefs.length > 0))
     throw new ErpFinancialsValidationError("Cross-source settlement requires explicit item and dimension mappings for dimensional invoices");
-  const controls = originals.filter(posting => parsePositiveOrZeroMoney(posting.debitAmount, "debit") > 0n);
-  if (controls.length !== 1 || controls[0]?.debitAmount !== storedMoney(target.original_amount, "original_amount"))
-    throw new ErpFinancialsValidationError("Cross-source settlement requires one unambiguous receivable control");
+  const controls = originals.filter(posting => parsePositiveOrZeroMoney(posting[controlSide], "control") > 0n);
+  if (controls.length !== 1 || controls[0]?.[controlSide] !== storedMoney(target.original_amount, "original_amount"))
+    throw new ErpFinancialsValidationError("Cross-source settlement requires one unambiguous receivable/payable control");
   const mapping = new Map(bridge.accountMappings.map(row => [row.historicalAccountId, row.nativeAccountId]));
   const historicalIds = unique(originals.map(posting => posting.accountId));
   if (mapping.size !== bridge.accountMappings.length || mapping.size !== historicalIds.length || historicalIds.some(id => !mapping.has(id)))
@@ -7547,18 +7555,18 @@ async function prepareCrossSourceCustomerSettlement(
     const newAccount = accounts.find(row => row.source_id === context.sourceId && row.account_id === newId);
     if (!oldAccount || !newAccount || newAccount.active !== true || oldAccount.classification !== newAccount.classification
       || (newAccount.currency_code != null && newAccount.currency_code !== context.currencyCode)
-      || (oldId === controls[0].accountId ? newAccount.classification !== "asset" : !["income", "other_income"].includes(String(newAccount.classification))))
+      || (oldId === controls[0].accountId ? newAccount.classification !== (payable ? "liability" : "asset") : !(payable ? ["expense", "cost_of_goods_sold", "other_expense"] : ["income", "other_income"]).includes(String(newAccount.classification))))
       throw new ErpFinancialsValidationError("Settlement account mapping changes classification or uses an unavailable account");
   }
   const cash = (await client.query(`select p.* from erp_financials.ledger_postings p
     join erp_financials.transactions t using(tenant_id,source_id,transaction_id)
     where p.tenant_id=$1 and p.source_id=$2 and t.source_transaction_id=$3
-      and t.source_transaction_type='Subledger:customer_payment' and t.status='posted' and p.accounting_basis='cash'
-    for share of p,t`, [context.tenantId, context.sourceId, `${String(receipt[0]?.source_transaction_id)}:accounting-basis:cash`])).rows;
-  const credit = cash.filter(row => parsePositiveOrZeroMoney(row.credit_amount, "credit_amount") > 0n);
+      and t.source_transaction_type=$4 and t.status='posted' and p.accounting_basis='cash'
+    for share of p,t`, [context.tenantId, context.sourceId, `${String(receipt[0]?.source_transaction_id)}:accounting-basis:cash`, `Subledger:${sourceType}`])).rows;
+  const credit = cash.filter(row => parsePositiveOrZeroMoney(row[fundingSide], fundingSide) > 0n);
   if (credit.length !== 1 || credit[0]?.account_id !== mapping.get(controls[0].accountId)
-    || storedMoney(credit[0]?.credit_amount, "credit_amount") !== storedMoney(source.original_amount, "original_amount"))
-    throw new ErpFinancialsValidationError("Mapped receivable control does not match the native receipt cash credit");
+    || storedMoney(credit[0]?.[fundingSide], fundingSide) !== storedMoney(source.original_amount, "original_amount"))
+    throw new ErpFinancialsValidationError("Mapped control does not match the original native payment cash posting");
   // Subtract exact earlier cash allocations. The final installment consumes all
   // remaining cents; independent percentage rounding cannot over-recognize income.
   const recognized = (await client.query(`select source_posting_id,debit_amount::text,credit_amount::text from erp_financials.ledger_postings
@@ -7575,7 +7583,7 @@ async function prepareCrossSourceCustomerSettlement(
       throw new ErpFinancialsValidationError("Historical invoice cash allocations exceed the original journal");
     return { ...posting, debitAmount: formatMoney(remainingDebit), creditAmount: formatMoney(remainingCredit), netAmount: formatMoney(remainingDebit - remainingCredit) };
   });
-  const postings = projectCashBasisApplication({ applicationId, applicationType: "customer_payment_to_invoice", action: "recognize",
+  const postings = projectCashBasisApplication({ applicationId, applicationType: payable ? "bill_payment_to_bill" : "customer_payment_to_invoice", action: "recognize",
     appliedAmount: amount, effectiveDate: input.applicationDate, importBatchId: scopedRecordId(context, "import_batch", `cross-source-settlement:${applicationId}:recognize`), accrualPostings: remaining });
   await assertPostingAccountEligibility(client, context, [...mapping.values()]);
   return postings.map(posting => {
@@ -7586,7 +7594,7 @@ async function prepareCrossSourceCustomerSettlement(
     const { transactionLineId: _line, itemId: _item, checkpointId: _checkpoint, ...fact } = posting;
     void _line; void _item; void _checkpoint;
     return { ...fact, sourceId: context.sourceId, accountId, partyId: bridge.nativePartyId,
-      sourcePayloadRef: { sourceObjectType: "CrossSourceCustomerSettlement", sourceObjectId: applicationId,
+      sourcePayloadRef: { sourceObjectType: payable ? "CrossSourceVendorSettlement" : "CrossSourceCustomerSettlement", sourceObjectId: applicationId,
         preview: { targetSourceId: bridge.targetSourceId, targetDocumentId: input.targetDocumentId, reviewRef: bridge.reviewRef,
           historicalSourcePostingId: posting.sourcePostingId.slice(`cash-application:${applicationId}:recognize:`.length), historicalAccountId: posting.accountId } } };
   });
@@ -7601,9 +7609,9 @@ async function persistCrossSourceSettlement(client: PostgresQueryClient, context
   await storage.upsertImportBatch({ tenantId: context.tenantId, sourceId: context.sourceId, importBatchId,
     mode: "delta", status: "completed", startedAt: now, completedAt: now, sourceObjectCounts: { applications: 1, postings: postings.length } });
   await storage.upsertTransactions([{ tenantId: context.tenantId, sourceId: context.sourceId, transactionId,
-    sourceTransactionId: identity, sourceTransactionType: "Subledger:cross_source_customer_settlement", transactionDate: effectiveDate,
+    sourceTransactionId: identity, sourceTransactionType: postings[0]?.sourcePayloadRef?.sourceObjectType === "CrossSourceVendorSettlement" ? "Subledger:cross_source_vendor_settlement" : "Subledger:cross_source_customer_settlement", transactionDate: effectiveDate,
     postedAt: now, updatedAt: now, currencyCode: context.currencyCode, status: "posted",
-    sourcePayloadRef: { sourceObjectType: "CrossSourceCustomerSettlement", sourceObjectId: applicationId,
+    sourcePayloadRef: { sourceObjectType: postings[0]?.sourcePayloadRef?.sourceObjectType === "CrossSourceVendorSettlement" ? "CrossSourceVendorSettlement" : "CrossSourceCustomerSettlement", sourceObjectId: applicationId,
       preview: { action, bookId: context.bookId ?? null } } }]);
   await storage.upsertLedgerPostings(postings.map(posting => ({ ...posting, transactionId, importBatchId })));
   await storage.markReportSnapshotsStaleForPostingChanges({ tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId,
