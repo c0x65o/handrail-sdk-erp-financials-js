@@ -4914,7 +4914,8 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     const documents=(resources.operationalDocuments ?? []).map(r=>({...r,resource:{...r.resource,
       transactionDate:r.resource.sourceTransactionType==='Invoice'?'2025-07-01':'2025-07-03',
       ...(r.resource.sourceTransactionType==='Invoice'?{transactionNumber:'1396',totalAmount:'27.56',openAmount:'0.00',lines:r.resource.lines.map(l=>({...l,sourceAmount:'27.56',sourceQuantity:'1.00',sourceUnitAmount:'27.56'}))}:{})}}));
-    await runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:quickBooksSubledgerFacts(),resources:{...resources,operationalDocuments:documents}}));
+    const fixtureRunner = targetVersion !== undefined && targetVersion < 50 ? preCrossSourceFixtureRunner(runner) : runner;
+    await fixtureRunner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:'company_qbo',importedAt:'2026-08-12T12:00:00.000Z',facts:quickBooksSubledgerFacts(),resources:{...resources,operationalDocuments:documents}}));
     const docs=(await pool.query<Record<string, unknown>>(`select * from erp_financials.subledger_documents order by document_type`)).rows;
     const payment=docs.find(d=>d.document_type==='customer_payment');const invoice=docs.find(d=>d.document_type==='invoice');
     if(!payment||!invoice) throw Error('Fixture missing documents');
@@ -10492,7 +10493,7 @@ insert into erp_financials.journal_entry_links values
       receivableAccount: { accountId: "account_ar" }, revenueLines: [{ accountId: "account_income", amount: "25.00" }] });
     const cancelled = await sdk.invoices.voidIssued({ operation, invoiceDocumentId: invoice.documentId, expectedVersion: 1, idempotencyKey: "upgrade:cancel", date: "2026-08-02" });
     if (detached) {
-      const older = createErpFinancialsSdk({ ...scope, database: { transaction: work => runner.transaction(client => work({
+      const older = createErpFinancialsSdk({ ...scope, database: { transaction: work => preCrossSourceFixtureRunner(runner).transaction(client => work({
         query: (sql, values) => sql.includes("select invoice_void_id from erp_financials.invoice_voids") ? Promise.resolve({ rows: [] }) : client.query(sql, values)
       })) } });
       await older.commands.paymentApplications.unapply({ operation, applicationId: cancelled.applicationId, expectedVersion: 1, effectiveDate: "2026-08-03" });
@@ -13780,7 +13781,7 @@ function requiredComponentFixture<T>(value:T|undefined):T { if(value===undefined
  * This is not a runtime compatibility adapter or proof of an old SDK binary.
  * The adapter refuses explicit components because those did not exist then. */
 function preComponentFixtureRunner(database:ErpFinancialsTransactionRunner):ErpFinancialsTransactionRunner {
-  return {transaction:work=>database.transaction(client=>work({
+  return {transaction:work=>preCrossSourceFixtureRunner(database).transaction(client=>work({
     query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
       if(sql.includes('insert into "erp_financials"."subledger_document_lines"')){
         if(params.length!==22||params[20]!==undefined||params[21]!==undefined)throw Error("Historical fixture cannot contain component accounts");
@@ -13798,11 +13799,11 @@ function preComponentFixtureRunner(database:ErpFinancialsTransactionRunner):ErpF
 function preCrossSourceFixtureRunner(database:ErpFinancialsTransactionRunner):ErpFinancialsTransactionRunner {
   return {transaction:work=>database.transaction(client=>work({
     query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
-      if(sql.includes('insert into "erp_financials"."subledger_applications"')){
+      if(sql.includes('insert into "erp_financials"."subledger_applications"') && sql.includes('"target_document_source_id"')){
         if(params.length!==19||params[18]!==null)throw Error("Historical fixture cannot contain cross-source applications");
         return client.query<Row>(sql.replace(', "target_document_source_id"','').replace(', $19)',')'),params.slice(0,18));
       }
-      return client.query<Row>(sql,params);
+      return client.query<Row>(sql.replace(/(?:(?:"?[a-z_]+"?)\.)?"?target_document_source_id"?/gu,'null::text'),params);
     }
   }))};
 }
