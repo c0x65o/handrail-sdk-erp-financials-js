@@ -4573,7 +4573,7 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
       payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "100.00" }] });
     const before = await depositDatabaseState(pool);
     const result = await migratePostgresSchema(runner, { appliedByRef: "hold:upgrade" });
-    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[31, 32], [32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]]);
+    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[31, 32], [32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50]]);
     const after = stripNewComponentNulls(await depositDatabaseState(pool));
     for (const table of Object.keys(before)) {
       if (table === "schema_migrations") continue;
@@ -5026,7 +5026,7 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     const before=await depositDatabaseState(pool);
     const result=await migratePostgresSchema(runner,{appliedByRef:'synthetic:correction-replay-upgrade'});
     expect(result.currentVersion).toBe(26);
-    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[26,27],[27,28],[28,29],[29,30],[30,31],[31,32],[32,33],[33,34],[34,35],[35,36],[36,37],[37,38],[38,39],[39,40],[40,41],[41,42],[42,43],[43,44],[44,45],[45,46],[46,47],[47,48],[48,49]]);
+    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[26,27],[27,28],[28,29],[29,30],[30,31],[31,32],[32,33],[33,34],[34,35],[35,36],[36,37],[37,38],[38,39],[39,40],[40,41],[41,42],[42,43],[43,44],[44,45],[45,46],[46,47],[47,48],[48,49],[49,50]]);
     const after=stripNewComponentNulls(await depositDatabaseState(pool));
     for (const table of Object.keys(before).filter(table=>table!=='schema_migrations')) {
       const rows = before[table];
@@ -5260,7 +5260,7 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
       await sdk.books.bindSource({ operation: sdkOperation(), bookId, sourceId: "source_1",
         sourceRole: "active", effectiveFrom: "2026-01-01" });
     }
-    const financials = depositService(runner, scope);
+    const financials = depositService(targetVersion !== undefined && targetVersion < 50 ? preCrossSourceFixtureRunner(runner) : runner, scope);
     await financials.fiscalPeriods.define({
       operation: sdkOperation(), fiscalYear: 2026, periodNumber: 8,
       periodStart: "2026-08-01", periodEnd: "2026-08-31"
@@ -6821,7 +6821,7 @@ insert into erp_financials.ledger_postings (
     await expect(migratePostgresSchema(failed,{appliedByRef:"cash_lookup:failed"})).rejects.toThrow("injected real migration failure");
     expect(await depositDatabaseState(pool)).toEqual(before);
     expect((await pool.query("select to_regclass('erp_financials.subledger_documents_transaction_idx') index_name")).rows).toEqual([{index_name:null}]);
-    expect((await migratePostgresSchema(runner,{appliedByRef:"cash_lookup:upgrade"})).applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[44,45],[45,46],[46,47],[47,48],[48,49]]);
+    expect((await migratePostgresSchema(runner,{appliedByRef:"cash_lookup:upgrade"})).applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[44,45],[45,46],[46,47],[47,48],[48,49],[49,50]]);
     const index=(await pool.query<{indexdef:string}>("select indexdef from pg_indexes where schemaname='erp_financials' and indexname='subledger_documents_transaction_idx'")).rows[0];
     expect(index?.indexdef).toContain("(tenant_id, company_id, source_id, transaction_id, document_type)");
     const after=stripNewRecognitionNulls(await depositDatabaseState(pool));expectInitialMaintenanceTables(before, after);delete before.schema_migrations;delete after.schema_migrations;expect(after).toEqual(before);
@@ -8004,7 +8004,7 @@ insert into erp_financials.journal_entry_links values
       payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" }, allocations: [{ billId: bill.documentId, amount: "20.00", expectedBillVersion: 1 }] });
     const before = await depositDatabaseState(pool);
     const result = await migratePostgresSchema(runner, { appliedByRef: "bill-audit:upgrade" });
-    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]]);
+    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50]]);
     const after = stripNewComponentNulls(await depositDatabaseState(pool));
     for (const table of Object.keys(before)) if (table !== "schema_migrations") expect(after[table], table).toEqual(before[table]);
     expect((await validatePostgresSchema(pool)).compatible).toBe(true);
@@ -8396,8 +8396,8 @@ insert into erp_financials.journal_entry_links values
     const applied = await financials.paymentApplications.apply(command);
     const before = await depositDatabaseState(pool);
     const upgrade = await migratePostgresSchema(runner, { appliedByRef: "receipt-upgrade:47" });
-    expect(upgrade.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[46, 47], [47, 48], [48, 49]]);
-    const after = await depositDatabaseState(pool); expectInitialMaintenanceTables(before, after); delete before.schema_migrations; delete after.schema_migrations;
+    expect(upgrade.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[46, 47], [47, 48], [48, 49], [49, 50]]);
+    const after = stripNewCrossSourceNulls(await depositDatabaseState(pool)); expectInitialMaintenanceTables(before, after); delete before.schema_migrations; delete after.schema_migrations;
     expect(after).toEqual(before);
     await expect(pool.query(`insert into erp_financials.subledger_applications
       select (jsonb_populate_record(null::erp_financials.subledger_applications,
@@ -8930,7 +8930,7 @@ insert into erp_financials.journal_entry_links values
     const columns=await pool.query("select column_name from information_schema.columns where table_schema='erp_financials' and column_name in ('tax_account_id','discount_account_id')");
     expect(columns.rows).toEqual([]);
     const result=await migratePostgresSchema(runner,{appliedByRef:"components:upgrade"});
-    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[42,43],[43,44],[44,45],[45,46],[46,47],[47,48],[48,49]]);
+    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[42,43],[43,44],[44,45],[45,46],[46,47],[47,48],[48,49],[49,50]]);
     const after=stripNewRecognitionNulls(await depositDatabaseState(pool));
     // New nullable provenance columns are the only changes to existing rows.
     for(const table of ["invoice_draft_lines","subledger_document_lines"])for(const entry of after[table]??[]){
@@ -9733,7 +9733,7 @@ insert into erp_financials.journal_entry_links values
     expect(await depositDatabaseState(pool)).toEqual(before);
     expect(await constraints()).toEqual(beforeConstraints);
     const result = await migratePostgresSchema(runner, { appliedByRef: "overdue:upgrade" });
-    expect(result.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]]);
+    expect(result.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50]]);
     const after = stripNewRecognitionNulls(await depositDatabaseState(pool));
     for (const [table, rows] of Object.entries(before)) if (!/migration|schema_version/.test(table)) expect(after[table]).toEqual(rows);
     const retained = await constraints();
@@ -10506,7 +10506,7 @@ insert into erp_financials.journal_entry_links values
       expect((await validatePostgresMigrationHistory(pool)).currentVersion).toBe(39);
     } else {
       const result = await migratePostgresSchema(runner, { appliedByRef: "test:cancel-upgrade" });
-      expect(result.applied.map(row => row.toVersion)).toEqual([40, 41, 42, 43, 44, 45, 46, 47, 48, 49]);
+      expect(result.applied.map(row => row.toVersion)).toEqual([40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50]);
       const after = stripNewComponentNulls(await depositDatabaseState(pool));
       expect(after.cash_flow_purpose_corrections).toEqual([]); before.cash_flow_purpose_corrections = [];
       expectInitialMaintenanceTables(before, after);
@@ -11496,7 +11496,7 @@ where application.subledger_application_id = $1`,
     await depositFixture("overdue_creation", 38);
     const before = await depositDatabaseState(pool);
     const migrated = await migratePostgresSchema(runner, { appliedByRef: "overdue:v39" });
-    expect(migrated.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]]);
+    expect(migrated.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50]]);
     // Migration evidence changes; no business facts are rewritten.
     const after = stripNewRecognitionNulls(await depositDatabaseState(pool));
     for (const [table, rows] of Object.entries(before)) if (!/migration|schema_version/.test(table)) expect(after[table]).toEqual(rows);
@@ -13793,8 +13793,29 @@ function preComponentFixtureRunner(database:ErpFinancialsTransactionRunner):ErpF
     }
   }))};
 }
-function stripNewRecognitionNulls(state:Record<string,unknown[]>):Record<string,unknown[]> {
+/** Historical fixture construction only; retain pre-schema50 same-source SQL.
+ * Reject cross-source coordinates, and execute all actual accounting in PG. */
+function preCrossSourceFixtureRunner(database:ErpFinancialsTransactionRunner):ErpFinancialsTransactionRunner {
+  return {transaction:work=>database.transaction(client=>work({
+    query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<PostgresQueryResult<Row>> {
+      if(sql.includes('insert into "erp_financials"."subledger_applications"')){
+        if(params.length!==19||params[18]!==null)throw Error("Historical fixture cannot contain cross-source applications");
+        return client.query<Row>(sql.replace(', "target_document_source_id"','').replace(', $19)',')'),params.slice(0,18));
+      }
+      return client.query<Row>(sql,params);
+    }
+  }))};
+}
+function stripNewCrossSourceNulls(state:Record<string,unknown[]>):Record<string,unknown[]> {
   const result=structuredClone(state);
+  for(const entry of result.subledger_applications??[]){
+    const row=(entry as {row:Record<string,unknown>}).row;
+    expect(row.target_document_source_id).toBeNull();delete row.target_document_source_id;
+  }
+  return result;
+}
+function stripNewRecognitionNulls(state:Record<string,unknown[]>):Record<string,unknown[]> {
+  const result=stripNewCrossSourceNulls(state);
   for(const entry of result.subledger_documents??[]){
     const row=(entry as {row:Record<string,unknown>}).row;
     expect(row.recognition_date).toBeNull();delete row.recognition_date;
