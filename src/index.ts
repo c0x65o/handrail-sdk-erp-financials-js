@@ -763,6 +763,7 @@ export type {
   RetireReceiptApplicationInput,
   RetireReceiptApplicationResult,
   EndSubledgerApplicationInput,
+  ImportedApplicationCorrection,
   ErpFinancials,
   ErpFinancialsAccountDefinition,
   ErpFinancialsAccountReference,

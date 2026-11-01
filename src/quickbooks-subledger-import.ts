@@ -129,14 +129,19 @@ export async function persistQuickBooksSubledgerResources(
   suppliedInput: PersistQuickBooksSubledgerResourcesInput & { readonly client: PostgresQueryClient }
 ): Promise<QuickBooksSubledgerImportResult> {
   const corrections = await loadCustomerPaymentCorrectionReplayState(suppliedInput.client, suppliedInput.facts.company.tenantId, suppliedInput.facts.source.sourceId);
-  const correctedProviderIds = new Set(corrections.map(row => row.dependency.sourceTransactionId));
   const correctedPaymentIds = new Set(corrections.map(row => row.dependency.paymentId));
   const preservedInvoiceIds = corrections.flatMap(row => row.reopenedInvoiceIds);
   // Provider timestamps are not total-order revision/deletion evidence. Preserve
   // the local overlay for every version of this Payment, never fabricate a delete.
   const input = { ...suppliedInput, resources: { ...suppliedInput.resources,
     operationalDocuments: (suppliedInput.resources.operationalDocuments ?? suppliedInput.resources.ledgerTransactions ?? []).filter(row =>
-      !(row.resource.sourceTransactionType === "Payment" && correctedProviderIds.has(row.resource.sourceTransactionId))) } };
+      !corrections.some(c => row.resource.sourceTransactionType === (c.providerType ?? "Payment") && row.resource.sourceTransactionId === c.dependency.sourceTransactionId)) } };
+
+  const retainedImportedTargets = new Set(corrections.filter(c => c.providerType === "Bill").map(c => c.dependency.sourceTransactionId));
+  if (input.resources.operationalDocuments.some(row => row.resource.lines.some(line =>
+    line.linkedTransactions?.some(link => retainedImportedTargets.has(link.sourceTransactionId))))) {
+    throw new Error("Provider links to a locally corrected imported bill require explicit reconciliation before import");
+  }
 
   await input.client.query(
     `select set_config('erp_financials.quickbooks_projection_refresh', 'on', true)`

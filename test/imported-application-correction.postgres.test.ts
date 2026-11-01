@@ -1,0 +1,193 @@
+import { required } from "./support/imported-credit-fixture.js";
+import { Pool, type PoolClient } from "pg";
+import {
+  ERP_FINANCIALS_NORMALIZED_QUICKBOOKS_SYNC_FIXTURES,
+  createCompanySourceBinding, createErpFinancialsSdk, createPostgresStorageAdapter,
+  mapNormalizedQuickBooksFullSyncResponseToCanonicalFacts, migratePostgresSchema,
+  persistCanonicalFacts, persistQuickBooksSubledgerResources,
+  type HandrailQuickBooksLedgerTransactionResource, type PostgresQueryClient,
+} from "@handrail/erp-financials";
+import { afterAll, beforeAll, expect, it } from "vitest";
+
+const url = process.env.ERP_FINANCIALS_TEST_DATABASE_URL;
+if (url && !new URL(url).pathname.includes("test")) throw Error("Requires isolated test database");
+const pool = new Pool({ connectionString:url,max:1 });
+let connection: PoolClient | undefined;
+const client: PostgresQueryClient = { async query(statement,values) {
+  const result = await required(connection).query(statement,values ? [...values] : []);
+  return {rows:result.rows,rowCount:result.rowCount ?? 0};
+} };
+beforeAll(async () => { if(url) { connection=await pool.connect(); await migratePostgresSchema({transaction:work=>work(client)},{appliedByRef:"imported-correction-test"}); } });
+afterAll(async () => { connection?.release(); await pool.end(); });
+
+it.skipIf(!url)("corrects original imported settlement through the active source, preserves history, and fences provider replay", async () => {
+  await client.query("begin");
+  try {
+  const companyId = "imported-bill-payment-contract";
+  const { facts, adapterInput } = mapNormalizedQuickBooksFullSyncResponseToCanonicalFacts(
+    ERP_FINANCIALS_NORMALIZED_QUICKBOOKS_SYNC_FIXTURES.fullSync.response, { companyId });
+  const vendor = required(facts.parties.find(party => party.partyType === "vendor"));
+  const envelope = required(adapterInput.resources.accounts[0]);
+  const resource = (id: string, type: string, date: string,
+    lines: HandrailQuickBooksLedgerTransactionResource["resource"]["lines"]): HandrailQuickBooksLedgerTransactionResource => ({
+    ...envelope, resourceId: id, resourceType: "LedgerTransaction", resource: {
+      sourceTransactionId: id, sourceTransactionType: type, transactionDate: date,
+      currencyCode: "USD", totalAmount: "100.00", openAmount: "0.00", unappliedAmount: "0.00",
+      partyRef: { sourceObjectId: vendor.sourcePartyId, partyType: "vendor" }, lines,
+    },
+  });
+  const documents = [
+    resource("historical-bill", "Bill", "2026-01-10", [{ lineNumber: 1, sourceLineId: "1", postings: [], sourceAmount: "100.00", accountRef: { sourceObjectId: "79" } }]),
+    resource("historical-payment", "BillPayment", "2026-01-20", [{ lineNumber: 1, sourceLineId: "1", postings: [], sourceAmount: "100.00",
+      linkedTransactions: [{ sourceTransactionId: "historical-bill", sourceTransactionType: "Bill" }] }]),
+  ];
+  const imported = { ...facts, transactionLines: [], postings: [], transactions: documents.map(document => ({
+    ...required(facts.transactions[0]), transactionId: document.resourceId, sourceTransactionId: document.resourceId,
+    sourceTransactionType: document.resource.sourceTransactionType, transactionDate: document.resource.transactionDate, partyId: vendor.partyId,
+  })) };
+  const operation = { actorRef: "requester", approverRef: "independent-reviewer", requestId: "imported-payment-contract",
+    correlationId: "imported-payment-contract", reasonCode: "application-correction", occurredAt: "2026-02-03T12:00:00.000Z" };
+  const storage = createPostgresStorageAdapter(client);
+  await persistCanonicalFacts(storage, imported);
+  const importedResult = await persistQuickBooksSubledgerResources({ client, companyId, importedAt: operation.occurredAt,
+    facts: imported, resources: { ...adapterInput.resources, operationalDocuments: documents } });
+  expect(importedResult.unresolvedApplications).toEqual([]);
+  expect(importedResult.applications).toBe(1);
+  const historicalSnapshot = async () => (await client.query(`select a.subledger_application_id, a.application_type, a.status, a.version,
+    a.applied_amount::text as amount, source.document_type as source_type, source.open_amount::text as source_open,
+    target.document_type as target_type, target.open_amount::text as target_open
+    from erp_financials.subledger_applications a
+    join erp_financials.subledger_documents source on source.subledger_document_id=a.source_document_id
+    join erp_financials.subledger_documents target on target.subledger_document_id=a.target_document_id
+    where a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3`, [facts.company.tenantId, companyId, facts.source.sourceId])).rows;
+  const before = await historicalSnapshot();
+  expect(before).toHaveLength(1);
+  expect(before[0]).toMatchObject({ application_type: "bill_payment_to_bill", status: "applied", version: 1,
+    amount: "100.00", source_type: "bill_payment", source_open: "0.00", target_type: "vendor_bill", target_open: "0.00" });
+
+  const sourceId = "native-bill-payment-source", bookId = "imported-bill-payment-book";
+  await storage.upsertAccountingSource({ tenantId: facts.company.tenantId, sourceId, sourceSystem: "native_erp",
+    providerEnvironment: "native", connectionRef: sourceId, status: "active" });
+  await storage.upsertCompanySourceBinding(createCompanySourceBinding({ tenantId: facts.company.tenantId, companyId, sourceId, createdAt: operation.occurredAt }));
+  const sdk = createErpFinancialsSdk({ database: { transaction: work => work(client) }, tenantId: facts.company.tenantId,
+    companyId, bookId, writeSourceId: sourceId, currencyCode: "USD", postingPolicy: "legacy_unrestricted", financialApprovalPolicy: { mode: "independent" } });
+  await sdk.books.define({ operation, bookId, name: "Imported payment correction contract", baseCurrencyCode: "USD" });
+  await sdk.books.bindSource({ operation, bookId, sourceId: facts.source.sourceId, sourceRole: "historical", effectiveThrough: "2026-01-31" });
+  await sdk.books.bindSource({ operation, bookId, sourceId, sourceRole: "active", effectiveFrom: "2026-02-01" });
+  const vendorId = "native-vendor";
+  await sdk.commands.parties.ensureActive({ operation, partyId: vendorId, sourcePartyId: "vendor_1", partyType: "vendor", displayName: "Native reviewed vendor" });
+  for (const parent of [
+    { accountKey: "cash", name: "Bank", classification: "asset" as const, type: "Bank" },
+    { accountKey: "ap", name: "Accounts payable", classification: "liability" as const, type: "AccountsPayable" },
+    { accountKey: "expense", name: "Expense", classification: "expense" as const, type: "Expense" },
+  ]) await sdk.commands.accounts.upsertTree({ operation: { ...operation, requestId: parent.accountKey }, parent });
+  const bill = await sdk.commands.vendorBills.create({ operation, idempotencyKey: "native-control-bill", date: "2026-02-01",
+    dueDate: "2026-02-28", vendorId, payableAccount: { accountKey: "ap" }, expenseLines: [{ accountKey: "expense", amount: "100.00" }] });
+  const payment = await sdk.commands.billPayments.recordAndApply({ operation, idempotencyKey: "native-control-payment", date: "2026-02-02",
+    vendorId, amount: "100.00", cashAccount: { accountKey: "cash" }, payableAccount: { accountKey: "ap" }, paymentMethod: "ach",
+    allocations: [{ billId: bill.documentId, amount: "100.00", expectedBillVersion: bill.version }] });
+  const review = await sdk.queries.getBillPaymentCorrectionReview({ sourceId, paymentId: payment.billPaymentId, limit: 10 });
+  expect(review.items).toHaveLength(1);
+  await sdk.commands.paymentApplications.unapply({ operation, applicationId: required(review.items[0]).applicationId,
+    expectedVersion: required(review.items[0]).version, effectiveDate: "2026-02-03" });
+  expect((await sdk.queries.getBillPaymentCorrectionReview({ sourceId, paymentId: payment.billPaymentId, limit: 10 })).payment)
+    .toMatchObject({ amount: "100.00", unappliedAmount: "100.00", status: "cleared" });
+  expect(await sdk.queries.getVendorBill(bill.documentId)).toMatchObject({ openAmount: "100.00" });
+
+  const applicationId = String(required(before[0]).subledger_application_id);
+  const eventCount = async () => (await client.query("select count(*)::int as count from erp_financials.financial_lifecycle_events")).rows;
+  const eventsBefore = await eventCount();
+  // Desired upstream regression: this source-qualified historical correction
+  // resolves, retains original import facts, and reopens both balances to 100.
+  await expect(sdk.commands.paymentApplications.unapply({ operation, applicationId, expectedVersion: 1, effectiveDate: "2026-02-03" }))
+    .rejects.toMatchObject({ code: "missing_document", message: `Subledger application ${applicationId} does not exist in this scope` });
+  expect(await historicalSnapshot()).toEqual(before);
+  expect(await eventCount()).toEqual(eventsBefore);
+  // A historical writer can find the application, but the cash correction must
+  // still respect the historical source's closed reporting-book window.
+  const historical = createErpFinancialsSdk({ database: { transaction: work => work(client) }, tenantId: facts.company.tenantId,
+    companyId, bookId, writeSourceId: facts.source.sourceId, currencyCode: "USD", postingPolicy: "legacy_unrestricted",
+    financialApprovalPolicy: { mode: "independent" } });
+  const expenseAccountId = "imported-expense-account", payableAccountId = "imported-payable-account";
+  await storage.upsertAccounts([
+    { ...required(facts.accounts[0]), accountId: expenseAccountId, sourceAccountId: "expense-fixture", name: "Imported expense", classification: "expense", type: "Expense" },
+    { ...required(facts.accounts[0]), accountId: payableAccountId, sourceAccountId: "ap-fixture", name: "Imported payable", classification: "liability", type: "AccountsPayable" },
+  ]);
+  const { transactionLineId: _lineId, ...posting } = required(facts.postings[0]); void _lineId;
+  await storage.upsertLedgerPostings([
+    { ...posting, postingId: "imported-bill-expense", sourcePostingId: "imported-bill-expense", transactionId: "historical-bill", accountId: expenseAccountId, postingDate: "2026-01-10", partyId: vendor.partyId, debitAmount: "100.00", creditAmount: "0.00", netAmount: "100.00" },
+    { ...posting, postingId: "imported-bill-payable", sourcePostingId: "imported-bill-payable", transactionId: "historical-bill", accountId: payableAccountId, postingDate: "2026-01-10", partyId: vendor.partyId, debitAmount: "0.00", creditAmount: "100.00", netAmount: "-100.00" },
+  ]);
+  await client.query("savepoint historical_writer_window");
+  await expect(historical.commands.paymentApplications.unapply({ operation, applicationId, expectedVersion: 1, effectiveDate: "2026-02-03" }))
+    .rejects.toMatchObject({ message: `posting date 2026-02-03 is outside every reporting-book window for source ${facts.source.sourceId}` });
+  await client.query("rollback to savepoint historical_writer_window");
+  await client.query("release savepoint historical_writer_window");
+  expect(await historicalSnapshot()).toEqual(before);
+  expect(await eventCount()).toEqual(eventsBefore);
+  const corrections = await client.query(`select posting_id from erp_financials.ledger_postings
+    where tenant_id=$1 and source_id=$2 and accounting_basis='cash' and posting_date='2026-02-03'`,
+    [facts.company.tenantId, facts.source.sourceId]);
+  expect(corrections.rows).toEqual([]);
+  // Exact imported accrual and cash provenance, separate from the canonical headers.
+  await storage.upsertTransactions([
+    { ...required(imported.transactions[0]),transactionId:"bill-accrual",sourceTransactionId:"bill-accrual",partyId:vendor.partyId,
+      sourcePayloadRef:{sourceObjectType:"Bill",sourceObjectId:"historical-bill"} },
+    { ...required(imported.transactions[1]),transactionId:"payment-cash",sourceTransactionId:"payment-cash",partyId:vendor.partyId,
+      sourcePayloadRef:{sourceObjectType:"BillPayment",sourceObjectId:"historical-payment"} },
+  ]);
+  const bankId="historical-bank";
+  await storage.upsertAccounts([{ ...required(facts.accounts[0]),accountId:bankId,sourceAccountId:bankId,type:"Bank",classification:"asset",name:"Historical bank" }]);
+  const originalJournal = [
+    { ...posting,postingId:"bill-basis-expense",sourcePostingId:"bill-basis-expense",transactionId:"bill-accrual",accountId:expenseAccountId,postingDate:"2026-01-10",partyId:vendor.partyId,debitAmount:"100.00",creditAmount:"0.00",netAmount:"100.00",accountingBasis:"accrual" as const },
+    { ...posting,postingId:"bill-basis-payable",sourcePostingId:"bill-basis-payable",transactionId:"bill-accrual",accountId:payableAccountId,postingDate:"2026-01-10",partyId:vendor.partyId,debitAmount:"0.00",creditAmount:"100.00",netAmount:"-100.00",accountingBasis:"accrual" as const },
+    { ...posting,postingId:"payment-cash-expense",sourcePostingId:"payment-cash-expense",transactionId:"payment-cash",accountId:expenseAccountId,postingDate:"2026-01-20",partyId:vendor.partyId,debitAmount:"100.00",creditAmount:"0.00",netAmount:"100.00",accountingBasis:"cash" as const },
+    { ...posting,postingId:"payment-cash-bank",sourcePostingId:"payment-cash-bank",transactionId:"payment-cash",accountId:bankId,postingDate:"2026-01-20",partyId:vendor.partyId,debitAmount:"0.00",creditAmount:"100.00",netAmount:"-100.00",accountingBasis:"cash" as const },
+  ];
+  await storage.upsertLedgerPostings(originalJournal);
+  const nativeAccounts=(await client.query(`select account_id,type from erp_financials.accounts where tenant_id=$1 and source_id=$2`,[facts.company.tenantId,sourceId])).rows;
+  const importedCorrection={applicationSourceId:facts.source.sourceId,reviewRef:"review:original-payment",historicalPartyId:vendor.partyId,nativePartyId:vendorId,
+    accountMappings:[{historicalAccountId:expenseAccountId,nativeAccountId:String(required(nativeAccounts.find(a=>a.type==='Expense')).account_id)},
+      {historicalAccountId:payableAccountId,nativeAccountId:String(required(nativeAccounts.find(a=>a.type==='AccountsPayable')).account_id)}]};
+  const command={operation,applicationId,expectedVersion:1,effectiveDate:"2026-02-03",importedCorrection};
+  for (const invalid of [
+    {...command,operation:{...operation,approverRef:operation.actorRef}},
+    {...command,effectiveDate:"2026-01-19"},
+    {...command,importedCorrection:{...importedCorrection,nativePartyId:"unreviewed-vendor"}},
+    {...command,importedCorrection:{...importedCorrection,accountMappings:[]}},
+    {...command,expectedVersion:2},
+  ]) await expect(sdk.commands.paymentApplications.unapply(invalid)).rejects.toThrow();
+  const historicalFacts=async()=>(await client.query(`select to_jsonb(p) as fact from erp_financials.ledger_postings p where tenant_id=$1 and source_id=$2 order by posting_id`,[facts.company.tenantId,facts.source.sourceId])).rows;
+  const journalBefore=await historicalFacts();
+  const ended=await sdk.commands.paymentApplications.unapply(command);
+  expect(ended.status).toBe("unapplied");
+  expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,amount:"100.00",source_open:"100.00",target_open:"100.00"}]);
+  expect(await historicalFacts()).toEqual(journalBefore);
+  const nativeReversals=async()=>(await client.query(`select p.posting_id,p.posting_date::text,p.debit_amount::text,p.credit_amount::text,a.type,p.accounting_basis
+    from erp_financials.ledger_postings p join erp_financials.accounts a using(tenant_id,source_id,account_id)
+    join erp_financials.transactions t using(tenant_id,source_id,transaction_id)
+    where p.source_id=$1 and t.source_transaction_id=$2 order by a.type`,[sourceId,`cross-source-settlement:${applicationId}:reverse`])).rows;
+  const reverse=await nativeReversals();
+  expect(reverse).toMatchObject([
+    {posting_date:"2026-02-03",debit_amount:"100.00",credit_amount:"0.00",type:"AccountsPayable",accounting_basis:"cash"},
+    {posting_date:"2026-02-03",debit_amount:"0.00",credit_amount:"100.00",type:"Expense",accounting_basis:"cash"},
+  ]);
+  expect(await sdk.commands.paymentApplications.unapply(command)).toEqual(ended);
+  await expect(sdk.commands.paymentApplications.unapply({...command,effectiveDate:"2026-02-04"})).rejects.toThrow();
+  await expect(sdk.commands.paymentApplications.unapply({...command,importedCorrection:{...importedCorrection,reviewRef:"different-review"}})).rejects.toThrow();
+  const historicBills=await sdk.queries.listVendorBills({asOfDate:"2026-02-02",vendorId:vendor.partyId});
+  expect(historicBills.items).toHaveLength(1);
+  expect(historicBills.items[0]?.openAmount).toBe("0.00");
+  expect((await sdk.queries.listVendorBills({asOfDate:"2026-02-03",vendorId:vendor.partyId})).items[0]?.openAmount).toBe("100.00");
+  for (const changed of [false,true]) {
+    const result=await persistCanonicalFacts(storage,{...imported,transactions:imported.transactions.map(t=>({...t,...(changed?{status:"void" as const}:{})})),postings:originalJournal.map(p=>({...p,...(changed?{debitAmount:p.debitAmount==="100.00"?"90.00":"0.00",creditAmount:p.creditAmount==="100.00"?"90.00":"0.00",netAmount:p.netAmount==="100.00"?"90.00":"-90.00"}:{})}))});
+    expect(result.correctionDependencies).toHaveLength(2);
+    const replay=await persistQuickBooksSubledgerResources({client,companyId,importedAt:operation.occurredAt,facts:imported,
+      replaceMissingDocuments:true,resources:{...adapterInput.resources,operationalDocuments:documents.map(d=>({...d,...(changed?{syncAction:"deleted" as const}:{})}))}});
+    expect(replay.correctionDependencies).toHaveLength(2);
+    expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,source_open:"100.00",target_open:"100.00"}]);
+    expect(await historicalFacts()).toEqual(journalBefore);
+    expect(await nativeReversals()).toEqual(reverse);
+  }
+  } finally { await client.query("rollback"); }
+});

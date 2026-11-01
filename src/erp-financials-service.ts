@@ -810,7 +810,14 @@ export type RetireReceiptApplicationResult =
   | { readonly status: "already_recorded"; readonly application: SubledgerApplicationResult }
   | { readonly status: "retired" | "already_retired"; readonly sourceDocumentId: string; readonly targetDocumentId: string; readonly idempotencyKey: string; readonly lifecycleEventId: string };
 
+/** Original imported application stays in its historical source. Only the
+ * compensating journal uses the active writer. Bind reviewRef to host approval. */
+export type ImportedApplicationCorrection = Omit<CrossSourceSettlement, "targetSourceId"> & {
+  readonly applicationSourceId: string;
+};
+
 export type EndSubledgerApplicationInput = {
+  readonly importedCorrection?: ImportedApplicationCorrection;
   readonly operation: FinancialOperationContext;
   readonly applicationId: string;
   /** Accounting date used to enforce fiscal-period and posting-lock policy. */
@@ -3989,22 +3996,30 @@ async function endSubledgerApplication(
   assertFinancialApproval(context, input.operation);
   assertIsoDate(input.effectiveDate, "effectiveDate");
   assertExpectedSubledgerVersion(input.expectedVersion, "expectedVersion");
+  const applicationSourceId = input.importedCorrection?.applicationSourceId ?? context.sourceId;
+  if (input.importedCorrection && (applicationSourceId === context.sourceId || !input.importedCorrection.reviewRef.trim()
+    || !input.operation.approverRef || input.operation.approverRef === input.operation.actorRef))
+    throw new ErpFinancialsValidationError("Imported correction requires a historical source and independent reviewed approval");
+  const correctionEvidence = input.importedCorrection ? {
+    ...input.importedCorrection, accountingSourceId: context.sourceId, bookId: context.bookId ?? null,
+    accountMappings: [...input.importedCorrection.accountMappings].sort((a,b) => a.historicalAccountId.localeCompare(b.historicalAccountId))
+  } : undefined;
   return context.database.transaction(async (client) => {
     const coordinate = (await client.query(`select target_document_source_id from erp_financials.subledger_applications
       where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_application_id=$4`,
-      [context.tenantId, context.companyId, context.sourceId, input.applicationId])).rows[0];
+      [context.tenantId, context.companyId, applicationSourceId, input.applicationId])).rows[0];
     const targetSource = storedOptionalString(coordinate?.target_document_source_id);
-    for (const sourceId of unique([context.sourceId, ...(targetSource ? [targetSource] : [])]).sort())
+    for (const sourceId of unique([context.sourceId, applicationSourceId, ...(targetSource ? [targetSource] : [])]).sort())
       await lockCustomerPaymentCorrectionSource(client, context.tenantId, sourceId);
     await acquireTransactionLock(
       client,
-      `subledger-application:${context.tenantId}:${context.companyId}:${context.sourceId}:${input.applicationId}`
+      `subledger-application:${context.tenantId}:${context.companyId}:${applicationSourceId}:${input.applicationId}`
     );
     const currentResult = await client.query(
       `select *, "application_date"::text as "application_date" from "erp_financials"."subledger_applications"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_application_id" = $4
 for update`,
-      [context.tenantId, context.companyId, context.sourceId, input.applicationId]
+      [context.tenantId, context.companyId, applicationSourceId, input.applicationId]
     );
     const current = currentResult.rows[0];
     if (current === undefined) {
@@ -4026,7 +4041,7 @@ for update`,
     const cancellation = await client.query(
       `select invoice_void_id from erp_financials.invoice_voids
        where tenant_id=$1 and company_id=$2 and source_id=$3 and application_id=$4 limit 1`,
-      [context.tenantId, context.companyId, context.sourceId, input.applicationId]
+      [context.tenantId, context.companyId, applicationSourceId, input.applicationId]
     );
     if (cancellation.rows.length) throw new ErpFinancialsError("terminal_state_conflict",
       "Invoice cancellation credit cannot be detached; record a separately reviewed replacement invoice instead");
@@ -4038,7 +4053,7 @@ for update`,
         `select "idempotency_key", "payload", "aggregate_id", "event_type"
 from "erp_financials"."financial_lifecycle_events"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "event_id" = $4`,
-        [context.tenantId, context.companyId, context.sourceId, current.ended_event_id]
+        [context.tenantId, context.companyId, applicationSourceId, current.ended_event_id]
       );
       const ended = event.rows[0];
       const payload = storedJson(ended?.payload);
@@ -4047,6 +4062,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "event_id"
       if (ended === undefined || evidence === undefined
         || ended.aggregate_id !== input.applicationId || ended.event_type !== `subledger_application.${status}`
         || evidence.effectiveDate !== input.effectiveDate || evidence.priorVersion !== input.expectedVersion
+        || canonicalCorrectionJson(evidence.importedCorrection) !== canonicalCorrectionJson(correctionEvidence)
         || evidence.status !== status || storedInteger(current.version, "version") !== input.expectedVersion + 1) {
         throw new ErpFinancialsIdempotencyConflictError(`subledger-application:${input.applicationId}:${status}`);
       }
@@ -4066,10 +4082,12 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "event_id"
     if (context.postingPolicy === "enforce_fiscal_periods") {
       await assertPostingDateAllowed(client, context, input.effectiveDate);
     }
+    const importedPostings = input.importedCorrection
+      ? await prepareImportedApplicationReversal(client, context, current, input) : undefined;
     const lifecycle = await appendFinancialLifecycleEvent(client, {
       tenantId: context.tenantId,
       companyId: context.companyId,
-      sourceId: context.sourceId,
+      sourceId: applicationSourceId,
       aggregateType: "subledger_application",
       aggregateId: input.applicationId,
       eventType: `subledger_application.${status}`,
@@ -4077,7 +4095,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "event_id"
       operation: input.operation,
       recordedAt: context.now(),
       priorEventId: storedString(current.applied_event_id, "applied_event_id"),
-      payload: { effectiveDate: input.effectiveDate, priorVersion: currentVersion, status }
+      payload: { effectiveDate: input.effectiveDate, priorVersion: currentVersion, status, ...(correctionEvidence ? { importedCorrection: correctionEvidence } : {}) }
     });
     const updated = await client.query(
       `update "erp_financials"."subledger_applications"
@@ -4088,7 +4106,7 @@ returning *`,
       [
         context.tenantId,
         context.companyId,
-        context.sourceId,
+        applicationSourceId,
         input.applicationId,
         status,
         lifecycle.eventId,
@@ -4103,7 +4121,9 @@ returning *`,
         details: { applicationId: input.applicationId }
       });
     }
-    const cashBasisPostingIds = current.target_document_source_id != null && current.target_document_source_id !== context.sourceId
+    const cashBasisPostingIds = importedPostings
+      ? await persistCrossSourceSettlement(client, context, importedPostings, input.applicationId, input.effectiveDate, "reverse")
+      : current.target_document_source_id != null && current.target_document_source_id !== context.sourceId
       ? await reverseCrossSourceSettlement(client, context, current, input)
       : await persistCashBasisApplicationProjection(client, context, {
       action: "reverse",
@@ -7653,4 +7673,105 @@ async function reverseCrossSourceSettlement(client: PostgresQueryClient, context
     postingDate: input.effectiveDate, debitAmount: posting.creditAmount, creditAmount: posting.debitAmount,
     netAmount: formatMoney(parsePositiveOrZeroMoney(posting.creditAmount, "credit") - parsePositiveOrZeroMoney(posting.debitAmount, "debit")) }));
   return persistCrossSourceSettlement(client, context, postings, input.applicationId, input.effectiveDate, "reverse");
+}
+
+function canonicalCorrectionJson(value: unknown): string {
+  if (value === undefined) return "undefined";
+  if (Array.isArray(value)) return `[${value.map(canonicalCorrectionJson).join(",")}]`;
+  if (value !== null && typeof value === "object") return `{${Object.entries(value).sort(([a],[b]) => a.localeCompare(b)).map(([key,item]) => `${JSON.stringify(key)}:${canonicalCorrectionJson(item)}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+/** Full, plain imported bill settlements only. Refuse ambiguous allocations;
+ * the retained provider cash journal must prove the exact expense recognition. */
+async function prepareImportedApplicationReversal(client: PostgresQueryClient, context: ServiceContext,
+  application: Record<string, unknown>, input: EndSubledgerApplicationInput): Promise<readonly LedgerPosting[]> {
+  const review = input.importedCorrection;
+  if (!review) throw new ErpFinancialsValidationError("Missing imported correction review");
+  const historicalSource = review.applicationSourceId;
+  const fail = (message: string): never => { throw new ErpFinancialsValidationError(message); };
+  if (application.application_type !== "bill_payment_to_bill" || application.target_document_source_id != null
+    || application.currency_code !== context.currencyCode || input.effectiveDate < storedDate(application.application_date, "application_date"))
+    fail("Imported correction requires an original same-source bill payment and a non-backdated correction");
+  const event = (await client.query(`select event_type from erp_financials.financial_lifecycle_events
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and event_id=$4`,
+    [context.tenantId,context.companyId,historicalSource,application.applied_event_id])).rows[0];
+  if (event?.event_type !== "quickbooks_application_imported") fail("Correction requires the original provider application event");
+  const docs = (await client.query(`select * from erp_financials.subledger_documents
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_document_id=any($4::text[]) order by subledger_document_id for update`,
+    [context.tenantId,context.companyId,historicalSource,[application.source_document_id,application.target_document_id]])).rows;
+  const payment = docs.find(d => d.subledger_document_id === application.source_document_id);
+  const bill = docs.find(d => d.subledger_document_id === application.target_document_id);
+  if (!payment || !bill || payment.document_type !== "bill_payment" || bill.document_type !== "vendor_bill"
+    || docs.some(d => d.party_id !== review.historicalPartyId || d.currency_code !== context.currencyCode
+      || storedMoney(d.original_amount,"original_amount") !== storedMoney(application.applied_amount,"applied_amount")
+      || storedMoney(d.open_amount,"open_amount") !== "0.00" || d.status !== "settled"))
+    return fail("Imported correction requires a fully evidenced, fully settled bill and payment for the reviewed vendor");
+  const peers = (await client.query(`select subledger_application_id from erp_financials.subledger_applications
+    where tenant_id=$1 and company_id=$2 and ((source_id=$3 and source_document_id=$4)
+      or (coalesce(target_document_source_id,source_id)=$3 and target_document_id=$5)) for share`,
+    [context.tenantId,context.companyId,historicalSource,payment.subledger_document_id,bill.subledger_document_id])).rows;
+  if (peers.length !== 1) fail("Imported correction requires one unambiguous original full application");
+  const bindings = (await client.query(`select b.*,s.source_system from erp_financials.reporting_book_sources b
+    join erp_financials.accounting_sources s using(tenant_id,source_id)
+    where b.tenant_id=$1 and b.company_id=$2 and b.book_id=$3 and b.source_id=any($4::text[]) for share of b,s`,
+    [context.tenantId,context.companyId,context.bookId,[context.sourceId,historicalSource]])).rows;
+  const active = bindings.find(b => b.source_id === context.sourceId), historical = bindings.find(b => b.source_id === historicalSource);
+  const within = (b: Record<string,unknown> | undefined, date: string) => !!b
+    && (b.effective_from == null || storedDate(b.effective_from,"effective_from") <= date)
+    && (b.effective_through == null || storedDate(b.effective_through,"effective_through") >= date);
+  if (active?.source_role !== "active" || active.source_system !== "native_erp" || !within(active,input.effectiveDate)
+    || historical?.source_role !== "historical" || historical.source_system !== "quickbooks"
+    || !within(historical,storedDate(application.application_date,"application_date"))
+    || !within(historical,storedDate(bill.recognition_date ?? bill.document_date,"document_date")))
+    fail("Correction requires historical import and active native accounting within their original book windows");
+  const party = (await client.query(`select party_id from erp_financials.parties where tenant_id=$1 and source_id=$2
+    and party_id=$3 and party_type='vendor' and active=true for share`,[context.tenantId,context.sourceId,review.nativePartyId])).rows;
+  if (party.length !== 1) fail("Correction requires an active reviewed native vendor");
+  // Historical context is read-only: never pass it to posting or command code.
+  const originals = (await loadImportedDocumentAccrualPostings(client,{ ...context,sourceId:historicalSource },storedString(bill.transaction_id,"transaction_id"))).map(storedLedgerPosting);
+  if (originals.some(p => p.itemId !== undefined || p.dimensionRefs.length)) fail("Dimensional imported corrections require explicit component mappings");
+  const mappings = new Map(review.accountMappings.map(m => [m.historicalAccountId,m.nativeAccountId]));
+  const ids = unique(originals.map(p => p.accountId));
+  if (mappings.size !== review.accountMappings.length || mappings.size !== ids.length || ids.some(id => !mappings.has(id))) fail("Correction mappings must cover exactly the original journal accounts");
+  const accounts = (await client.query(`select * from erp_financials.accounts where tenant_id=$1 and
+    ((source_id=$2 and account_id=any($3::text[])) or (source_id=$4 and account_id=any($5::text[]))) for share`,
+    [context.tenantId,historicalSource,ids,context.sourceId,[...mappings.values()]])).rows;
+  const controls = originals.filter(p => accounts.some(a => a.source_id===historicalSource && a.account_id===p.accountId && a.type==='AccountsPayable' && a.classification==='liability'));
+  const control = controls[0];
+  if (controls.length !== 1 || !control || control.creditAmount !== storedMoney(application.applied_amount,"applied_amount") || control.debitAmount !== "0.00") return fail("Imported correction requires one exact payable control");
+  for (const [oldId,newId] of mappings) {
+    const old = accounts.find(a => a.source_id===historicalSource && a.account_id===oldId), next = accounts.find(a => a.source_id===context.sourceId && a.account_id===newId);
+    if (!old || !next || next.active !== true || old.classification !== next.classification
+      || (next.currency_code != null && next.currency_code !== context.currencyCode)
+      || (oldId===control.accountId ? next.type!=='AccountsPayable' : !["expense","cost_of_goods_sold","other_expense"].includes(String(old.classification))))
+      fail("Correction account mapping changes classification or uses an unavailable account");
+  }
+  const metadata = storedJson(payment.metadata) as Record<string,JsonValue>;
+  const cash = (await client.query(`select p.*,a.type as account_type from erp_financials.ledger_postings p
+    join erp_financials.transactions t using(tenant_id,source_id,transaction_id)
+    join erp_financials.accounts a using(tenant_id,source_id,account_id)
+    where p.tenant_id=$1 and p.source_id=$2 and p.accounting_basis='cash' and t.status='posted'
+      and t.source_payload_ref->>'sourceObjectType'='BillPayment' and t.source_payload_ref->>'sourceObjectId'=$3
+    order by p.posting_id for share of p,t,a`,[context.tenantId,historicalSource,metadata.sourceTransactionId])).rows;
+  const bank = cash.filter(p => p.account_type==='Bank');
+  const expenses = originals.filter(p => p.accountId !== control.accountId);
+  if (new Set(cash.map(p=>p.transaction_id)).size !== 1 || bank.length !== 1
+    || storedMoney(bank[0]?.credit_amount,"credit_amount") !== storedMoney(application.applied_amount,"applied_amount")
+    || storedMoney(bank[0]?.debit_amount,"debit_amount") !== "0.00" || cash.length !== expenses.length+1
+    || expenses.some(p => !cash.some(c => c.account_id===p.accountId && storedMoney(c.debit_amount,"debit_amount")===p.debitAmount && storedMoney(c.credit_amount,"credit_amount")===p.creditAmount))
+    || cash.some(p => p.currency_code!==context.currencyCode || p.party_id!==review.historicalPartyId || p.item_id!=null || (p.dimension_refs as unknown[]).length))
+    fail("Imported correction requires the exact original payment cash recognition journal");
+  await assertPostingAccountEligibility(client,context,[...mappings.values()]);
+  return projectCashBasisApplication({ applicationId:input.applicationId,applicationType:"bill_payment_to_bill",action:"reverse",
+    appliedAmount:storedMoney(application.applied_amount,"applied_amount"),effectiveDate:input.effectiveDate,
+    importBatchId:scopedRecordId(context,"import_batch",`cross-source-settlement:${input.applicationId}:reverse`),accrualPostings:originals }).map(posting => {
+      const accountId = mappings.get(posting.accountId);
+      if (!accountId) throw new ErpFinancialsValidationError("Missing mapped correction account");
+      const { transactionLineId:_line,itemId:_item,checkpointId:_checkpoint,...fact }=posting; void _line;void _item;void _checkpoint;
+      return { ...fact,postingId:scopedRecordId(context,"posting",`imported-correction:${posting.postingId}`),sourceId:context.sourceId,
+        accountId,partyId:review.nativePartyId,
+        sourcePayloadRef:{ sourceObjectType:"CrossSourceVendorSettlement",sourceObjectId:input.applicationId,
+          preview:{ applicationSourceId:historicalSource,originalPostingId:posting.postingId,reviewRef:review.reviewRef } } };
+    });
 }
