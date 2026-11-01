@@ -7756,11 +7756,16 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
     order by p.posting_id for share of p,t,a`,[context.tenantId,historicalSource,metadata.sourceTransactionId])).rows;
   const bank = cash.filter(p => p.account_type==='Bank');
   const expenses = originals.filter(p => p.accountId !== control.accountId);
+  // Compare a multiset: repeated expense-account lines must each be consumed
+  // exactly once, rather than matching the same cash row more than once.
+  const expectedCash = expenses.map(p => `${p.accountId}:${p.debitAmount}:${p.creditAmount}`).sort();
+  const retainedCash = cash.filter(p => p.account_type !== "Bank")
+    .map(p => `${String(p.account_id)}:${storedMoney(p.debit_amount,"debit_amount")}:${storedMoney(p.credit_amount,"credit_amount")}`).sort();
   if (new Set(cash.map(p=>p.transaction_id)).size !== 1 || bank.length !== 1
     || storedMoney(bank[0]?.credit_amount,"credit_amount") !== storedMoney(application.applied_amount,"applied_amount")
     || storedMoney(bank[0]?.debit_amount,"debit_amount") !== "0.00" || cash.length !== expenses.length+1
-    || expenses.some(p => !cash.some(c => c.account_id===p.accountId && storedMoney(c.debit_amount,"debit_amount")===p.debitAmount && storedMoney(c.credit_amount,"credit_amount")===p.creditAmount))
-    || cash.some(p => p.currency_code!==context.currencyCode || p.party_id!==review.historicalPartyId || p.item_id!=null || (p.dimension_refs as unknown[]).length))
+    || canonicalCorrectionJson(expectedCash) !== canonicalCorrectionJson(retainedCash)
+    || cash.some(p => storedDate(p.posting_date,"posting_date")!==storedDate(payment.document_date,"document_date") || p.currency_code!==context.currencyCode || p.party_id!==review.historicalPartyId || p.item_id!=null || (p.dimension_refs as unknown[]).length))
     fail("Imported correction requires the exact original payment cash recognition journal");
   await assertPostingAccountEligibility(client,context,[...mappings.values()]);
   return projectCashBasisApplication({ applicationId:input.applicationId,applicationType:"bill_payment_to_bill",action:"reverse",

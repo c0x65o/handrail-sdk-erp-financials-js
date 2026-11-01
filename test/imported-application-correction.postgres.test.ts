@@ -157,6 +157,17 @@ it.skipIf(!url)("corrects original imported settlement through the active source
     {...command,importedCorrection:{...importedCorrection,accountMappings:[]}},
     {...command,expectedVersion:2},
   ]) await expect(sdk.commands.paymentApplications.unapply(invalid)).rejects.toThrow();
+  await client.query("savepoint duplicated_expense_evidence");
+  const expense=required(originalJournal[0]), cashExpense=required(originalJournal[2]);
+  await storage.upsertLedgerPostings([
+    {...expense,debitAmount:"50.00",netAmount:"50.00"},
+    {...expense,postingId:"duplicate-accrual-expense",sourcePostingId:"duplicate-accrual-expense",debitAmount:"50.00",netAmount:"50.00"},
+    {...cashExpense,debitAmount:"50.00",netAmount:"50.00"},
+    {...cashExpense,postingId:"duplicate-cash-expense",sourcePostingId:"duplicate-cash-expense",debitAmount:"40.00",netAmount:"40.00"},
+  ]);
+  await expect(sdk.commands.paymentApplications.unapply(command)).rejects.toThrow("exact original payment cash recognition journal");
+  await client.query("rollback to savepoint duplicated_expense_evidence");
+  await client.query("release savepoint duplicated_expense_evidence");
   const historicalFacts=async()=>(await client.query(`select to_jsonb(p) as fact from erp_financials.ledger_postings p where tenant_id=$1 and source_id=$2 order by posting_id`,[facts.company.tenantId,facts.source.sourceId])).rows;
   const journalBefore=await historicalFacts();
   const ended=await sdk.commands.paymentApplications.unapply(command);
