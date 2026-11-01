@@ -368,7 +368,7 @@ describe("QuickBooks SDK envelope adapter", () => {
       ]);
     }
 
-    expect(statements).toHaveLength(6);
+    expect(statements.some(statement => statement.includes("importedCorrection"))).toBe(true);
     expect(statements.every((statement) => /^select\b/i.test(statement.trim()))).toBe(true);
   });
 

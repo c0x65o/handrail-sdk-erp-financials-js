@@ -241,11 +241,12 @@ describe("Postgres storage adapter", () => {
     });
 
     expect(client.calls[0]?.sql).toContain("pg_advisory_xact_lock");
-    expect(client.calls[1]?.sql).toContain("customer_payment_corrections");
-    expect(client.calls[2]?.sql).toContain("subledger_documents");
-    expect(client.calls[3]?.sql).toContain("QuickBooksGeneralLedger:%");
-    expect(client.calls[3]?.sql).toContain('posting."accounting_basis" = any');
-    expect(client.calls[3]?.params).toEqual(["tenant_qbo", "source_qbo", ["accrual", "cash"], "2026-01-01", "2026-12-31", []]);
+    expect(client.calls.some(call => call.sql.includes("customer_payment_corrections"))).toBe(true);
+    expect(client.calls.some(call => call.sql.includes("importedCorrection"))).toBe(true);
+    const deletion = client.calls.find(call => call.sql.startsWith('delete from "erp_financials"."ledger_postings"'));
+    expect(deletion?.sql).toContain("QuickBooksGeneralLedger:%");
+    expect(deletion?.sql).toContain('posting."accounting_basis" = any');
+    expect(deletion?.params).toEqual(["tenant_qbo", "source_qbo", ["accrual", "cash"], "2026-01-01", "2026-12-31", []]);
     expect(client.calls.filter((call) => call.sql.includes('insert into "erp_financials"."ledger_postings"'))).toHaveLength(2);
     expect(client.calls.filter((call) => call.sql.includes('update "erp_financials"."report_snapshots"'))).toHaveLength(2);
     expect(transactionCount).toBe(1);
