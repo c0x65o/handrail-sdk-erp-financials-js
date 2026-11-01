@@ -26,11 +26,15 @@ it.skipIf(!url).each([
   { label:"full signed", billAmount:"100.00", billOpen:"0.00", expense:"150.00", contra:"50.00", cashExpense:"150.00", cashContra:"50.00" },
   { label:"partial signed", billAmount:"200.00", billOpen:"100.00", expense:"300.00", contra:"100.00", cashExpense:"150.00", cashContra:"50.00" },
   { label:"split payment", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
+  { label:"full tax", billAmount:"100.00", billOpen:"0.00", expense:"80.00", contra:"0.00", cashExpense:"80.00", cashContra:"0.00", component:"tax" },
+  { label:"partial tax", billAmount:"200.00", billOpen:"100.00", expense:"160.00", contra:"0.00", cashExpense:"80.00", cashContra:"0.00", component:"tax" },
+  { label:"full withholding", billAmount:"100.00", billOpen:"0.00", expense:"120.00", contra:"0.00", cashExpense:"120.00", cashContra:"0.00", component:"liability" },
+  { label:"split tax", billAmount:"100.00", billOpen:"0.00", expense:"80.00", contra:"0.00", cashExpense:"80.00", cashContra:"0.00", component:"tax" },
   { label:"multiple payments", billAmount:"200.00", billOpen:"0.00", expense:"200.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
 ])("corrects $label imported settlement through the active source, preserves history, and fences provider replay", async scenario => {
   await client.query("begin");
   try {
-  const split = scenario.label === "split payment";
+  const split = scenario.label.startsWith("split ");
   const companyId = "imported-bill-payment-contract";
   const { facts, adapterInput } = mapNormalizedQuickBooksFullSyncResponseToCanonicalFacts(
     ERP_FINANCIALS_NORMALIZED_QUICKBOOKS_SYNC_FIXTURES.fullSync.response, { companyId });
@@ -164,10 +168,21 @@ it.skipIf(!url).each([
     { ...required(originalJournal[0]),postingId:"bill-basis-contra",sourcePostingId:"bill-basis-contra",debitAmount:"0.00",creditAmount:scenario.contra,netAmount:`-${scenario.contra}` },
     { ...required(originalJournal[2]),postingId:"payment-cash-contra",sourcePostingId:"payment-cash-contra",debitAmount:"0.00",creditAmount:scenario.cashContra,netAmount:`-${scenario.cashContra}` },
   );
+  const componentType = scenario.component === "tax" ? "OtherCurrentAsset" : "OtherCurrentLiability";
+  const componentClass = scenario.component === "tax" ? "asset" : "liability";
+  if (scenario.component) {
+    await storage.upsertAccounts([{...required(facts.accounts[0]),accountId:"imported-component",sourceAccountId:"component",name:"Reviewed component",classification:componentClass,type:componentType}]);
+    await sdk.commands.accounts.upsertTree({operation:{...operation,requestId:"component"},parent:{accountKey:"component",name:"Reviewed component",classification:componentClass,type:componentType}});
+    const amount = scenario.billAmount === "200.00" ? "40.00" : "20.00";
+    const amounts = (value:string) => scenario.component === "tax" ? {debitAmount:value,creditAmount:"0.00",netAmount:value} : {debitAmount:"0.00",creditAmount:value,netAmount:`-${value}`};
+    originalJournal.push({...required(originalJournal[0]),postingId:"bill-component",sourcePostingId:"bill-component",accountId:"imported-component",...amounts(amount)},
+      {...required(originalJournal[2]),postingId:"cash-component",sourcePostingId:"cash-component",accountId:"imported-component",...amounts("20.00")});
+  }
   if(split) {
     await storage.upsertTransactions([{...required(imported.transactions[0]),transactionId:"other-bill-accrual",sourceTransactionId:"other-bill-accrual",partyId:vendor.partyId,sourcePayloadRef:{sourceObjectType:"Bill",sourceObjectId:"other-bill"}}]);
-    originalJournal.push(...originalJournal.slice(0,2).map(p=>({...p,postingId:`other-${p.postingId}`,sourcePostingId:`other-${p.postingId}`,transactionId:"other-bill-accrual",postingDate:"2026-01-11"})));
+    originalJournal.push(...originalJournal.filter(p=>p.transactionId==="bill-accrual").map(p=>({...p,postingId:`other-${p.postingId}`,sourcePostingId:`other-${p.postingId}`,transactionId:"other-bill-accrual",postingDate:"2026-01-11"})));
     originalJournal.push({...required(originalJournal[2]),postingId:"other-payment-expense",sourcePostingId:"other-payment-expense"});
+    if (scenario.component) originalJournal.push({...required(originalJournal.find(p=>p.postingId==="cash-component")),postingId:"other-cash-component",sourcePostingId:"other-cash-component"});
     Object.assign(required(originalJournal[3]),{creditAmount:"200.00",netAmount:"-200.00"});
   }
   await storage.upsertLedgerPostings(originalJournal);
@@ -175,6 +190,7 @@ it.skipIf(!url).each([
   const importedCorrection={applicationSourceId:facts.source.sourceId,reviewRef:"review:original-payment",historicalPartyId:vendor.partyId,nativePartyId:vendorId,
     accountMappings:[{historicalAccountId:expenseAccountId,nativeAccountId:String(required(nativeAccounts.find(a=>a.type==='Expense')).account_id)},
       {historicalAccountId:payableAccountId,nativeAccountId:String(required(nativeAccounts.find(a=>a.type==='AccountsPayable')).account_id)}]};
+  if (scenario.component) importedCorrection.accountMappings.push({historicalAccountId:"imported-component",nativeAccountId:String(required(nativeAccounts.find(a=>a.type===componentType)).account_id)});
   const command={operation,applicationId,expectedVersion:1,effectiveDate:"2026-02-03",importedCorrection};
   for (const invalid of [
     {...command,operation:{...operation,approverRef:operation.actorRef}},
@@ -183,6 +199,14 @@ it.skipIf(!url).each([
     {...command,importedCorrection:{...importedCorrection,accountMappings:[]}},
     {...command,expectedVersion:2},
   ]) await expect(sdk.commands.paymentApplications.unapply(invalid)).rejects.toThrow();
+  if (scenario.component) {
+    await expect(sdk.commands.paymentApplications.unapply({...command,importedCorrection:{...importedCorrection,accountMappings:importedCorrection.accountMappings.filter(m=>m.historicalAccountId!=="imported-component")}})).rejects.toThrow("cover exactly");
+    await client.query("savepoint incompatible_component");
+    await client.query("update erp_financials.accounts set type='Bank' where source_id=$1 and account_id=$2",[sourceId,required(importedCorrection.accountMappings.find(m=>m.historicalAccountId==="imported-component")).nativeAccountId]);
+    await expect(sdk.commands.paymentApplications.unapply(command)).rejects.toThrow("mapping changes classification");
+    await client.query("rollback to savepoint incompatible_component");
+    await client.query("release savepoint incompatible_component");
+  }
   if(scenario.label === "full plain") {
   await client.query("savepoint duplicated_expense_evidence");
   const expense=required(originalJournal[0]), cashExpense=required(originalJournal[2]);
@@ -221,6 +245,7 @@ it.skipIf(!url).each([
     {posting_date:"2026-02-03",debit_amount:"100.00",credit_amount:"0.00",type:"AccountsPayable",accounting_basis:"cash"},
     ... (scenario.cashContra !== "0.00" ? [{posting_date:"2026-02-03",debit_amount:scenario.cashContra,credit_amount:"0.00",type:"Expense",accounting_basis:"cash"}] : []),
     {posting_date:"2026-02-03",debit_amount:"0.00",credit_amount:scenario.cashExpense,type:"Expense",accounting_basis:"cash"},
+    ...(scenario.component ? [{posting_date:"2026-02-03",debit_amount:scenario.component==="tax"?"0.00":"20.00",credit_amount:scenario.component==="tax"?"20.00":"0.00",type:componentType,accounting_basis:"cash"}] : []),
   ]);
   expect(await sdk.commands.paymentApplications.unapply(command)).toEqual(ended);
   await expect(sdk.commands.paymentApplications.unapply({...command,effectiveDate:"2026-02-04"})).rejects.toThrow();

@@ -812,3 +812,18 @@ so PostgreSQL can estimate their selectivity from column statistics.
 This change does not establish a production latency guarantee. The benchmark
 records independent exact controls, concurrent posting and query plans; release
 acceptance still requires the representative workload and deployed resources.
+
+### Imported bill-payment component correction
+
+`paymentApplications.unapply` with `importedCorrection` supports explicitly reviewed
+`OtherCurrentAsset` tax components and `OtherCurrentLiability` / `LongTermLiability`
+components as well as signed expense lines. Every original account must have an
+explicit mapping. Component mappings preserve both classification and account type.
+The entire retained payment cash journal must equal proportional recognition of all
+its original allocations, including signed components and rounding. This applies
+to fully allocated payments, including partial bill payments and split payments.
+Only the selected original allocation is reversed through the active source;
+original journals and historical balances remain retained and provider replay is fenced.
+No tax amounts are inferred. Dimensions, originally unapplied payment residuals,
+partial reversal of an allocation and unsupported control account components remain
+rejected. Hosts must bind approvals to the retained journals and mapped account semantics.

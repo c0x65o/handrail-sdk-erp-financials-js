@@ -7754,11 +7754,19 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
   const controls = originals.filter(p => accounts.some(a => a.source_id===historicalSource && a.account_id===p.accountId && a.type==='AccountsPayable' && a.classification==='liability'));
   const control = controls[0];
   if (controls.length !== 1 || !control || control.creditAmount !== storedMoney(bill.original_amount,"original_amount") || control.debitAmount !== "0.00") return fail("Imported correction requires one exact payable control");
+  // Explicit reviewed account mappings preserve component identity. Tax assets
+  // and withholding liabilities are reversible only when the retained payment
+  // journal proves the same recognition; never infer a tax component or flatten
+  // it into expense. Bank, receivable, payable and equity components stay fenced.
+  const isComponent = (a: Record<string, unknown>) =>
+    (a.classification === "asset" && a.type === "OtherCurrentAsset")
+    || (a.classification === "liability" && ["OtherCurrentLiability", "LongTermLiability"].includes(String(a.type)));
+  const isExpense = (a: Record<string, unknown>) => ["expense", "cost_of_goods_sold", "other_expense"].includes(String(a.classification));
   for (const [oldId,newId] of mappings) {
     const old = accounts.find(a => a.source_id===historicalSource && a.account_id===oldId), next = accounts.find(a => a.source_id===context.sourceId && a.account_id===newId);
     if (!old || !next || next.active !== true || old.classification !== next.classification
       || (next.currency_code != null && next.currency_code !== context.currencyCode)
-      || (oldId===control.accountId ? next.type!=='AccountsPayable' : !["expense","cost_of_goods_sold","other_expense"].includes(String(old.classification))))
+      || (oldId===control.accountId ? next.type!=='AccountsPayable' : !(isExpense(old) || (isComponent(old) && old.type === next.type))))
       fail("Correction account mapping changes classification or uses an unavailable account");
   }
   const metadata = storedJson(payment.metadata) as Record<string,JsonValue>;
@@ -7796,8 +7804,8 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
     const otherControls = otherPostings.filter(p=>otherAccounts.some(a=>a.account_id===p.accountId && a.type==="AccountsPayable" && a.classification==="liability"));
     const otherControl = otherControls[0];
     if (otherControls.length!==1 || !otherControl || otherControl.creditAmount!==storedMoney(other.original_amount,"original_amount") || otherControl.debitAmount!=="0.00"
-      || otherPostings.some(p=>p.itemId!==undefined || p.dimensionRefs.length || (p!==otherControl && !otherAccounts.some(a=>a.account_id===p.accountId && ["expense","cost_of_goods_sold","other_expense"].includes(String(a.classification))))))
-      return fail("Split correction requires exact plain expense journals for every original bill");
+      || otherPostings.some(p=>p.itemId!==undefined || p.dimensionRefs.length || (p!==otherControl && !otherAccounts.some(a=>a.account_id===p.accountId && (isExpense(a) || isComponent(a))))))
+      return fail("Split correction requires exact supported expense/component journals for every original bill");
     paymentExpenses.push(...projectCashBasisApplication({applicationId:String(peer.subledger_application_id),applicationType:"bill_payment_to_bill",action:"recognize",
       appliedAmount:storedMoney(peer.applied_amount,"applied_amount"),effectiveDate:input.effectiveDate,
       importBatchId:scopedRecordId(context,"import_batch",`split-proof:${input.applicationId}`),accrualPostings:otherPostings,controlAccountId:otherControl.accountId}).filter(p=>p.accountId!==otherControl.accountId));
