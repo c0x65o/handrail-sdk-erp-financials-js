@@ -7706,16 +7706,22 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
     || docs.some(d => d.party_id !== review.historicalPartyId || d.currency_code !== context.currencyCode)
     || storedMoney(payment.original_amount,"original_amount") !== storedMoney(application.applied_amount,"applied_amount")
     || storedMoney(payment.open_amount,"open_amount") !== "0.00" || payment.status !== "settled"
-    || !["open", "partially_applied", "settled"].includes(String(bill.status))
-    || parsePositiveOrZeroMoney(storedMoney(bill.original_amount,"original_amount"),"bill amount")
-      - parsePositiveOrZeroMoney(storedMoney(bill.open_amount,"open_amount"),"bill open amount")
-      !== parsePositiveMoney(storedMoney(application.applied_amount,"applied_amount"),"application amount"))
+    || !["open", "partially_applied", "settled"].includes(String(bill.status)))
     return fail("Imported correction requires one fully applied payment and an exactly reconciled bill balance for the reviewed vendor");
-  const peers = (await client.query(`select subledger_application_id from erp_financials.subledger_applications
+  const peers = (await client.query(`select * from erp_financials.subledger_applications
     where tenant_id=$1 and company_id=$2 and ((source_id=$3 and source_document_id=$4)
       or (coalesce(target_document_source_id,source_id)=$3 and target_document_id=$5)) for share`,
     [context.tenantId,context.companyId,historicalSource,payment.subledger_document_id,bill.subledger_document_id])).rows;
-  if (peers.length !== 1) fail("Imported correction requires one unambiguous original application");
+  const paymentApplications = peers.filter(p => p.source_id === historicalSource && p.source_document_id === payment.subledger_document_id);
+  const billApplications = peers.filter(p => (p.target_document_source_id ?? p.source_id) === historicalSource && p.target_document_id === bill.subledger_document_id);
+  if (paymentApplications.length !== 1 || billApplications.some(p => p.source_id !== historicalSource
+    || p.target_document_source_id != null || p.application_type !== "bill_payment_to_bill"))
+    fail("Imported correction requires one payment allocation and same-source bill payment applications");
+  const applied = billApplications.filter(p => p.status === "applied").reduce((sum,p) =>
+    sum + parsePositiveMoney(storedMoney(p.applied_amount,"applied_amount"),"application amount"), 0n);
+  if (parsePositiveOrZeroMoney(storedMoney(bill.original_amount,"original_amount"),"bill amount")
+      - parsePositiveOrZeroMoney(storedMoney(bill.open_amount,"open_amount"),"bill open amount") !== applied)
+    fail("Imported correction requires an exactly reconciled bill application balance");
   const bindings = (await client.query(`select b.*,s.source_system from erp_financials.reporting_book_sources b
     join erp_financials.accounting_sources s using(tenant_id,source_id)
     where b.tenant_id=$1 and b.company_id=$2 and b.book_id=$3 and b.source_id=any($4::text[]) for share of b,s`,

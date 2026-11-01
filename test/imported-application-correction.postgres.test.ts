@@ -25,6 +25,7 @@ it.skipIf(!url).each([
   { label:"partial plain", billAmount:"200.00", billOpen:"100.00", expense:"200.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"full signed", billAmount:"100.00", billOpen:"0.00", expense:"150.00", contra:"50.00", cashExpense:"150.00", cashContra:"50.00" },
   { label:"partial signed", billAmount:"200.00", billOpen:"100.00", expense:"300.00", contra:"100.00", cashExpense:"150.00", cashContra:"50.00" },
+  { label:"multiple payments", billAmount:"200.00", billOpen:"0.00", expense:"200.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
 ])("corrects $label imported settlement through the active source, preserves history, and fences provider replay", async scenario => {
   await client.query("begin");
   try {
@@ -46,6 +47,10 @@ it.skipIf(!url).each([
     resource("historical-payment", "BillPayment", "2026-01-20", [{ lineNumber: 1, sourceLineId: "1", postings: [], sourceAmount: "100.00",
       linkedTransactions: [{ sourceTransactionId: "historical-bill", sourceTransactionType: "Bill" }] }]),
   ];
+  const multiple = scenario.label === "multiple payments";
+  const correctedOpen = multiple ? "100.00" : scenario.billAmount;
+  if (multiple) documents.push(resource("other-payment", "BillPayment", "2026-01-21", [{ lineNumber:1,sourceLineId:"1",postings:[],sourceAmount:"100.00",
+    linkedTransactions:[{sourceTransactionId:"historical-bill",sourceTransactionType:"Bill"}] }]));
   const imported = { ...facts, transactionLines: [], postings: [], transactions: documents.map(document => ({
     ...required(facts.transactions[0]), transactionId: document.resourceId, sourceTransactionId: document.resourceId,
     sourceTransactionType: document.resource.sourceTransactionType, transactionDate: document.resource.transactionDate, partyId: vendor.partyId,
@@ -57,14 +62,14 @@ it.skipIf(!url).each([
   const importedResult = await persistQuickBooksSubledgerResources({ client, companyId, importedAt: operation.occurredAt,
     facts: imported, resources: { ...adapterInput.resources, operationalDocuments: documents } });
   expect(importedResult.unresolvedApplications).toEqual([]);
-  expect(importedResult.applications).toBe(1);
+  expect(importedResult.applications).toBe(multiple ? 2 : 1);
   const historicalSnapshot = async () => (await client.query(`select a.subledger_application_id, a.application_type, a.status, a.version,
     a.applied_amount::text as amount, source.document_type as source_type, source.open_amount::text as source_open,
     target.document_type as target_type, target.open_amount::text as target_open
     from erp_financials.subledger_applications a
     join erp_financials.subledger_documents source on source.subledger_document_id=a.source_document_id
     join erp_financials.subledger_documents target on target.subledger_document_id=a.target_document_id
-    where a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3`, [facts.company.tenantId, companyId, facts.source.sourceId])).rows;
+    where a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3 and source.metadata->>'sourceTransactionId'='historical-payment'`, [facts.company.tenantId, companyId, facts.source.sourceId])).rows;
   const before = await historicalSnapshot();
   expect(before).toHaveLength(1);
   expect(before[0]).toMatchObject({ application_type: "bill_payment_to_bill", status: "applied", version: 1,
@@ -186,9 +191,14 @@ it.skipIf(!url).each([
   await client.query("release savepoint cash_rounding_mismatch");
   const historicalFacts=async()=>(await client.query(`select to_jsonb(p) as fact from erp_financials.ledger_postings p where tenant_id=$1 and source_id=$2 order by posting_id`,[facts.company.tenantId,facts.source.sourceId])).rows;
   const journalBefore=await historicalFacts();
+  const peerFacts = async () => (await client.query(`select to_jsonb(a) as application from erp_financials.subledger_applications a
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_application_id<>$4 order by subledger_application_id`,
+    [facts.company.tenantId,companyId,facts.source.sourceId,applicationId])).rows;
+  const peersBefore = await peerFacts();
   const ended=await sdk.commands.paymentApplications.unapply(command);
+  expect(await peerFacts()).toEqual(peersBefore);
   expect(ended.status).toBe("unapplied");
-  expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,amount:"100.00",source_open:"100.00",target_open:scenario.billAmount}]);
+  expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,amount:"100.00",source_open:"100.00",target_open:correctedOpen}]);
   expect(await historicalFacts()).toEqual(journalBefore);
   const nativeReversals=async()=>(await client.query(`select p.posting_id,p.posting_date::text,p.debit_amount::text,p.credit_amount::text,a.type,p.accounting_basis
     from erp_financials.ledger_postings p join erp_financials.accounts a using(tenant_id,source_id,account_id)
@@ -206,14 +216,15 @@ it.skipIf(!url).each([
   const historicBills=await sdk.queries.listVendorBills({asOfDate:"2026-02-02",vendorId:vendor.partyId});
   expect(historicBills.items).toHaveLength(1);
   expect(historicBills.items[0]?.openAmount).toBe(scenario.billOpen);
-  expect((await sdk.queries.listVendorBills({asOfDate:"2026-02-03",vendorId:vendor.partyId})).items[0]?.openAmount).toBe(scenario.billAmount);
+  expect((await sdk.queries.listVendorBills({asOfDate:"2026-02-03",vendorId:vendor.partyId})).items[0]?.openAmount).toBe(correctedOpen);
   for (const changed of [false,true]) {
     const result=await persistCanonicalFacts(storage,{...imported,transactions:imported.transactions.map(t=>({...t,...(changed?{status:"void" as const}:{})})),postings:originalJournal.map(p=>({...p,...(changed?{debitAmount:p.debitAmount==="100.00"?"90.00":"0.00",creditAmount:p.creditAmount==="100.00"?"90.00":"0.00",netAmount:p.netAmount==="100.00"?"90.00":"-90.00"}:{})}))});
     expect(result.correctionDependencies).toHaveLength(2);
-    const replay=await persistQuickBooksSubledgerResources({client,companyId,importedAt:operation.occurredAt,facts:imported,
+    const replayPromise=persistQuickBooksSubledgerResources({client,companyId,importedAt:operation.occurredAt,facts:imported,
       replaceMissingDocuments:true,resources:{...adapterInput.resources,operationalDocuments:documents.map(d=>({...d,...(changed?{syncAction:"deleted" as const}:{})}))}});
-    expect(replay.correctionDependencies).toHaveLength(2);
-    expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,source_open:"100.00",target_open:scenario.billAmount}]);
+    if (multiple) await expect(replayPromise).rejects.toThrow("Provider links to a locally corrected imported bill require explicit reconciliation");
+    else expect((await replayPromise).correctionDependencies).toHaveLength(2);
+    expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,source_open:"100.00",target_open:correctedOpen}]);
     expect(await historicalFacts()).toEqual(journalBefore);
     expect(await nativeReversals()).toEqual(reverse);
   }
