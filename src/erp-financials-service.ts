@@ -7682,7 +7682,7 @@ function canonicalCorrectionJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-/** Full, plain imported bill settlements only. Refuse ambiguous allocations;
+/** One fully applied imported payment, including a partially paid or signed bill. Refuse ambiguous allocations;
  * the retained provider cash journal must prove the exact expense recognition. */
 async function prepareImportedApplicationReversal(client: PostgresQueryClient, context: ServiceContext,
   application: Record<string, unknown>, input: EndSubledgerApplicationInput): Promise<readonly LedgerPosting[]> {
@@ -7703,15 +7703,19 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
   const payment = docs.find(d => d.subledger_document_id === application.source_document_id);
   const bill = docs.find(d => d.subledger_document_id === application.target_document_id);
   if (!payment || !bill || payment.document_type !== "bill_payment" || bill.document_type !== "vendor_bill"
-    || docs.some(d => d.party_id !== review.historicalPartyId || d.currency_code !== context.currencyCode
-      || storedMoney(d.original_amount,"original_amount") !== storedMoney(application.applied_amount,"applied_amount")
-      || storedMoney(d.open_amount,"open_amount") !== "0.00" || d.status !== "settled"))
-    return fail("Imported correction requires a fully evidenced, fully settled bill and payment for the reviewed vendor");
+    || docs.some(d => d.party_id !== review.historicalPartyId || d.currency_code !== context.currencyCode)
+    || storedMoney(payment.original_amount,"original_amount") !== storedMoney(application.applied_amount,"applied_amount")
+    || storedMoney(payment.open_amount,"open_amount") !== "0.00" || payment.status !== "settled"
+    || !["open", "partially_applied", "settled"].includes(String(bill.status))
+    || parsePositiveOrZeroMoney(storedMoney(bill.original_amount,"original_amount"),"bill amount")
+      - parsePositiveOrZeroMoney(storedMoney(bill.open_amount,"open_amount"),"bill open amount")
+      !== parsePositiveMoney(storedMoney(application.applied_amount,"applied_amount"),"application amount"))
+    return fail("Imported correction requires one fully applied payment and an exactly reconciled bill balance for the reviewed vendor");
   const peers = (await client.query(`select subledger_application_id from erp_financials.subledger_applications
     where tenant_id=$1 and company_id=$2 and ((source_id=$3 and source_document_id=$4)
       or (coalesce(target_document_source_id,source_id)=$3 and target_document_id=$5)) for share`,
     [context.tenantId,context.companyId,historicalSource,payment.subledger_document_id,bill.subledger_document_id])).rows;
-  if (peers.length !== 1) fail("Imported correction requires one unambiguous original full application");
+  if (peers.length !== 1) fail("Imported correction requires one unambiguous original application");
   const bindings = (await client.query(`select b.*,s.source_system from erp_financials.reporting_book_sources b
     join erp_financials.accounting_sources s using(tenant_id,source_id)
     where b.tenant_id=$1 and b.company_id=$2 and b.book_id=$3 and b.source_id=any($4::text[]) for share of b,s`,
@@ -7729,7 +7733,7 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
     and party_id=$3 and party_type='vendor' and active=true for share`,[context.tenantId,context.sourceId,review.nativePartyId])).rows;
   if (party.length !== 1) fail("Correction requires an active reviewed native vendor");
   // Historical context is read-only: never pass it to posting or command code.
-  const originals = (await loadImportedDocumentAccrualPostings(client,{ ...context,sourceId:historicalSource },storedString(bill.transaction_id,"transaction_id"))).map(storedLedgerPosting);
+  const originals = (await loadImportedDocumentAccrualPostings(client,{ ...context,sourceId:historicalSource },storedString(bill.transaction_id,"transaction_id"),true)).map(storedLedgerPosting);
   if (originals.some(p => p.itemId !== undefined || p.dimensionRefs.length)) fail("Dimensional imported corrections require explicit component mappings");
   const mappings = new Map(review.accountMappings.map(m => [m.historicalAccountId,m.nativeAccountId]));
   const ids = unique(originals.map(p => p.accountId));
@@ -7739,7 +7743,7 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
     [context.tenantId,historicalSource,ids,context.sourceId,[...mappings.values()]])).rows;
   const controls = originals.filter(p => accounts.some(a => a.source_id===historicalSource && a.account_id===p.accountId && a.type==='AccountsPayable' && a.classification==='liability'));
   const control = controls[0];
-  if (controls.length !== 1 || !control || control.creditAmount !== storedMoney(application.applied_amount,"applied_amount") || control.debitAmount !== "0.00") return fail("Imported correction requires one exact payable control");
+  if (controls.length !== 1 || !control || control.creditAmount !== storedMoney(bill.original_amount,"original_amount") || control.debitAmount !== "0.00") return fail("Imported correction requires one exact payable control");
   for (const [oldId,newId] of mappings) {
     const old = accounts.find(a => a.source_id===historicalSource && a.account_id===oldId), next = accounts.find(a => a.source_id===context.sourceId && a.account_id===newId);
     if (!old || !next || next.active !== true || old.classification !== next.classification
@@ -7755,7 +7759,13 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
       and t.source_payload_ref->>'sourceObjectType'='BillPayment' and t.source_payload_ref->>'sourceObjectId'=$3
     order by p.posting_id for share of p,t,a`,[context.tenantId,historicalSource,metadata.sourceTransactionId])).rows;
   const bank = cash.filter(p => p.account_type==='Bank');
-  const expenses = originals.filter(p => p.accountId !== control.accountId);
+  // Proportional recognition is only a candidate: every retained cash line
+  // must prove this exact allocation, including rounding and signed expenses.
+  const recognized = projectCashBasisApplication({ applicationId:input.applicationId,applicationType:"bill_payment_to_bill",action:"recognize",
+    appliedAmount:storedMoney(application.applied_amount,"applied_amount"),effectiveDate:input.effectiveDate,
+    importBatchId:scopedRecordId(context,"import_batch",`cross-source-settlement:${input.applicationId}:reverse`),
+    accrualPostings:originals,controlAccountId:control.accountId });
+  const expenses = recognized.filter(p => p.accountId !== control.accountId);
   // Compare a multiset: repeated expense-account lines must each be consumed
   // exactly once, rather than matching the same cash row more than once.
   const expectedCash = expenses.map(p => `${p.accountId}:${p.debitAmount}:${p.creditAmount}`).sort();
@@ -7770,7 +7780,7 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
   await assertPostingAccountEligibility(client,context,[...mappings.values()]);
   return projectCashBasisApplication({ applicationId:input.applicationId,applicationType:"bill_payment_to_bill",action:"reverse",
     appliedAmount:storedMoney(application.applied_amount,"applied_amount"),effectiveDate:input.effectiveDate,
-    importBatchId:scopedRecordId(context,"import_batch",`cross-source-settlement:${input.applicationId}:reverse`),accrualPostings:originals }).map(posting => {
+    importBatchId:scopedRecordId(context,"import_batch",`cross-source-settlement:${input.applicationId}:reverse`),accrualPostings:originals,controlAccountId:control.accountId }).map(posting => {
       const accountId = mappings.get(posting.accountId);
       if (!accountId) throw new ErpFinancialsValidationError("Missing mapped correction account");
       const { transactionLineId:_line,itemId:_item,checkpointId:_checkpoint,...fact }=posting; void _line;void _item;void _checkpoint;

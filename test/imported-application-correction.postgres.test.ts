@@ -20,7 +20,12 @@ const client: PostgresQueryClient = { async query(statement,values) {
 beforeAll(async () => { if(url) { connection=await pool.connect(); await migratePostgresSchema({transaction:work=>work(client)},{appliedByRef:"imported-correction-test"}); } });
 afterAll(async () => { connection?.release(); await pool.end(); });
 
-it.skipIf(!url)("corrects original imported settlement through the active source, preserves history, and fences provider replay", async () => {
+it.skipIf(!url).each([
+  { label:"full plain", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
+  { label:"partial plain", billAmount:"200.00", billOpen:"100.00", expense:"200.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
+  { label:"full signed", billAmount:"100.00", billOpen:"0.00", expense:"150.00", contra:"50.00", cashExpense:"150.00", cashContra:"50.00" },
+  { label:"partial signed", billAmount:"200.00", billOpen:"100.00", expense:"300.00", contra:"100.00", cashExpense:"150.00", cashContra:"50.00" },
+])("corrects $label imported settlement through the active source, preserves history, and fences provider replay", async scenario => {
   await client.query("begin");
   try {
   const companyId = "imported-bill-payment-contract";
@@ -32,12 +37,12 @@ it.skipIf(!url)("corrects original imported settlement through the active source
     lines: HandrailQuickBooksLedgerTransactionResource["resource"]["lines"]): HandrailQuickBooksLedgerTransactionResource => ({
     ...envelope, resourceId: id, resourceType: "LedgerTransaction", resource: {
       sourceTransactionId: id, sourceTransactionType: type, transactionDate: date,
-      currencyCode: "USD", totalAmount: "100.00", openAmount: "0.00", unappliedAmount: "0.00",
+      currencyCode: "USD", totalAmount: type === "Bill" ? scenario.billAmount : "100.00", openAmount: type === "Bill" ? scenario.billOpen : "0.00", unappliedAmount: "0.00",
       partyRef: { sourceObjectId: vendor.sourcePartyId, partyType: "vendor" }, lines,
     },
   });
   const documents = [
-    resource("historical-bill", "Bill", "2026-01-10", [{ lineNumber: 1, sourceLineId: "1", postings: [], sourceAmount: "100.00", accountRef: { sourceObjectId: "79" } }]),
+    resource("historical-bill", "Bill", "2026-01-10", [{ lineNumber: 1, sourceLineId: "1", postings: [], sourceAmount: scenario.billAmount, accountRef: { sourceObjectId: "79" } }]),
     resource("historical-payment", "BillPayment", "2026-01-20", [{ lineNumber: 1, sourceLineId: "1", postings: [], sourceAmount: "100.00",
       linkedTransactions: [{ sourceTransactionId: "historical-bill", sourceTransactionType: "Bill" }] }]),
   ];
@@ -63,7 +68,7 @@ it.skipIf(!url)("corrects original imported settlement through the active source
   const before = await historicalSnapshot();
   expect(before).toHaveLength(1);
   expect(before[0]).toMatchObject({ application_type: "bill_payment_to_bill", status: "applied", version: 1,
-    amount: "100.00", source_type: "bill_payment", source_open: "0.00", target_type: "vendor_bill", target_open: "0.00" });
+    amount: "100.00", source_type: "bill_payment", source_open: "0.00", target_type: "vendor_bill", target_open: scenario.billOpen });
 
   const sourceId = "native-bill-payment-source", bookId = "imported-bill-payment-book";
   await storage.upsertAccountingSource({ tenantId: facts.company.tenantId, sourceId, sourceSystem: "native_erp",
@@ -115,8 +120,8 @@ it.skipIf(!url)("corrects original imported settlement through the active source
   ]);
   const { transactionLineId: _lineId, ...posting } = required(facts.postings[0]); void _lineId;
   await storage.upsertLedgerPostings([
-    { ...posting, postingId: "imported-bill-expense", sourcePostingId: "imported-bill-expense", transactionId: "historical-bill", accountId: expenseAccountId, postingDate: "2026-01-10", partyId: vendor.partyId, debitAmount: "100.00", creditAmount: "0.00", netAmount: "100.00" },
-    { ...posting, postingId: "imported-bill-payable", sourcePostingId: "imported-bill-payable", transactionId: "historical-bill", accountId: payableAccountId, postingDate: "2026-01-10", partyId: vendor.partyId, debitAmount: "0.00", creditAmount: "100.00", netAmount: "-100.00" },
+    { ...posting, postingId: "imported-bill-expense", sourcePostingId: "imported-bill-expense", transactionId: "historical-bill", accountId: expenseAccountId, postingDate: "2026-01-10", partyId: vendor.partyId, debitAmount: scenario.billAmount, creditAmount: "0.00", netAmount: scenario.billAmount },
+    { ...posting, postingId: "imported-bill-payable", sourcePostingId: "imported-bill-payable", transactionId: "historical-bill", accountId: payableAccountId, postingDate: "2026-01-10", partyId: vendor.partyId, debitAmount: "0.00", creditAmount: scenario.billAmount, netAmount: `-${scenario.billAmount}` },
   ]);
   await client.query("savepoint historical_writer_window");
   await expect(historical.commands.paymentApplications.unapply({ operation, applicationId, expectedVersion: 1, effectiveDate: "2026-02-03" }))
@@ -139,11 +144,15 @@ it.skipIf(!url)("corrects original imported settlement through the active source
   const bankId="historical-bank";
   await storage.upsertAccounts([{ ...required(facts.accounts[0]),accountId:bankId,sourceAccountId:bankId,type:"Bank",classification:"asset",name:"Historical bank" }]);
   const originalJournal = [
-    { ...posting,postingId:"bill-basis-expense",sourcePostingId:"bill-basis-expense",transactionId:"bill-accrual",accountId:expenseAccountId,postingDate:"2026-01-10",partyId:vendor.partyId,debitAmount:"100.00",creditAmount:"0.00",netAmount:"100.00",accountingBasis:"accrual" as const },
-    { ...posting,postingId:"bill-basis-payable",sourcePostingId:"bill-basis-payable",transactionId:"bill-accrual",accountId:payableAccountId,postingDate:"2026-01-10",partyId:vendor.partyId,debitAmount:"0.00",creditAmount:"100.00",netAmount:"-100.00",accountingBasis:"accrual" as const },
-    { ...posting,postingId:"payment-cash-expense",sourcePostingId:"payment-cash-expense",transactionId:"payment-cash",accountId:expenseAccountId,postingDate:"2026-01-20",partyId:vendor.partyId,debitAmount:"100.00",creditAmount:"0.00",netAmount:"100.00",accountingBasis:"cash" as const },
+    { ...posting,postingId:"bill-basis-expense",sourcePostingId:"bill-basis-expense",transactionId:"bill-accrual",accountId:expenseAccountId,postingDate:"2026-01-10",partyId:vendor.partyId,debitAmount:scenario.expense,creditAmount:"0.00",netAmount:scenario.expense,accountingBasis:"accrual" as const },
+    { ...posting,postingId:"bill-basis-payable",sourcePostingId:"bill-basis-payable",transactionId:"bill-accrual",accountId:payableAccountId,postingDate:"2026-01-10",partyId:vendor.partyId,debitAmount:"0.00",creditAmount:scenario.billAmount,netAmount:`-${scenario.billAmount}`,accountingBasis:"accrual" as const },
+    { ...posting,postingId:"payment-cash-expense",sourcePostingId:"payment-cash-expense",transactionId:"payment-cash",accountId:expenseAccountId,postingDate:"2026-01-20",partyId:vendor.partyId,debitAmount:scenario.cashExpense,creditAmount:"0.00",netAmount:scenario.cashExpense,accountingBasis:"cash" as const },
     { ...posting,postingId:"payment-cash-bank",sourcePostingId:"payment-cash-bank",transactionId:"payment-cash",accountId:bankId,postingDate:"2026-01-20",partyId:vendor.partyId,debitAmount:"0.00",creditAmount:"100.00",netAmount:"-100.00",accountingBasis:"cash" as const },
   ];
+  if(scenario.contra !== "0.00") originalJournal.push(
+    { ...required(originalJournal[0]),postingId:"bill-basis-contra",sourcePostingId:"bill-basis-contra",debitAmount:"0.00",creditAmount:scenario.contra,netAmount:`-${scenario.contra}` },
+    { ...required(originalJournal[2]),postingId:"payment-cash-contra",sourcePostingId:"payment-cash-contra",debitAmount:"0.00",creditAmount:scenario.cashContra,netAmount:`-${scenario.cashContra}` },
+  );
   await storage.upsertLedgerPostings(originalJournal);
   const nativeAccounts=(await client.query(`select account_id,type from erp_financials.accounts where tenant_id=$1 and source_id=$2`,[facts.company.tenantId,sourceId])).rows;
   const importedCorrection={applicationSourceId:facts.source.sourceId,reviewRef:"review:original-payment",historicalPartyId:vendor.partyId,nativePartyId:vendorId,
@@ -157,6 +166,7 @@ it.skipIf(!url)("corrects original imported settlement through the active source
     {...command,importedCorrection:{...importedCorrection,accountMappings:[]}},
     {...command,expectedVersion:2},
   ]) await expect(sdk.commands.paymentApplications.unapply(invalid)).rejects.toThrow();
+  if(scenario.label === "full plain") {
   await client.query("savepoint duplicated_expense_evidence");
   const expense=required(originalJournal[0]), cashExpense=required(originalJournal[2]);
   await storage.upsertLedgerPostings([
@@ -168,35 +178,42 @@ it.skipIf(!url)("corrects original imported settlement through the active source
   await expect(sdk.commands.paymentApplications.unapply(command)).rejects.toThrow("exact original payment cash recognition journal");
   await client.query("rollback to savepoint duplicated_expense_evidence");
   await client.query("release savepoint duplicated_expense_evidence");
+  }
+  await client.query("savepoint cash_rounding_mismatch");
+  await client.query("update erp_financials.ledger_postings set debit_amount=debit_amount+0.01,net_amount=net_amount+0.01 where posting_id=$1",[required(originalJournal[2]).postingId]);
+  await expect(sdk.commands.paymentApplications.unapply(command)).rejects.toThrow("exact original payment cash recognition journal");
+  await client.query("rollback to savepoint cash_rounding_mismatch");
+  await client.query("release savepoint cash_rounding_mismatch");
   const historicalFacts=async()=>(await client.query(`select to_jsonb(p) as fact from erp_financials.ledger_postings p where tenant_id=$1 and source_id=$2 order by posting_id`,[facts.company.tenantId,facts.source.sourceId])).rows;
   const journalBefore=await historicalFacts();
   const ended=await sdk.commands.paymentApplications.unapply(command);
   expect(ended.status).toBe("unapplied");
-  expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,amount:"100.00",source_open:"100.00",target_open:"100.00"}]);
+  expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,amount:"100.00",source_open:"100.00",target_open:scenario.billAmount}]);
   expect(await historicalFacts()).toEqual(journalBefore);
   const nativeReversals=async()=>(await client.query(`select p.posting_id,p.posting_date::text,p.debit_amount::text,p.credit_amount::text,a.type,p.accounting_basis
     from erp_financials.ledger_postings p join erp_financials.accounts a using(tenant_id,source_id,account_id)
     join erp_financials.transactions t using(tenant_id,source_id,transaction_id)
-    where p.source_id=$1 and t.source_transaction_id=$2 order by a.type`,[sourceId,`cross-source-settlement:${applicationId}:reverse`])).rows;
+    where p.source_id=$1 and t.source_transaction_id=$2 order by a.type,p.credit_amount`,[sourceId,`cross-source-settlement:${applicationId}:reverse`])).rows;
   const reverse=await nativeReversals();
   expect(reverse).toMatchObject([
     {posting_date:"2026-02-03",debit_amount:"100.00",credit_amount:"0.00",type:"AccountsPayable",accounting_basis:"cash"},
-    {posting_date:"2026-02-03",debit_amount:"0.00",credit_amount:"100.00",type:"Expense",accounting_basis:"cash"},
+    ... (scenario.cashContra !== "0.00" ? [{posting_date:"2026-02-03",debit_amount:scenario.cashContra,credit_amount:"0.00",type:"Expense",accounting_basis:"cash"}] : []),
+    {posting_date:"2026-02-03",debit_amount:"0.00",credit_amount:scenario.cashExpense,type:"Expense",accounting_basis:"cash"},
   ]);
   expect(await sdk.commands.paymentApplications.unapply(command)).toEqual(ended);
   await expect(sdk.commands.paymentApplications.unapply({...command,effectiveDate:"2026-02-04"})).rejects.toThrow();
   await expect(sdk.commands.paymentApplications.unapply({...command,importedCorrection:{...importedCorrection,reviewRef:"different-review"}})).rejects.toThrow();
   const historicBills=await sdk.queries.listVendorBills({asOfDate:"2026-02-02",vendorId:vendor.partyId});
   expect(historicBills.items).toHaveLength(1);
-  expect(historicBills.items[0]?.openAmount).toBe("0.00");
-  expect((await sdk.queries.listVendorBills({asOfDate:"2026-02-03",vendorId:vendor.partyId})).items[0]?.openAmount).toBe("100.00");
+  expect(historicBills.items[0]?.openAmount).toBe(scenario.billOpen);
+  expect((await sdk.queries.listVendorBills({asOfDate:"2026-02-03",vendorId:vendor.partyId})).items[0]?.openAmount).toBe(scenario.billAmount);
   for (const changed of [false,true]) {
     const result=await persistCanonicalFacts(storage,{...imported,transactions:imported.transactions.map(t=>({...t,...(changed?{status:"void" as const}:{})})),postings:originalJournal.map(p=>({...p,...(changed?{debitAmount:p.debitAmount==="100.00"?"90.00":"0.00",creditAmount:p.creditAmount==="100.00"?"90.00":"0.00",netAmount:p.netAmount==="100.00"?"90.00":"-90.00"}:{})}))});
     expect(result.correctionDependencies).toHaveLength(2);
     const replay=await persistQuickBooksSubledgerResources({client,companyId,importedAt:operation.occurredAt,facts:imported,
       replaceMissingDocuments:true,resources:{...adapterInput.resources,operationalDocuments:documents.map(d=>({...d,...(changed?{syncAction:"deleted" as const}:{})}))}});
     expect(replay.correctionDependencies).toHaveLength(2);
-    expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,source_open:"100.00",target_open:"100.00"}]);
+    expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,source_open:"100.00",target_open:scenario.billAmount}]);
     expect(await historicalFacts()).toEqual(journalBefore);
     expect(await nativeReversals()).toEqual(reverse);
   }
