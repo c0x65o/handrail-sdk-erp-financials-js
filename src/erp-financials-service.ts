@@ -7682,7 +7682,7 @@ function canonicalCorrectionJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-/** One fully applied imported payment, including a partially paid or signed bill. Refuse ambiguous allocations;
+/** Original imported allocations, including split payments and partially paid or signed bills. Refuse ambiguous allocations;
  * the retained provider cash journal must prove the exact expense recognition. */
 async function prepareImportedApplicationReversal(client: PostgresQueryClient, context: ServiceContext,
   application: Record<string, unknown>, input: EndSubledgerApplicationInput): Promise<readonly LedgerPosting[]> {
@@ -7704,19 +7704,23 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
   const bill = docs.find(d => d.subledger_document_id === application.target_document_id);
   if (!payment || !bill || payment.document_type !== "bill_payment" || bill.document_type !== "vendor_bill"
     || docs.some(d => d.party_id !== review.historicalPartyId || d.currency_code !== context.currencyCode)
-    || storedMoney(payment.original_amount,"original_amount") !== storedMoney(application.applied_amount,"applied_amount")
-    || storedMoney(payment.open_amount,"open_amount") !== "0.00" || payment.status !== "settled"
+    || !["settled", "partially_applied"].includes(String(payment.status))
     || !["open", "partially_applied", "settled"].includes(String(bill.status)))
-    return fail("Imported correction requires one fully applied payment and an exactly reconciled bill balance for the reviewed vendor");
+    return fail("Imported correction requires a reconciled payment and bill balance for the reviewed vendor");
   const peers = (await client.query(`select * from erp_financials.subledger_applications
     where tenant_id=$1 and company_id=$2 and ((source_id=$3 and source_document_id=$4)
       or (coalesce(target_document_source_id,source_id)=$3 and target_document_id=$5)) for share`,
     [context.tenantId,context.companyId,historicalSource,payment.subledger_document_id,bill.subledger_document_id])).rows;
   const paymentApplications = peers.filter(p => p.source_id === historicalSource && p.source_document_id === payment.subledger_document_id);
   const billApplications = peers.filter(p => (p.target_document_source_id ?? p.source_id) === historicalSource && p.target_document_id === bill.subledger_document_id);
-  if (paymentApplications.length !== 1 || billApplications.some(p => p.source_id !== historicalSource
+  if (!paymentApplications.length || paymentApplications.some(p => p.target_document_source_id != null || p.application_type !== "bill_payment_to_bill") || billApplications.some(p => p.source_id !== historicalSource
     || p.target_document_source_id != null || p.application_type !== "bill_payment_to_bill"))
-    fail("Imported correction requires one payment allocation and same-source bill payment applications");
+    fail("Imported correction requires original same-source bill payment allocations");
+  const paymentTotal = parsePositiveMoney(storedMoney(payment.original_amount,"original_amount"),"payment amount");
+  const sumApplications = (rows: Record<string, unknown>[]) => rows.reduce((sum,p) => sum + parsePositiveMoney(storedMoney(p.applied_amount,"applied_amount"),"application amount"),0n);
+  if (sumApplications(paymentApplications) !== paymentTotal
+    || sumApplications(paymentApplications.filter(p => p.status === "applied")) !== paymentTotal - parsePositiveOrZeroMoney(storedMoney(payment.open_amount,"open_amount"),"payment open amount"))
+    fail("Imported correction requires exactly reconciled original payment allocations");
   const applied = billApplications.filter(p => p.status === "applied").reduce((sum,p) =>
     sum + parsePositiveMoney(storedMoney(p.applied_amount,"applied_amount"),"application amount"), 0n);
   if (parsePositiveOrZeroMoney(storedMoney(bill.original_amount,"original_amount"),"bill amount")
@@ -7774,12 +7778,36 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
   const expenses = recognized.filter(p => p.accountId !== control.accountId);
   // Compare a multiset: repeated expense-account lines must each be consumed
   // exactly once, rather than matching the same cash row more than once.
-  const expectedCash = expenses.map(p => `${p.accountId}:${p.debitAmount}:${p.creditAmount}`).sort();
+  const paymentExpenses = [...expenses];
+  // Prove the entire original payment journal, but reverse only the selected allocation.
+  for (const peer of paymentApplications.filter(p => p.subledger_application_id !== application.subledger_application_id)) {
+    const peerEvent = (await client.query(`select event_type from erp_financials.financial_lifecycle_events where tenant_id=$1 and company_id=$2 and source_id=$3 and event_id=$4`,
+      [context.tenantId,context.companyId,historicalSource,peer.applied_event_id])).rows[0];
+    const other = (await client.query(`select * from erp_financials.subledger_documents where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_document_id=$4 for share`,
+      [context.tenantId,context.companyId,historicalSource,peer.target_document_id])).rows[0];
+    if (!other || other.document_type !== "vendor_bill" || other.party_id !== review.historicalPartyId || other.currency_code !== context.currencyCode
+      || peerEvent?.event_type !== "quickbooks_application_imported" || !["applied","unapplied","voided"].includes(String(peer.status))
+      || !within(historical,storedDate(peer.application_date,"application_date"))
+      || !within(historical,storedDate(other.recognition_date ?? other.document_date,"document_date")))
+      return fail("Split correction requires original same-vendor bill allocations within the historical window");
+    const otherPostings = (await loadImportedDocumentAccrualPostings(client,{...context,sourceId:historicalSource},storedString(other.transaction_id,"transaction_id"),true)).map(storedLedgerPosting);
+    const otherAccounts = (await client.query(`select account_id,type,classification from erp_financials.accounts where tenant_id=$1 and source_id=$2 and account_id=any($3::text[]) for share`,
+      [context.tenantId,historicalSource,unique(otherPostings.map(p=>p.accountId))])).rows;
+    const otherControls = otherPostings.filter(p=>otherAccounts.some(a=>a.account_id===p.accountId && a.type==="AccountsPayable" && a.classification==="liability"));
+    const otherControl = otherControls[0];
+    if (otherControls.length!==1 || !otherControl || otherControl.creditAmount!==storedMoney(other.original_amount,"original_amount") || otherControl.debitAmount!=="0.00"
+      || otherPostings.some(p=>p.itemId!==undefined || p.dimensionRefs.length || (p!==otherControl && !otherAccounts.some(a=>a.account_id===p.accountId && ["expense","cost_of_goods_sold","other_expense"].includes(String(a.classification))))))
+      return fail("Split correction requires exact plain expense journals for every original bill");
+    paymentExpenses.push(...projectCashBasisApplication({applicationId:String(peer.subledger_application_id),applicationType:"bill_payment_to_bill",action:"recognize",
+      appliedAmount:storedMoney(peer.applied_amount,"applied_amount"),effectiveDate:input.effectiveDate,
+      importBatchId:scopedRecordId(context,"import_batch",`split-proof:${input.applicationId}`),accrualPostings:otherPostings,controlAccountId:otherControl.accountId}).filter(p=>p.accountId!==otherControl.accountId));
+  }
+  const expectedCash = paymentExpenses.map(p => `${p.accountId}:${p.debitAmount}:${p.creditAmount}`).sort();
   const retainedCash = cash.filter(p => p.account_type !== "Bank")
     .map(p => `${String(p.account_id)}:${storedMoney(p.debit_amount,"debit_amount")}:${storedMoney(p.credit_amount,"credit_amount")}`).sort();
   if (new Set(cash.map(p=>p.transaction_id)).size !== 1 || bank.length !== 1
-    || storedMoney(bank[0]?.credit_amount,"credit_amount") !== storedMoney(application.applied_amount,"applied_amount")
-    || storedMoney(bank[0]?.debit_amount,"debit_amount") !== "0.00" || cash.length !== expenses.length+1
+    || storedMoney(bank[0]?.credit_amount,"credit_amount") !== storedMoney(payment.original_amount,"original_amount")
+    || storedMoney(bank[0]?.debit_amount,"debit_amount") !== "0.00" || cash.length !== paymentExpenses.length+1
     || canonicalCorrectionJson(expectedCash) !== canonicalCorrectionJson(retainedCash)
     || cash.some(p => storedDate(p.posting_date,"posting_date")!==storedDate(payment.document_date,"document_date") || p.currency_code!==context.currencyCode || p.party_id!==review.historicalPartyId || p.item_id!=null || (p.dimension_refs as unknown[]).length))
     fail("Imported correction requires the exact original payment cash recognition journal");

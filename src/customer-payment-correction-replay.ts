@@ -46,7 +46,11 @@ export async function loadCustomerPaymentCorrectionReplayState(
     join erp_financials.subledger_applications a on a.tenant_id=e.tenant_id and a.company_id=e.company_id
       and a.source_id=e.source_id and a.ended_event_id=e.event_id
     join erp_financials.subledger_documents d on d.tenant_id=a.tenant_id and d.company_id=a.company_id
-      and d.source_id=a.source_id and d.subledger_document_id in (a.source_document_id,a.target_document_id)
+      and d.source_id=a.source_id and (d.subledger_document_id in (a.source_document_id,a.target_document_id)
+        or exists(select 1 from erp_financials.subledger_applications sibling
+          where sibling.tenant_id=a.tenant_id and sibling.company_id=a.company_id and sibling.source_id=a.source_id
+            and sibling.source_document_id=a.source_document_id and sibling.target_document_source_id is null
+            and sibling.target_document_id=d.subledger_document_id))
     where e.tenant_id=$1 and e.source_id=$2 and e.payload ? 'importedCorrection'
     order by e.event_id,d.subledger_document_id`,[tenantId,sourceId]);
   const retained: CustomerPaymentCorrectionReplayState[] = imported.rows.map(row => ({

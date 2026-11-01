@@ -25,10 +25,12 @@ it.skipIf(!url).each([
   { label:"partial plain", billAmount:"200.00", billOpen:"100.00", expense:"200.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"full signed", billAmount:"100.00", billOpen:"0.00", expense:"150.00", contra:"50.00", cashExpense:"150.00", cashContra:"50.00" },
   { label:"partial signed", billAmount:"200.00", billOpen:"100.00", expense:"300.00", contra:"100.00", cashExpense:"150.00", cashContra:"50.00" },
+  { label:"split payment", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"multiple payments", billAmount:"200.00", billOpen:"0.00", expense:"200.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
 ])("corrects $label imported settlement through the active source, preserves history, and fences provider replay", async scenario => {
   await client.query("begin");
   try {
+  const split = scenario.label === "split payment";
   const companyId = "imported-bill-payment-contract";
   const { facts, adapterInput } = mapNormalizedQuickBooksFullSyncResponseToCanonicalFacts(
     ERP_FINANCIALS_NORMALIZED_QUICKBOOKS_SYNC_FIXTURES.fullSync.response, { companyId });
@@ -38,7 +40,7 @@ it.skipIf(!url).each([
     lines: HandrailQuickBooksLedgerTransactionResource["resource"]["lines"]): HandrailQuickBooksLedgerTransactionResource => ({
     ...envelope, resourceId: id, resourceType: "LedgerTransaction", resource: {
       sourceTransactionId: id, sourceTransactionType: type, transactionDate: date,
-      currencyCode: "USD", totalAmount: type === "Bill" ? scenario.billAmount : "100.00", openAmount: type === "Bill" ? scenario.billOpen : "0.00", unappliedAmount: "0.00",
+      currencyCode: "USD", totalAmount: type === "Bill" ? scenario.billAmount : split ? "200.00" : "100.00", openAmount: type === "Bill" ? scenario.billOpen : "0.00", unappliedAmount: "0.00",
       partyRef: { sourceObjectId: vendor.sourcePartyId, partyType: "vendor" }, lines,
     },
   });
@@ -47,6 +49,10 @@ it.skipIf(!url).each([
     resource("historical-payment", "BillPayment", "2026-01-20", [{ lineNumber: 1, sourceLineId: "1", postings: [], sourceAmount: "100.00",
       linkedTransactions: [{ sourceTransactionId: "historical-bill", sourceTransactionType: "Bill" }] }]),
   ];
+  if (split) {
+    documents.push(resource("other-bill", "Bill", "2026-01-11", [{lineNumber:1,sourceLineId:"1",postings:[],sourceAmount:"100.00",accountRef:{sourceObjectId:"79"}}]));
+    documents[1] = {...required(documents[1]), resource:{...required(documents[1]).resource, lines:[...required(documents[1]).resource.lines,{lineNumber:2,sourceLineId:"2",postings:[],sourceAmount:"100.00",linkedTransactions:[{sourceTransactionId:"other-bill",sourceTransactionType:"Bill"}]}]}};
+  }
   const multiple = scenario.label === "multiple payments";
   const correctedOpen = multiple ? "100.00" : scenario.billAmount;
   if (multiple) documents.push(resource("other-payment", "BillPayment", "2026-01-21", [{ lineNumber:1,sourceLineId:"1",postings:[],sourceAmount:"100.00",
@@ -62,14 +68,14 @@ it.skipIf(!url).each([
   const importedResult = await persistQuickBooksSubledgerResources({ client, companyId, importedAt: operation.occurredAt,
     facts: imported, resources: { ...adapterInput.resources, operationalDocuments: documents } });
   expect(importedResult.unresolvedApplications).toEqual([]);
-  expect(importedResult.applications).toBe(multiple ? 2 : 1);
+  expect(importedResult.applications).toBe(multiple || split ? 2 : 1);
   const historicalSnapshot = async () => (await client.query(`select a.subledger_application_id, a.application_type, a.status, a.version,
     a.applied_amount::text as amount, source.document_type as source_type, source.open_amount::text as source_open,
     target.document_type as target_type, target.open_amount::text as target_open
     from erp_financials.subledger_applications a
     join erp_financials.subledger_documents source on source.subledger_document_id=a.source_document_id
     join erp_financials.subledger_documents target on target.subledger_document_id=a.target_document_id
-    where a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3 and source.metadata->>'sourceTransactionId'='historical-payment'`, [facts.company.tenantId, companyId, facts.source.sourceId])).rows;
+    where a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3 and source.metadata->>'sourceTransactionId'='historical-payment' and target.metadata->>'sourceTransactionId'='historical-bill'`, [facts.company.tenantId, companyId, facts.source.sourceId])).rows;
   const before = await historicalSnapshot();
   expect(before).toHaveLength(1);
   expect(before[0]).toMatchObject({ application_type: "bill_payment_to_bill", status: "applied", version: 1,
@@ -158,6 +164,12 @@ it.skipIf(!url).each([
     { ...required(originalJournal[0]),postingId:"bill-basis-contra",sourcePostingId:"bill-basis-contra",debitAmount:"0.00",creditAmount:scenario.contra,netAmount:`-${scenario.contra}` },
     { ...required(originalJournal[2]),postingId:"payment-cash-contra",sourcePostingId:"payment-cash-contra",debitAmount:"0.00",creditAmount:scenario.cashContra,netAmount:`-${scenario.cashContra}` },
   );
+  if(split) {
+    await storage.upsertTransactions([{...required(imported.transactions[0]),transactionId:"other-bill-accrual",sourceTransactionId:"other-bill-accrual",partyId:vendor.partyId,sourcePayloadRef:{sourceObjectType:"Bill",sourceObjectId:"other-bill"}}]);
+    originalJournal.push(...originalJournal.slice(0,2).map(p=>({...p,postingId:`other-${p.postingId}`,sourcePostingId:`other-${p.postingId}`,transactionId:"other-bill-accrual",postingDate:"2026-01-11"})));
+    originalJournal.push({...required(originalJournal[2]),postingId:"other-payment-expense",sourcePostingId:"other-payment-expense"});
+    Object.assign(required(originalJournal[3]),{creditAmount:"200.00",netAmount:"-200.00"});
+  }
   await storage.upsertLedgerPostings(originalJournal);
   const nativeAccounts=(await client.query(`select account_id,type from erp_financials.accounts where tenant_id=$1 and source_id=$2`,[facts.company.tenantId,sourceId])).rows;
   const importedCorrection={applicationSourceId:facts.source.sourceId,reviewRef:"review:original-payment",historicalPartyId:vendor.partyId,nativePartyId:vendorId,
@@ -214,19 +226,28 @@ it.skipIf(!url).each([
   await expect(sdk.commands.paymentApplications.unapply({...command,effectiveDate:"2026-02-04"})).rejects.toThrow();
   await expect(sdk.commands.paymentApplications.unapply({...command,importedCorrection:{...importedCorrection,reviewRef:"different-review"}})).rejects.toThrow();
   const historicBills=await sdk.queries.listVendorBills({asOfDate:"2026-02-02",vendorId:vendor.partyId});
-  expect(historicBills.items).toHaveLength(1);
+  expect(historicBills.items).toHaveLength(split ? 2 : 1);
   expect(historicBills.items[0]?.openAmount).toBe(scenario.billOpen);
-  expect((await sdk.queries.listVendorBills({asOfDate:"2026-02-03",vendorId:vendor.partyId})).items[0]?.openAmount).toBe(correctedOpen);
+  expect((await sdk.queries.listVendorBills({asOfDate:"2026-02-03",vendorId:vendor.partyId})).items.map(b=>b.openAmount)).toContain(correctedOpen);
   for (const changed of [false,true]) {
     const result=await persistCanonicalFacts(storage,{...imported,transactions:imported.transactions.map(t=>({...t,...(changed?{status:"void" as const}:{})})),postings:originalJournal.map(p=>({...p,...(changed?{debitAmount:p.debitAmount==="100.00"?"90.00":"0.00",creditAmount:p.creditAmount==="100.00"?"90.00":"0.00",netAmount:p.netAmount==="100.00"?"90.00":"-90.00"}:{})}))});
-    expect(result.correctionDependencies).toHaveLength(2);
+    expect(result.correctionDependencies).toHaveLength(split ? 3 : 2);
     const replayPromise=persistQuickBooksSubledgerResources({client,companyId,importedAt:operation.occurredAt,facts:imported,
       replaceMissingDocuments:true,resources:{...adapterInput.resources,operationalDocuments:documents.map(d=>({...d,...(changed?{syncAction:"deleted" as const}:{})}))}});
     if (multiple) await expect(replayPromise).rejects.toThrow("Provider links to a locally corrected imported bill require explicit reconciliation");
-    else expect((await replayPromise).correctionDependencies).toHaveLength(2);
+    else expect((await replayPromise).correctionDependencies).toHaveLength(split ? 3 : 2);
     expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,source_open:"100.00",target_open:correctedOpen}]);
+    expect(await peerFacts()).toEqual(peersBefore);
     expect(await historicalFacts()).toEqual(journalBefore);
     expect(await nativeReversals()).toEqual(reverse);
+  }
+  if(split) {
+    const sibling = required((await client.query(`select subledger_application_id from erp_financials.subledger_applications where source_id=$1 and subledger_application_id<>$2`,[facts.source.sourceId,applicationId])).rows[0]);
+    const second = {...command,applicationId:String(sibling.subledger_application_id),effectiveDate:"2026-02-04"};
+    expect((await sdk.commands.paymentApplications.unapply(second)).status).toBe("unapplied");
+    expect(await historicalSnapshot()).toMatchObject([{source_open:"200.00",target_open:"100.00"}]);
+    expect(await sdk.commands.paymentApplications.unapply(second)).toMatchObject({status:"unapplied"});
+    expect(await historicalFacts()).toEqual(journalBefore);
   }
   } finally { await client.query("rollback"); }
 });
