@@ -21,6 +21,8 @@ beforeAll(async () => { if(url) { connection=await pool.connect(); await migrate
 afterAll(async () => { connection?.release(); await pool.end(); });
 
 it.skipIf(!url).each([
+  { label:"residual payment", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
+  { label:"split residual", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"full plain", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"partial plain", billAmount:"200.00", billOpen:"100.00", expense:"200.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"full signed", billAmount:"100.00", billOpen:"0.00", expense:"150.00", contra:"50.00", cashExpense:"150.00", cashContra:"50.00" },
@@ -35,6 +37,9 @@ it.skipIf(!url).each([
   await client.query("begin");
   try {
   const split = scenario.label.startsWith("split ");
+  const residual = scenario.label.includes("residual");
+  const originalOpen = residual ? "25.00" : "0.00";
+  const paymentAmount = residual ? (split ? "225.00" : "125.00") : (split ? "200.00" : "100.00");
   const companyId = "imported-bill-payment-contract";
   const { facts, adapterInput } = mapNormalizedQuickBooksFullSyncResponseToCanonicalFacts(
     ERP_FINANCIALS_NORMALIZED_QUICKBOOKS_SYNC_FIXTURES.fullSync.response, { companyId });
@@ -44,7 +49,7 @@ it.skipIf(!url).each([
     lines: HandrailQuickBooksLedgerTransactionResource["resource"]["lines"]): HandrailQuickBooksLedgerTransactionResource => ({
     ...envelope, resourceId: id, resourceType: "LedgerTransaction", resource: {
       sourceTransactionId: id, sourceTransactionType: type, transactionDate: date,
-      currencyCode: "USD", totalAmount: type === "Bill" ? scenario.billAmount : split ? "200.00" : "100.00", openAmount: type === "Bill" ? scenario.billOpen : "0.00", unappliedAmount: "0.00",
+      currencyCode: "USD", totalAmount: type === "Bill" ? scenario.billAmount : paymentAmount, openAmount: type === "Bill" ? scenario.billOpen : originalOpen, unappliedAmount: type === "Bill" ? "0.00" : originalOpen,
       partyRef: { sourceObjectId: vendor.sourcePartyId, partyType: "vendor" }, lines,
     },
   });
@@ -83,7 +88,7 @@ it.skipIf(!url).each([
   const before = await historicalSnapshot();
   expect(before).toHaveLength(1);
   expect(before[0]).toMatchObject({ application_type: "bill_payment_to_bill", status: "applied", version: 1,
-    amount: "100.00", source_type: "bill_payment", source_open: "0.00", target_type: "vendor_bill", target_open: scenario.billOpen });
+    amount: "100.00", source_type: "bill_payment", source_open: originalOpen, target_type: "vendor_bill", target_open: scenario.billOpen });
 
   const sourceId = "native-bill-payment-source", bookId = "imported-bill-payment-book";
   await storage.upsertAccountingSource({ tenantId: facts.company.tenantId, sourceId, sourceSystem: "native_erp",
@@ -185,6 +190,10 @@ it.skipIf(!url).each([
     if (scenario.component) originalJournal.push({...required(originalJournal.find(p=>p.postingId==="cash-component")),postingId:"other-cash-component",sourcePostingId:"other-cash-component"});
     Object.assign(required(originalJournal[3]),{creditAmount:"200.00",netAmount:"-200.00"});
   }
+  if (residual) {
+    Object.assign(required(originalJournal[3]),{creditAmount:paymentAmount,netAmount:`-${paymentAmount}`});
+    originalJournal.push({...required(originalJournal[2]),postingId:"payment-residual",sourcePostingId:"payment-residual",accountId:payableAccountId,debitAmount:"25.00",creditAmount:"0.00",netAmount:"25.00"});
+  }
   await storage.upsertLedgerPostings(originalJournal);
   const nativeAccounts=(await client.query(`select account_id,type from erp_financials.accounts where tenant_id=$1 and source_id=$2`,[facts.company.tenantId,sourceId])).rows;
   const importedCorrection={applicationSourceId:facts.source.sourceId,reviewRef:"review:original-payment",historicalPartyId:vendor.partyId,nativePartyId:vendorId,
@@ -225,6 +234,13 @@ it.skipIf(!url).each([
   await expect(sdk.commands.paymentApplications.unapply(command)).rejects.toThrow("exact original payment cash recognition journal");
   await client.query("rollback to savepoint cash_rounding_mismatch");
   await client.query("release savepoint cash_rounding_mismatch");
+  if (residual) {
+    await client.query("savepoint wrong_residual");
+    await client.query("update erp_financials.ledger_postings set account_id=$1 where posting_id='payment-residual'",[expenseAccountId]);
+    await expect(sdk.commands.paymentApplications.unapply(command)).rejects.toThrow("exact original payment cash recognition journal");
+    await client.query("rollback to savepoint wrong_residual");
+    await client.query("release savepoint wrong_residual");
+  }
   const historicalFacts=async()=>(await client.query(`select to_jsonb(p) as fact from erp_financials.ledger_postings p where tenant_id=$1 and source_id=$2 order by posting_id`,[facts.company.tenantId,facts.source.sourceId])).rows;
   const journalBefore=await historicalFacts();
   const peerFacts = async () => (await client.query(`select to_jsonb(a) as application from erp_financials.subledger_applications a
@@ -234,7 +250,7 @@ it.skipIf(!url).each([
   const ended=await sdk.commands.paymentApplications.unapply(command);
   expect(await peerFacts()).toEqual(peersBefore);
   expect(ended.status).toBe("unapplied");
-  expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,amount:"100.00",source_open:"100.00",target_open:correctedOpen}]);
+  expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,amount:"100.00",source_open:residual?"125.00":"100.00",target_open:correctedOpen}]);
   expect(await historicalFacts()).toEqual(journalBefore);
   const nativeReversals=async()=>(await client.query(`select p.posting_id,p.posting_date::text,p.debit_amount::text,p.credit_amount::text,a.type,p.accounting_basis
     from erp_financials.ledger_postings p join erp_financials.accounts a using(tenant_id,source_id,account_id)
@@ -261,7 +277,7 @@ it.skipIf(!url).each([
       replaceMissingDocuments:true,resources:{...adapterInput.resources,operationalDocuments:documents.map(d=>({...d,...(changed?{syncAction:"deleted" as const}:{})}))}});
     if (multiple) await expect(replayPromise).rejects.toThrow("Provider links to a locally corrected imported bill require explicit reconciliation");
     else expect((await replayPromise).correctionDependencies).toHaveLength(split ? 3 : 2);
-    expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,source_open:"100.00",target_open:correctedOpen}]);
+    expect(await historicalSnapshot()).toMatchObject([{status:"unapplied",version:2,source_open:residual?"125.00":"100.00",target_open:correctedOpen}]);
     expect(await peerFacts()).toEqual(peersBefore);
     expect(await historicalFacts()).toEqual(journalBefore);
     expect(await nativeReversals()).toEqual(reverse);
@@ -270,7 +286,7 @@ it.skipIf(!url).each([
     const sibling = required((await client.query(`select subledger_application_id from erp_financials.subledger_applications where source_id=$1 and subledger_application_id<>$2`,[facts.source.sourceId,applicationId])).rows[0]);
     const second = {...command,applicationId:String(sibling.subledger_application_id),effectiveDate:"2026-02-04"};
     expect((await sdk.commands.paymentApplications.unapply(second)).status).toBe("unapplied");
-    expect(await historicalSnapshot()).toMatchObject([{source_open:"200.00",target_open:"100.00"}]);
+    expect(await historicalSnapshot()).toMatchObject([{source_open:paymentAmount,target_open:"100.00"}]);
     expect(await sdk.commands.paymentApplications.unapply(second)).toMatchObject({status:"unapplied"});
     expect(await historicalFacts()).toEqual(journalBefore);
   }

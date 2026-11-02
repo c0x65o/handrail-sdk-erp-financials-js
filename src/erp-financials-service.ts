@@ -7718,7 +7718,8 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
     fail("Imported correction requires original same-source bill payment allocations");
   const paymentTotal = parsePositiveMoney(storedMoney(payment.original_amount,"original_amount"),"payment amount");
   const sumApplications = (rows: Record<string, unknown>[]) => rows.reduce((sum,p) => sum + parsePositiveMoney(storedMoney(p.applied_amount,"applied_amount"),"application amount"),0n);
-  if (sumApplications(paymentApplications) !== paymentTotal
+  const originalResidual = paymentTotal - sumApplications(paymentApplications);
+  if (originalResidual < 0n
     || sumApplications(paymentApplications.filter(p => p.status === "applied")) !== paymentTotal - parsePositiveOrZeroMoney(storedMoney(payment.open_amount,"open_amount"),"payment open amount"))
     fail("Imported correction requires exactly reconciled original payment allocations");
   const applied = billApplications.filter(p => p.status === "applied").reduce((sum,p) =>
@@ -7810,12 +7811,16 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
       appliedAmount:storedMoney(peer.applied_amount,"applied_amount"),effectiveDate:input.effectiveDate,
       importBatchId:scopedRecordId(context,"import_batch",`split-proof:${input.applicationId}`),accrualPostings:otherPostings,controlAccountId:otherControl.accountId}).filter(p=>p.accountId!==otherControl.accountId));
   }
-  const expectedCash = paymentExpenses.map(p => `${p.accountId}:${p.debitAmount}:${p.creditAmount}`).sort();
+  const expectedCash = paymentExpenses.map(p => `${p.accountId}:${p.debitAmount}:${p.creditAmount}`);
+  // The unallocated original cash stays in historical A/P. Prove it exactly;
+  // never reverse it as part of the selected application or infer an expense.
+  if (originalResidual > 0n) expectedCash.push(`${control.accountId}:${formatMoney(originalResidual)}:0.00`);
+  expectedCash.sort();
   const retainedCash = cash.filter(p => p.account_type !== "Bank")
     .map(p => `${String(p.account_id)}:${storedMoney(p.debit_amount,"debit_amount")}:${storedMoney(p.credit_amount,"credit_amount")}`).sort();
   if (new Set(cash.map(p=>p.transaction_id)).size !== 1 || bank.length !== 1
     || storedMoney(bank[0]?.credit_amount,"credit_amount") !== storedMoney(payment.original_amount,"original_amount")
-    || storedMoney(bank[0]?.debit_amount,"debit_amount") !== "0.00" || cash.length !== paymentExpenses.length+1
+    || storedMoney(bank[0]?.debit_amount,"debit_amount") !== "0.00" || cash.length !== expectedCash.length+1
     || canonicalCorrectionJson(expectedCash) !== canonicalCorrectionJson(retainedCash)
     || cash.some(p => storedDate(p.posting_date,"posting_date")!==storedDate(payment.document_date,"document_date") || p.currency_code!==context.currencyCode || p.party_id!==review.historicalPartyId || p.item_id!=null || (p.dimension_refs as unknown[]).length))
     fail("Imported correction requires the exact original payment cash recognition journal");
