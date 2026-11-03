@@ -4189,7 +4189,7 @@ returning *`,
         aggregateType: "subledger_application", aggregateId: retainedId, eventType: "imported_application_retained",
         idempotencyKey: `imported-retained:${input.applicationId}:v${String(currentVersion)}`,
         operation: input.operation, recordedAt: context.now(), priorEventId: lifecycle.eventId,
-        payload: { retainedFromApplicationId: input.applicationId, amount: formatMoney(retainedMinor), accountingSourceId: context.sourceId, bookId: context.bookId ?? null }
+        payload: { applicationDate: input.effectiveDate, retainedFromApplicationId: input.applicationId, amount: formatMoney(retainedMinor), accountingSourceId: context.sourceId, bookId: context.bookId ?? null }
       });
       await client.query(`insert into erp_financials.subledger_applications
         (subledger_application_id,tenant_id,company_id,source_id,application_type,source_document_id,target_document_id,

@@ -265,6 +265,10 @@ it.skipIf(!url).each([
     expect(await rootSnapshot()).toMatchObject([{source_open:"50.00",target_open:"50.00"}]);
     await sdk.commands.paymentApplications.unapply({...command,applicationId:required(second.retainedApplication).applicationId,effectiveDate:"2026-02-05"});
     expect(await rootSnapshot()).toMatchObject([{source_open:"100.00",target_open:"100.00"}]);
+    for (const [asOfDate,expected] of [["2026-02-02","0.00"],["2026-02-03","25.00"],["2026-02-04","50.00"],["2026-02-05","100.00"]]) {
+      const statement=await sdk.queries.getCustomerStatement({customerId:customer.partyId,asOfDate:required(asOfDate)});
+      expect(statement.items.find(i=>i.invoiceId===first.targetDocumentId)?.openBalance).toBe(expected);
+    }
     expect(await historicalFacts()).toEqual(journalBefore);
     expect(await sdk.commands.paymentApplications.unapply(partialCommand)).toEqual(first);
     if (scenario.label.startsWith("dimensional")) {

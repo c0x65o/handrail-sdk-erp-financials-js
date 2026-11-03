@@ -3411,6 +3411,23 @@ from posted`,
   });
 }
 
+// A retained historical allocation belongs to its independently approved active
+// correction book, while its immutable source-document coordinate remains historical.
+function retainedImportedApplicationInBookSql(): string {
+  return `exists(select 1 from erp_financials.financial_lifecycle_events retained
+    join erp_financials.reporting_book_sources writer on writer.tenant_id=retained.tenant_id
+      and writer.company_id=retained.company_id and writer.book_id=$3
+      and writer.source_id=retained.payload->>'accountingSourceId' and writer.source_role='active'
+    join erp_financials.accounting_sources definition on definition.tenant_id=writer.tenant_id
+      and definition.source_id=writer.source_id and definition.source_system='native_erp'
+    where retained.tenant_id=application.tenant_id and retained.company_id=application.company_id
+      and retained.source_id=application.source_id and retained.event_id=application.applied_event_id
+      and retained.aggregate_id=application.subledger_application_id and retained.event_type='imported_application_retained'
+      and retained.payload->>'bookId'=$3 and retained.approver_ref is not null and retained.approver_ref<>retained.actor_ref
+      and (writer.effective_from is null or writer.effective_from<=application.application_date)
+      and (writer.effective_through is null or writer.effective_through>=application.application_date))`;
+}
+
 async function getCustomerStatement(
   scope: Scope,
   request: CustomerStatementRequest
@@ -3495,12 +3512,11 @@ async function getCustomerStatement(
     on application_book_source."tenant_id" = application."tenant_id"
    and application_book_source."company_id" = application."company_id"
    and application_book_source."book_id" = $3 and application_book_source."source_id" = application."source_id"
-   and (application_book_source."effective_from" is null
-     or (application_book_source."effective_from" <= coalesce(source_document."recognition_date",source_document."document_date")
-       and application_book_source."effective_from" <= application."application_date"))
-   and (application_book_source."effective_through" is null
-     or (application_book_source."effective_through" >= coalesce(source_document."recognition_date",source_document."document_date")
-       and application_book_source."effective_through" >= application."application_date"))
+   and ((application_book_source."effective_from" is null or application_book_source."effective_from" <= coalesce(source_document."recognition_date",source_document."document_date"))
+     and (application_book_source."effective_through" is null or application_book_source."effective_through" >= coalesce(source_document."recognition_date",source_document."document_date")))
+   and (((application_book_source."effective_from" is null or application_book_source."effective_from" <= application."application_date")
+     and (application_book_source."effective_through" is null or application_book_source."effective_through" >= application."application_date"))
+     or ${retainedImportedApplicationInBookSql()})
   where application."tenant_id" = $1 and application."company_id" = $2
     and application."application_type" in ('customer_payment_to_invoice', 'credit_to_invoice', 'write_off_to_invoice')
     and application."currency_code" = $5 and application."application_date" <= $6::date
@@ -4398,8 +4414,9 @@ async function listCustomerPaymentRegister(
     join "erp_financials"."reporting_book_sources" application_source
       on application_source."tenant_id" = application."tenant_id" and application_source."company_id" = application."company_id"
      and application_source."book_id" = $3 and application_source."source_id" = application."source_id"
-     and (application_source."effective_from" is null or application_source."effective_from" <= application."application_date")
-     and (application_source."effective_through" is null or application_source."effective_through" >= application."application_date")
+     and (((application_source."effective_from" is null or application_source."effective_from" <= application."application_date")
+     and (application_source."effective_through" is null or application_source."effective_through" >= application."application_date"))
+     or ${retainedImportedApplicationInBookSql()})
     join "erp_financials"."subledger_documents" invoice
       on invoice."tenant_id" = application."tenant_id" and invoice."company_id" = application."company_id"
      and invoice."source_id" = coalesce(application."target_document_source_id",application."source_id") and invoice."subledger_document_id" = application."target_document_id"
