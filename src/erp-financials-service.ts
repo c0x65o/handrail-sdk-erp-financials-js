@@ -7794,7 +7794,7 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
   const controlAmount = (p: LedgerPosting) => customer ? p.debitAmount : p.creditAmount;
   const controlOffset = (p: LedgerPosting) => customer ? p.creditAmount : p.debitAmount;
   const fail = (message: string): never => { throw new ErpFinancialsValidationError(message); };
-  if (application.application_type !== applicationType || application.target_document_source_id != null
+  if (application.application_type !== applicationType || (application.target_document_source_id ?? application.source_id) !== historicalSource
     || application.currency_code !== context.currencyCode || input.effectiveDate < storedDate(application.application_date, "application_date"))
     fail("Imported correction requires an original same-source customer or vendor payment and a non-backdated correction");
   const event = (await client.query(`select event_type from erp_financials.financial_lifecycle_events
@@ -7816,14 +7816,14 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
       or (coalesce(target_document_source_id,source_id)=$3 and target_document_id=$5)) for share`,
     [context.tenantId,context.companyId,historicalSource,payment.subledger_document_id,bill.subledger_document_id])).rows;
   const originalEvents = (await client.query(`select event_id from erp_financials.financial_lifecycle_events
-    where tenant_id=$1 and company_id=$2 and source_id=$3 and event_type='quickbooks_application_imported'`,
-    [context.tenantId,context.companyId,historicalSource])).rows;
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and event_type='quickbooks_application_imported' and event_id=any($4::text[])`,
+    [context.tenantId,context.companyId,historicalSource,peers.map(p=>p.applied_event_id)])).rows;
   const originalEventIds = new Set(originalEvents.map(e=>e.event_id));
   const allPaymentApplications = peers.filter(p => p.source_id === historicalSource && p.source_document_id === payment.subledger_document_id);
   const paymentApplications = peers.filter(p => originalEventIds.has(p.applied_event_id)).filter(p => p.source_id === historicalSource && p.source_document_id === payment.subledger_document_id);
   const billApplications = peers.filter(p => (p.target_document_source_id ?? p.source_id) === historicalSource && p.target_document_id === bill.subledger_document_id);
-  if (!paymentApplications.length || paymentApplications.some(p => p.target_document_source_id != null || p.application_type !== applicationType) || billApplications.some(p => p.source_id !== historicalSource
-    || p.target_document_source_id != null || p.application_type !== applicationType))
+  if (!paymentApplications.length || paymentApplications.some(p => (p.target_document_source_id ?? p.source_id) !== historicalSource || p.application_type !== applicationType) || billApplications.some(p => p.source_id !== historicalSource
+    || (p.target_document_source_id ?? p.source_id) !== historicalSource || p.application_type !== applicationType))
     fail("Imported correction requires original same-source customer or vendor payment allocations");
   const paymentTotal = parsePositiveMoney(storedMoney(payment.original_amount,"original_amount"),"payment amount");
   const sumApplications = (rows: Record<string, unknown>[]) => rows.reduce((sum,p) => sum + parsePositiveMoney(storedMoney(p.applied_amount,"applied_amount"),"application amount"),0n);

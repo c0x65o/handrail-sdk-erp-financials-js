@@ -9,9 +9,16 @@ export async function importedCorrectionDimensions(client: PostgresQueryClient,
   postings: readonly LedgerPosting[], mappings: readonly ImportedDimensionMapping[] = [],
 ): Promise<(refs: readonly DimensionRef[]) => readonly DimensionRef[]> {
   const fail = (): never => { throw new ErpFinancialsError('invalid_input', 'Imported correction requires exact active dimension mappings of the same kind'); };
+  const refs = postings.flatMap(p=>p.dimensionRefs);
+  if (!refs.length) {
+    if (mappings.length) fail();
+    return values => values.length ? fail() : [];
+  }
+  const ids=[...mappings.flatMap(m=>[m.historicalDimensionId,m.nativeDimensionId]),...refs.flatMap(ref=>ref.dimensionId?[ref.dimensionId]:[])];
+  const providerIds=refs.flatMap(ref=>ref.sourceDimensionId?[ref.sourceDimensionId]:[]);
   const dimensions = (await client.query(`select * from erp_financials.accounting_dimensions
-    where tenant_id=$1 and source_id=any($2::text[]) order by source_id,dimension_id for share`,
-    [scope.tenantId, [scope.historicalSourceId, scope.nativeSourceId]])).rows;
+    where tenant_id=$1 and source_id=any($2::text[]) and (dimension_id=any($3::text[]) or source_dimension_id=any($4::text[])) order by source_id,dimension_id for share`,
+    [scope.tenantId, [scope.historicalSourceId, scope.nativeSourceId],ids,providerIds])).rows;
   const resolve = (ref: DimensionRef) => {
     const matches = dimensions.filter(d => d.source_id === scope.historicalSourceId && d.dimension_kind === ref.dimensionKind
       && (ref.dimensionId === undefined || d.dimension_id === ref.dimensionId)

@@ -24,6 +24,7 @@ it.skipIf(!url).each([
   { label:"dimensional partial release", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"dimensional", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"partial release", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
+  { label:"partial release explicit coordinates", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"residual payment", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"split residual", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"full plain", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
@@ -78,6 +79,11 @@ it.skipIf(!url).each([
     netAmount: p.netAmount === "0.00" ? "0.00" : p.netAmount.startsWith("-") ? p.netAmount.slice(1) : `-${p.netAmount}`,
   })));
   await persistCanonicalFacts(storage, imported);
+  if (scenario.label.includes("explicit coordinates")) await client.query(`
+    create function erp_financials.test_explicit_coordinates() returns trigger language plpgsql as $$
+    begin new.target_document_source_id:=new.source_id; return new; end $$;
+    create trigger aaa_test_explicit_coordinates before insert on erp_financials.subledger_applications
+      for each row execute function erp_financials.test_explicit_coordinates();`);
   const importedResult = await persistQuickBooksSubledgerResources({ client, companyId, importedAt: operation.occurredAt,
     facts: imported, resources: { ...adapterInput.resources, operationalDocuments: documents } });
   expect(importedResult.unresolvedApplications).toEqual([]);
