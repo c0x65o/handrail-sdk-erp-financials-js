@@ -21,6 +21,9 @@ beforeAll(async () => { if(url) { connection=await pool.connect(); await migrate
 afterAll(async () => { connection?.release(); await pool.end(); });
 
 it.skipIf(!url).each([
+  { label:"dimensional partial release", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
+  { label:"dimensional", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
+  { label:"partial release", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"residual payment", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"split residual", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
   { label:"full plain", billAmount:"100.00", billOpen:"0.00", expense:"100.00", contra:"0.00", cashExpense:"100.00", cashContra:"0.00" },
@@ -182,13 +185,26 @@ it.skipIf(!url).each([
     Object.assign(required(originalJournal[3]),{creditAmount:paymentAmount,netAmount:`-${paymentAmount}`});
     originalJournal.push({...required(originalJournal[2]),postingId:"payment-residual",sourcePostingId:"payment-residual",accountId:payableAccountId,debitAmount:"25.00",creditAmount:"0.00",netAmount:"25.00"});
   }
+  if (scenario.label.startsWith("dimensional")) {
+    await storage.upsertDimensions([
+      {tenantId:facts.company.tenantId,sourceId:facts.source.sourceId,dimensionId:"historical-class",dimensionKind:"class",sourceDimensionId:"old-class",name:"Original class",active:true},
+      {tenantId:facts.company.tenantId,sourceId,dimensionId:"native-class",dimensionKind:"class",sourceDimensionId:"new-class",name:"Mapped class",active:true},
+    ]);
+    for (const line of originalJournal.filter(p => p.accountId === expenseAccountId)) {
+      Object.assign(line,{dimensionRefs:[{dimensionId:"historical-class",dimensionKind:"class",sourceDimensionId:"old-class",name:"Original class"}]});
+    }
+  }
   await storage.upsertLedgerPostings(originalJournal);
   const nativeAccounts=(await client.query(`select account_id,type from erp_financials.accounts where tenant_id=$1 and source_id=$2`,[facts.company.tenantId,sourceId])).rows;
-  const importedCorrection={applicationSourceId:facts.source.sourceId,reviewRef:"review:original-payment",historicalPartyId:customer.partyId,nativePartyId:customerId,
+  const importedCorrection={...(scenario.label.startsWith("dimensional") ? {dimensionMappings:[{historicalDimensionId:"historical-class",nativeDimensionId:"native-class"}]} : {}),applicationSourceId:facts.source.sourceId,reviewRef:"review:original-payment",historicalPartyId:customer.partyId,nativePartyId:customerId,
     accountMappings:[{historicalAccountId:expenseAccountId,nativeAccountId:String(required(nativeAccounts.find(a=>a.type==='Income')).account_id)},
       {historicalAccountId:payableAccountId,nativeAccountId:String(required(nativeAccounts.find(a=>a.type==='AccountsReceivable')).account_id)}]};
   if (scenario.component) importedCorrection.accountMappings.push({historicalAccountId:"imported-component",nativeAccountId:String(required(nativeAccounts.find(a=>a.type===componentType)).account_id)});
   const command={operation,applicationId,expectedVersion:1,effectiveDate:"2026-02-03",importedCorrection};
+  if (scenario.label.startsWith("dimensional")) {
+    await expect(sdk.commands.paymentApplications.unapply({...command,importedCorrection:{...importedCorrection,dimensionMappings:[]}})).rejects.toThrow("dimension mappings");
+    await expect(sdk.commands.paymentApplications.unapply({...command,importedCorrection:{...importedCorrection,dimensionMappings:[{historicalDimensionId:"historical-class",nativeDimensionId:"wrong-class"}]}})).rejects.toThrow("dimension mappings");
+  }
   for (const invalid of [
     {...command,operation:{...operation,approverRef:operation.actorRef}},
     {...command,effectiveDate:"2026-01-19"},
@@ -235,6 +251,29 @@ it.skipIf(!url).each([
     where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_application_id<>$4 order by subledger_application_id`,
     [facts.company.tenantId,companyId,facts.source.sourceId,applicationId])).rows;
   const peersBefore = await peerFacts();
+  if (scenario.label.includes("partial release")) {
+    const rootSnapshot=async () => (await historicalSnapshot()).filter(row => row.subledger_application_id === applicationId);
+    const partialCommand={...command,amount:"25.00"};
+    const first=await sdk.commands.paymentApplications.unapply(partialCommand);
+    expect(first.releasedAmount).toBe("25.00");
+    expect(first.retainedApplication?.appliedAmount).toBe("75.00");
+    expect(await rootSnapshot()).toMatchObject([{amount:"100.00",source_open:"25.00",target_open:"25.00",status:"unapplied"}]);
+    expect(await sdk.commands.paymentApplications.unapply(partialCommand)).toEqual(first);
+    await expect(sdk.commands.paymentApplications.unapply({...partialCommand,amount:"26.00"})).rejects.toThrow();
+    const second=await sdk.commands.paymentApplications.unapply({...command,applicationId:required(first.retainedApplication).applicationId,amount:"25.00",effectiveDate:"2026-02-04"});
+    expect(second.retainedApplication?.appliedAmount).toBe("50.00");
+    expect(await rootSnapshot()).toMatchObject([{source_open:"50.00",target_open:"50.00"}]);
+    await sdk.commands.paymentApplications.unapply({...command,applicationId:required(second.retainedApplication).applicationId,effectiveDate:"2026-02-05"});
+    expect(await rootSnapshot()).toMatchObject([{source_open:"100.00",target_open:"100.00"}]);
+    expect(await historicalFacts()).toEqual(journalBefore);
+    expect(await sdk.commands.paymentApplications.unapply(partialCommand)).toEqual(first);
+    if (scenario.label.startsWith("dimensional")) {
+      const refs=(await client.query(`select dimension_refs from erp_financials.ledger_postings where source_id=$1 and dimension_refs <> '[]'::jsonb`,[sourceId])).rows;
+      expect(refs.length).toBeGreaterThan(0);
+      expect(refs.every(p => JSON.stringify(p.dimension_refs).includes("native-class") && !JSON.stringify(p.dimension_refs).includes("historical-class"))).toBe(true);
+    }
+    return;
+  }
   const ended=await sdk.commands.paymentApplications.unapply(command);
   expect(await peerFacts()).toEqual(peersBefore);
   expect(ended.status).toBe("unapplied");

@@ -1,3 +1,4 @@
+import { importedCorrectionDimensions, type ImportedDimensionMapping } from "./imported-correction-dimensions.js";
 import { lockSubledgerDocumentCoordinates } from "./subledger-document-coordinates.js";
 import {retainJournalAccountPolicy} from "./journal-account-policy.js";
 import { correctCashFlowPurpose, type CorrectCashFlowPurposeInput, type CorrectCashFlowPurposeResult } from "./cash-flow-purpose.js";
@@ -818,9 +819,12 @@ export type RetireReceiptApplicationResult =
  * compensating journal uses the active writer. Bind reviewRef to host approval. */
 export type ImportedApplicationCorrection = Omit<CrossSourceSettlement, "targetSourceId"> & {
   readonly applicationSourceId: string;
+  readonly dimensionMappings?: readonly ImportedDimensionMapping[];
 };
 
 export type EndSubledgerApplicationInput = {
+  /** Release this amount; imported allocations retain the remainder atomically. */
+  readonly amount?: DecimalString;
   readonly importedCorrection?: ImportedApplicationCorrection;
   readonly operation: FinancialOperationContext;
   readonly applicationId: string;
@@ -851,6 +855,8 @@ export type SettleInvoiceWriteOffResult = {
 };
 
 export type SubledgerApplicationResult = {
+  readonly releasedAmount?: DecimalString;
+  readonly retainedApplication?: SubledgerApplicationResult;
   readonly status: "applied" | "already_applied" | "unapplied" | "voided";
   readonly applicationId: string;
   readonly version: number;
@@ -4069,6 +4075,19 @@ for update`,
     );
     if (cancellation.rows.length) throw new ErpFinancialsError("terminal_state_conflict",
       "Invoice cancellation credit cannot be detached; record a separately reviewed replacement invoice instead");
+    const releasedAmount = input.amount === undefined ? storedMoney(current.applied_amount, "applied_amount") : formatMoney(parsePositiveMoney(input.amount, "amount"));
+    const retainedMinor = parsePositiveMoney(storedMoney(current.applied_amount, "applied_amount"), "applied amount") - parsePositiveMoney(releasedAmount, "amount");
+    if (retainedMinor < 0n) throw new ErpFinancialsValidationError("Reversal amount exceeds the allocation");
+    if (retainedMinor > 0n && !input.importedCorrection) throw new ErpFinancialsValidationError("Partial SDK reversal currently requires imported correction review");
+    const retainedId = scopedRecordId(context, "application", `imported-retained:${applicationSourceId}:${input.applicationId}:v${String(input.expectedVersion)}`);
+    const withRetained = async (result: SubledgerApplicationResult): Promise<SubledgerApplicationResult> => {
+      if (retainedMinor === 0n) return result;
+      const retained = (await client.query(`select * from erp_financials.subledger_applications
+        where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_application_id=$4`,
+        [context.tenantId, context.companyId, applicationSourceId, retainedId])).rows[0];
+      if (!retained) throw new ErpFinancialsValidationError("Missing retained imported allocation");
+      return { ...result, releasedAmount, retainedApplication: applicationResult({ ...retained, version:1,ended_event_id:null }, "applied") };
+    };
     const currentStatus = storedString(current.status, "status");
     if (currentStatus === status) {
       // A retry may use a new transport request, but cannot silently change
@@ -4086,11 +4105,12 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "event_id"
       if (ended === undefined || evidence === undefined
         || ended.aggregate_id !== input.applicationId || ended.event_type !== `subledger_application.${status}`
         || evidence.effectiveDate !== input.effectiveDate || evidence.priorVersion !== input.expectedVersion
+        || (evidence.releasedAmount ?? storedMoney(current.applied_amount, "applied_amount")) !== releasedAmount
         || canonicalCorrectionJson(evidence.importedCorrection) !== canonicalCorrectionJson(correctionEvidence)
         || evidence.status !== status || storedInteger(current.version, "version") !== input.expectedVersion + 1) {
         throw new ErpFinancialsIdempotencyConflictError(`subledger-application:${input.applicationId}:${status}`);
       }
-      return applicationResult(current, status);
+      return withRetained(applicationResult(current, status));
     }
     if (currentStatus !== "applied") {
       throw new ErpFinancialsValidationError(`Subledger application is already ${currentStatus}`);
@@ -4108,6 +4128,8 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "event_id"
     }
     const importedPostings = input.importedCorrection
       ? await prepareImportedApplicationReversal(client, context, current, input) : undefined;
+    const retainedPostings = retainedMinor > 0n ? await prepareImportedApplicationReversal(client, context, current,
+      input, formatMoney(retainedMinor)) : undefined;
     const lifecycle = await appendFinancialLifecycleEvent(client, {
       tenantId: context.tenantId,
       companyId: context.companyId,
@@ -4119,7 +4141,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "event_id"
       operation: input.operation,
       recordedAt: context.now(),
       priorEventId: storedString(current.applied_event_id, "applied_event_id"),
-      payload: { effectiveDate: input.effectiveDate, priorVersion: currentVersion, status, ...(correctionEvidence ? { importedCorrection: correctionEvidence } : {}) }
+      payload: { effectiveDate: input.effectiveDate, priorVersion: currentVersion, releasedAmount, status, ...(correctionEvidence ? { importedCorrection: correctionEvidence } : {}) }
     });
     const updated = await client.query(
       `update "erp_financials"."subledger_applications"
@@ -4161,6 +4183,27 @@ returning *`,
         storedString(current.target_document_id, "target_document_id")
       )
     });
+    if (retainedPostings) {
+      const retainedEvent = await appendFinancialLifecycleEvent(client, {
+        tenantId: context.tenantId, companyId: context.companyId, sourceId: applicationSourceId,
+        aggregateType: "subledger_application", aggregateId: retainedId, eventType: "imported_application_retained",
+        idempotencyKey: `imported-retained:${input.applicationId}:v${String(currentVersion)}`,
+        operation: input.operation, recordedAt: context.now(), priorEventId: lifecycle.eventId,
+        payload: { retainedFromApplicationId: input.applicationId, amount: formatMoney(retainedMinor), accountingSourceId: context.sourceId, bookId: context.bookId ?? null }
+      });
+      await client.query(`insert into erp_financials.subledger_applications
+        (subledger_application_id,tenant_id,company_id,source_id,application_type,source_document_id,target_document_id,
+         applied_amount,currency_code,application_date,status,version,idempotency_key,applied_event_id,created_at,updated_at)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'applied',1,$11,$12,$13,$13)`,
+        [retainedId,context.tenantId,context.companyId,applicationSourceId,current.application_type,current.source_document_id,
+          current.target_document_id,formatMoney(retainedMinor),current.currency_code,input.effectiveDate,
+          `imported-retained:${input.applicationId}:v${String(currentVersion)}`,retainedEvent.eventId,context.now()]);
+      await persistCrossSourceSettlement(client, context, retainedPostings.map(p => ({ ...p,
+        debitAmount:p.creditAmount,creditAmount:p.debitAmount,
+        netAmount:formatMoney(parsePositiveOrZeroMoney(p.creditAmount,"credit")-parsePositiveOrZeroMoney(p.debitAmount,"debit")),
+        postingId:scopedRecordId(context,"posting",`retained:${retainedId}:${p.postingId}`),
+        sourcePostingId:`retained:${retainedId}:${p.sourcePostingId}` })),retainedId,input.effectiveDate,"recognize");
+    }
     await appendServiceOutboxEvent(client, context, {
       eventType: `subledger_application.${status}`,
       aggregateType: "subledger_application",
@@ -4168,7 +4211,7 @@ returning *`,
       idempotencyKey: `subledger-application:${input.applicationId}:outbox:${status}:v${String(currentVersion)}`,
       payload: { applicationId: input.applicationId, cashBasisPostingIds, effectiveDate: input.effectiveDate, priorVersion: currentVersion, status }
     });
-    return applicationResult(row, status);
+    return withRetained(applicationResult(row, status));
   });
 }
 
@@ -7713,10 +7756,33 @@ function canonicalCorrectionJson(value: unknown): string {
 /** Original imported allocations, including split payments and partially paid or signed bills. Refuse ambiguous allocations;
  * the retained provider cash journal must prove the exact expense recognition. */
 async function prepareImportedApplicationReversal(client: PostgresQueryClient, context: ServiceContext,
-  application: Record<string, unknown>, input: EndSubledgerApplicationInput): Promise<readonly LedgerPosting[]> {
+  application: Record<string, unknown>, input: EndSubledgerApplicationInput, reversalAmount?: string): Promise<readonly LedgerPosting[]> {
   const review = input.importedCorrection;
   if (!review) throw new ErpFinancialsValidationError("Missing imported correction review");
   const historicalSource = review.applicationSourceId;
+  const selectedAmount = reversalAmount ?? storedMoney(application.applied_amount,"applied_amount");
+  if (input.effectiveDate < storedDate(application.application_date,"application_date")) throw new ErpFinancialsValidationError("Reversal cannot precede retained allocation");
+  const selected = application;
+  const seen = new Set<string>();
+  for (;;) {
+    const identity=storedString(application.subledger_application_id,"application id");
+    if (seen.has(identity) || seen.size >= 100) throw new ErpFinancialsValidationError("Invalid imported allocation lineage");
+    seen.add(identity);
+    const provenance=(await client.query(`select event_type,payload from erp_financials.financial_lifecycle_events
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and event_id=$4`,
+      [context.tenantId,context.companyId,historicalSource,application.applied_event_id])).rows[0];
+    if (provenance?.event_type === "quickbooks_application_imported") break;
+    const payload=storedJson(provenance?.payload) as Record<string,JsonValue> | undefined;
+    if (provenance?.event_type !== "imported_application_retained" || payload?.accountingSourceId !== context.sourceId || payload.bookId !== context.bookId)
+      throw new ErpFinancialsValidationError("Correction requires original import or approved retained allocation");
+    const parent=(await client.query(`select *,application_date::text as application_date from erp_financials.subledger_applications
+      where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_application_id=$4 for share`,
+      [context.tenantId,context.companyId,historicalSource,payload.retainedFromApplicationId])).rows[0];
+    if (!parent || parent.status === "applied" || parent.source_document_id !== selected.source_document_id || parent.target_document_id !== selected.target_document_id
+      || parent.application_type !== selected.application_type || parent.currency_code !== selected.currency_code)
+      throw new ErpFinancialsValidationError("Retained allocation lineage does not match the original documents");
+    application=parent;
+  }
   const customer = application.application_type === "customer_payment_to_invoice";
   const applicationType = customer ? "customer_payment_to_invoice" : "bill_payment_to_bill";
   const paymentType = customer ? "customer_payment" : "bill_payment";
@@ -7749,7 +7815,12 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
     where tenant_id=$1 and company_id=$2 and ((source_id=$3 and source_document_id=$4)
       or (coalesce(target_document_source_id,source_id)=$3 and target_document_id=$5)) for share`,
     [context.tenantId,context.companyId,historicalSource,payment.subledger_document_id,bill.subledger_document_id])).rows;
-  const paymentApplications = peers.filter(p => p.source_id === historicalSource && p.source_document_id === payment.subledger_document_id);
+  const originalEvents = (await client.query(`select event_id from erp_financials.financial_lifecycle_events
+    where tenant_id=$1 and company_id=$2 and source_id=$3 and event_type='quickbooks_application_imported'`,
+    [context.tenantId,context.companyId,historicalSource])).rows;
+  const originalEventIds = new Set(originalEvents.map(e=>e.event_id));
+  const allPaymentApplications = peers.filter(p => p.source_id === historicalSource && p.source_document_id === payment.subledger_document_id);
+  const paymentApplications = peers.filter(p => originalEventIds.has(p.applied_event_id)).filter(p => p.source_id === historicalSource && p.source_document_id === payment.subledger_document_id);
   const billApplications = peers.filter(p => (p.target_document_source_id ?? p.source_id) === historicalSource && p.target_document_id === bill.subledger_document_id);
   if (!paymentApplications.length || paymentApplications.some(p => p.target_document_source_id != null || p.application_type !== applicationType) || billApplications.some(p => p.source_id !== historicalSource
     || p.target_document_source_id != null || p.application_type !== applicationType))
@@ -7758,7 +7829,7 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
   const sumApplications = (rows: Record<string, unknown>[]) => rows.reduce((sum,p) => sum + parsePositiveMoney(storedMoney(p.applied_amount,"applied_amount"),"application amount"),0n);
   const originalResidual = paymentTotal - sumApplications(paymentApplications);
   if (originalResidual < 0n
-    || sumApplications(paymentApplications.filter(p => p.status === "applied")) !== paymentTotal - parsePositiveOrZeroMoney(storedMoney(payment.open_amount,"open_amount"),"payment open amount"))
+    || sumApplications(allPaymentApplications.filter(p => p.status === "applied")) !== paymentTotal - parsePositiveOrZeroMoney(storedMoney(payment.open_amount,"open_amount"),"payment open amount"))
     fail("Imported correction requires exactly reconciled original payment allocations");
   const applied = billApplications.filter(p => p.status === "applied").reduce((sum,p) =>
     sum + parsePositiveMoney(storedMoney(p.applied_amount,"applied_amount"),"application amount"), 0n);
@@ -7783,7 +7854,8 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
   if (party.length !== 1) fail("Correction requires an active reviewed native vendor");
   // Historical context is read-only: never pass it to posting or command code.
   const originals = (await loadImportedDocumentAccrualPostings(client,{ ...context,sourceId:historicalSource },storedString(bill.transaction_id,"transaction_id"),true)).map(storedLedgerPosting);
-  if (originals.some(p => p.itemId !== undefined || p.dimensionRefs.length)) fail("Dimensional imported corrections require explicit component mappings");
+  if (originals.some(p => p.itemId !== undefined)) fail("Imported item corrections require explicit item mappings");
+  const mapDimensions = await importedCorrectionDimensions(client, { tenantId:context.tenantId,historicalSourceId:historicalSource,nativeSourceId:context.sourceId }, originals, review.dimensionMappings);
   const mappings = new Map(review.accountMappings.map(m => [m.historicalAccountId,m.nativeAccountId]));
   const ids = unique(originals.map(p => p.accountId));
   if (mappings.size !== review.accountMappings.length || mappings.size !== ids.length || ids.some(id => !mappings.has(id))) fail("Correction mappings must cover exactly the original journal accounts");
@@ -7843,34 +7915,34 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
     const otherControls = otherPostings.filter(p=>otherAccounts.some(a=>a.account_id===p.accountId && a.type===controlType && a.classification===controlClass));
     const otherControl = otherControls[0];
     if (otherControls.length!==1 || !otherControl || controlAmount(otherControl)!==storedMoney(other.original_amount,"original_amount") || controlOffset(otherControl)!=="0.00"
-      || otherPostings.some(p=>p.itemId!==undefined || p.dimensionRefs.length || (p!==otherControl && !otherAccounts.some(a=>a.account_id===p.accountId && (isExpense(a) || isComponent(a))))))
+      || otherPostings.some(p=>p.itemId!==undefined || (p!==otherControl && !otherAccounts.some(a=>a.account_id===p.accountId && (isExpense(a) || isComponent(a))))))
       return fail("Split correction requires exact supported expense/component journals for every original bill");
     paymentExpenses.push(...projectCashBasisApplication({applicationId:String(peer.subledger_application_id),applicationType,action:"recognize",
       appliedAmount:storedMoney(peer.applied_amount,"applied_amount"),effectiveDate:input.effectiveDate,
       importBatchId:scopedRecordId(context,"import_batch",`split-proof:${input.applicationId}`),accrualPostings:otherPostings,controlAccountId:otherControl.accountId}).filter(p=>p.accountId!==otherControl.accountId));
   }
-  const expectedCash = paymentExpenses.map(p => `${p.accountId}:${p.debitAmount}:${p.creditAmount}`);
+  const expectedCash = paymentExpenses.map(p => `${p.accountId}:${p.debitAmount}:${p.creditAmount}:${canonicalCorrectionJson(p.dimensionRefs)}`);
   // The unallocated original cash stays in historical A/P. Prove it exactly;
   // never reverse it as part of the selected application or infer an expense.
-  if (originalResidual > 0n) expectedCash.push(`${control.accountId}:${customer ? "0.00" : formatMoney(originalResidual)}:${customer ? formatMoney(originalResidual) : "0.00"}`);
+  if (originalResidual > 0n) expectedCash.push(`${control.accountId}:${customer ? "0.00" : formatMoney(originalResidual)}:${customer ? formatMoney(originalResidual) : "0.00"}:[]`);
   expectedCash.sort();
   const retainedCash = cash.filter(p => p.account_type !== "Bank")
-    .map(p => `${String(p.account_id)}:${storedMoney(p.debit_amount,"debit_amount")}:${storedMoney(p.credit_amount,"credit_amount")}`).sort();
+    .map(p => `${String(p.account_id)}:${storedMoney(p.debit_amount,"debit_amount")}:${storedMoney(p.credit_amount,"credit_amount")}:${canonicalCorrectionJson(storedDimensionRefs(p.dimension_refs))}`).sort();
   if (new Set(cash.map(p=>p.transaction_id)).size !== 1 || bank.length !== 1
     || storedMoney(bank[0]?.[customer ? "debit_amount" : "credit_amount"],"credit_amount") !== storedMoney(payment.original_amount,"original_amount")
     || storedMoney(bank[0]?.[customer ? "credit_amount" : "debit_amount"],"debit_amount") !== "0.00" || cash.length !== expectedCash.length+1
     || canonicalCorrectionJson(expectedCash) !== canonicalCorrectionJson(retainedCash)
-    || cash.some(p => storedDate(p.posting_date,"posting_date")!==storedDate(payment.document_date,"document_date") || p.currency_code!==context.currencyCode || p.party_id!==review.historicalPartyId || p.item_id!=null || (p.dimension_refs as unknown[]).length))
+    || cash.some(p => storedDate(p.posting_date,"posting_date")!==storedDate(payment.document_date,"document_date") || p.currency_code!==context.currencyCode || p.party_id!==review.historicalPartyId || p.item_id!=null || (p.account_type === "Bank" && storedDimensionRefs(p.dimension_refs).length > 0)))
     fail("Imported correction requires the exact original payment cash recognition journal");
   await assertPostingAccountEligibility(client,context,[...mappings.values()]);
   return projectCashBasisApplication({ applicationId:input.applicationId,applicationType,action:"reverse",
-    appliedAmount:storedMoney(application.applied_amount,"applied_amount"),effectiveDate:input.effectiveDate,
+    appliedAmount:selectedAmount,effectiveDate:input.effectiveDate,
     importBatchId:scopedRecordId(context,"import_batch",`cross-source-settlement:${input.applicationId}:reverse`),accrualPostings:originals,controlAccountId:control.accountId }).map(posting => {
       const accountId = mappings.get(posting.accountId);
       if (!accountId) throw new ErpFinancialsValidationError("Missing mapped correction account");
       const { transactionLineId:_line,itemId:_item,checkpointId:_checkpoint,...fact }=posting; void _line;void _item;void _checkpoint;
       return { ...fact,postingId:scopedRecordId(context,"posting",`imported-correction:${posting.postingId}`),sourceId:context.sourceId,
-        accountId,partyId:review.nativePartyId,
+        accountId,partyId:review.nativePartyId,dimensionRefs:mapDimensions(posting.dimensionRefs),dimensionHash:createDimensionHash(mapDimensions(posting.dimensionRefs)),
         sourcePayloadRef:{ sourceObjectType:customer ? "CrossSourceCustomerSettlement" : "CrossSourceVendorSettlement",sourceObjectId:input.applicationId,
           preview:{ applicationSourceId:historicalSource,originalPostingId:posting.postingId,reviewRef:review.reviewRef } } };
     });
