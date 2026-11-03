@@ -53,7 +53,7 @@ describe("canonical schema manifest", () => {
 
   it("is versioned and covers the documented canonical entities", () => {
     expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.manifestVersion).toBe("2026-10-31.provider-application-refresh");
-    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion).toBe(53);
+    expect(POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion).toBe(54);
 
     const tableNames = POSTGRES_CANONICAL_SCHEMA_MANIFEST.tables.map((table) => table.name);
 

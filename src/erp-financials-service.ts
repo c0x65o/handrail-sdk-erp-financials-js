@@ -388,7 +388,7 @@ export type IssueCreditMemoInput = IssueCreditMemoCommon &
 
 export type IssueRefundInput = SubledgerDocumentInputCommon & {
   /** Fully fund issuance atomically; credits must belong to this source/customer. */
-  readonly creditFunding?: readonly { readonly creditDocumentId: string; readonly expectedVersion: number; readonly amount: DecimalString }[];
+  readonly creditFunding?: readonly { readonly creditDocumentId: string; readonly expectedVersion: number; readonly amount: DecimalString; readonly settlement?: CreditSettlementReview }[];
   readonly customerId: string;
   readonly amount: DecimalString;
   readonly receivableAccount: ErpFinancialsAccountReference;
@@ -788,6 +788,17 @@ export type CrossSourceSettlement = {
 /** Backward-compatible name for the original customer-only bridge. */
 export type CrossSourceCustomerSettlement = CrossSourceSettlement;
 
+/** Independent approval of credit funding across exact source coordinates. The
+ * application and its lifecycle belong to the writer, not the funding document.
+ * A party association alone never authorizes a settlement. */
+export type CreditSettlementReview = {
+  readonly sourceSourceId: string;
+  readonly targetSourceId: string;
+  readonly sourcePartyId: string;
+  readonly targetPartyId: string;
+  readonly reviewRef: string;
+};
+
 export type ApplySubledgerPaymentInput = {
   readonly operation: FinancialOperationContext;
   readonly idempotencyKey: string;
@@ -799,6 +810,7 @@ export type ApplySubledgerPaymentInput = {
   readonly expectedSourceVersion: number;
   readonly expectedTargetVersion: number;
   readonly crossSource?: CrossSourceSettlement;
+  readonly creditSettlement?: CreditSettlementReview;
   readonly match?: {
     readonly matchCandidateId: string;
     readonly matchDecisionId: string;
@@ -1992,14 +2004,15 @@ async function issueRefund(context: ServiceContext, raw: IssueRefundInput): Prom
     assertExpectedSubledgerVersion(item.expectedVersion, "expectedVersion");
     return { ...item, amount: normalizedPositiveMoney(item.amount, "creditFunding.amount") };
   });
-  if (funding && (!funding.length || new Set(funding.map(item => item.creditDocumentId)).size !== funding.length ||
+  if (funding && (!funding.length || new Set(funding.map(item => `${item.settlement?.sourceSourceId ?? context.sourceId}:${item.creditDocumentId}`)).size !== funding.length ||
     funding.reduce((total, item) => total + parsePositiveMoney(item.amount, "amount"), 0n) !== parsePositiveMoney(amount, "amount"))) {
     throw new ErpFinancialsValidationError("Distinct funding credits must total the refund amount");
   }
   const refundProvenance = optionalReferenceProvenance({ relatedInvoiceId: input.relatedInvoiceId,
     refundMethod: input.refundMethod, lifecycleReference: input.lifecycleReference }, "refund");
   return context.database.transaction(async client => {
-    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    for (const sourceId of unique([context.sourceId,...(funding ?? []).flatMap(item => item.settlement ? [item.settlement.sourceSourceId,item.settlement.targetSourceId] : [])]).sort())
+      await lockCustomerPaymentCorrectionSource(client,context.tenantId,sourceId);
     const nested = nestedServiceContext(context, client);
     const refund = await createSubledgerDocument(nested, {
       ...commonSubledgerDocument(context, input, "refund", amount, funding !== undefined, {
@@ -2014,7 +2027,8 @@ async function issueRefund(context: ServiceContext, raw: IssueRefundInput): Prom
       await applySubledgerPayment(nested, { operation: input.operation,
         idempotencyKey: `${input.idempotencyKey}:credit-funding:${String(index)}`, applicationType: "credit_to_refund",
         sourceDocumentId: item.creditDocumentId, targetDocumentId: refund.documentId, amount: item.amount,
-        applicationDate: input.date, expectedSourceVersion: item.expectedVersion, expectedTargetVersion: index + 1 });
+        applicationDate: input.date, expectedSourceVersion: item.expectedVersion, expectedTargetVersion: index + 1,
+        ...(item.settlement ? {creditSettlement:item.settlement} : {}) });
     }
     const row = await loadSubledgerDocumentByIdempotencyKey(client, context, input.idempotencyKey);
     return documentResult(row, refund.journal);
@@ -3818,6 +3832,40 @@ async function writeSubledgerDocumentLines(
   }
 }
 
+async function assertCreditSettlementReview(client:PostgresQueryClient,context:ServiceContext,input:ApplySubledgerPaymentInput,
+  source:Record<string,unknown>,target:Record<string,unknown>):Promise<void> {
+  const review=input.creditSettlement;
+  if(!review)throw new ErpFinancialsValidationError("Missing credit settlement review");
+  if (source.source_id!==review.sourceSourceId || target.source_id!==review.targetSourceId
+    || source.party_id!==review.sourcePartyId || target.party_id!==review.targetPartyId
+    || source.currency_code!==context.currencyCode || target.currency_code!==context.currencyCode
+    || input.applicationDate<storedDate(source.document_date,"document_date")
+    || input.applicationDate<storedDate(target.recognition_date ?? target.document_date,"recognition_date"))
+    throw new ErpFinancialsValidationError("Credit settlement review does not match source coordinates, parties, currency or dates");
+  const bindings=(await client.query(`select b.*,s.source_system from erp_financials.reporting_book_sources b
+    join erp_financials.accounting_sources s using(tenant_id,source_id)
+    where b.tenant_id=$1 and b.company_id=$2 and b.book_id=$3 and b.source_id=any($4::text[]) for share of b,s`,
+    [context.tenantId,context.companyId,context.bookId,unique([context.sourceId,review.sourceSourceId,review.targetSourceId])])).rows;
+  const within=(b:Record<string,unknown>|undefined,date:string)=>b!==undefined
+    && (b.effective_from==null || storedDate(b.effective_from,"effective_from")<=date)
+    && (b.effective_through==null || storedDate(b.effective_through,"effective_through")>=date);
+  const writer=bindings.find(b=>b.source_id===context.sourceId);
+  if (writer?.source_role!=="active" || writer.source_system!=="native_erp" || !within(writer,input.applicationDate))
+    throw new ErpFinancialsValidationError("Credit settlement requires the active native writer in its book date window");
+  for (const document of [source,target]) {
+    const binding=bindings.find(b=>b.source_id===document.source_id);
+    if (document.source_id===context.sourceId) {
+      const posted=(await client.query(`select book_id from erp_financials.financial_outbox where tenant_id=$1 and company_id=$2
+        and source_id=$3 and aggregate_id=$4 and event_type='ledger.posted' for key share`,
+        [context.tenantId,context.companyId,context.sourceId,document.transaction_id])).rows;
+      if (posted.length!==1 || posted[0]?.book_id!==context.bookId) throw new ErpFinancialsValidationError("Credit settlement requires native posting evidence in this book");
+    } else if (binding?.source_role!=="historical" || binding.source_system!=="quickbooks"
+      || !within(binding,storedDate(document.recognition_date ?? document.document_date,"document_date"))) {
+      throw new ErpFinancialsValidationError("Credit settlement requires reviewed historical documents in this book's date windows");
+    }
+  }
+}
+
 function applySubledgerPayment(context: ServiceContext, input: ApplySubledgerPaymentInput): Promise<SubledgerApplicationResult>;
 function applySubledgerPayment(context: ServiceContext, input: ApplySubledgerPaymentInput, retirement: FinancialOperationContext): Promise<RetireReceiptApplicationResult>;
 async function applySubledgerPayment(
@@ -3844,6 +3892,14 @@ async function applySubledgerPayment(
     for (const key of ["targetSourceId", "nativePartyId", "historicalPartyId", "reviewRef"] as const) assertNonEmpty(input.crossSource[key], `crossSource.${key}`);
     if (!input.crossSource.accountMappings.length) throw new ErpFinancialsValidationError("Cross-source settlement requires complete account mappings");
   }
+  if (input.creditSettlement) {
+    assertFinancialApproval(context,input.operation);
+    if (!context.bookId || input.crossSource || input.match || retirementInput
+      || !["credit_to_invoice","vendor_credit_to_bill","credit_to_refund"].includes(input.applicationType)
+      || !input.operation.approverRef || input.operation.approverRef === input.operation.actorRef)
+      throw new ErpFinancialsValidationError("Source-aware credit settlement requires independent approval in a reporting book");
+    for (const key of ["sourceSourceId","targetSourceId","sourcePartyId","targetPartyId","reviewRef"] as const) assertNonEmpty(input.creditSettlement[key],`creditSettlement.${key}`);
+  }
   const commandChecksum = subledgerApplicationCommandChecksum(context, input, amount);
   const applicationId = scopedRecordId(context, "subledger_application", input.idempotencyKey);
   const retirement = retirementInput === undefined ? undefined : copyFinancialOperation(retirementInput);
@@ -3856,7 +3912,7 @@ async function applySubledgerPayment(
     approverRef: retirement.approverRef ?? null, reasonCode: retirement.reasonCode, reasonDetail: retirement.reasonDetail ?? null })).digest("hex");
   const eventKey = `subledger-application:${input.idempotencyKey}:applied`;
   return context.database.transaction(async (client) => {
-    for (const sourceId of unique([context.sourceId, ...(input.crossSource ? [input.crossSource.targetSourceId] : [])]).sort())
+    for (const sourceId of unique([context.sourceId, ...(input.crossSource ? [input.crossSource.targetSourceId] : []), ...(input.creditSettlement ? [input.creditSettlement.sourceSourceId,input.creditSettlement.targetSourceId] : [])]).sort())
       await lockCustomerPaymentCorrectionSource(client, context.tenantId, sourceId);
     await acquireTransactionLock(
       client,
@@ -3911,11 +3967,12 @@ async function applySubledgerPayment(
     const [source, target] = await loadSubledgerDocumentsForUpdate(client, context, [
       input.sourceDocumentId,
       input.targetDocumentId
-    ], input.crossSource?.targetSourceId);
+    ], input.creditSettlement?.targetSourceId ?? input.crossSource?.targetSourceId,input.creditSettlement?.sourceSourceId);
+    if (input.creditSettlement) await assertCreditSettlementReview(client,context,input,source,target);
     const crossSourcePlan = input.crossSource === undefined ? undefined : await prepareCrossSourceSettlement(client, context, input, source, target, amount, applicationId);
     if (input.applicationType === "bill_payment_to_bill" && target.payment_hold === true) throw new ErpFinancialsError("terminal_state_conflict", "Vendor bill is on payment hold");
     assertSubledgerApplicationDocuments(input, source,
-      crossSourcePlan ? { ...target, party_id: source.party_id } : target, amount);
+      crossSourcePlan || input.creditSettlement ? { ...target, party_id: source.party_id } : target, amount);
     if (input.match !== undefined) {
       await assertAcceptedSubledgerMatch(client, context, { ...input, match: input.match }, source, target);
     }
@@ -3940,6 +3997,7 @@ async function applySubledgerPayment(
         sourceDocumentId: input.sourceDocumentId,
         targetDocumentId: input.targetDocumentId,
         ...(input.crossSource === undefined ? {} : { crossSource: input.crossSource }),
+        ...(input.creditSettlement === undefined ? {} : {creditSettlement:input.creditSettlement}),
         ...(input.match === undefined
           ? {}
           : {
@@ -3955,8 +4013,8 @@ async function applySubledgerPayment(
   "subledger_application_id", "tenant_id", "company_id", "source_id", "application_type", "source_document_id",
   "target_document_id", "applied_amount", "currency_code", "application_date", "status", "version",
   "idempotency_key", "applied_event_id", "ended_event_id", "match_candidate_id", "match_decision_id", "match_method",
-  "match_score", "match_evidence", "created_at", "updated_at", "target_document_source_id"
-) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'applied', 1, $11, $12, null, $13, $14, $15, $16, $17, $18, $18, $19)
+  "match_score", "match_evidence", "created_at", "updated_at", "target_document_source_id", "source_document_source_id"
+) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'applied', 1, $11, $12, null, $13, $14, $15, $16, $17, $18, $18, $19, $20)
 returning *`,
       [
         applicationId,
@@ -3977,7 +4035,8 @@ returning *`,
         input.match?.score,
         input.match?.evidence === undefined ? undefined : JSON.stringify(input.match.evidence),
         context.now(),
-        input.crossSource?.targetSourceId ?? null
+        input.creditSettlement?.targetSourceId ?? input.crossSource?.targetSourceId ?? null,
+        input.creditSettlement?.sourceSourceId ?? null
       ]
     );
     const row = inserted.rows[0];
@@ -4031,11 +4090,12 @@ async function endSubledgerApplication(
     accountMappings: [...input.importedCorrection.accountMappings].sort((a,b) => a.historicalAccountId.localeCompare(b.historicalAccountId))
   } : undefined;
   return context.database.transaction(async (client) => {
-    const coordinate = (await client.query(`select target_document_source_id from erp_financials.subledger_applications
+    const coordinate = (await client.query(`select target_document_source_id,source_document_source_id from erp_financials.subledger_applications
       where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_application_id=$4`,
       [context.tenantId, context.companyId, applicationSourceId, input.applicationId])).rows[0];
     const targetSource = storedOptionalString(coordinate?.target_document_source_id);
-    for (const sourceId of unique([context.sourceId, applicationSourceId, ...(targetSource ? [targetSource] : [])]).sort())
+    const fundingSource = storedOptionalString(coordinate?.source_document_source_id);
+    for (const sourceId of unique([context.sourceId, applicationSourceId, ...(targetSource ? [targetSource] : []), ...(fundingSource ? [fundingSource] : [])]).sort())
       await lockCustomerPaymentCorrectionSource(client, context.tenantId, sourceId);
     await acquireTransactionLock(
       client,
@@ -4055,10 +4115,11 @@ for update`,
         { applicationId: input.applicationId }
       );
     }
-    if (current.target_document_source_id != null && current.target_document_source_id !== context.sourceId) {
+    if ((current.target_document_source_id != null && current.target_document_source_id !== context.sourceId)
+      || (current.source_document_source_id != null && current.source_document_source_id !== context.sourceId)) {
       if (!input.operation.approverRef || input.operation.approverRef === input.operation.actorRef)
         throw new ErpFinancialsValidationError("Cross-source settlement undo requires independent approval");
-      if (current.target_document_source_id !== targetSource)
+      if (storedOptionalString(current.target_document_source_id) !== targetSource || storedOptionalString(current.source_document_source_id) !== fundingSource)
         throw new ErpFinancialsError("optimistic_concurrency_conflict", "Settlement source coordinates changed before locking", { retryable: true });
     }
     if (current.application_type === "credit_to_refund" && input.effectiveDate < storedDate(current.application_date, "application_date")) {
@@ -4171,6 +4232,7 @@ returning *`,
     }
     const cashBasisPostingIds = importedPostings
       ? await persistCrossSourceSettlement(client, context, importedPostings, input.applicationId, input.effectiveDate, "reverse")
+      : ["credit_to_invoice","vendor_credit_to_bill","credit_to_refund"].includes(String(current.application_type)) ? []
       : current.target_document_source_id != null && current.target_document_source_id !== context.sourceId
       ? await reverseCrossSourceSettlement(client, context, current, input)
       : await persistCashBasisApplicationProjection(client, context, {
@@ -4829,7 +4891,8 @@ function subledgerApplicationCommandChecksum(context: ServiceContext, input: App
     expectedSourceVersion: input.expectedSourceVersion, expectedTargetVersion: input.expectedTargetVersion,
     match: input.match ?? null, actorRef: input.operation.actorRef, approverRef: input.operation.approverRef ?? null,
     reasonCode: input.operation.reasonCode, reasonDetail: input.operation.reasonDetail ?? null,
-    ...(input.crossSource === undefined ? {} : { crossSource: input.crossSource })
+    ...(input.crossSource === undefined ? {} : { crossSource: input.crossSource }),
+        ...(input.creditSettlement === undefined ? {} : {creditSettlement:input.creditSettlement})
   })).digest("hex");
 }
 

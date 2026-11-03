@@ -95,6 +95,7 @@ export class PostgresMigrationError extends Error {
 const namespace = POSTGRES_CANONICAL_SCHEMA_MANIFEST.namespace;
 const migrationLockKey = `${namespace}:schema-migrations`;
 const migrationFiles = {
+  sourceCreditV54: new URL("../migrations/future-erp/20261103020000_add_source_aware_credit_funding.sql", import.meta.url),
   creditRefundV53: new URL("../migrations/future-erp/20261103010000_add_atomic_credit_refunds.sql", import.meta.url),
   crossSourceVendorV52: new URL("../migrations/future-erp/20261031030000_add_cross_source_vendor_settlement.sql", import.meta.url),
   providerApplicationRefreshV51: new URL("../migrations/future-erp/20261031020000_preserve_provider_application_refresh.sql",import.meta.url),
@@ -370,7 +371,8 @@ export const POSTGRES_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
   migration("20261031010000_add_cross_source_customer_settlement","Reviewed native receipt settlement of historical invoices",49,50,migrationFiles.crossSourceSettlementV50),
   migration("20261031020000_preserve_provider_application_refresh","Preserve provider application refresh balance deltas",50,51,migrationFiles.providerApplicationRefreshV51),
   migration("20261031030000_add_cross_source_vendor_settlement", "Reviewed native payment settlement of historical vendor bills", 51, 52, migrationFiles.crossSourceVendorV52),
-  migration("20261103010000_add_atomic_credit_refunds", "Atomic credit-funded refunds", 52, 53, migrationFiles.creditRefundV53)
+  migration("20261103010000_add_atomic_credit_refunds", "Atomic credit-funded refunds", 52, 53, migrationFiles.creditRefundV53),
+  migration("20261103020000_add_source_aware_credit_funding", "Source-aware independently reviewed credit funding", 53, 54, migrationFiles.sourceCreditV54)
 ] as const;
 
 export async function planPostgresMigrations(

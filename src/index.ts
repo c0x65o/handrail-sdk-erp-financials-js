@@ -758,6 +758,7 @@ export type {
   ApplySubledgerPaymentInput,
   CrossSourceCustomerSettlement,
   CrossSourceSettlement,
+  CreditSettlementReview,
   RetireBillPaymentRecordingInput,
   RetireBillPaymentRecordingResult,
   RetireReceiptApplicationInput,

@@ -21,11 +21,13 @@ suite('reviewed native receipt → historical invoice settlement', () => {
   } };
   beforeEach(async() => { await pool.query('drop schema if exists erp_financials cascade'); });
   afterAll(async() => { await pool.end(); });
-  async function fixture() {
+  async function fixture(withCredit=false) {
     await migratePostgresSchema(runner, { appliedByRef: 'test:cross-source' });
     const original = importedCreditFixture();
     const invoice = required(original.resources.operationalDocuments?.[0]);
-    const documents = [{ ...invoice, resource: { ...invoice.resource, openAmount: '27.56' } }];
+    const documents = [{ ...invoice, resource: { ...invoice.resource, openAmount: '27.56' } },
+      ...(withCredit ? [{...invoice,resourceId:'imported-credit',resource:{...invoice.resource,sourceTransactionId:'imported-credit',sourceTransactionType:'CreditMemo',totalAmount:'100.00',openAmount:'100.00',
+        lines:[{sourceLineId:'1',lineNumber:1,sourceAmount:'100.00',accountRef:{sourceObjectId:'revenue'},postings:[]}]}}] : [])];
     const resources = { ...original.resources, operationalDocuments: documents, ledgerTransactions: documents.map(row => ({ ...row, resource: { ...row.resource, lines: [] } })) };
     const facts = mapHandrailQuickBooksSdkResourcesToCanonicalFacts({ resources, context: { ...scope, realmId: 'synthetic-realm', providerEnvironment: 'sandbox',
       accountingBasis: 'accrual', defaultCurrencyCode: 'USD', importBatchId: 'cross-source-batch', checkpointId: 'cross-source-checkpoint', importedAt: now } });
@@ -71,6 +73,52 @@ suite('reviewed native receipt → historical invoice settlement', () => {
         reviewRef: 'approved-review:1', accountMappings: facts.accounts.filter(a => ['ar','revenue'].includes(a.sourceAccountId)).map(a => ({ historicalAccountId: a.accountId, nativeAccountId: required(accounts[a.sourceAccountId]) })) } };
     return { sdk, command, replay, customerId, historicalCustomerId: required(facts.parties[0]).partyId, sourceId };
   }
+  it('settles imported credits under independent source-aware approval and preserves dated undo/reapplication', async()=>{
+    const {sdk,sourceId,customerId,historicalCustomerId,replay}=await fixture(true);
+    const credit=required((await pool.query<{subledger_document_id:string;version:number}>("select subledger_document_id,version from erp_financials.subledger_documents where document_type='credit_memo'")).rows[0]);
+    const invoice=await sdk.commands.invoices.create({operation,idempotencyKey:'credit-native-invoice',date:'2025-08-01',dueDate:'2025-08-31',customerId,receivableAccount:{accountKey:'ar'},
+      revenueLines:[{accountKey:'revenue',amount:'100.00'}]});
+    const review={sourceSourceId:scope.sourceId,targetSourceId:sourceId,sourcePartyId:historicalCustomerId,targetPartyId:customerId,reviewRef:'independent-credit-review'};
+    const command={operation,idempotencyKey:'reviewed-credit',applicationType:'credit_to_invoice' as const,sourceDocumentId:credit.subledger_document_id,targetDocumentId:invoice.documentId,
+      amount:'30.00',applicationDate:'2025-08-02',expectedSourceVersion:credit.version,expectedTargetVersion:invoice.version,creditSettlement:review};
+    await expect(sdk.commands.paymentApplications.apply({...command,operation:{...operation,approverRef:operation.actorRef}})).rejects.toThrow('must differ');
+    await expect(sdk.commands.paymentApplications.apply({...command,creditSettlement:{...review,sourcePartyId:'wrong'}})).rejects.toThrow('coordinates');
+    const applied=await sdk.commands.paymentApplications.apply(command);
+    expect((await sdk.commands.paymentApplications.apply(command)).status).toBe('already_applied');
+    await expect(sdk.commands.paymentApplications.apply({...command,creditSettlement:{...review,reviewRef:'changed'}})).rejects.toThrow();
+    expect((await sdk.queries.getOperationalDocument(credit.subledger_document_id)).openAmount).toBe('70.00');
+    await replay();
+    expect((await sdk.queries.getOperationalDocument(credit.subledger_document_id)).openAmount).toBe('70.00');
+    await expect(pool.query("update erp_financials.transactions set memo='changed' where source_id=$1 and source_transaction_id='imported-credit'",[scope.sourceId])).rejects.toThrow('cannot be rewritten');
+    expect((await sdk.queries.getCustomerStatement({customerId:historicalCustomerId,asOfDate:'2025-08-01'})).balance?.unappliedCreditAmount).toBe('100.00');
+    expect((await sdk.queries.getCustomerStatement({customerId:historicalCustomerId,asOfDate:'2025-08-02'})).balance?.unappliedCreditAmount).toBe('70.00');
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:applied.applicationId,expectedVersion:applied.version,effectiveDate:'2025-08-03'});
+    expect((await sdk.queries.getCustomerStatement({customerId:historicalCustomerId,asOfDate:'2025-08-02'})).balance?.unappliedCreditAmount).toBe('70.00');
+    expect((await sdk.queries.getCustomerStatement({customerId:historicalCustomerId,asOfDate:'2025-08-03'})).balance?.unappliedCreditAmount).toBe('100.00');
+    const reapplication=await sdk.commands.paymentApplications.apply({...command,idempotencyKey:'credit-reapply',applicationDate:'2025-08-04',expectedSourceVersion:(await sdk.queries.getOperationalDocument(credit.subledger_document_id)).version,expectedTargetVersion:(await sdk.queries.getOperationalDocument(invoice.documentId)).version});
+    expect(reapplication.status).toBe('applied');
+    await expect(pool.query("update erp_financials.subledger_documents set open_amount=100 where subledger_document_id=$1",[credit.subledger_document_id])).rejects.toThrow();
+  });
+  it('atomically funds a refund from an imported credit, restores its source on void, and supports reviewed native funding',async()=>{
+    const {sdk,sourceId,customerId,historicalCustomerId}=await fixture(true);
+    const credit=required((await pool.query<{subledger_document_id:string;version:number}>("select subledger_document_id,version from erp_financials.subledger_documents where document_type='credit_memo'")).rows[0]);
+    const settlement={sourceSourceId:scope.sourceId,targetSourceId:sourceId,sourcePartyId:historicalCustomerId,targetPartyId:customerId,reviewRef:'independent-refund-review'};
+    const command={operation,idempotencyKey:'imported-funded-refund',date:'2025-08-02',customerId,amount:'30.00',receivableAccount:{accountKey:'ar'},cashAccount:{accountKey:'cash'},
+      creditFunding:[{creditDocumentId:credit.subledger_document_id,expectedVersion:credit.version,amount:'30.00',settlement}]};
+    await expect(sdk.commands.refunds.issue({...command,amount:'101.00',creditFunding:[{...required(command.creditFunding[0]),amount:'101.00'}]})).rejects.toThrow();
+    expect((await pool.query("select count(*)::int n from erp_financials.subledger_documents where document_type='refund'")).rows).toEqual([{n:0}]);
+    const refund=await sdk.commands.refunds.issue(command);
+    expect(refund.openAmount).toBe('0.00');
+    expect((await sdk.commands.refunds.issue(command)).status).toBe('already_posted');
+    expect((await sdk.queries.getOperationalDocument(credit.subledger_document_id)).openAmount).toBe('70.00');
+    await sdk.commands.refunds.voidIssued({operation,adjustmentDocumentId:refund.documentId,expectedVersion:refund.version,idempotencyKey:'void-imported-refund',date:'2025-08-03'});
+    expect((await sdk.queries.getOperationalDocument(credit.subledger_document_id)).openAmount).toBe('100.00');
+    expect((await sdk.queries.getCustomerStatement({customerId:historicalCustomerId,asOfDate:'2025-08-02'})).balance?.unappliedCreditAmount).toBe('70.00');
+    expect((await sdk.queries.getCustomerStatement({customerId:historicalCustomerId,asOfDate:'2025-08-03'})).balance?.unappliedCreditAmount).toBe('100.00');
+    const native=await sdk.commands.credits.issue({operation,idempotencyKey:'native-reviewed-credit',date:'2025-08-03',customerId,amount:'30.00',receivableAccount:{accountKey:'ar'},revenueAccount:{accountKey:'revenue'}});
+    const result=await sdk.commands.refunds.issue({...command,idempotencyKey:'native-reviewed-refund',date:'2025-08-04',creditFunding:[{creditDocumentId:native.documentId,expectedVersion:native.version,amount:'30.00',settlement:{...settlement,sourceSourceId:sourceId,sourcePartyId:customerId}}]});
+    expect(result.openAmount).toBe('0.00');
+  });
   it('settles once in the active window, preserves dated balances on replay and exactly reverses', async() => {
     const { sdk, command, replay, customerId, historicalCustomerId, sourceId } = await fixture();
     const result = await sdk.commands.paymentApplications.apply(command);

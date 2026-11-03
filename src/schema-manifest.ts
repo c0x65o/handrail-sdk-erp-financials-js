@@ -62,7 +62,7 @@ export type PostgresTableManifest = {
 
 export type PostgresSchemaManifest = {
   readonly manifestVersion: "2026-10-31.provider-application-refresh";
-  readonly schemaVersion: 53;
+  readonly schemaVersion: 54;
   readonly dialect: "postgres";
   readonly namespace: "erp_financials";
   readonly requiredTriggers: readonly PostgresTriggerManifest[];
@@ -153,10 +153,11 @@ const table = (
 
 export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
   manifestVersion: "2026-10-31.provider-application-refresh",
-  schemaVersion: 53,
+  schemaVersion: 54,
   dialect: "postgres",
   namespace: "erp_financials",
   requiredTriggers: [
+    {name:"reviewed_credit_funding_guard",table:"subledger_documents",timing:"before",events:["update","delete"],functionName:"guard_reviewed_credit_funding"},
     { name: "cross_source_invoice_facts_guard", table: "subledger_documents", timing: "before", events: ["update", "delete"], functionName: "guard_cross_source_invoice_facts" },
     { name: "cross_source_invoice_balance_guard", table: "subledger_documents", timing: "after", events: ["update"], functionName: "check_cross_source_invoice_balance", deferredConstraint: true },
     ...["transactions", "ledger_postings", "transaction_lines"].map(table => ({ name: "cross_source_historical_journal_guard", table, timing: "before" as const, events: ["insert", "update", "delete"] as const, functionName: "guard_cross_source_historical_journal" })),
@@ -1347,6 +1348,7 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
         text("source_document_id"),
         text("target_document_id"),
         text("target_document_source_id", true),
+        text("source_document_source_id", true),
         numeric("applied_amount"),
         text("currency_code"),
         date("application_date"),
@@ -1406,7 +1408,7 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
         },
         foreignKey(
           "subledger_applications_source_document_scope_fk",
-          ["tenant_id", "company_id", "source_id", "source_document_id"],
+          ["tenant_id", "company_id", "source_document_source_id", "source_document_id"],
           "subledger_documents",
           ["tenant_id", "company_id", "source_id", "subledger_document_id"]
         ),
