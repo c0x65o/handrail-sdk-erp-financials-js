@@ -201,6 +201,13 @@ it.skipIf(!url).each([
     }
   }
   await storage.upsertLedgerPostings(originalJournal);
+  if (multiple) {
+    await storage.upsertTransactions([{...required(imported.transactions[1]),transactionId:"other-payment-cash",sourceTransactionId:"other-payment-cash",transactionDate:"2026-01-21",
+      sourcePayloadRef:{sourceObjectType:"Payment",sourceObjectId:"other-payment"}}]);
+    await storage.upsertLedgerPostings(originalJournal.filter(p=>p.accountingBasis==="cash").map(p=>({...p,
+      transactionId:"other-payment-cash",postingId:`other-${p.postingId}`,sourcePostingId:`other-${p.sourcePostingId}`,postingDate:"2026-01-21"})));
+  }
+
   const nativeAccounts=(await client.query(`select account_id,type from erp_financials.accounts where tenant_id=$1 and source_id=$2`,[facts.company.tenantId,sourceId])).rows;
   const importedCorrection={...(scenario.label.startsWith("dimensional") ? {dimensionMappings:[{historicalDimensionId:"historical-class",nativeDimensionId:"native-class"}]} : {}),applicationSourceId:facts.source.sourceId,reviewRef:"review:original-payment",historicalPartyId:customer.partyId,nativePartyId:customerId,
     accountMappings:[{historicalAccountId:expenseAccountId,nativeAccountId:String(required(nativeAccounts.find(a=>a.type==='Income')).account_id)},
@@ -264,6 +271,16 @@ it.skipIf(!url).each([
     expect(first.releasedAmount).toBe("25.00");
     expect(first.retainedApplication?.appliedAmount).toBe("75.00");
     expect(await rootSnapshot()).toMatchObject([{amount:"100.00",source_open:"25.00",target_open:"25.00",status:"unapplied"}]);
+    const nativePartial=await sdk.commands.invoices.create({operation,idempotencyKey:'native-partial-target',date:'2026-02-03',dueDate:'2026-02-28',
+      customerId:customerId,receivableAccount:{accountKey:'ap'},revenueLines:[{accountKey:'expense',amount:'25.00'}]});
+    const releasedPayment=await sdk.queries.getOperationalDocument(first.sourceDocumentId);
+    const partialApply={operation,idempotencyKey:'partial-released-cash',applicationType:'customer_payment_to_invoice' as const,
+      sourceDocumentId:first.sourceDocumentId,targetDocumentId:nativePartial.documentId,amount:'25.00',applicationDate:'2026-02-03',
+      expectedSourceVersion:releasedPayment.version,expectedTargetVersion:nativePartial.version,
+      crossSource:{...importedCorrection,targetSourceId:sourceId,accountMappings:[],importedFunding:{sourceId:facts.source.sourceId,partyId:customer.partyId}}};
+    const partialApplied=await sdk.commands.paymentApplications.apply(partialApply);
+    await expect(sdk.commands.paymentApplications.apply({...partialApply,idempotencyKey:'reuse-partial-release',expectedSourceVersion:releasedPayment.version+1,expectedTargetVersion:nativePartial.version+1})).rejects.toThrow('net-released-cash');
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:partialApplied.applicationId,expectedVersion:1,effectiveDate:'2026-02-03'});
     expect(await sdk.commands.paymentApplications.unapply(partialCommand)).toEqual(first);
     await expect(sdk.commands.paymentApplications.unapply({...partialCommand,amount:"26.00"})).rejects.toThrow();
     const second=await sdk.commands.paymentApplications.unapply({...command,applicationId:required(first.retainedApplication).applicationId,amount:"25.00",effectiveDate:"2026-02-04"});
@@ -322,6 +339,81 @@ it.skipIf(!url).each([
     expect(await historicalSnapshot()).toMatchObject([{source_open:paymentAmount,target_open:"100.00"}]);
     expect(await sdk.commands.paymentApplications.unapply(second)).toMatchObject({status:"unapplied"});
     expect(await historicalFacts()).toEqual(journalBefore);
+  }
+
+  if (scenario.label === "full plain" || scenario.label === "full signed" || scenario.label === "residual payment") {
+    // A different, unpaid historical invoice: no native receipt or bank posting
+    // is invented. The release journal alone funds the reviewed reapplication.
+    await client.query(`insert into erp_financials.transactions select (jsonb_populate_record(null::erp_financials.transactions,
+      to_jsonb(t)||jsonb_build_object('transaction_id','reapply-target','source_transaction_id','reapply-target',
+        'source_payload_ref',jsonb_build_object('sourceObjectType','Invoice','sourceObjectId','reapply-target')))).*
+      from erp_financials.transactions t where tenant_id=$1 and source_id=$2 and transaction_id='historical-bill'`,[facts.company.tenantId,facts.source.sourceId]);
+    await client.query(`insert into erp_financials.transactions select (jsonb_populate_record(null::erp_financials.transactions,
+      to_jsonb(t)||jsonb_build_object('transaction_id','reapply-accrual','source_transaction_id','reapply-accrual',
+        'source_payload_ref',jsonb_build_object('sourceObjectType','Invoice','sourceObjectId','reapply-target')))).*
+      from erp_financials.transactions t where tenant_id=$1 and source_id=$2 and transaction_id='bill-accrual'`,[facts.company.tenantId,facts.source.sourceId]);
+    await client.query(`insert into erp_financials.ledger_postings select (jsonb_populate_record(null::erp_financials.ledger_postings,
+      to_jsonb(p)||jsonb_build_object('posting_id','reapply-'||posting_id,'source_posting_id','reapply-'||source_posting_id,
+        'transaction_id','reapply-accrual'))).* from erp_financials.ledger_postings p
+      where tenant_id=$1 and source_id=$2 and transaction_id='bill-accrual' and accounting_basis='accrual'`,[facts.company.tenantId,facts.source.sourceId]);
+    await client.query(`insert into erp_financials.subledger_documents select (jsonb_populate_record(null::erp_financials.subledger_documents,
+      to_jsonb(d)||jsonb_build_object('subledger_document_id','reapply-document','transaction_id','reapply-target',
+        'idempotency_key','reapply-document','original_amount',100,'open_amount',100,'version',1,'status','open',
+        'metadata',jsonb_build_object('provider','quickbooks','sourceTransactionId','reapply-target','sourceTransactionType','Invoice')))).*
+      from erp_financials.subledger_documents d where tenant_id=$1 and source_id=$2 and subledger_document_id=$3`,
+      [facts.company.tenantId,facts.source.sourceId,ended.targetDocumentId]);
+    const payment=await sdk.queries.getOperationalDocument(ended.sourceDocumentId);
+    const apply={operation,idempotencyKey:'released-cash-reapply',applicationType:'customer_payment_to_invoice' as const,
+      sourceDocumentId:payment.documentId,targetDocumentId:'reapply-document',amount:'100.00',applicationDate:'2026-02-04',
+      expectedSourceVersion:payment.version,expectedTargetVersion:1,
+      crossSource:{...importedCorrection,targetSourceId:facts.source.sourceId,importedFunding:{sourceId:facts.source.sourceId,partyId:customer.partyId}}};
+    await expect(sdk.commands.paymentApplications.apply({...apply,applicationDate:'2026-02-02'})).rejects.toThrow('net-released-cash');
+    await expect(sdk.commands.paymentApplications.apply({...apply,crossSource:{...apply.crossSource,importedFunding:{...apply.crossSource.importedFunding,partyId:'wrong'}}})).rejects.toThrow();
+    await client.query('savepoint wrong_cash_proof');
+    await expect(client.query(`update erp_financials.ledger_postings set credit_amount=credit_amount+0.01,net_amount=net_amount-0.01
+      where source_id=$1 and account_id=$2 and accounting_basis='cash'`,[sourceId,required(importedCorrection.accountMappings.find(m=>m.historicalAccountId===payableAccountId)).nativeAccountId])).rejects.toThrow("immutable");
+    await client.query('rollback to savepoint wrong_cash_proof');
+    await client.query('release savepoint wrong_cash_proof');
+    const result=await sdk.commands.paymentApplications.apply(apply);
+    expect((await sdk.commands.paymentApplications.apply(apply)).status).toBe('already_applied');
+    expect((await sdk.queries.getOperationalDocument(payment.documentId)).openAmount).toBe(residual?'25.00':'0.00');
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:result.applicationId,expectedVersion:1,effectiveDate:'2026-02-06'});
+    const nextPayment=await sdk.queries.getOperationalDocument(payment.documentId);
+    const nextTarget=await sdk.queries.getOperationalDocument('reapply-document');
+    const next={...apply,idempotencyKey:'released-cash-reapply-again',expectedSourceVersion:nextPayment.version,expectedTargetVersion:nextTarget.version};
+    // Current open balance includes the later undo; an earlier date cannot spend it.
+    await expect(sdk.commands.paymentApplications.apply({...next,applicationDate:'2026-02-05'})).rejects.toThrow('net-released-cash');
+    const again=await sdk.commands.paymentApplications.apply({...next,applicationDate:'2026-02-06'});
+    expect(again.status).toBe('applied');
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:again.applicationId,expectedVersion:1,effectiveDate:'2026-02-07'});
+    const originalTarget=await sdk.queries.getOperationalDocument(ended.targetDocumentId);
+    const originalSource=await sdk.queries.getOperationalDocument(payment.documentId);
+    const originalApplied=await sdk.commands.paymentApplications.apply({...apply,idempotencyKey:'reapply-original-target',
+      targetDocumentId:originalTarget.documentId,expectedSourceVersion:originalSource.version,expectedTargetVersion:originalTarget.version,applicationDate:'2026-02-07'});
+    expect((await sdk.queries.getOperationalDocument(originalTarget.documentId)).openAmount).toBe('0.00');
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:originalApplied.applicationId,expectedVersion:1,effectiveDate:'2026-02-08'});
+    const nativeTarget=await sdk.commands.invoices.create({operation,idempotencyKey:'native-funding-target',date:'2026-02-08',dueDate:'2026-02-28',
+      customerId:customerId,receivableAccount:{accountKey:'ap'},revenueLines:[{accountKey:'expense',amount:'100.00'}]});
+    const finalSource=await sdk.queries.getOperationalDocument(payment.documentId);
+    const nativeApplied=await sdk.commands.paymentApplications.apply({...apply,idempotencyKey:'reapply-native-target',targetDocumentId:nativeTarget.documentId,
+      expectedSourceVersion:finalSource.version,expectedTargetVersion:nativeTarget.version,applicationDate:'2026-02-08',
+      crossSource:{...apply.crossSource,targetSourceId:sourceId,accountMappings:[]}});
+    expect((await sdk.queries.getOperationalDocument(nativeTarget.documentId)).openAmount).toBe('0.00');
+    expect((await sdk.queries.getCustomerStatement({customerId,asOfDate:'2026-02-08'})).items.find(i=>i.invoiceId===nativeTarget.documentId)?.openBalance).toBe('0.00');
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:nativeApplied.applicationId,expectedVersion:1,effectiveDate:'2026-02-09'});
+    expect((await sdk.queries.getOperationalDocument(nativeTarget.documentId)).openAmount).toBe('100.00');
+
+  }
+  if (multiple) {
+    const payment=await sdk.queries.getOperationalDocument(ended.sourceDocumentId), target=await sdk.queries.getOperationalDocument(ended.targetDocumentId);
+    const apply={operation,idempotencyKey:'multiple-original-reapply',applicationType:'customer_payment_to_invoice' as const,sourceDocumentId:payment.documentId,
+      targetDocumentId:target.documentId,amount:'40.00',applicationDate:'2026-02-04',expectedSourceVersion:payment.version,expectedTargetVersion:target.version,
+      crossSource:{...importedCorrection,targetSourceId:facts.source.sourceId,importedFunding:{sourceId:facts.source.sourceId,partyId:customer.partyId}}};
+    const first=await sdk.commands.paymentApplications.apply(apply);
+    const next=await sdk.commands.paymentApplications.apply({...apply,idempotencyKey:'multiple-original-final',amount:'60.00',expectedSourceVersion:payment.version+1,expectedTargetVersion:target.version+1});
+    expect((await sdk.queries.getOperationalDocument(target.documentId)).openAmount).toBe('0.00');
+    for (const entry of [first,next]) await sdk.commands.paymentApplications.unapply({operation,applicationId:entry.applicationId,expectedVersion:1,effectiveDate:'2026-02-05'});
+    expect((await sdk.queries.getOperationalDocument(target.documentId)).openAmount).toBe('100.00');
   }
   } finally { await client.query("rollback"); }
 });

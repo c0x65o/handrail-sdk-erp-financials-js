@@ -3485,7 +3485,7 @@ async function getCustomerStatement(
 ), active_applications as (
   select application."target_document_id" as "invoice_id", application."subledger_application_id" as "application_id",
     application."application_type", application."application_date", application."applied_amount",
-    application."currency_code", application."source_document_id", source_document."document_type" as "source_document_type",
+    application."currency_code", application."source_document_id", source_document."source_id" as "funding_source_id", source_document."document_type" as "source_document_type",
     source_document."document_number" as "source_document_number", source_document."document_date" as "source_document_date",
     source_document."transaction_id" as "source_transaction_id", source_transaction."source_transaction_id" as "source_external_transaction_id",
     source_transaction."source_transaction_type", application_source."source_system",
@@ -3507,13 +3507,16 @@ async function getCustomerStatement(
     on source_transaction."tenant_id" = source_document."tenant_id" and source_transaction."source_id" = source_document."source_id"
    and source_transaction."transaction_id" = source_document."transaction_id"
   join "erp_financials"."accounting_sources" application_source
-    on application_source."tenant_id" = application."tenant_id" and application_source."source_id" = application."source_id"
+    on application_source."tenant_id" = application."tenant_id" and application_source."source_id" = source_document."source_id"
   join "erp_financials"."reporting_book_sources" application_book_source
     on application_book_source."tenant_id" = application."tenant_id"
    and application_book_source."company_id" = application."company_id"
    and application_book_source."book_id" = $3 and application_book_source."source_id" = application."source_id"
-   and ((application_book_source."effective_from" is null or application_book_source."effective_from" <= coalesce(source_document."recognition_date",source_document."document_date"))
-     and (application_book_source."effective_through" is null or application_book_source."effective_through" >= coalesce(source_document."recognition_date",source_document."document_date")))
+   and exists (select 1 from erp_financials.reporting_book_sources funding_book_source
+     where funding_book_source.tenant_id=source_document.tenant_id and funding_book_source.company_id=source_document.company_id
+       and funding_book_source.book_id=$3 and funding_book_source.source_id=source_document.source_id
+       and (funding_book_source.effective_from is null or funding_book_source.effective_from<=coalesce(source_document.recognition_date,source_document.document_date))
+       and (funding_book_source.effective_through is null or funding_book_source.effective_through>=coalesce(source_document.recognition_date,source_document.document_date)))
    and (((application_book_source."effective_from" is null or application_book_source."effective_from" <= application."application_date")
      and (application_book_source."effective_through" is null or application_book_source."effective_through" >= application."application_date"))
      or ${retainedImportedApplicationInBookSql()})
@@ -3557,7 +3560,7 @@ async function getCustomerStatement(
       'applicationDate', application."application_date", 'amount', application."applied_amount"::text,
       'currencyCode', application."currency_code", 'sourceDocumentId', application."source_document_id",
       'sourceDocumentType', application."source_document_type", 'sourceDocumentNumber', application."source_document_number",
-      'sourceDocumentDate', application."source_document_date", 'sourceId', invoice."source_id",
+      'sourceDocumentDate', application."source_document_date", 'sourceId', application."funding_source_id",
       'sourceSystem', application."source_system", 'providerEnvironment', application."provider_environment",
       'transactionId', application."source_transaction_id",
       'sourceTransactionId', application."source_external_transaction_id",

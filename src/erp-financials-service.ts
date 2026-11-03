@@ -776,6 +776,8 @@ export type SubledgerApplicationType =
  * The host must bind reviewRef to its immutable approval receipt. Names/provider IDs
  * are never identity evidence. The operation requires an independent approver. */
 export type CrossSourceSettlement = {
+  /** Reuse only independently reviewed cash released from this imported payment. */
+  readonly importedFunding?: { readonly sourceId: string; readonly partyId: string };
   readonly dimensionMappings?: readonly ImportedDimensionMapping[];
   readonly itemMappings?: readonly { readonly historicalItemId: string; readonly nativeItemId: string }[];
   readonly targetSourceId: string;
@@ -3887,10 +3889,17 @@ async function applySubledgerPayment(
     if (!input.operation.approverRef || input.operation.approverRef === input.operation.actorRef)
       throw new ErpFinancialsValidationError("Cross-source settlement requires independent approval");
     if (!["customer_payment_to_invoice", "bill_payment_to_bill"].includes(input.applicationType) || input.match || retirementInput
-      || !context.bookId || input.crossSource.targetSourceId === context.sourceId)
+      || !context.bookId || (input.crossSource.targetSourceId === context.sourceId && !input.crossSource.importedFunding))
       throw new ErpFinancialsValidationError("Cross-source settlement supports reviewed native payments and historical invoices or bills only");
     for (const key of ["targetSourceId", "nativePartyId", "historicalPartyId", "reviewRef"] as const) assertNonEmpty(input.crossSource[key], `crossSource.${key}`);
-    if (!input.crossSource.accountMappings.length) throw new ErpFinancialsValidationError("Cross-source settlement requires complete account mappings");
+    if (input.crossSource.importedFunding) {
+      assertNonEmpty(input.crossSource.importedFunding.sourceId, "crossSource.importedFunding.sourceId");
+      assertNonEmpty(input.crossSource.importedFunding.partyId, "crossSource.importedFunding.partyId");
+      if (input.crossSource.importedFunding.sourceId === context.sourceId
+        || (input.crossSource.targetSourceId !== context.sourceId && input.crossSource.importedFunding.sourceId !== input.crossSource.targetSourceId))
+        throw new ErpFinancialsValidationError("Imported funding and target must share the reviewed historical source");
+    }
+    if (input.crossSource.targetSourceId !== context.sourceId && !input.crossSource.accountMappings.length) throw new ErpFinancialsValidationError("Cross-source settlement requires complete account mappings");
   }
   if (input.creditSettlement) {
     assertFinancialApproval(context,input.operation);
@@ -3912,7 +3921,7 @@ async function applySubledgerPayment(
     approverRef: retirement.approverRef ?? null, reasonCode: retirement.reasonCode, reasonDetail: retirement.reasonDetail ?? null })).digest("hex");
   const eventKey = `subledger-application:${input.idempotencyKey}:applied`;
   return context.database.transaction(async (client) => {
-    for (const sourceId of unique([context.sourceId, ...(input.crossSource ? [input.crossSource.targetSourceId] : []), ...(input.creditSettlement ? [input.creditSettlement.sourceSourceId,input.creditSettlement.targetSourceId] : [])]).sort())
+    for (const sourceId of unique([context.sourceId, ...(input.crossSource ? [input.crossSource.targetSourceId, ...(input.crossSource.importedFunding ? [input.crossSource.importedFunding.sourceId] : [])] : []), ...(input.creditSettlement ? [input.creditSettlement.sourceSourceId,input.creditSettlement.targetSourceId] : [])]).sort())
       await lockCustomerPaymentCorrectionSource(client, context.tenantId, sourceId);
     await acquireTransactionLock(
       client,
@@ -3967,7 +3976,7 @@ async function applySubledgerPayment(
     const [source, target] = await loadSubledgerDocumentsForUpdate(client, context, [
       input.sourceDocumentId,
       input.targetDocumentId
-    ], input.creditSettlement?.targetSourceId ?? input.crossSource?.targetSourceId,input.creditSettlement?.sourceSourceId);
+    ], input.creditSettlement?.targetSourceId ?? input.crossSource?.targetSourceId,input.creditSettlement?.sourceSourceId ?? input.crossSource?.importedFunding?.sourceId);
     if (input.creditSettlement) await assertCreditSettlementReview(client,context,input,source,target);
     const crossSourcePlan = input.crossSource === undefined ? undefined : await prepareCrossSourceSettlement(client, context, input, source, target, amount, applicationId);
     if (input.applicationType === "bill_payment_to_bill" && target.payment_hold === true) throw new ErpFinancialsError("terminal_state_conflict", "Vendor bill is on payment hold");
@@ -4036,14 +4045,14 @@ returning *`,
         input.match?.evidence === undefined ? undefined : JSON.stringify(input.match.evidence),
         context.now(),
         input.creditSettlement?.targetSourceId ?? input.crossSource?.targetSourceId ?? null,
-        input.creditSettlement?.sourceSourceId ?? null
+        input.creditSettlement?.sourceSourceId ?? input.crossSource?.importedFunding?.sourceId ?? null
       ]
     );
     const row = inserted.rows[0];
     if (row === undefined) {
       throw new Error("Subledger application insert did not return its row");
     }
-    const cashBasisPostingIds = crossSourcePlan
+    const cashBasisPostingIds = crossSourcePlan && target.source_id !== context.sourceId
       ? await persistCrossSourceSettlement(client, context, crossSourcePlan, applicationId, input.applicationDate, "recognize")
       : await persistCashBasisApplicationProjection(client, context, {
       action: "recognize",
@@ -7658,6 +7667,75 @@ function requiredMappedItem(mappings: ReadonlyMap<string,string>, historicalItem
 
 /** Cash recognition belongs to the active source, not the historical invoice's
  * expired reporting window. The original document and journal remain untouched. */
+/** A corrected imported payment is not a native receipt. Prove its net released
+ * cash in this writer/book, then reserve every outstanding later use. The source
+ * lock and document row lock held by apply serialize competing approvals. */
+async function assertImportedSettlementFunding(client: PostgresQueryClient, context: ServiceContext,
+  input: ApplySubledgerPaymentInput, source: Record<string, unknown>, amount: string, controlAccountId: string): Promise<void> {
+  const bridge = input.crossSource;
+  if (!bridge?.importedFunding) throw new ErpFinancialsValidationError("Missing imported funding review");
+  const funding = bridge.importedFunding;
+  const fail = (): never => { throw new ErpFinancialsValidationError("Imported funding requires equivalent dated net-released-cash evidence in this book"); };
+  if (source.source_id !== funding.sourceId || source.party_id !== funding.partyId || funding.partyId !== bridge.historicalPartyId) fail();
+  const binding=(await client.query(`select 1 from erp_financials.reporting_book_sources b
+    join erp_financials.accounting_sources s using(tenant_id,source_id)
+    where b.tenant_id=$1 and b.company_id=$2 and b.book_id=$3 and b.source_id=$4
+      and b.source_role='historical' and s.source_system='quickbooks'
+      and (b.effective_from is null or b.effective_from<=$5::date) and (b.effective_through is null or b.effective_through>=$5::date)
+    for share of b,s`,[context.tenantId,context.companyId,context.bookId,funding.sourceId,source.document_date])).rows;
+  if (binding.length!==1) fail();
+  const rows = (await client.query(`select a.*,e.payload,e.event_type,e.actor_ref,e.approver_ref
+    from erp_financials.subledger_applications a
+    left join erp_financials.financial_lifecycle_events e on e.tenant_id=a.tenant_id and e.company_id=a.company_id
+      and e.source_id=a.source_id and e.event_id=a.ended_event_id
+    where a.tenant_id=$1 and a.company_id=$2 and coalesce(a.source_document_source_id,a.source_id)=$3
+      and a.source_document_id=$4 order by a.source_id,a.subledger_application_id for share of a`,
+    [context.tenantId,context.companyId,funding.sourceId,input.sourceDocumentId])).rows;
+  let released = 0n, consumed = 0n;
+  for (const row of rows) {
+    const payload = storedJson(row.payload) as Record<string, JsonValue> | null;
+    if (row.source_id !== funding.sourceId) {
+      if (row.source_id !== context.sourceId || row.application_type !== input.applicationType) fail();
+      // Future allocations reserve cash too; a dated undo releases it only on its date.
+      if (row.status === "applied" || !payload || typeof payload.effectiveDate !== "string" || payload.effectiveDate > input.applicationDate)
+        consumed += parsePositiveMoney(row.applied_amount, "applied_amount");
+      continue;
+    }
+    if (row.status === "applied" || !payload || typeof payload.effectiveDate !== "string" || payload.effectiveDate > input.applicationDate) continue;
+    const review = payload.importedCorrection as Record<string, JsonValue> | undefined;
+    if (!review || review.accountingSourceId !== context.sourceId || review.bookId !== context.bookId
+      || review.applicationSourceId !== funding.sourceId || review.historicalPartyId !== funding.partyId
+      || review.nativePartyId !== bridge.nativePartyId || row.application_type !== input.applicationType
+      || !row.approver_ref || row.approver_ref === row.actor_ref) fail();
+    const release = parsePositiveMoney(payload.releasedAmount, "releasedAmount");
+    const retained = (await client.query(`select a.subledger_application_id,a.applied_amount from erp_financials.subledger_applications a
+      join erp_financials.financial_lifecycle_events e on e.tenant_id=a.tenant_id and e.company_id=a.company_id
+        and e.source_id=a.source_id and e.event_id=a.applied_event_id
+      where a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3 and a.source_document_id=$4
+        and e.event_type='imported_application_retained' and e.payload->>'retainedFromApplicationId'=$5`,
+      [context.tenantId,context.companyId,funding.sourceId,input.sourceDocumentId,row.subledger_application_id])).rows;
+    const retainedAmount = retained.reduce((sum,r) => sum + parsePositiveMoney(r.applied_amount,"retained amount"),0n);
+    if (release + retainedAmount !== parsePositiveMoney(row.applied_amount,"applied amount")) fail();
+    const ids = [scopedRecordId(context,"transaction",`cross-source-settlement:${String(row.subledger_application_id)}:reverse`),
+      ...retained.map(r=>scopedRecordId(context,"transaction",`cross-source-settlement:${String(r.subledger_application_id)}:recognize`))];
+    const cash = (await client.query(`select p.*,t.source_payload_ref from erp_financials.ledger_postings p
+      join erp_financials.transactions t using(tenant_id,source_id,transaction_id)
+      where p.tenant_id=$1 and p.source_id=$2 and p.transaction_id=any($3::text[]) and p.accounting_basis='cash'
+        and t.status='posted' and t.currency_code=$4 and p.posting_date=$5::date for share of p,t`,
+      [context.tenantId,context.sourceId,ids,context.currencyCode,payload.effectiveDate])).rows;
+    if (!ids.every(id=>cash.some(p=>p.transaction_id===id)) || cash.some(p=>
+      (storedJson(p.source_payload_ref) as {preview?:{bookId?:unknown}} | null)?.preview?.bookId !== context.bookId)) fail();
+    for (const id of ids) if (cash.filter(p=>p.transaction_id===id).reduce((sum,p)=>sum+
+      parsePositiveOrZeroMoney(p.debit_amount,"debit")-parsePositiveOrZeroMoney(p.credit_amount,"credit"),0n)!==0n) fail();
+    const control = cash.filter(p=>p.account_id===controlAccountId);
+    if (control.some(p=>p.party_id!==bridge.nativePartyId)) fail();
+    const net = control.reduce((sum,p)=>sum+parsePositiveOrZeroMoney(p.credit_amount,"credit")-parsePositiveOrZeroMoney(p.debit_amount,"debit"),0n);
+    if ((input.applicationType === "bill_payment_to_bill" ? -net : net) !== release) fail();
+    released += release;
+  }
+  if (released - consumed < parsePositiveMoney(amount,"amount")) fail();
+}
+
 async function prepareCrossSourceSettlement(
   client: PostgresQueryClient, context: ServiceContext, input: ApplySubledgerPaymentInput,
   source: Record<string, unknown>, target: Record<string, unknown>, amount: string, applicationId: string
@@ -7669,7 +7747,33 @@ async function prepareCrossSourceSettlement(
   const controlSide = payable ? "creditAmount" : "debitAmount";
   const fundingSide = payable ? "debit_amount" : "credit_amount";
   if (!bridge) throw new ErpFinancialsValidationError("Missing settlement review");
-  if (source.party_id !== bridge.nativePartyId || target.party_id !== bridge.historicalPartyId
+  if (bridge.importedFunding && bridge.targetSourceId === context.sourceId) {
+    if (source.document_type !== sourceType || target.document_type !== targetType
+      || source.party_id !== bridge.importedFunding.partyId || target.party_id !== bridge.nativePartyId
+      || source.currency_code !== context.currencyCode || target.currency_code !== context.currencyCode
+      || input.applicationDate < storedDate(target.recognition_date ?? target.document_date,"recognition date"))
+      throw new ErpFinancialsValidationError("Imported funding does not match the native target review");
+    const evidence = (await client.query(`select p.account_id from erp_financials.ledger_postings p
+      join erp_financials.accounts a using(tenant_id,source_id,account_id)
+      where p.tenant_id=$1 and p.source_id=$2 and p.transaction_id=$3 and p.accounting_basis='accrual'
+        and a.type=$4 and a.active=true and p.currency_code=$5 and p.party_id=$6
+        and p.${payable ? "credit_amount" : "debit_amount"}=$7::numeric
+      for share of p,a`,[context.tenantId,context.sourceId,target.transaction_id,payable?"AccountsPayable":"AccountsReceivable",
+      context.currencyCode,bridge.nativePartyId,target.original_amount])).rows;
+    const provenance = (await client.query(`select 1 from erp_financials.financial_outbox o
+      join erp_financials.reporting_book_sources b on b.tenant_id=o.tenant_id and b.company_id=o.company_id and b.book_id=o.book_id and b.source_id=o.source_id
+      where o.tenant_id=$1 and o.company_id=$2 and o.book_id=$3 and o.source_id=$4 and o.aggregate_id=$5 and o.event_type='ledger.posted'
+        and b.source_role='active' and (b.effective_from is null or b.effective_from<=$6::date)
+        and (b.effective_through is null or b.effective_through>=$6::date)`,
+      [context.tenantId,context.companyId,context.bookId,context.sourceId,target.transaction_id,input.applicationDate])).rows;
+    if (evidence.length!==1 || provenance.length!==1) throw new ErpFinancialsValidationError("Native target requires its exact control and posting book");
+    await assertImportedSettlementFunding(client,context,input,source,amount,storedString(evidence[0]?.account_id,"control"));
+    const plan=await prepareCashBasisApplicationProjection(client,context,{applicationId,applicationType:input.applicationType,
+      action:"recognize",appliedAmount:amount,effectiveDate:input.applicationDate,targetTransactionId:storedString(target.transaction_id,"transaction")});
+    if (!plan) throw new ErpFinancialsValidationError("Missing native target cash projection");
+    return plan.postings;
+  }
+  if (source.party_id !== (bridge.importedFunding?.partyId ?? bridge.nativePartyId) || target.party_id !== bridge.historicalPartyId
     || source.currency_code !== context.currencyCode || target.currency_code !== context.currencyCode
     || source.document_type !== sourceType || target.document_type !== targetType
     || [source.status, target.status].some(status => status === "voided" || status === "replaced"))
@@ -7686,26 +7790,56 @@ async function prepareCrossSourceSettlement(
     || historical.source_system !== "quickbooks" || !within(native, input.applicationDate)
     || !within(historical, storedDate(target.recognition_date ?? target.document_date, "recognition_date")))
     throw new ErpFinancialsValidationError("Settlement requires active native and historical QuickBooks sources in this book's date windows");
-  const receipt = (await client.query(`select t.* from erp_financials.transactions t
+  const receipt = bridge.importedFunding ? [] : (await client.query(`select t.* from erp_financials.transactions t
     join erp_financials.financial_outbox o on o.tenant_id=t.tenant_id and o.source_id=t.source_id and o.aggregate_id=t.transaction_id
     where t.tenant_id=$1 and t.source_id=$2 and t.transaction_id=$3 and o.company_id=$4 and o.book_id=$5
       and o.event_type='ledger.posted' and t.source_transaction_type=$6 and t.status='posted'
     for share of t,o`, [context.tenantId, context.sourceId, source.transaction_id, context.companyId, context.bookId, `Subledger:${sourceType}`])).rows;
-  if (receipt.length !== 1) throw new ErpFinancialsValidationError("Cross-source settlement requires an original native receipt in this book");
-  const prior = (await client.query(`select a.*,e.payload from erp_financials.subledger_applications a
+  if (!bridge.importedFunding && receipt.length !== 1) throw new ErpFinancialsValidationError("Cross-source settlement requires an original native receipt in this book");
+  const prior = (await client.query(`select a.*,e.payload,e.event_type,ended.payload as ended_payload from erp_financials.subledger_applications a
     join erp_financials.financial_lifecycle_events e on e.tenant_id=a.tenant_id and e.company_id=a.company_id
       and e.source_id=a.source_id and e.event_id=a.applied_event_id
+    left join erp_financials.financial_lifecycle_events ended on ended.tenant_id=a.tenant_id and ended.company_id=a.company_id
+      and ended.source_id=a.source_id and ended.event_id=a.ended_event_id
     where a.tenant_id=$1 and a.company_id=$2 and coalesce(a.target_document_source_id,a.source_id)=$3
       and a.target_document_id=$4 order by a.subledger_application_id for share of a,e`,
     [context.tenantId, context.companyId, bridge.targetSourceId, input.targetDocumentId])).rows;
-  if (prior.some(row => row.application_type !== input.applicationType || row.source_id !== context.sourceId
-    || row.target_document_source_id !== bridge.targetSourceId))
-    throw new ErpFinancialsValidationError("Historical invoice already has unsupported provider or other-source settlement");
+  for (const row of prior) {
+    if (row.application_type !== input.applicationType) throw new ErpFinancialsValidationError("Unsupported target settlement type");
+    if (row.source_id === context.sourceId && row.target_document_source_id === bridge.targetSourceId) {
+      const journal=(await client.query(`select source_payload_ref from erp_financials.transactions
+        where tenant_id=$1 and source_id=$2 and transaction_id=$3 and status='posted' for share`,
+        [context.tenantId,context.sourceId,scopedRecordId(context,"transaction",`cross-source-settlement:${String(row.subledger_application_id)}:recognize`)])).rows[0];
+      if ((storedJson(journal?.source_payload_ref) as {preview?:{bookId?:unknown}} | null)?.preview?.bookId !== context.bookId)
+        throw new ErpFinancialsValidationError("Prior target settlement must belong to this posting book");
+      continue;
+    }
+    if (row.source_id === bridge.targetSourceId && row.event_type === "quickbooks_application_imported" && row.status === "applied") {
+      // Read-only reuse of the full imported cash proof; no reversal is posted.
+      await prepareImportedApplicationReversal(client,context,row,{operation:input.operation,
+        applicationId:String(row.subledger_application_id),expectedVersion:storedInteger(row.version,"version"),effectiveDate:input.applicationDate,
+        importedCorrection:{...bridge,applicationSourceId:bridge.targetSourceId}},undefined,true);
+      continue;
+    }
+    const appliedEvidence = storedJson(row.payload) as Record<string, JsonValue> | null;
+    const endedEvidence = storedJson(row.ended_payload) as Record<string, JsonValue> | null;
+    const correction = endedEvidence?.importedCorrection as Record<string, JsonValue> | undefined;
+    const reviewedOriginal = row.event_type === "quickbooks_application_imported" && row.status !== "applied"
+      && correction?.accountingSourceId === context.sourceId && correction.bookId === context.bookId
+      && correction.historicalPartyId === bridge.historicalPartyId && correction.nativePartyId === bridge.nativePartyId;
+    const reviewedRetained = row.event_type === "imported_application_retained"
+      && appliedEvidence?.accountingSourceId === context.sourceId && appliedEvidence.bookId === context.bookId;
+    if (row.source_id !== bridge.targetSourceId || !(reviewedOriginal || reviewedRetained))
+      throw new ErpFinancialsValidationError("Historical invoice already has unsupported provider or other-source settlement");
+    if ((typeof endedEvidence?.effectiveDate === "string" && endedEvidence.effectiveDate > input.applicationDate)
+      || storedDate(row.application_date,"application date") > input.applicationDate)
+      throw new ErpFinancialsValidationError("Reapplication cannot precede the reviewed target correction");
+  }
   const applied = prior.filter(row => row.status === "applied").reduce((sum, row) => sum + parsePositiveMoney(row.applied_amount, "applied_amount"), 0n);
   if (parsePositiveOrZeroMoney(target.open_amount, "open_amount") + applied !== parsePositiveMoney(target.original_amount, "original_amount"))
     throw new ErpFinancialsValidationError("Historical provider balance lacks complete settlement evidence");
   const historicalContext = { ...context, sourceId: bridge.targetSourceId };
-  const originals = (await loadImportedDocumentAccrualPostings(client, historicalContext, storedString(target.transaction_id, "transaction_id"), payable)).map(storedLedgerPosting);
+  const originals = (await loadImportedDocumentAccrualPostings(client, historicalContext, storedString(target.transaction_id, "transaction_id"), true)).map(storedLedgerPosting);
   const mapDimensions = await importedCorrectionDimensions(client,
     {tenantId:context.tenantId,historicalSourceId:bridge.targetSourceId,nativeSourceId:context.sourceId}, originals, bridge.dimensionMappings);
   const itemIds=unique(originals.flatMap(p=>p.itemId ? [p.itemId] : []));
@@ -7726,12 +7860,12 @@ async function prepareCrossSourceSettlement(
         throw new ErpFinancialsValidationError("Settlement item account conflicts with the reviewed account mapping");
     }
   }
-  const historicalAccounts = payable ? (await client.query(`select account_id,type,classification from erp_financials.accounts
+  const historicalAccounts = (await client.query(`select account_id,type,classification from erp_financials.accounts
     where tenant_id=$1 and source_id=$2 and account_id=any($3::text[]) for share`,
-    [context.tenantId, bridge.targetSourceId, unique(originals.map(posting => posting.accountId))])).rows : [];
+    [context.tenantId, bridge.targetSourceId, unique(originals.map(posting => posting.accountId))])).rows;
   const controls = originals.filter(posting => parsePositiveOrZeroMoney(posting[controlSide], "control") > 0n
-    && (!payable || historicalAccounts.some(account => account.account_id === posting.accountId
-      && account.type === "AccountsPayable" && account.classification === "liability")));
+    && historicalAccounts.some(account => account.account_id === posting.accountId
+      && account.type === (payable ? "AccountsPayable" : "AccountsReceivable") && account.classification === (payable ? "liability" : "asset")));
   if (controls.length !== 1 || controls[0]?.[controlSide] !== storedMoney(target.original_amount, "original_amount")
     || originals.filter(posting => posting.accountId === controls[0]?.accountId).length !== 1
     || (payable && controls[0].debitAmount !== "0.00"))
@@ -7751,6 +7885,9 @@ async function prepareCrossSourceSettlement(
       || (oldId === controls[0].accountId ? newAccount.classification !== (payable ? "liability" : "asset") : !(payable ? ["expense", "cost_of_goods_sold", "other_expense"] : ["income", "other_income"]).includes(String(newAccount.classification))))
       throw new ErpFinancialsValidationError("Settlement account mapping changes classification or uses an unavailable account");
   }
+  if (bridge.importedFunding) {
+    await assertImportedSettlementFunding(client, context, input, source, amount, storedString(mapping.get(controls[0].accountId),"mapped control"));
+  } else {
   const cash = (await client.query(`select p.* from erp_financials.ledger_postings p
     join erp_financials.transactions t using(tenant_id,source_id,transaction_id)
     where p.tenant_id=$1 and p.source_id=$2 and t.source_transaction_id=$3
@@ -7760,16 +7897,26 @@ async function prepareCrossSourceSettlement(
   if (credit.length !== 1 || credit[0]?.account_id !== mapping.get(controls[0].accountId)
     || storedMoney(credit[0]?.[fundingSide], fundingSide) !== storedMoney(source.original_amount, "original_amount"))
     throw new ErpFinancialsValidationError("Mapped control does not match the original native payment cash posting");
+  }
   // Subtract exact earlier cash allocations. The final installment consumes all
   // remaining cents; independent percentage rounding cannot over-recognize income.
-  const recognized = (await client.query(`select source_posting_id,debit_amount::text,credit_amount::text from erp_financials.ledger_postings
+  const recognized = (await client.query(`select transaction_id,source_posting_id,debit_amount::text,credit_amount::text from erp_financials.ledger_postings
     where tenant_id=$1 and source_id=$2 and transaction_id=any($3::text[]) and accounting_basis='cash'`,
     [context.tenantId, context.sourceId, prior.flatMap(row => ["recognize", "reverse"].map(action =>
       scopedRecordId(context, "transaction", `cross-source-settlement:${String(row.subledger_application_id)}:${action}`)))])).rows;
+  const importedBaseline = prior.filter(row=>row.event_type === "quickbooks_application_imported").flatMap(row=>
+    projectCashBasisApplication({applicationId:String(row.subledger_application_id),applicationType:payable ? "bill_payment_to_bill" : "customer_payment_to_invoice",
+      action:"recognize",appliedAmount:storedMoney(row.applied_amount,"applied_amount"),effectiveDate:input.applicationDate,
+      importBatchId:"reviewed-imported-baseline",accrualPostings:originals,controlAccountId:storedString(controls[0]?.accountId,"control")}));
   const remaining = originals.map(posting => {
     const previous = recognized.filter(row => prior.some(application => ["recognize", "reverse"].some(action =>
-      row.source_posting_id === `cash-application:${String(application.subledger_application_id)}:${action}:${posting.sourcePostingId}`)));
-    const used = previous.reduce((sum, row) => sum + parsePositiveOrZeroMoney(row.debit_amount, "debit") - parsePositiveOrZeroMoney(row.credit_amount, "credit"), 0n);
+      row.source_posting_id === `cash-application:${String(application.subledger_application_id)}:${action}:${posting.sourcePostingId}`
+      || (application.event_type === "imported_application_retained" && action === "recognize"
+        && row.transaction_id === scopedRecordId(context,"transaction",`cross-source-settlement:${String(application.subledger_application_id)}:recognize`)
+        && String(row.source_posting_id).endsWith(`:reverse:${posting.sourcePostingId}`)))));
+    const baseline = importedBaseline.filter(p=>p.sourcePostingId.endsWith(`:recognize:${posting.sourcePostingId}`))
+      .reduce((sum,p)=>sum+parsePositiveOrZeroMoney(p.debitAmount,"debit")-parsePositiveOrZeroMoney(p.creditAmount,"credit"),0n);
+    const used = previous.reduce((sum, row) => sum + parsePositiveOrZeroMoney(row.debit_amount, "debit") - parsePositiveOrZeroMoney(row.credit_amount, "credit"), baseline);
     const debit = parsePositiveOrZeroMoney(posting.debitAmount, "debit"), credit = parsePositiveOrZeroMoney(posting.creditAmount, "credit");
     const remainingDebit = debit > 0n ? debit - used : 0n, remainingCredit = credit > 0n ? credit + used : 0n;
     if (remainingDebit < 0n || remainingDebit > debit || remainingCredit < 0n || remainingCredit > credit)
@@ -7778,7 +7925,7 @@ async function prepareCrossSourceSettlement(
   });
   const postings = projectCashBasisApplication({ applicationId, applicationType: payable ? "bill_payment_to_bill" : "customer_payment_to_invoice", action: "recognize",
     appliedAmount: amount, effectiveDate: input.applicationDate, importBatchId: scopedRecordId(context, "import_batch", `cross-source-settlement:${applicationId}:recognize`), accrualPostings: remaining,
-    ...(payable ? { controlAccountId: controls[0].accountId } : {}) });
+    controlAccountId: controls[0].accountId });
   await assertPostingAccountEligibility(client, context, [...mapping.values()]);
   return postings.map(posting => {
     const accountId = mapping.get(posting.accountId);
@@ -7847,7 +7994,7 @@ function canonicalCorrectionJson(value: unknown): string {
 /** Original imported allocations, including split payments and partially paid or signed bills. Refuse ambiguous allocations;
  * the retained provider cash journal must prove the exact expense recognition. */
 async function prepareImportedApplicationReversal(client: PostgresQueryClient, context: ServiceContext,
-  application: Record<string, unknown>, input: EndSubledgerApplicationInput, reversalAmount?: string): Promise<readonly LedgerPosting[]> {
+  application: Record<string, unknown>, input: EndSubledgerApplicationInput, reversalAmount?: string, reviewedTargetApplications = false): Promise<readonly LedgerPosting[]> {
   const review = input.importedCorrection;
   if (!review) throw new ErpFinancialsValidationError("Missing imported correction review");
   const historicalSource = review.applicationSourceId;
@@ -7903,18 +8050,19 @@ async function prepareImportedApplicationReversal(client: PostgresQueryClient, c
     || !["open", "partially_applied", "settled"].includes(String(bill.status)))
     return fail("Imported correction requires a reconciled payment and bill balance for the reviewed vendor");
   const peers = (await client.query(`select * from erp_financials.subledger_applications
-    where tenant_id=$1 and company_id=$2 and ((source_id=$3 and source_document_id=$4)
+    where tenant_id=$1 and company_id=$2 and ((coalesce(source_document_source_id,source_id)=$3 and source_document_id=$4)
       or (coalesce(target_document_source_id,source_id)=$3 and target_document_id=$5)) for share`,
     [context.tenantId,context.companyId,historicalSource,payment.subledger_document_id,bill.subledger_document_id])).rows;
   const originalEvents = (await client.query(`select event_id from erp_financials.financial_lifecycle_events
     where tenant_id=$1 and company_id=$2 and source_id=$3 and event_type='quickbooks_application_imported' and event_id=any($4::text[])`,
     [context.tenantId,context.companyId,historicalSource,peers.map(p=>p.applied_event_id)])).rows;
   const originalEventIds = new Set(originalEvents.map(e=>e.event_id));
-  const allPaymentApplications = peers.filter(p => p.source_id === historicalSource && p.source_document_id === payment.subledger_document_id);
+  const allPaymentApplications = peers.filter(p => (p.source_document_source_id ?? p.source_id) === historicalSource && p.source_document_id === payment.subledger_document_id);
   const paymentApplications = peers.filter(p => originalEventIds.has(p.applied_event_id)).filter(p => p.source_id === historicalSource && p.source_document_id === payment.subledger_document_id);
   const billApplications = peers.filter(p => (p.target_document_source_id ?? p.source_id) === historicalSource && p.target_document_id === bill.subledger_document_id);
-  if (!paymentApplications.length || paymentApplications.some(p => (p.target_document_source_id ?? p.source_id) !== historicalSource || p.application_type !== applicationType) || billApplications.some(p => p.source_id !== historicalSource
-    || (p.target_document_source_id ?? p.source_id) !== historicalSource || p.application_type !== applicationType))
+  if (!paymentApplications.length || paymentApplications.some(p => (p.target_document_source_id ?? p.source_id) !== historicalSource || p.application_type !== applicationType) || billApplications.some(p => (p.source_id !== historicalSource
+    || (p.target_document_source_id ?? p.source_id) !== historicalSource || p.application_type !== applicationType)
+      && !(reviewedTargetApplications && p.source_id===context.sourceId && p.target_document_source_id===historicalSource && p.application_type===applicationType)))
     fail("Imported correction requires original same-source customer or vendor payment allocations");
   const paymentTotal = parsePositiveMoney(storedMoney(payment.original_amount,"original_amount"),"payment amount");
   const sumApplications = (rows: Record<string, unknown>[]) => rows.reduce((sum,p) => sum + parsePositiveMoney(storedMoney(p.applied_amount,"applied_amount"),"application amount"),0n);
