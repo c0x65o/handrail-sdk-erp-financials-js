@@ -137,9 +137,13 @@ export async function persistQuickBooksSubledgerResources(
     operationalDocuments: (suppliedInput.resources.operationalDocuments ?? suppliedInput.resources.ledgerTransactions ?? []).filter(row =>
       !corrections.some(c => row.resource.sourceTransactionType === (c.providerType ?? "Payment") && row.resource.sourceTransactionId === c.dependency.sourceTransactionId)) } };
 
-  const retainedImportedTargets = new Set(corrections.filter(c => c.providerType === "Bill").map(c => c.dependency.sourceTransactionId));
+  const retainedImportedTargets = new Set(corrections.filter(c => c.providerType === "Bill" || c.providerType === "Invoice").map(c => `${c.providerType ?? ""}:${c.dependency.sourceTransactionId}`));
+  const retainedTargetIds = new Set(corrections.filter(c => c.providerType === "Bill" || c.providerType === "Invoice")
+    .map(c => c.dependency.sourceTransactionId));
   if (input.resources.operationalDocuments.some(row => row.resource.lines.some(line =>
-    line.linkedTransactions?.some(link => retainedImportedTargets.has(link.sourceTransactionId))))) {
+    line.linkedTransactions?.some(link => link.sourceTransactionType
+      ? retainedImportedTargets.has(`${link.sourceTransactionType}:${link.sourceTransactionId}`)
+      : retainedTargetIds.has(link.sourceTransactionId))))) {
     throw new Error("Provider links to a locally corrected imported bill require explicit reconciliation before import");
   }
 
