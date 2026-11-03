@@ -776,6 +776,8 @@ export type SubledgerApplicationType =
  * The host must bind reviewRef to its immutable approval receipt. Names/provider IDs
  * are never identity evidence. The operation requires an independent approver. */
 export type CrossSourceSettlement = {
+  readonly dimensionMappings?: readonly ImportedDimensionMapping[];
+  readonly itemMappings?: readonly { readonly historicalItemId: string; readonly nativeItemId: string }[];
   readonly targetSourceId: string;
   readonly nativePartyId: string;
   readonly historicalPartyId: string;
@@ -7585,6 +7587,12 @@ function stableJson(value: unknown): string {
   throw new ErpFinancialsValidationError("Journal entry contains a value that cannot be checksummed");
 }
 
+function requiredMappedItem(mappings: ReadonlyMap<string,string>, historicalItemId: string): string {
+  const id=mappings.get(historicalItemId);
+  if (!id) throw new ErpFinancialsValidationError("Missing reviewed item mapping");
+  return id;
+}
+
 /** Cash recognition belongs to the active source, not the historical invoice's
  * expired reporting window. The original document and journal remain untouched. */
 async function prepareCrossSourceSettlement(
@@ -7635,8 +7643,26 @@ async function prepareCrossSourceSettlement(
     throw new ErpFinancialsValidationError("Historical provider balance lacks complete settlement evidence");
   const historicalContext = { ...context, sourceId: bridge.targetSourceId };
   const originals = (await loadImportedDocumentAccrualPostings(client, historicalContext, storedString(target.transaction_id, "transaction_id"), payable)).map(storedLedgerPosting);
-  if (originals.some(posting => posting.itemId !== undefined || posting.dimensionRefs.length > 0))
-    throw new ErpFinancialsValidationError("Cross-source settlement requires explicit item and dimension mappings for dimensional invoices");
+  const mapDimensions = await importedCorrectionDimensions(client,
+    {tenantId:context.tenantId,historicalSourceId:bridge.targetSourceId,nativeSourceId:context.sourceId}, originals, bridge.dimensionMappings);
+  const itemIds=unique(originals.flatMap(p=>p.itemId ? [p.itemId] : []));
+  const itemMappings=new Map((bridge.itemMappings??[]).map(m=>[m.historicalItemId,m.nativeItemId]));
+  if(itemMappings.size !== (bridge.itemMappings??[]).length || itemMappings.size !== itemIds.length || itemIds.some(id=>!itemMappings.has(id)))
+    throw new ErpFinancialsValidationError("Settlement item mappings must cover exactly the original journal items");
+  const items=itemIds.length ? (await client.query(`select * from erp_financials.items where tenant_id=$1
+    and ((source_id=$2 and item_id=any($3::text[])) or (source_id=$4 and item_id=any($5::text[]))) for share`,
+    [context.tenantId,bridge.targetSourceId,itemIds,context.sourceId,[...itemMappings.values()]])).rows : [];
+  for(const [oldId,newId] of itemMappings) {
+    const old=items.find(i=>i.source_id===bridge.targetSourceId && i.item_id===oldId);
+    const next=items.find(i=>i.source_id===context.sourceId && i.item_id===newId);
+    if(!old || !next || next.active!==true || old.item_type!==next.item_type)
+      throw new ErpFinancialsValidationError("Settlement item mapping requires an active native item of the same type");
+    for(const key of ["income_account_id","expense_account_id","asset_account_id"] as const) {
+      const mapped=bridge.accountMappings.find(m=>m.historicalAccountId===old[key]);
+      if(mapped && next[key]!==mapped.nativeAccountId)
+        throw new ErpFinancialsValidationError("Settlement item account conflicts with the reviewed account mapping");
+    }
+  }
   const historicalAccounts = payable ? (await client.query(`select account_id,type,classification from erp_financials.accounts
     where tenant_id=$1 and source_id=$2 and account_id=any($3::text[]) for share`,
     [context.tenantId, bridge.targetSourceId, unique(originals.map(posting => posting.accountId))])).rows : [];
@@ -7699,6 +7725,8 @@ async function prepareCrossSourceSettlement(
     const { transactionLineId: _line, itemId: _item, checkpointId: _checkpoint, ...fact } = posting;
     void _line; void _item; void _checkpoint;
     return { ...fact, sourceId: context.sourceId, accountId, partyId: bridge.nativePartyId,
+      ...(_item === undefined ? {} : {itemId:requiredMappedItem(itemMappings, _item)}),
+      dimensionRefs:mapDimensions(posting.dimensionRefs), dimensionHash:createDimensionHash(mapDimensions(posting.dimensionRefs)),
       sourcePayloadRef: { sourceObjectType: payable ? "CrossSourceVendorSettlement" : "CrossSourceCustomerSettlement", sourceObjectId: applicationId,
         preview: { targetSourceId: bridge.targetSourceId, targetDocumentId: input.targetDocumentId, reviewRef: bridge.reviewRef,
           historicalSourcePostingId: posting.sourcePostingId.slice(`cash-application:${applicationId}:recognize:`.length), historicalAccountId: posting.accountId } } };

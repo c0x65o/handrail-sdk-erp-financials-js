@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { Pool } from 'pg';
-import { createPostgresStorageAdapter, createCompanySourceBinding, persistCanonicalFacts, persistQuickBooksSubledgerResources,
+import { createDimensionHash, createPostgresStorageAdapter, createCompanySourceBinding, persistCanonicalFacts, persistQuickBooksSubledgerResources,
   createPostgresQuickBooksDualBasisBackfillPersistence, migratePostgresSchema, materializeQuickBooksBasisBackfill,
   mapHandrailQuickBooksSdkResourcesToCanonicalFacts } from '@handrail/erp-financials';
 import { createErpFinancialsSdk } from '@handrail/erp-financials/sdk';
@@ -109,6 +109,37 @@ suite('reviewed native receipt → historical invoice settlement', () => {
     expect((await pool.query("select sum(debit_amount-credit_amount)::text as net from erp_financials.ledger_postings p join erp_financials.transactions t using(tenant_id,source_id,transaction_id) where t.source_transaction_type='Subledger:cross_source_customer_settlement'")).rows[0]).toEqual({ net: '0.00' });
     expect((await sdk.queries.getCustomerStatement({ customerId, asOfDate: '2025-08-03' })).balance?.unappliedCashAmount).toBe('27.56');
     expect((await sdk.queries.getCustomerStatement({ customerId: historicalCustomerId, asOfDate: '2025-08-03' })).balance?.invoiceOutstandingAmount).toBe('27.56');
+  });
+  it('preserves reviewed item and dimension coordinates through settlement, undo and reapplication', async()=>{
+    const {sdk,command,sourceId}=await fixture();
+    const revenue=(await pool.query("select account_id from erp_financials.accounts where source_id=$1 and classification='income'",[scope.sourceId])).rows[0] as {account_id:string};
+    const mapping=required(command.crossSource.accountMappings.find(m=>m.historicalAccountId===revenue.account_id));
+    await runner.transaction(async client=>{
+      const storage=createPostgresStorageAdapter(client);
+      await storage.upsertDimensions([
+        {tenantId:scope.tenantId,sourceId:scope.sourceId,dimensionId:'old-class',dimensionKind:'class',sourceDimensionId:'class-1',name:'Historical',active:true},
+        {tenantId:scope.tenantId,sourceId,dimensionId:'new-class',dimensionKind:'class',sourceDimensionId:'class-2',name:'Native',active:true}]);
+      await storage.upsertItems([
+        {tenantId:scope.tenantId,sourceId:scope.sourceId,itemId:'old-item',sourceItemId:'item-1',itemType:'service',name:'Original',incomeAccountId:mapping.historicalAccountId,active:true},
+        {tenantId:scope.tenantId,sourceId,itemId:'new-item',sourceItemId:'item-2',itemType:'service',name:'Native',incomeAccountId:mapping.nativeAccountId,active:true}]);
+      const refs=[{dimensionId:'old-class',dimensionKind:'class',sourceDimensionId:'class-1',name:'Historical'}];
+      await client.query("update erp_financials.ledger_postings set item_id='old-item',dimension_refs=$3::jsonb,dimension_hash=$4 where source_id=$1 and account_id=$2",[scope.sourceId,mapping.historicalAccountId,JSON.stringify(refs),createDimensionHash(refs)]);
+    });
+    const reviewed={...command,crossSource:{...command.crossSource,dimensionMappings:[{historicalDimensionId:'old-class',nativeDimensionId:'new-class'}],itemMappings:[{historicalItemId:'old-item',nativeItemId:'new-item'}]}};
+    await expect(sdk.commands.paymentApplications.apply(command)).rejects.toThrow();
+    await expect(sdk.commands.paymentApplications.apply({...reviewed,crossSource:{...reviewed.crossSource,itemMappings:[]}})).rejects.toThrow('item mappings');
+    await pool.query("update erp_financials.items set active=false where source_id=$1 and item_id='new-item'",[sourceId]);
+    await expect(sdk.commands.paymentApplications.apply(reviewed)).rejects.toThrow('active native item');
+    await pool.query("update erp_financials.items set active=true where source_id=$1 and item_id='new-item'",[sourceId]);
+    const original=(await pool.query('select to_jsonb(p) fact from erp_financials.ledger_postings p where source_id=$1 order by posting_id',[scope.sourceId])).rows;
+    const result=await sdk.commands.paymentApplications.apply(reviewed);
+    await expect(sdk.commands.paymentApplications.apply({...reviewed,crossSource:{...reviewed.crossSource,itemMappings:[]}})).rejects.toThrow();
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:result.applicationId,expectedVersion:result.version,effectiveDate:'2025-08-03'});
+    await sdk.commands.paymentApplications.apply({...reviewed,idempotencyKey:'mapped-reapplication',applicationDate:'2025-08-04',expectedSourceVersion:command.expectedSourceVersion+2,expectedTargetVersion:command.expectedTargetVersion+2});
+    const rows=(await pool.query("select item_id,dimension_refs from erp_financials.ledger_postings where source_id=$1 and item_id is not null order by posting_date",[sourceId])).rows;
+    expect(rows).toHaveLength(3);
+    for(const row of rows) expect(row).toMatchObject({item_id:'new-item',dimension_refs:[{dimensionId:'new-class',dimensionKind:'class'}]});
+    expect((await pool.query('select to_jsonb(p) fact from erp_financials.ledger_postings p where source_id=$1 order by posting_id',[scope.sourceId])).rows).toEqual(original);
   });
   it('serializes undo with a historical-source collection reader', async() => {
     const { sdk, command, historicalCustomerId } = await fixture();
