@@ -1,3 +1,4 @@
+import { lockSubledgerDocumentCoordinates } from "./subledger-document-coordinates.js";
 import {retainJournalAccountPolicy} from "./journal-account-policy.js";
 import { correctCashFlowPurpose, type CorrectCashFlowPurposeInput, type CorrectCashFlowPurposeResult } from "./cash-flow-purpose.js";
 import { normalizeInvoiceComponents, invoiceComponentJournalLines, invoiceComponentRequirements, assertInvoiceComponentPolicy, type InvoicePostingComponents } from "./invoice-components.js";
@@ -4570,35 +4571,18 @@ async function loadSubledgerDocumentsForUpdate(
   client: PostgresQueryClient,
   context: ServiceContext,
   ids: readonly [string, string],
-  targetSourceId?: string
+  targetSourceId?: string,
+  sourceSourceId?: string
 ): Promise<readonly [Record<string, unknown>, Record<string, unknown>]> {
-  if (ids[0] === ids[1]) {
-    throw new ErpFinancialsValidationError("Subledger application source and target documents must differ");
+  try {
+    return await lockSubledgerDocumentCoordinates(client, context,
+      { sourceId: sourceSourceId ?? context.sourceId, documentId: ids[0] },
+      { sourceId: targetSourceId ?? context.sourceId, documentId: ids[1] });
+  } catch (error) {
+    if (error instanceof ErpFinancialsError && ["invalid_input", "missing_document"].includes(error.code))
+      throw new ErpFinancialsValidationError(error.message, error.code, error.details);
+    throw error;
   }
-  const result = targetSourceId === undefined ? await client.query(
-    `select *, "document_date"::text as "document_date", "due_date"::text as "due_date", (to_jsonb("subledger_documents")->>'recognition_date') as "recognition_date" from "erp_financials"."subledger_documents"
-where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger_document_id" = any($4::text[])
-order by "subledger_document_id"
-for update`,
-    [context.tenantId, context.companyId, context.sourceId, [...ids].sort()]
-  ) : await client.query(
-    `select *, "document_date"::text as "document_date", "due_date"::text as "due_date", (to_jsonb("subledger_documents")->>'recognition_date') as "recognition_date" from "erp_financials"."subledger_documents"
-where "tenant_id" = $1 and "company_id" = $2
-  and (("source_id" = $3 and "subledger_document_id" = $4) or ("source_id" = $5 and "subledger_document_id" = $6))
-order by "subledger_document_id"
-for update`,
-    [context.tenantId, context.companyId, context.sourceId, ids[0], targetSourceId, ids[1]]
-  );
-  const byId = new Map(result.rows.map((row) => [storedString(row.subledger_document_id, "subledger_document_id"), row]));
-  const source = byId.get(ids[0]);
-  const target = byId.get(ids[1]);
-  if (source === undefined || target === undefined) {
-    throw new ErpFinancialsValidationError(
-      "Both subledger application documents must exist in the current scope",
-      "missing_document"
-    );
-  }
-  return [source, target];
 }
 
 function assertSubledgerApplicationDocuments(

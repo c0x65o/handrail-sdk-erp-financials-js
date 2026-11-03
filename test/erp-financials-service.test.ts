@@ -1964,6 +1964,12 @@ class ServiceTestClient implements PostgresQueryClient {
         const row = this.subledgerDocuments.find((document) => document.idempotency_key === params[3]);
         return Promise.resolve({ rows: (row === undefined ? [] : [row]) as unknown as readonly Row[] });
       }
+      if (sql.includes('order by source_id,subledger_document_id for update')) {
+        const rows = this.subledgerDocuments.filter(document => document.tenant_id === params[0] && document.company_id === params[1]
+          && ((document.source_id === params[2] && document.subledger_document_id === params[3])
+            || (document.source_id === params[4] && document.subledger_document_id === params[5])));
+        return Promise.resolve({ rows: rows as unknown as readonly Row[] });
+      }
       const ids = params[3];
       let rows = Array.isArray(ids)
         ? this.subledgerDocuments.filter((document) => ids.includes(document.subledger_document_id))

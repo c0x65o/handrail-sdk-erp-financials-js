@@ -1,0 +1,29 @@
+{
+  "scope": "Coordinate-aware subledger document locking; not imported-credit settlement enablement",
+  "behavior": "Load and lock exact tenant/company/source/document coordinates in deterministic order; reject missing or ambiguous results; preserve public validation errors.",
+  "validation": {
+    "lintTypecheckAndServiceTestsAction": "96436101-0a01-4529-9f93-36410e0dd435",
+    "serviceAndCoordinateTestsPassed": 43,
+    "migrationAndNativeRefundAction": "8f13b38b-3471-48c3-a92f-2a0a62a25ecf",
+    "migrationTestsPassed": 25,
+    "isolatedPostgresTestsPassed": 4,
+    "otherPostgresTestsNotSelected": 694,
+    "isolatedPostgresCleanup": "confirmed"
+  },
+  "unfinished": [
+    "Source-document schema coordinate, foreign key and balance trigger migration",
+    "Independent imported-credit settlement approval and source/book/account validation",
+    "Funding and reversal command integration, dated readers and provider-refresh protection",
+    "ERP integration and whole gap 20 closure"
+  ],
+  "hostValidation": {
+    "action": "f71d0445-3160-44b4-b57b-4d5764476635",
+    "head": "70a82a67b3c2ac5e0b7e57622c20bdc7ebc655ff",
+    "lint": "passed",
+    "repositoryTypecheck": "passed",
+    "note": "Existing uncommitted Agreements work included; prior errors no longer reproduce. Refund commits did not modify Agreements files."
+  },
+  "deployed": false,
+  "batch10": "untouched",
+  "recovery5a93991d": "untouched"
+}
