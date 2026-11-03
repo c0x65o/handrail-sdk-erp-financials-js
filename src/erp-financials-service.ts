@@ -385,6 +385,8 @@ export type IssueCreditMemoInput = IssueCreditMemoCommon &
   );
 
 export type IssueRefundInput = SubledgerDocumentInputCommon & {
+  /** Fully fund issuance atomically; credits must belong to this source/customer. */
+  readonly creditFunding?: readonly { readonly creditDocumentId: string; readonly expectedVersion: number; readonly amount: DecimalString }[];
   readonly customerId: string;
   readonly amount: DecimalString;
   readonly receivableAccount: ErpFinancialsAccountReference;
@@ -765,7 +767,8 @@ export type SubledgerApplicationType =
   | "credit_to_invoice"
   | "vendor_credit_to_bill"
   | "write_off_to_invoice"
-  | "customer_payment_to_refund";
+  | "customer_payment_to_refund"
+  | "credit_to_refund";
 
 /** Reviewed bridge from an active native payment to a historical invoice or vendor bill.
  * The host must bind reviewRef to its immutable approval receipt. Names/provider IDs
@@ -1972,27 +1975,40 @@ async function issueCreditMemo(
   });
 }
 
-async function issueRefund(context: ServiceContext, input: IssueRefundInput): Promise<SubledgerDocumentResult> {
+async function issueRefund(context: ServiceContext, raw: IssueRefundInput): Promise<SubledgerDocumentResult> {
+  const input = structuredClone(raw);
   const amount = normalizedPositiveMoney(input.amount, "amount");
-  const refundProvenance = optionalReferenceProvenance({
-    relatedInvoiceId: input.relatedInvoiceId,
-    refundMethod: input.refundMethod,
-    lifecycleReference: input.lifecycleReference
-  }, "refund");
-  return createSubledgerDocument(context, {
-    ...commonSubledgerDocument(
-      context,
-      input,
-      "refund",
-      amount,
-      false,
-      refundProvenance === undefined ? {} : { refundProvenance }
-    ),
-    partyId: input.customerId,
-    journalLines: [
-      { ...input.receivableAccount, debit: amount, partyId: input.customerId },
-      { ...input.cashAccount, credit: amount, partyId: input.customerId }
-    ]
+  const funding = input.creditFunding?.map(item => {
+    assertNonEmpty(item.creditDocumentId, "creditDocumentId");
+    assertExpectedSubledgerVersion(item.expectedVersion, "expectedVersion");
+    return { ...item, amount: normalizedPositiveMoney(item.amount, "creditFunding.amount") };
+  });
+  if (funding && (!funding.length || new Set(funding.map(item => item.creditDocumentId)).size !== funding.length ||
+    funding.reduce((total, item) => total + parsePositiveMoney(item.amount, "amount"), 0n) !== parsePositiveMoney(amount, "amount"))) {
+    throw new ErpFinancialsValidationError("Distinct funding credits must total the refund amount");
+  }
+  const refundProvenance = optionalReferenceProvenance({ relatedInvoiceId: input.relatedInvoiceId,
+    refundMethod: input.refundMethod, lifecycleReference: input.lifecycleReference }, "refund");
+  return context.database.transaction(async client => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
+    const nested = nestedServiceContext(context, client);
+    const refund = await createSubledgerDocument(nested, {
+      ...commonSubledgerDocument(context, input, "refund", amount, funding !== undefined, {
+        ...(refundProvenance === undefined ? {} : { refundProvenance }),
+        ...(funding === undefined ? {} : { creditRefundFunding: funding })
+      }),
+      partyId: input.customerId,
+      journalLines: [{ ...input.receivableAccount, debit: amount, partyId: input.customerId },
+        { ...input.cashAccount, credit: amount, partyId: input.customerId }]
+    });
+    for (const [index, item] of (funding ?? []).entries()) {
+      await applySubledgerPayment(nested, { operation: input.operation,
+        idempotencyKey: `${input.idempotencyKey}:credit-funding:${String(index)}`, applicationType: "credit_to_refund",
+        sourceDocumentId: item.creditDocumentId, targetDocumentId: refund.documentId, amount: item.amount,
+        applicationDate: input.date, expectedSourceVersion: item.expectedVersion, expectedTargetVersion: index + 1 });
+    }
+    const row = await loadSubledgerDocumentByIdempotencyKey(client, context, input.idempotencyKey);
+    return documentResult(row, refund.journal);
   });
 }
 
@@ -3991,7 +4007,8 @@ returning *`,
 async function endSubledgerApplication(
   context: ServiceContext,
   input: EndSubledgerApplicationInput,
-  status: "unapplied" | "voided"
+  status: "unapplied" | "voided",
+  refundLifecycle = false
 ): Promise<SubledgerApplicationResult> {
   assertFinancialApproval(context, input.operation);
   assertIsoDate(input.effectiveDate, "effectiveDate");
@@ -4034,6 +4051,12 @@ for update`,
         throw new ErpFinancialsValidationError("Cross-source settlement undo requires independent approval");
       if (current.target_document_source_id !== targetSource)
         throw new ErpFinancialsError("optimistic_concurrency_conflict", "Settlement source coordinates changed before locking", { retryable: true });
+    }
+    if (current.application_type === "credit_to_refund" && input.effectiveDate < storedDate(current.application_date, "application_date")) {
+      throw new ErpFinancialsValidationError("Refund reversal cannot precede its funding");
+    }
+    if (current.application_type === "credit_to_refund" && !refundLifecycle) {
+      throw new ErpFinancialsError("terminal_state_conflict", "Refund funding can only be released by voiding or replacing its refund");
     }
     if (current.application_type === "customer_payment_to_refund") {
       throw new ErpFinancialsError("terminal_state_conflict", "Cash return settlements cannot be detached from their refund");
@@ -4590,7 +4613,8 @@ function assertSubledgerApplicationDocuments(
     credit_to_invoice: [["credit_memo", "deposit"], "invoice"],
     vendor_credit_to_bill: [["vendor_credit"], "vendor_bill"],
     write_off_to_invoice: [["write_off"], "invoice"],
-    customer_payment_to_refund: [["customer_payment"], "refund"]
+    customer_payment_to_refund: [["customer_payment"], "refund"],
+    credit_to_refund: [["credit_memo"], "refund"]
   };
   const types = expectedTypes[input.applicationType];
   if (!types[0].includes(source.document_type as SubledgerDocumentType) || target.document_type !== types[1]) {
@@ -4619,6 +4643,10 @@ function assertSubledgerApplicationDocuments(
   }
   if (target.document_type === "invoice" && input.applicationDate < storedDate(target.recognition_date ?? target.document_date, "recognition_date")) {
     throw new ErpFinancialsValidationError("Invoice application cannot precede recognition; retain the receipt unapplied until recognition");
+  }
+  if (input.applicationType === "credit_to_refund" &&
+    (input.applicationDate < storedDate(source.document_date, "document_date") || input.applicationDate < storedDate(target.document_date, "document_date"))) {
+    throw new ErpFinancialsValidationError("Refund funding cannot precede either document");
   }
   const amountMinor = parsePositiveMoney(amount, "amount");
   if (
@@ -5000,7 +5028,8 @@ function assertSubledgerApplicationType(value: SubledgerApplicationType): void {
     "credit_to_invoice",
     "vendor_credit_to_bill",
     "write_off_to_invoice",
-    "customer_payment_to_refund"
+    "customer_payment_to_refund",
+    "credit_to_refund"
   ].includes(value)) {
     throw new ErpFinancialsValidationError(`Unsupported subledger application type ${value}`);
   }
@@ -6049,6 +6078,7 @@ async function runIssuedAdjustmentLifecycle(
   }
 
   return context.database.transaction(async (client) => {
+    await lockCustomerPaymentCorrectionSource(client, context.tenantId, context.sourceId);
     await acquireTransactionLock(
       client,
       `issued-adjustment:${context.tenantId}:${context.companyId}:${context.sourceId}:${input.adjustmentDocumentId}`
@@ -6113,9 +6143,22 @@ async function runIssuedAdjustmentLifecycle(
         ? {}
         : { priorEventId: original.journal.postedLifecycleEventId })
     });
+    let endingVersion = input.expectedVersion;
+    if (!replay && original.documentType === "refund") {
+      const funding = await client.query(`select subledger_application_id, version from erp_financials.subledger_applications
+        where tenant_id=$1 and company_id=$2 and source_id=$3 and target_document_id=$4
+          and application_type='credit_to_refund' and status='applied' order by subledger_application_id for update`,
+        [context.tenantId, context.companyId, context.sourceId, original.documentId]);
+      for (const item of funding.rows) {
+        await endSubledgerApplication(nestedServiceContext(context, client), { operation: input.operation,
+          applicationId: storedString(item.subledger_application_id, "applicationId"), expectedVersion: storedInteger(item.version, "version"),
+          effectiveDate: input.date }, "voided", true);
+        endingVersion++;
+      }
+    }
     const originalVersion = replay
       ? original.version
-      : await markIssuedAdjustmentVoided(client, context, original, input.expectedVersion);
+      : await markIssuedAdjustmentVoided(client, context, original, endingVersion);
 
     let replacement: SubledgerDocumentResult | undefined;
     let replacementLink: { readonly linkId: string; readonly eventId: string } | undefined;
@@ -6343,7 +6386,8 @@ set "open_amount" = 0, "status" = 'voided', "version" = "version" + 1, "updated_
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   and "subledger_document_id" = $4 and "version" = $6
   and (("document_type" = 'credit_memo' and "status" = 'open' and "open_amount" = "original_amount")
-    or ("document_type" in ('refund', 'write_off') and "status" = 'settled' and "open_amount" = 0))
+    or ("document_type" in ('refund', 'write_off') and "status" = 'settled' and "open_amount" = 0)
+    or ("document_type" = 'refund' and "metadata" ? 'creditRefundFunding' and "status" = 'open' and "open_amount" = "original_amount"))
 returning "version"`,
       [context.tenantId, context.companyId, context.sourceId, adjustment.documentId, context.now(), expectedVersion]
     );

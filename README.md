@@ -1050,3 +1050,19 @@ From 0.3.185 (schema 49 unchanged), `sdk.commands.vendorBills.retirePaymentHoldA
 If the command was accepted, the result is `already_recorded`: `receipt` retains the original hold/version and lifecycle event while `current` describes the present hold/version. Later release, settlement or fiscal close does not turn historical acceptance into an unaccepted command. Recovery performs no accounting change. If the command was not accepted, `retired` records an immutable fence under the **original** lifecycle key; a delayed setter, including a pre-upgrade implementation, rejects that key. Exact cancellation retries return `already_retired`. The original command and cancellation reasons are separately payload-bound. A changed actor, scope, version, business payload or cancellation reason conflicts.
 
 Cancellation checks native bill provenance (tenant/company/source, posting book and currency), but does not require the original version, open balance or fiscal period still to be current. It changes no hold, subledger balance, journal or outbox event. The source/key locks serialize execution and cancellation; a savepoint rolls back an interrupted cancellation even when a host catches its error inside a larger transaction. An uncertain commit must be retried with the same saved command and cancellation operation. Never restore execution mode after requesting cancellation, and never treat a missing search result or a current bill status as proof that the original command was unaccepted.
+
+### Credit-funded refunds
+
+`refunds.issue` accepts optional `creditFunding` allocations (`creditDocumentId`,
+`expectedVersion`, `amount`). Distinct native credits must total the refund,
+share its customer/currency, and have sufficient available balance. Issuance,
+credit applications, journals and audit events commit together. Omitting funding
+retains the existing ordinary-refund behavior; existing refunds are not reopened.
+Schema 53 enforces complete funding at transaction commit.
+
+`refunds.voidIssued` and `refunds.replaceIssued` release funding on the reversal
+date in the same transaction as the compensating journals. Generic application
+unapply cannot detach cash from funding. Replacement issuance may name new credit
+allocations; failure rolls the entire replacement back. Use a new idempotency key
+for a replacement, and retain the exact original command for transport retries.
+This contract does not authorize bank transfers or provider credential changes.

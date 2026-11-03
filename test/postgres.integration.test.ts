@@ -4573,7 +4573,7 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
       payableAccount: { accountId: "account_ap" }, expenseLines: [{ accountId: "account_cash", amount: "100.00" }] });
     const before = await depositDatabaseState(pool);
     const result = await migratePostgresSchema(runner, { appliedByRef: "hold:upgrade" });
-    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[31, 32], [32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52]]);
+    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[31, 32], [32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52], [52, 53]]);
     const after = stripNewComponentNulls(await depositDatabaseState(pool));
     for (const table of Object.keys(before)) {
       if (table === "schema_migrations") continue;
@@ -5027,7 +5027,7 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     const before=await depositDatabaseState(pool);
     const result=await migratePostgresSchema(runner,{appliedByRef:'synthetic:correction-replay-upgrade'});
     expect(result.currentVersion).toBe(26);
-    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[26,27],[27,28],[28,29],[29,30],[30,31],[31,32],[32,33],[33,34],[34,35],[35,36],[36,37],[37,38],[38,39],[39,40],[40,41],[41,42],[42,43],[43,44],[44,45],[45,46],[46,47],[47,48],[48,49],[49,50],[50,51],[51,52]]);
+    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[26,27],[27,28],[28,29],[29,30],[30,31],[31,32],[32,33],[33,34],[34,35],[35,36],[36,37],[37,38],[38,39],[39,40],[40,41],[41,42],[42,43],[43,44],[44,45],[45,46],[46,47],[47,48],[48,49],[49,50],[50,51],[51,52],[52,53]]);
     const after=stripNewComponentNulls(await depositDatabaseState(pool));
     for (const table of Object.keys(before).filter(table=>table!=='schema_migrations')) {
       const rows = before[table];
@@ -6103,7 +6103,7 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
     await persist();
     const before = await depositDatabaseState(pool);
     const upgrade = await migratePostgresSchema(runner, { appliedByRef: "refresh:repair" });
-    expect(upgrade.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[50, 51], [51, 52]]);
+    expect(upgrade.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[50, 51], [51, 52], [52, 53]]);
     const after = await depositDatabaseState(pool);
     delete before.schema_migrations; delete after.schema_migrations;
     expect(after).toEqual(before);
@@ -6846,7 +6846,7 @@ insert into erp_financials.ledger_postings (
     await expect(migratePostgresSchema(failed,{appliedByRef:"cash_lookup:failed"})).rejects.toThrow("injected real migration failure");
     expect(await depositDatabaseState(pool)).toEqual(before);
     expect((await pool.query("select to_regclass('erp_financials.subledger_documents_transaction_idx') index_name")).rows).toEqual([{index_name:null}]);
-    expect((await migratePostgresSchema(runner,{appliedByRef:"cash_lookup:upgrade"})).applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[44,45],[45,46],[46,47],[47,48],[48,49],[49,50],[50,51],[51,52]]);
+    expect((await migratePostgresSchema(runner,{appliedByRef:"cash_lookup:upgrade"})).applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[44,45],[45,46],[46,47],[47,48],[48,49],[49,50],[50,51],[51,52],[52,53]]);
     const index=(await pool.query<{indexdef:string}>("select indexdef from pg_indexes where schemaname='erp_financials' and indexname='subledger_documents_transaction_idx'")).rows[0];
     expect(index?.indexdef).toContain("(tenant_id, company_id, source_id, transaction_id, document_type)");
     const after=stripNewRecognitionNulls(await depositDatabaseState(pool));expectInitialMaintenanceTables(before, after);delete before.schema_migrations;delete after.schema_migrations;expect(after).toEqual(before);
@@ -7712,6 +7712,60 @@ insert into erp_financials.journal_entry_links values
     expect(mutableBalance.rows[0]?.open_amount).toBe("60");
   });
 
+  it.each([false, true])("atomic credit refund settles, reverses and reapplies without duplicate cash (split=%s)", async split => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:credit-refund" });
+    await seedAccountingScope(pool);
+    const sdk = depositService(runner);
+    const operation = sdkOperation();
+    await sdk.fiscalPeriods.define({ operation, fiscalYear: 2026, periodNumber: 8, periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+    const issueCredit = (key: string, customerId = "customer_1") => sdk.credits.issue({ operation, idempotencyKey: key,
+      date: "2026-08-02", customerId, amount: "100.00", receivableAccount: { accountId: "account_ar" }, revenueAccount: { accountId: "account_income" } });
+    const source = await issueCredit("fund:source"), other = await issueCredit("fund:other");
+    const foreign = await issueCredit("fund:foreign", "customer_2");
+    const command = { operation, idempotencyKey: "fund:refund", date: "2026-08-03", customerId: "customer_1", amount: "30.00",
+      refundMethod: "check", lifecycleReference: "CHECK-42", cashAccount: { accountId: "account_cash" }, receivableAccount: { accountId: "account_ar" },
+      creditFunding: split ? [{creditDocumentId:source.documentId,expectedVersion:1,amount:"10.00"},{creditDocumentId:other.documentId,expectedVersion:1,amount:"20.00"}]
+        : [{creditDocumentId:source.documentId,expectedVersion:1,amount:"30.00"}] };
+    const before = await depositDatabaseState(pool);
+    for (const changed of [
+      { amount: "31.00" }, { date: "2026-08-01" },
+      { creditFunding: [{creditDocumentId:source.documentId,expectedVersion:99,amount:"30.00"}] },
+      { creditFunding: [{creditDocumentId:foreign.documentId,expectedVersion:1,amount:"30.00"}] },
+      { amount: "101.00", creditFunding:[{creditDocumentId:source.documentId,expectedVersion:1,amount:"101.00"}] },
+    ]) {
+      await expect(sdk.refunds.issue({...command,...changed})).rejects.toBeDefined();
+      expect(await depositDatabaseState(pool)).toEqual(before);
+    }
+    const interrupted = depositService({ transaction: work => runner.transaction(client => work({
+      query<Row extends Record<string, unknown> = Record<string, unknown>>(statement: string, values?: readonly unknown[]) {
+        if (statement.includes('insert into "erp_financials"."subledger_applications"')) throw new Error("interrupted credit funding");
+        return client.query<Row>(statement, values);
+      }
+    })) });
+    await expect(interrupted.refunds.issue(command)).rejects.toThrow("interrupted credit funding");
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    const refund = await sdk.refunds.issue(command);
+    expect(refund).toMatchObject({openAmount:"0.00",documentStatus:"settled",version:split?3:2});
+    const after = await depositDatabaseState(pool);
+    expect(await sdk.refunds.issue(command)).toMatchObject({documentId:refund.documentId,status:"already_posted"});
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    await expect(sdk.refunds.issue({...command,creditFunding:[{creditDocumentId:other.documentId,expectedVersion:1,amount:"30.00"}]})).rejects.toBeDefined();
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    const applications = (await pool.query<{subledger_application_id:string}>("select subledger_application_id from erp_financials.subledger_applications where application_type='credit_to_refund'")).rows;
+    await expect(sdk.paymentApplications.unapply({operation,applicationId:requiredComponentFixture(applications[0]).subledger_application_id,expectedVersion:1,effectiveDate:"2026-08-04"})).rejects.toThrow("only be released");
+    const voidCommand = {operation,adjustmentDocumentId:refund.documentId,expectedVersion:refund.version,idempotencyKey:"fund:void",date:"2026-08-04"};
+    await expect(sdk.refunds.voidIssued({...voidCommand,date:"2026-08-02"})).rejects.toThrow("cannot precede");
+    expect(await depositDatabaseState(pool)).toEqual(after);
+    await sdk.refunds.voidIssued(voidCommand);
+    expect(await sdk.refunds.voidIssued(voidCommand)).toMatchObject({status:"already_voided"});
+    const balances = (await pool.query<{subledger_document_id:string;open_amount:string;version:number}>("select subledger_document_id,open_amount::text,version from erp_financials.subledger_documents where document_type='credit_memo'")).rows;
+    expect(balances.every(row=>Number(row.open_amount)===100)).toBe(true);
+    const current = requiredComponentFixture(balances.find(row=>row.subledger_document_id===source.documentId));
+    const replacement = await sdk.refunds.issue({...command,idempotencyKey:"fund:replacement",date:"2026-08-05",creditFunding:[{creditDocumentId:source.documentId,expectedVersion:current.version,amount:"30.00"}]});
+    expect(replacement).toMatchObject({openAmount:"0.00",documentStatus:"settled"});
+    expect((await pool.query<{status:string}>("select status from erp_financials.subledger_applications where target_document_id=$1",[refund.documentId])).rows.every(row=>row.status==='voided')).toBe(true);
+  });
+
   it.each([false, true])("native receipt cash return preserves invoice and cash agreement (applied=%s)", async (applied) => {
     await migratePostgresSchema(runner, { appliedByRef: "test:receipt-return" });
     await seedAccountingScope(pool);
@@ -8029,7 +8083,7 @@ insert into erp_financials.journal_entry_links values
       payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" }, allocations: [{ billId: bill.documentId, amount: "20.00", expectedBillVersion: 1 }] });
     const before = await depositDatabaseState(pool);
     const result = await migratePostgresSchema(runner, { appliedByRef: "bill-audit:upgrade" });
-    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52]]);
+    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52], [52, 53]]);
     const after = stripNewComponentNulls(await depositDatabaseState(pool));
     for (const table of Object.keys(before)) if (table !== "schema_migrations") expect(after[table], table).toEqual(before[table]);
     expect((await validatePostgresSchema(pool)).compatible).toBe(true);
@@ -8421,7 +8475,7 @@ insert into erp_financials.journal_entry_links values
     const applied = await financials.paymentApplications.apply(command);
     const before = await depositDatabaseState(pool);
     const upgrade = await migratePostgresSchema(runner, { appliedByRef: "receipt-upgrade:47" });
-    expect(upgrade.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52]]);
+    expect(upgrade.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52], [52, 53]]);
     const after = stripNewCrossSourceNulls(await depositDatabaseState(pool)); expectInitialMaintenanceTables(before, after); delete before.schema_migrations; delete after.schema_migrations;
     expect(after).toEqual(before);
     await expect(pool.query(`insert into erp_financials.subledger_applications
@@ -8955,7 +9009,7 @@ insert into erp_financials.journal_entry_links values
     const columns=await pool.query("select column_name from information_schema.columns where table_schema='erp_financials' and column_name in ('tax_account_id','discount_account_id')");
     expect(columns.rows).toEqual([]);
     const result=await migratePostgresSchema(runner,{appliedByRef:"components:upgrade"});
-    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[42,43],[43,44],[44,45],[45,46],[46,47],[47,48],[48,49],[49,50],[50,51],[51,52]]);
+    expect(result.applied.map(row=>[row.fromVersion,row.toVersion])).toEqual([[42,43],[43,44],[44,45],[45,46],[46,47],[47,48],[48,49],[49,50],[50,51],[51,52],[52,53]]);
     const after=stripNewRecognitionNulls(await depositDatabaseState(pool));
     // New nullable provenance columns are the only changes to existing rows.
     for(const table of ["invoice_draft_lines","subledger_document_lines"])for(const entry of after[table]??[]){
@@ -9758,7 +9812,7 @@ insert into erp_financials.journal_entry_links values
     expect(await depositDatabaseState(pool)).toEqual(before);
     expect(await constraints()).toEqual(beforeConstraints);
     const result = await migratePostgresSchema(runner, { appliedByRef: "overdue:upgrade" });
-    expect(result.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52]]);
+    expect(result.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52], [52, 53]]);
     const after = stripNewRecognitionNulls(await depositDatabaseState(pool));
     for (const [table, rows] of Object.entries(before)) if (!/migration|schema_version/.test(table)) expect(after[table]).toEqual(rows);
     const retained = await constraints();
@@ -10531,7 +10585,7 @@ insert into erp_financials.journal_entry_links values
       expect((await validatePostgresMigrationHistory(pool)).currentVersion).toBe(39);
     } else {
       const result = await migratePostgresSchema(runner, { appliedByRef: "test:cancel-upgrade" });
-      expect(result.applied.map(row => row.toVersion)).toEqual([40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52]);
+      expect(result.applied.map(row => row.toVersion)).toEqual([40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]);
       const after = stripNewComponentNulls(await depositDatabaseState(pool));
       expect(after.cash_flow_purpose_corrections).toEqual([]); before.cash_flow_purpose_corrections = [];
       expectInitialMaintenanceTables(before, after);
@@ -11521,7 +11575,7 @@ where application.subledger_application_id = $1`,
     await depositFixture("overdue_creation", 38);
     const before = await depositDatabaseState(pool);
     const migrated = await migratePostgresSchema(runner, { appliedByRef: "overdue:v39" });
-    expect(migrated.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52]]);
+    expect(migrated.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52], [52, 53]]);
     // Migration evidence changes; no business facts are rewritten.
     const after = stripNewRecognitionNulls(await depositDatabaseState(pool));
     for (const [table, rows] of Object.entries(before)) if (!/migration|schema_version/.test(table)) expect(after[table]).toEqual(rows);
@@ -12425,7 +12479,7 @@ where subledger_document_id = $1`, [original.documentId]);
         expectedVersion: 1 })).rejects.toThrow("must remain an active posting account");
       const upgraded = await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade" });
       expect(upgraded.currentVersion).toBe(upgrade);
-      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 51, toVersion: 52 });
+      expect(upgraded.applied.at(-1)).toMatchObject({ fromVersion: 52, toVersion: 53 });
       expect(await history()).toEqual(before);
       expect((await migratePostgresSchema(runner, { appliedByRef: "integration:inactive-upgrade-replay" })).applied).toEqual([]);
     }

@@ -642,7 +642,8 @@ export type PaymentApplicationMatchProvenance = {
 export type PaymentApplicationListItem = {
   readonly applicationId: string;
   readonly sourceId: string;
-  readonly applicationType: "customer_payment_to_invoice" | "bill_payment_to_bill" | "credit_to_invoice" | "vendor_credit_to_bill" | "write_off_to_invoice" | "customer_payment_to_refund";
+  readonly applicationType: "customer_payment_to_invoice" | "bill_payment_to_bill" | "credit_to_invoice" | "vendor_credit_to_bill" | "write_off_to_invoice" | "customer_payment_to_refund"
+  | "credit_to_refund";
   readonly status: "applied" | "unapplied" | "voided";
   readonly version: number;
   readonly applicationDate: IsoDate;
@@ -7566,7 +7567,7 @@ function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType 
         and ((customer_document.source_id=application.source_id and customer_document.subledger_document_id=application.source_document_id)
           or (customer_document.source_id=coalesce(application.target_document_source_id,application.source_id) and customer_document.subledger_document_id=application.target_document_id))
         and customer_document.party_id=${party})`}
-    and application."application_type" in ('customer_payment_to_invoice','credit_to_invoice','write_off_to_invoice','customer_payment_to_refund')
+    and application."application_type" in ('customer_payment_to_invoice','credit_to_invoice','write_off_to_invoice','customer_payment_to_refund','credit_to_refund')
     and application."application_date" <= ${asOf}::date
     and coalesce((applied_event."payload"->>'applicationDate')::date, (applied_event."occurred_at" at time zone 'UTC')::date) <= ${asOf}::date
     and (ended_event."event_id" is null or coalesce((ended_event."payload"->>'effectiveDate')::date, (ended_event."occurred_at" at time zone 'UTC')::date) > ${asOf}::date)
@@ -7576,8 +7577,8 @@ function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType 
     from effective_applications where application_type in ('customer_payment_to_invoice','credit_to_invoice','write_off_to_invoice')
     union all
     select source_id,source_document_id,
-      case when application_type='credit_to_invoice' then 'credit_memo' else 'customer_payment' end,applied_amount
-    from effective_applications where application_type in ('customer_payment_to_invoice','credit_to_invoice','customer_payment_to_refund')
+      case when application_type in ('credit_to_invoice','credit_to_refund') then 'credit_memo' else 'customer_payment' end,applied_amount
+    from effective_applications where application_type in ('customer_payment_to_invoice','credit_to_invoice','customer_payment_to_refund','credit_to_refund')
   ) sides group by source_id,document_id,document_type
 ), terminal_documents as (
   select link."source_id",link."original_transaction_id",min(related."transaction_date") "effective_date"

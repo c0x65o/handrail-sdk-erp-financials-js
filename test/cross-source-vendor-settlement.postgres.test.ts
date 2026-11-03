@@ -81,7 +81,7 @@ suite('reviewed native bill payment → historical vendor bill settlement', () =
       union all select 'transaction',to_jsonb(t) from erp_financials.transactions t order by kind,fact`)).rows;
     const before = await facts();
     const upgrade = await migratePostgresSchema(runner, { appliedByRef: 'test:vendor-upgrade' });
-    expect(upgrade.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[51,52]]);
+    expect(upgrade.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[51,52],[52,53]]);
     expect(await facts()).toEqual(before);
     await sdk.commands.paymentApplications.apply(command);
     expect((await sdk.queries.getOperationalDocument(command.targetDocumentId)).openAmount).toBe('0.00');
