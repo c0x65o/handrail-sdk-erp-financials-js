@@ -120,6 +120,8 @@ export type HandrailQuickBooksFullSyncServiceOptions = {
   readonly loadFullSyncResources: HandrailQuickBooksFullSyncProvider;
   readonly loadIncrementalSyncResources?: HandrailQuickBooksIncrementalSyncProvider;
   readonly loadProviderReport?: HandrailQuickBooksProviderReportProvider;
+  /** Opt in only when the provider supplies the complete, reconciled cash-flow totals contract. */
+  readonly loadCashFlowProviderReport?: HandrailQuickBooksProviderReportProvider;
   readonly loadServiceHealth?: HandrailQuickBooksServiceHealthProvider;
 };
 
@@ -220,9 +222,9 @@ export function createHandrailQuickBooksFullSyncServiceHandler(
       validateReportName(request, "trial_balance");
       return (await loadNormalizedQuickBooksProviderReport(options, request)) as NormalizedQuickBooksTrialBalanceReportResponseEnvelope;
     },
-    cashFlowParityReport(request) {
+    async cashFlowParityReport(request) {
       validateReportName(request, "cash_flow");
-      return Promise.resolve(buildUnsupportedQuickBooksCashFlowParityReportResponse(request));
+      return await loadNormalizedQuickBooksProviderReport(options, request) as NormalizedQuickBooksCashFlowParityReportResponseEnvelope;
     }
   };
 }
@@ -388,13 +390,10 @@ export function buildNormalizedQuickBooksProviderReportResponse(
   validateProviderReportRequest(request);
   assertNoCredentialKeys(providerReport);
 
-  if (request.reportName === "cash_flow") {
-    return buildUnsupportedQuickBooksCashFlowParityReportResponse(request);
-  }
-
   const providerReportRef = sanitizeProviderReportRef(providerReport.providerReportRef);
   validateProviderReportRef(request, providerReportRef);
   const totals = sanitizeProviderReportTotals(providerReport.totals);
+  if (request.reportName === "cash_flow") validateCashFlowTotals(totals, request.currencyCode);
   const accountTotals =
     providerReport.accountTotals === undefined
       ? undefined
@@ -590,7 +589,8 @@ async function loadNormalizedQuickBooksProviderReport(
 ): Promise<NormalizedQuickBooksProviderReportResponseEnvelope> {
   validateProviderReportRequest(request);
   if (request.reportName === "cash_flow") {
-    return buildUnsupportedQuickBooksCashFlowParityReportResponse(request);
+    if (!options.loadCashFlowProviderReport) return buildUnsupportedQuickBooksCashFlowParityReportResponse(request);
+    return buildNormalizedQuickBooksProviderReportResponse(request, await options.loadCashFlowProviderReport(request));
   }
   if (options.loadProviderReport === undefined) {
     throw new Error("QuickBooks provider report loader is required for supported provider reports");
@@ -1396,4 +1396,19 @@ function allResourceEnvelopes(resources: NormalizedQuickBooksSyncResourceSet): r
     ...(resources.departments ?? []),
     ...(resources.dimensions ?? [])
   ];
+}
+
+/** Exact public provider contract; never infer missing sections as zero. */
+function validateCashFlowTotals(totals: readonly NormalizedQuickBooksProviderReportTotal[], currencyCode?: string): void {
+  const required = ["net_income", "net_operating_cash", "net_investing_cash", "net_financing_cash", "net_cash_flow", "cash_beginning", "cash_ending"];
+  const amounts = new Map<string, bigint>();
+  for (const total of totals) {
+    if (!required.includes(total.totalKey) || amounts.has(total.totalKey)) throw new Error("Cash-flow totals require unique stable keys");
+    if (currencyCode !== undefined && total.currencyCode !== undefined && total.currencyCode !== currencyCode) throw new Error("Cash-flow total currency does not match request");
+    amounts.set(total.totalKey, parseMoney(total.amount));
+  }
+  if (required.some(key => !amounts.has(key))) throw new Error("Cash-flow totals contract is incomplete");
+  const value = (key: string) => { const amount = amounts.get(key); if (amount === undefined) throw new Error("Missing cash-flow total"); return amount; };
+  if (value("net_operating_cash") + value("net_investing_cash") + value("net_financing_cash") !== value("net_cash_flow")
+    || value("cash_beginning") + value("net_cash_flow") !== value("cash_ending")) throw new Error("Cash-flow totals do not reconcile");
 }
