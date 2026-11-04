@@ -3471,13 +3471,22 @@ async function getCustomerFundingDocuments(scope: Scope, request: CustomerStatem
   return scope.database.transaction(async client => {
     const book = await resolveBook(client, scope);
     const result = await client.query(`${receivableAgingDocumentsSql("$6", "$5", "'invoice'", "array['customer_payment','credit_memo','refund']", "$4")}
-select subledger_document_id, source_id, transaction_id, document_type, document_date::text,
+select documents.*, b.status as book_status,b.base_currency_code as book_currency,b.accounting_basis as book_basis
+from erp_financials.reporting_books b
+left join lateral (
+ select subledger_document_id, source_id, transaction_id, document_type, document_date::text,
  original_amount::text,historical_open_amount::text, (terminal_date <= $6::date) as terminal
-from aging_balances where document_type <> 'invoice'
-order by document_date,source_id,subledger_document_id limit 10001`,
+ from aging_balances where document_type <> 'invoice'
+ order by document_date,source_id,subledger_document_id limit 10001
+) documents on true
+where b.tenant_id=$1 and b.company_id=$2 and b.book_id=$3
+order by documents.document_date,documents.source_id,documents.subledger_document_id`,
       [scope.tenantId,scope.companyId,scope.bookId,input.customerId,book.currencyCode,input.asOfDate]);
-    if (result.rows.length > 10000) throw new ErpFinancialsError("unsupported_operation", "Customer funding history exceeds the complete-scan bound");
-    const rows: CustomerFundingDocument[] = result.rows.map(row => ({
+    const control = result.rows[0];
+    if (!control || control.book_status !== "active" || control.book_currency !== book.currencyCode || control.book_basis !== book.accountingBasis) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Reporting book changed during funding read");
+    const documents = result.rows.filter(row => row.subledger_document_id !== null);
+    if (documents.length > 10000) throw new ErpFinancialsError("unsupported_operation", "Customer funding history exceeds the complete-scan bound");
+    const rows: CustomerFundingDocument[] = documents.map(row => ({
       status: row.terminal === true ? "voided" : "posted",
       documentId: string(row.subledger_document_id,"subledger_document_id"), sourceId: string(row.source_id,"source_id"),
       transactionId: string(row.transaction_id,"transaction_id"),documentType: string(row.document_type,"document_type"),

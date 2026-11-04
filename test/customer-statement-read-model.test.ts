@@ -199,10 +199,10 @@ it("rejects malformed funding pagination before reading accounting", async () =>
 });
 
 it("retains source-qualified funding rows and binds continuations to the entire selection", async () => {
-  let available = "4.00";
+  let available = "4.00", bookStatus = "active";
   const queries=statement({query: async <Row extends Record<string,unknown>>(sql:string):Promise<PostgresQueryResult<Row>> => {
     if(sql.includes('from "erp_financials"."reporting_books"')) return rows<Row>([{base_currency_code:"USD",accounting_basis:"accrual",status:"active"}]);
-    return rows<Row>(["historical","native"].map(source_id=>({source_id,subledger_document_id:"same-id",transaction_id:"tx",document_type:"customer_payment",document_date:"2026-08-01",original_amount:"10.00",historical_open_amount:available})));
+    return rows<Row>(["historical","native"].map(source_id=>({book_status:bookStatus,book_currency:"USD",book_basis:"accrual",source_id,subledger_document_id:"same-id",transaction_id:"tx",document_type:"customer_payment",document_date:"2026-08-01",original_amount:"10.00",historical_open_amount:available})));
   }});
   const input={customerId:"customer",asOfDate:"2026-08-31",limit:1};
   const first=await queries.getCustomerFundingDocuments(input);
@@ -212,6 +212,9 @@ it("retains source-qualified funding rows and binds continuations to the entire 
   expect(second).toMatchObject({items:[{sourceId:"native",documentId:"same-id"}]});
   expect(second.nextCursor).toBeUndefined();
   await expect(queries.getCustomerFundingDocuments({...input,customerId:"different",cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+  bookStatus="inactive";
+  await expect(queries.getCustomerFundingDocuments(input)).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+  bookStatus="active";
   available="3.00";
   await expect(queries.getCustomerFundingDocuments({...input,cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
 });
