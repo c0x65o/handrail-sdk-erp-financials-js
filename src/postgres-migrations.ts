@@ -95,6 +95,7 @@ export class PostgresMigrationError extends Error {
 const namespace = POSTGRES_CANONICAL_SCHEMA_MANIFEST.namespace;
 const migrationLockKey = `${namespace}:schema-migrations`;
 const migrationFiles = {
+  vendorComponentsV56: new URL("../migrations/future-erp/20261104010000_signed_vendor_components.sql", import.meta.url),
   importedPaymentV55: new URL("../migrations/future-erp/20261103030000_add_imported_payment_funding.sql", import.meta.url),
   sourceCreditV54: new URL("../migrations/future-erp/20261103020000_add_source_aware_credit_funding.sql", import.meta.url),
   creditRefundV53: new URL("../migrations/future-erp/20261103010000_add_atomic_credit_refunds.sql", import.meta.url),
@@ -374,7 +375,8 @@ export const POSTGRES_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
   migration("20261031030000_add_cross_source_vendor_settlement", "Reviewed native payment settlement of historical vendor bills", 51, 52, migrationFiles.crossSourceVendorV52),
   migration("20261103010000_add_atomic_credit_refunds", "Atomic credit-funded refunds", 52, 53, migrationFiles.creditRefundV53),
   migration("20261103020000_add_source_aware_credit_funding", "Source-aware independently reviewed credit funding", 53, 54, migrationFiles.sourceCreditV54),
-  migration("20261103030000_add_imported_payment_funding", "Independently reviewed imported payment funding", 54, 55, migrationFiles.importedPaymentV55)
+  migration("20261103030000_add_imported_payment_funding", "Independently reviewed imported payment funding", 54, 55, migrationFiles.importedPaymentV55),
+  migration("20261104010000_signed_vendor_components", "Preserve signed explicit vendor tax components", 55, 56, migrationFiles.vendorComponentsV56)
 ] as const;
 
 export async function planPostgresMigrations(

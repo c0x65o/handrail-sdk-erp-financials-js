@@ -2165,8 +2165,9 @@ async function createVendorBill(
     sum + (line.amount.startsWith("-") ? -parsePositiveMoney(line.amount.slice(1), "expenseLines.amount")
       : parsePositiveMoney(line.amount, "expenseLines.amount")), 0n)), "net bill total");
   const signed = expenseLines.some(line => line.amount.startsWith("-"));
+  const components = expenseLines.some(line => line.taxAccount || line.discountAccount);
   const payableAccountId = resolveAccountId(context, input.payableAccount);
-  if (signed && expenseLines.some(line => resolveAccountId(context, line) === payableAccountId)) {
+  if ((signed || components) && expenseLines.some(line => resolveAccountId(context, line) === payableAccountId)) {
     throw new ErpFinancialsValidationError("Signed bill expense accounts must differ from its payable control");
   }
   const policyValue: unknown = input.accountPolicy;
@@ -2191,22 +2192,33 @@ async function createVendorBill(
   return createSubledgerDocument(context, {
     ...commonSubledgerDocument(context, input, "vendor_bill", amount, true,
       { ...(normalizedPolicy === undefined ? {} : { accountPolicy: normalizedPolicy }),
-        ...(signed ? { vendorBillCredit: { amount, payableAccountId } } : {}) }),
-    ...(normalizedPolicy === undefined ? {} : { accountRequirements: [
-      ...expenseLines.map(line => ({ accountId: resolveAccountId(context, line), classifications: normalizedPolicy.expenseClassifications })),
-      { accountId: resolveAccountId(context, input.payableAccount), classifications: normalizedPolicy.payableClassifications }
-    ] }),
+        ...((signed || components) ? { vendorBillCredit: { amount, payableAccountId } } : {}) }),
+    accountRequirements: [
+      ...(normalizedPolicy ? [
+        ...expenseLines.map(line => ({ accountId: resolveAccountId(context, line), classifications: normalizedPolicy.expenseClassifications })),
+        { accountId: payableAccountId, classifications: normalizedPolicy.payableClassifications }
+      ] : []),
+      ...expenseLines.flatMap(line => {
+        for (const ref of [line.taxAccount, line.discountAccount]) if (ref && resolveAccountId(context, ref) === payableAccountId) throw new ErpFinancialsValidationError("Bill component account must differ from payable control");
+        return [
+          ...(line.taxAccount ? [{ accountId: resolveAccountId(context, line.taxAccount), classifications: ["asset", "expense"] as AccountClassification[] }] : []),
+          ...(line.discountAccount ? [{ accountId: resolveAccountId(context, line.discountAccount), classifications: ["expense", "other_income"] as AccountClassification[] }] : []),
+        ];
+      })
+    ],
     dueDate: input.dueDate,
     partyId: input.vendorId,
     journalLines: [
-      ...expenseLines.map((line) => ({
-        ...accountReferenceOnly(line),
-        ...(line.amount.startsWith("-") ? { credit: line.amount.slice(1) } : { debit: line.amount }),
-        partyId: input.vendorId,
-        ...(line.itemId === undefined ? {} : { itemId: line.itemId }),
-        ...(line.description === undefined ? {} : { description: line.description }),
-        dimensionRefs: line.dimensionRefs
-      })),
+      ...expenseLines.flatMap(line => {
+        if (!line.taxAccount && !line.discountAccount) return [{
+          ...accountReferenceOnly(line),
+          ...(line.amount.startsWith("-") ? { credit: line.amount.slice(1) } : { debit: line.amount }),
+          partyId: input.vendorId, ...(line.itemId === undefined ? {} : { itemId: line.itemId }),
+          ...(line.description === undefined ? {} : { description: line.description }), dimensionRefs: line.dimensionRefs,
+        }];
+        const negative = line.amount.startsWith("-");
+        return invoiceComponentJournalLines({ ...line, amount: negative ? line.amount.slice(1) : line.amount }, input.vendorId, !negative);
+      }),
       { ...input.payableAccount, credit: amount, partyId: input.vendorId }
     ],
     // Attach attribution after commercial normalization, including signed bill-line normalization.
@@ -5078,28 +5090,29 @@ function normalizeSubledgerLines(
 }
 
 /** Vendor invoice credits retain their signed commercial line, not a second
- * liability or a collapsed net expense. Component tax/discount semantics for
- * negative lines are deliberately rejected until their own posting contract. */
-function normalizeVendorBillLines(lines: readonly VendorBillExpenseLine[]) {
+ * liability or a collapsed net expense. Explicit component accounts preserve
+ * gross expense, recoverable tax and discounts through cash recognition. */
+function normalizeVendorBillLines(lines: readonly VendorBillExpenseLine[]): readonly NormalizedSubledgerAmountLine[] {
   if (!Array.isArray(lines) || !lines.length) throw new ErpFinancialsValidationError("expenseLines must contain at least one line");
   return lines.map((line: VendorBillExpenseLine, index: number) => {
     const field = `expenseLines[${String(index)}]`;
-    if (line.taxAccount !== undefined || line.discountAccount !== undefined) throw new ErpFinancialsValidationError("Invoice component accounts are unsupported for this document type");
-    if (typeof line.amount !== "string" || !line.amount.startsWith("-")) {
-      const normalized = normalizeSubledgerLines([line], field)[0];
-      if (!normalized) throw new ErpFinancialsValidationError("Missing vendor bill line");
-      return normalized;
+    const negative = typeof line.amount === "string" && line.amount.startsWith("-");
+    if (negative && line.unitAmount !== undefined && (typeof line.unitAmount !== "string" || !line.unitAmount.startsWith("-"))) throw new ErpFinancialsValidationError(`${field}.unitAmount must be negative for a bill credit`);
+    if (!negative && line.taxAccount === undefined && line.discountAccount === undefined) {
+      const legacy = normalizeSubledgerLines([line], field)[0];
+      if (!legacy) throw new ErpFinancialsValidationError("Missing vendor bill line");
+      return legacy;
     }
-    if ((line.taxAmount !== undefined && parsePositiveOrZeroMoney(line.taxAmount, `${field}.taxAmount`) !== 0n)
-      || (line.discountAmount !== undefined && parsePositiveOrZeroMoney(line.discountAmount, `${field}.discountAmount`) !== 0n)) {
-      throw new ErpFinancialsValidationError("Signed vendor bill lines require zero tax and discount components");
+    const components = normalizeInvoiceComponents(line);
+    const normalized = normalizeCommercialDocumentLine({ ...line,
+      amount: negative ? line.amount.slice(1) : line.amount,
+      ...(negative && line.unitAmount !== undefined ? { unitAmount: line.unitAmount.slice(1) } : {})
+    }, field);
+    for (const [amount, account] of [[normalized.taxAmount, components.taxAccount], [normalized.discountAmount, components.discountAccount]] as const) {
+      if ((parsePositiveOrZeroMoney(amount, field) > 0n) !== Boolean(account)) throw new ErpFinancialsValidationError("Bill tax/discount components require explicit accounts and positive component amounts");
     }
-    if (line.unitAmount !== undefined && (typeof line.unitAmount !== "string" || !line.unitAmount.startsWith("-"))) {
-      throw new ErpFinancialsValidationError(`${field}.unitAmount must be negative for a bill credit`);
-    }
-    const normalized = normalizeCommercialDocumentLine({ ...line, amount: line.amount.slice(1),
-      ...(line.unitAmount === undefined ? {} : { unitAmount: line.unitAmount.slice(1) }) }, field);
-    return { ...accountReferenceOnly(line), ...normalized, amount: `-${normalized.amount}`, unitAmount: `-${normalized.unitAmount}` };
+    return { ...accountReferenceOnly(line), ...normalized, ...components,
+      ...(negative ? { amount: `-${normalized.amount}`, unitAmount: `-${normalized.unitAmount}` } : {}) };
   });
 }
 

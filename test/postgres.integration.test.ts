@@ -3401,6 +3401,57 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     expect(await journal("accrual")).toEqual(accrual);
   });
 
+  it.each([false, true])("vendor bill explicit components preserve cash installments and undo (credit=%s)", async credit => {
+    const { sdk, operation } = await paymentHoldFixture();
+    for (const [accountKey, classification, type] of [
+      ["component-expense", "expense", "Expense"], ["component-tax", "asset", "Other Current Asset"],
+      ["component-discount", "other_income", "Other Income"],
+    ] as const) await sdk.commands.accounts.upsertTree({ operation: { ...operation, requestId: `components:account:${accountKey}` }, parent: { accountKey, name: accountKey, classification, type } });
+    const component = { accountKey: "component-expense", amount: credit ? "-9.00" : "90.00", quantity: "1", unitAmount: credit ? "-10.00" : "100.00",
+      taxAmount: credit ? "1.00" : "10.00", discountAmount: credit ? "2.00" : "20.00",
+      taxAccount: { accountKey: "component-tax" }, discountAccount: { accountKey: "component-discount" } };
+    const command = { operation, idempotencyKey: "components:bill", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1",
+      payableAccount: { accountId: "account_ap" }, expenseLines: credit ? [{ accountKey: "component-expense", amount: "100.00" }, component] : [component] };
+    const bill = await sdk.commands.vendorBills.create(command);
+    const total = credit ? "91.00" : "90.00";
+    const detail = await sdk.queries.getVendorBill(bill.documentId);
+    expect(detail).toMatchObject({ originalAmount: total, openAmount: total });
+    expect(detail.lines.find(line => line.amount === component.amount)).toMatchObject({ taxAmount: component.taxAmount, discountAmount: component.discountAmount });
+    const journals = async (basis: string) => (await pool.query<Record<string, unknown>>(`select account_id,sum(debit_amount)::text as debit,sum(credit_amount)::text as credit
+      from erp_financials.ledger_postings where transaction_id=$1 and accounting_basis=$2 group by account_id order by account_id`, [bill.journal.transactionId, basis])).rows;
+    const accrual = await journals("accrual");
+    expect(accrual).toHaveLength(4);
+    expect(accrual).toEqual(expect.arrayContaining([
+      expect.objectContaining(credit ? { debit: "2.00", credit: "0.00" } : { debit: "0.00", credit: "20.00" }),
+      expect.objectContaining(credit ? { debit: "0.00", credit: "1.00" } : { debit: "10.00", credit: "0.00" }),
+    ]));
+    const installments = ["45.00", credit ? "46.00" : "45.00"];
+    let firstApplication: { applicationId: string; version: number } | undefined;
+    for (const [index, amount] of installments.entries()) {
+      const payment = await sdk.commands.billPayments.recordAndApply({ operation, idempotencyKey: `components:payment:${String(index)}`,
+        date: `2026-08-${String(10 + index)}`, vendorId: "vendor_1", amount, paymentMethod: "ach",
+        payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" },
+        allocations: [{ billId: bill.documentId, amount, expectedBillVersion: index + 1 }] });
+      if (index === 0) firstApplication = (await sdk.queries.getBillPaymentCorrectionReview({ sourceId: "source_1", paymentId: payment.billPaymentId, limit: 10 })).items[0];
+    }
+    expect(await journals("cash")).toEqual(accrual);
+    const invalidBefore = await depositDatabaseState(pool);
+    await expect(sdk.commands.vendorBills.create({ ...command, idempotencyKey: "components:invalid-control",
+      expenseLines: [{ ...component, taxAccount: { accountId: "account_ap" } }] })).rejects.toThrow();
+    await expect(sdk.commands.vendorBills.create({ ...command, idempotencyKey: "components:invalid-classification",
+      expenseLines: [{ ...component, discountAccount: { accountId: "account_cash" } }] })).rejects.toThrow();
+    expect(await depositDatabaseState(pool)).toEqual(invalidBefore);
+    const before = await depositDatabaseState(pool);
+    expect(await sdk.commands.vendorBills.create(command)).toMatchObject({ documentId: bill.documentId });
+    expect(await depositDatabaseState(pool)).toEqual(before);
+    await expect(sdk.commands.vendorBills.create({ ...command, expenseLines: command.expenseLines.map(line => ({ ...line, description: "Changed review" })) })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    if (!firstApplication) throw Error("Missing component application");
+    await sdk.commands.paymentApplications.unapply({ operation, applicationId: firstApplication.applicationId, expectedVersion: firstApplication.version, effectiveDate: "2026-08-20" });
+    expect(await sdk.queries.getVendorBill(bill.documentId, "2026-08-19")).toMatchObject({ openAmount: "0.00" });
+    expect(await sdk.queries.getVendorBill(bill.documentId, "2026-08-20")).toMatchObject({ openAmount: "45.00" });
+    expect(await journals("accrual")).toEqual(accrual);
+  });
+
   it("signed vendor bills reject invalid net, components, controls and arithmetic before writes", async () => {
     const { sdk, operation } = await paymentHoldFixture();
     const base = { operation, idempotencyKey: "signed:invalid", date: "2026-08-01", dueDate: "2026-08-31", vendorId: "vendor_1", payableAccount: { accountId: "account_ap" } };
@@ -8092,7 +8143,7 @@ insert into erp_financials.journal_entry_links values
       payableAccount: { accountId: "account_ap" }, cashAccount: { accountId: "account_cash" }, allocations: [{ billId: bill.documentId, amount: "20.00", expectedBillVersion: 1 }] });
     const before = await depositDatabaseState(pool);
     const result = await migratePostgresSchema(runner, { appliedByRef: "bill-audit:upgrade" });
-    expect(result.applied.map(item => [item.fromVersion, item.toVersion])).toEqual([[32, 33], [33, 34], [34, 35], [35, 36], [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52], [52, 53]]);
+    expect(result.applied.map(row => [row.fromVersion, row.toVersion])).toEqual(Array.from({ length: POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion - 32 }, (_, index) => [32 + index, 33 + index]));
     const after = stripNewComponentNulls(await depositDatabaseState(pool));
     for (const table of Object.keys(before)) if (table !== "schema_migrations") expect(after[table], table).toEqual(before[table]);
     expect((await validatePostgresSchema(pool)).compatible).toBe(true);
@@ -11584,7 +11635,7 @@ where application.subledger_application_id = $1`,
     await depositFixture("overdue_creation", 38);
     const before = await depositDatabaseState(pool);
     const migrated = await migratePostgresSchema(runner, { appliedByRef: "overdue:v39" });
-    expect(migrated.applied.map(row => [row.fromVersion, row.toVersion])).toEqual([[38, 39], [39, 40], [40, 41], [41, 42], [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49], [49, 50], [50, 51], [51, 52], [52, 53]]);
+    expect(migrated.applied.map(row => [row.fromVersion, row.toVersion])).toEqual(Array.from({ length: POSTGRES_CANONICAL_SCHEMA_MANIFEST.schemaVersion - 38 }, (_, index) => [38 + index, 39 + index]));
     // Migration evidence changes; no business facts are rewritten.
     const after = stripNewRecognitionNulls(await depositDatabaseState(pool));
     for (const [table, rows] of Object.entries(before)) if (!/migration|schema_version/.test(table)) expect(after[table]).toEqual(rows);
