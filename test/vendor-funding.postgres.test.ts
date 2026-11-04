@@ -86,4 +86,28 @@ suite('reviewed native bill payment → historical vendor bill settlement', () =
     expect((await funding('2025-08-03')).items[0]?.availableAmount).toBe('27.56');
     expect((await sdk.queries.getVendorFundingDocuments({vendorId:'other',asOfDate:'2025-08-03'})).items).toHaveLength(0);
   });
+  it('reconciles vendor liability through journal refunds and dated reversals without double counting funding', async () => {
+    const { sdk, command, customerId, sourceId, historicalCustomerId } = await fixture();
+    const statement = (asOfDate: string) => sdk.queries.getVendorLiabilityStatement({vendorId:customerId,sourceId,asOfDate});
+    expect((await statement('2025-07-31')).netLiabilityAmount).toBe('0.00');
+    expect((await statement('2025-08-01')).netLiabilityAmount).toBe('-27.56');
+    expect((await sdk.queries.getVendorLiabilityStatement({vendorId:historicalCustomerId,sourceId:scope.sourceId,asOfDate:'2025-08-01'})).netLiabilityAmount).toBe('27.56');
+    const refund = await sdk.commands.journalEntries.post({operation,idempotencyKey:'vendor-refund',date:'2025-08-04',origin:{module:'Manual',reference:'Vendor refund'},
+      lines:[{accountKey:'cash',debit:'10.01',partyId:customerId},{accountKey:'ar',credit:'10.01',partyId:customerId}]});
+    expect((await statement('2025-08-03')).netLiabilityAmount).toBe('-27.56');
+    const refunded = await statement('2025-08-04');
+    expect(refunded.netLiabilityAmount).toBe('-17.55');
+    expect(refunded.items.filter(r=>r.transactionId===refund.transactionId)).toHaveLength(2);
+    // Funding remains a separate operational control, never subtracted a second time.
+    expect((await sdk.queries.getVendorFundingDocuments({vendorId:customerId,asOfDate:'2025-08-04'})).items[0]?.availableAmount).toBe('27.56');
+    await sdk.commands.journalEntries.reverse({operation,originalTransactionId:refund.transactionId,idempotencyKey:'vendor-refund-reversal',date:'2025-08-05'});
+    expect((await statement('2025-08-04')).netLiabilityAmount).toBe('-17.55');
+    expect((await statement('2025-08-05')).netLiabilityAmount).toBe('-27.56');
+    await sdk.commands.paymentApplications.apply(command);
+    const native = await statement('2025-08-05');
+    const historical = await sdk.queries.getVendorLiabilityStatement({vendorId:historicalCustomerId,sourceId:scope.sourceId,asOfDate:'2025-08-05'});
+    expect(Number(native.netLiabilityAmount)+Number(historical.netLiabilityAmount)).toBe(0);
+    await expect(sdk.queries.getVendorLiabilityStatement({vendorId:customerId,sourceId:'other',asOfDate:'2025-08-05'})).rejects.toBeDefined();
+  });
+
 });

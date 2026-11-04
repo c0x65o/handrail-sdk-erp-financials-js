@@ -486,3 +486,5 @@ export {changePostgresAccountingAccess,withPostgresAccountingAccess,readPostgres
 export type {AccountingAccessState,AccountingAccessCommand,AccountingHostRelation,AccountingHostGuardsRequest} from './accounting-access.js';
 
 export type { BankStatementCommandAttempt, RetireBankStatementCommandInput, RetireBankStatementCommandResult } from "./bank-statements.js";
+
+export type { VendorLiabilityStatementRequest, VendorLiabilityStatement, VendorLiabilityPosting } from "./vendor-liability-statement.js";

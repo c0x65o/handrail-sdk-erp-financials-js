@@ -1,3 +1,4 @@
+import { readVendorLiabilityStatement, type VendorLiabilityStatementRequest, type VendorLiabilityStatement } from "./vendor-liability-statement.js";
 import {readJournalAccountPolicy,type JournalAccountPolicyRequest,type JournalAccountPolicyPage} from "./journal-account-policy.js";
 import { withAccountingReferenceGuard, type AccountingReferenceGuardRequest, type AccountingReferenceGuard } from "./accounting-reference-guard.js";
 import { readReportingCalendar, type ReportingCalendarRequest, type ReportingCalendar } from "./reporting-calendar.js";
@@ -1781,6 +1782,7 @@ export type FinancialReadModels = {
   listInvoiceAudit(invoiceId: string, input?: PageRequest): Promise<Page<InvoiceAuditEvent>>;
   getInvoiceSummary(input?: { readonly asOfDate?: IsoDate }): Promise<InvoiceSummary>;
   getCustomerStatement(input: CustomerStatementRequest): Promise<CustomerStatement>;
+  getVendorLiabilityStatement(input: VendorLiabilityStatementRequest): Promise<VendorLiabilityStatement>;
   getVendorFundingDocuments(input: VendorFundingDocumentRequest): Promise<VendorFundingDocumentPage>;
   getCustomerFundingDocuments(input: CustomerStatementRequest): Promise<CustomerFundingDocumentPage>;
   getCurrentInvoiceLinePage(input: CurrentInvoiceLineRequest): Promise<CurrentInvoiceLinePage>;
@@ -1942,6 +1944,7 @@ export function createFinancialReadModels(input: Scope): FinancialReadModels {
     listInvoiceAudit: (invoiceId, request = {}) => listInvoiceAudit(input, invoiceId, request),
     getInvoiceSummary: (request = {}) => getInvoiceSummary(input, request),
     getCustomerStatement: (request) => getCustomerStatement(input, request),
+    getVendorLiabilityStatement: request => readVendorLiabilityStatement(input, request),
     getVendorFundingDocuments: request => getVendorFundingDocuments(input, request),
     getCustomerFundingDocuments: request => getCustomerFundingDocuments(input, request),
     getCurrentInvoiceLinePage: request => getCurrentInvoiceLinePage(input, request),
