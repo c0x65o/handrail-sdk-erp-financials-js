@@ -385,6 +385,9 @@ export type CustomerFundingDocument = {
   readonly originalAmount: DecimalString;
   readonly availableAmount: DecimalString;
 };
+export type VendorFundingDocumentRequest = PageRequest & { readonly vendorId: string; readonly asOfDate: IsoDate };
+export type VendorFundingDocumentPage = Omit<CustomerFundingDocumentPage, "customerId"> & { readonly vendorId: string };
+
 export type CustomerFundingDocumentPage = {
   readonly customerId: string;
   readonly asOfDate: IsoDate;
@@ -1778,6 +1781,7 @@ export type FinancialReadModels = {
   listInvoiceAudit(invoiceId: string, input?: PageRequest): Promise<Page<InvoiceAuditEvent>>;
   getInvoiceSummary(input?: { readonly asOfDate?: IsoDate }): Promise<InvoiceSummary>;
   getCustomerStatement(input: CustomerStatementRequest): Promise<CustomerStatement>;
+  getVendorFundingDocuments(input: VendorFundingDocumentRequest): Promise<VendorFundingDocumentPage>;
   getCustomerFundingDocuments(input: CustomerStatementRequest): Promise<CustomerFundingDocumentPage>;
   getCurrentInvoiceLinePage(input: CurrentInvoiceLineRequest): Promise<CurrentInvoiceLinePage>;
   getCurrentVendorBillPage(input: CurrentVendorBillRequest): Promise<CurrentVendorBillPage>;
@@ -1938,6 +1942,7 @@ export function createFinancialReadModels(input: Scope): FinancialReadModels {
     listInvoiceAudit: (invoiceId, request = {}) => listInvoiceAudit(input, invoiceId, request),
     getInvoiceSummary: (request = {}) => getInvoiceSummary(input, request),
     getCustomerStatement: (request) => getCustomerStatement(input, request),
+    getVendorFundingDocuments: request => getVendorFundingDocuments(input, request),
     getCustomerFundingDocuments: request => getCustomerFundingDocuments(input, request),
     getCurrentInvoiceLinePage: request => getCurrentInvoiceLinePage(input, request),
     getCurrentVendorBillPage: request => getCurrentVendorBillPage(input, request),
@@ -3499,6 +3504,55 @@ order by documents.document_date,documents.source_id,documents.subledger_documen
     const items = rows.slice(offset,offset+limit), next = offset+items.length;
     return {customerId: input.customerId,asOfDate: input.asOfDate,currencyCode: book.currencyCode,revision,totalCount: rows.length,items,
       ...(next < rows.length ? {nextCursor: Buffer.from(JSON.stringify({kind:"customer-funding-v1",revision,offset:next})).toString("base64url")} : {})};
+  });
+}
+
+async function getVendorFundingDocuments(scope: Scope, request: VendorFundingDocumentRequest): Promise<VendorFundingDocumentPage> {
+  const input = structuredClone(request);
+  assertNonEmpty(input.vendorId, "vendorId"); assertDate(input.asOfDate, "asOfDate");
+  const limit = input.limit ?? 50;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new ErpFinancialsError("invalid_input", "Funding page limit must be between 1 and 200");
+  let offset = 0, expectedRevision: string | undefined;
+  if (input.cursor !== undefined) {
+    try {
+      if (input.cursor.length > 1024 || !/^[A-Za-z0-9_-]+$/u.test(input.cursor)) throw Error();
+      const cursor: unknown = JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8"));
+      if (!isRecord(cursor) || cursor.kind !== "vendor-funding-v1" || typeof cursor.revision !== "string"
+        || !/^[a-f0-9]{64}$/u.test(cursor.revision) || typeof cursor.offset !== "number" || !Number.isInteger(cursor.offset) || cursor.offset < 1 || cursor.offset > 10000) throw Error();
+      offset = cursor.offset; expectedRevision = cursor.revision;
+    } catch { throw new ErpFinancialsError("invalid_input", "Invalid funding document cursor"); }
+  }
+  return scope.database.transaction(async client => {
+    const book = await resolveBook(client, scope);
+    const result = await client.query(`${vendorFundingDocumentsSql("$6", "$5", "'vendor_bill'", "array['bill_payment','vendor_credit']", "$4")}
+select documents.*, b.status as book_status,b.base_currency_code as book_currency,b.accounting_basis as book_basis
+from erp_financials.reporting_books b
+left join lateral (
+ select subledger_document_id, source_id, transaction_id, document_type, document_date::text,
+ original_amount::text,historical_open_amount::text, (terminal_date <= $6::date) as terminal
+ from aging_balances where document_type <> 'vendor_bill'
+ order by document_date,source_id,subledger_document_id limit 10001
+) documents on true
+where b.tenant_id=$1 and b.company_id=$2 and b.book_id=$3
+order by documents.document_date,documents.source_id,documents.subledger_document_id`,
+      [scope.tenantId,scope.companyId,scope.bookId,input.vendorId,book.currencyCode,input.asOfDate]);
+    const control = result.rows[0];
+    if (!control || control.book_status !== "active" || control.book_currency !== book.currencyCode || control.book_basis !== book.accountingBasis) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Reporting book changed during funding read");
+    const documents = result.rows.filter(row => row.subledger_document_id !== null);
+    if (documents.length > 10000) throw new ErpFinancialsError("unsupported_operation", "Vendor funding history exceeds the complete-scan bound");
+    const rows: CustomerFundingDocument[] = documents.map(row => ({
+      status: row.terminal === true ? "voided" : "posted",
+      documentId: string(row.subledger_document_id,"subledger_document_id"), sourceId: string(row.source_id,"source_id"),
+      transactionId: string(row.transaction_id,"transaction_id"),documentType: string(row.document_type,"document_type"),
+      documentDate: date(row.document_date,"document_date"),originalAmount: money(row.original_amount,"original_amount"),
+      availableAmount: money(row.historical_open_amount,"historical_open_amount")
+    }));
+    const revision = createHash("sha256").update(JSON.stringify([scope.tenantId,scope.companyId,scope.bookId,input.vendorId,input.asOfDate,book.currencyCode,rows])).digest("hex");
+    if (expectedRevision !== undefined && revision !== expectedRevision) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Funding history changed; restart pagination");
+    if (offset > rows.length) throw new ErpFinancialsError("invalid_input", "Funding cursor exceeds document count");
+    const items = rows.slice(offset,offset+limit), next = offset+items.length;
+    return {vendorId: input.vendorId,asOfDate: input.asOfDate,currencyCode: book.currencyCode,revision,totalCount: rows.length,items,
+      ...(next < rows.length ? {nextCursor: Buffer.from(JSON.stringify({kind:"vendor-funding-v1",revision,offset:next})).toString("base64url")} : {})};
   });
 }
 
@@ -7708,6 +7762,85 @@ left join "erp_financials"."parties" party
 left join applied_documents applied on applied.source_id=document."source_id"
  and applied.document_id=document."subledger_document_id" and applied.document_type=document."document_type"
 left join terminal_documents terminal on document."document_type" <> 'invoice'
+ and terminal."source_id"=document."source_id" and terminal."original_transaction_id"=document."transaction_id"
+where document."tenant_id" = $1 and document."company_id" = $2
+  ${party === undefined ? "" : `and document.party_id=${party}`}
+  and (document."document_type" = ${documentType} or document."document_type" = any(${offsetTypes}::text[]))
+  and document."currency_code" = ${currency} and coalesce(document."recognition_date",document."document_date") <= ${asOf}::date
+), aging_documents as (
+  select "party_id", "party_name", "document_type", "aging_date", "due_date",
+    case when "document_type" = ${documentType} then "historical_open_amount" else -"historical_open_amount" end as "signed_open_amount"
+  from aging_balances where "historical_open_amount" > 0
+)`;
+}
+
+function vendorFundingDocumentsSql(asOf = "$6", currency = "$5", documentType = "$4", offsetTypes = "$7", party?: string): string {
+  return `with effective_applications as materialized (
+  select application."source_id",coalesce(application."source_document_source_id",application."source_id") as funding_source_id,coalesce(application."target_document_source_id",application."source_id") as target_source_id,application."target_document_id",application."source_document_id",
+    application."application_type",application."applied_amount"
+  from "erp_financials"."subledger_applications" application
+  join "erp_financials"."reporting_book_sources" source
+    on source."tenant_id" = application."tenant_id" and source."company_id" = application."company_id"
+   and source."source_id" = application."source_id" and source."book_id" = $3
+  join "erp_financials"."financial_lifecycle_events" applied_event
+    on applied_event."tenant_id" = application."tenant_id" and applied_event."company_id" = application."company_id"
+   and applied_event."source_id" = application."source_id" and applied_event."event_id" = application."applied_event_id"
+  left join "erp_financials"."financial_lifecycle_events" ended_event
+    on ended_event."tenant_id" = application."tenant_id" and ended_event."company_id" = application."company_id"
+   and ended_event."source_id" = application."source_id" and ended_event."event_id" = application."ended_event_id"
+  where application."tenant_id" = $1 and application."company_id" = $2 and application."currency_code" = ${currency}
+    ${party === undefined ? "" : `and exists(select 1 from erp_financials.subledger_documents customer_document
+      where customer_document.tenant_id=application.tenant_id and customer_document.company_id=application.company_id
+        and ((customer_document.source_id=coalesce(application.source_document_source_id,application.source_id) and customer_document.subledger_document_id=application.source_document_id)
+          or (customer_document.source_id=coalesce(application.target_document_source_id,application.source_id) and customer_document.subledger_document_id=application.target_document_id))
+        and customer_document.party_id=${party})`}
+    and application."application_type" in ('bill_payment_to_bill','vendor_credit_to_bill')
+    and application."application_date" <= ${asOf}::date
+    and coalesce((applied_event."payload"->>'applicationDate')::date, (applied_event."occurred_at" at time zone 'UTC')::date) <= ${asOf}::date
+    and (ended_event."event_id" is null or coalesce((ended_event."payload"->>'effectiveDate')::date, (ended_event."occurred_at" at time zone 'UTC')::date) > ${asOf}::date)
+), applied_documents as (
+  select source_id, document_id, document_type, sum(applied_amount) amount from (
+    select target_source_id as source_id,target_document_id document_id,'vendor_bill'::text document_type,applied_amount
+    from effective_applications where application_type in ('bill_payment_to_bill','vendor_credit_to_bill')
+    union all
+    select funding_source_id as source_id,source_document_id,
+      case when application_type in ('vendor_credit_to_bill') then 'vendor_credit' else 'bill_payment' end,applied_amount
+    from effective_applications where application_type in ('bill_payment_to_bill','vendor_credit_to_bill')
+  ) sides group by source_id,document_id,document_type
+), terminal_documents as (
+  select link."source_id",link."original_transaction_id",min(related."transaction_date") "effective_date"
+  from "erp_financials"."journal_entry_links" link
+  join "erp_financials"."transactions" related on related."tenant_id" = link."tenant_id"
+   and related."source_id" = link."source_id" and related."transaction_id" = link."related_transaction_id"
+  where link."tenant_id" = $1 and link."company_id" = $2 and link."link_type" in ('void','reversal')
+  ${party === undefined ? "" : `and exists(select 1 from erp_financials.subledger_documents customer_document
+    where customer_document.tenant_id=link.tenant_id and customer_document.company_id=link.company_id
+      and customer_document.source_id=link.source_id and customer_document.transaction_id=link.original_transaction_id
+      and customer_document.party_id=${party})`}
+  group by link."source_id",link."original_transaction_id"
+), aging_balances as (
+select document."subledger_document_id", document."source_id", document."transaction_id", document."document_date", document."original_amount", terminal."effective_date" as "terminal_date",
+  document."party_id", party."display_name" as "party_name", document."document_type", document."due_date",
+  case when document."document_type" = ${documentType} then coalesce(document."due_date", document."document_date") else document."document_date" end as "aging_date",
+  case
+    when document."document_type" = 'refund' then 0
+    when terminal."effective_date" <= ${asOf}::date then 0
+    -- Preserve provider-owned current snapshots where the provider does not
+    -- supply a complete application history (same contract as the AP register).
+    when document."metadata"->>'provider' = 'quickbooks' and document."updated_at" < (${asOf}::date + interval '1 day') then document."open_amount"
+    else greatest(document."original_amount" - coalesce(applied."amount", 0), 0)
+  end as "historical_open_amount"
+from "erp_financials"."subledger_documents" document
+join "erp_financials"."reporting_book_sources" source
+  on source."tenant_id" = document."tenant_id" and source."company_id" = document."company_id"
+ and source."book_id" = $3 and source."source_id" = document."source_id"
+ and (source."effective_from" is null or source."effective_from" <= coalesce(document."recognition_date",document."document_date"))
+ and (source."effective_through" is null or source."effective_through" >= coalesce(document."recognition_date",document."document_date"))
+left join "erp_financials"."parties" party
+  on party."tenant_id" = document."tenant_id" and party."source_id" = document."source_id" and party."party_id" = document."party_id"
+left join applied_documents applied on applied.source_id=document."source_id"
+ and applied.document_id=document."subledger_document_id" and applied.document_type=document."document_type"
+left join terminal_documents terminal on document."document_type" <> 'vendor_bill'
  and terminal."source_id"=document."source_id" and terminal."original_transaction_id"=document."transaction_id"
 where document."tenant_id" = $1 and document."company_id" = $2
   ${party === undefined ? "" : `and document.party_id=${party}`}

@@ -356,6 +356,8 @@ export type {
   CustomerStatement,
   CustomerFundingDocument,
   CustomerFundingDocumentPage,
+  VendorFundingDocumentRequest,
+  VendorFundingDocumentPage,
   CustomerStatementBalance,
   CustomerStatementApplicationEvidence,
   CustomerStatementRequest,
