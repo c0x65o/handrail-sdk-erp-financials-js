@@ -29,7 +29,7 @@ const minor = (value: unknown): bigint => {
   if (/[1-9]/.test(fraction.slice(2))) return fail("Vendor amount contains fractional cents");
   return (value.startsWith("-") ? -1n : 1n) * (BigInt(whole ?? fail("Missing vendor amount")) * 100n + BigInt(fraction.slice(0, 2).padEnd(2, "0")));
 };
-const decimal = (value: bigint): string => `${value < 0n ? "-" : ""}${(value < 0n ? -value : value) / 100n}.${String((value < 0n ? -value : value) % 100n).padStart(2, "0")}`;
+const decimal = (value: bigint): string => `${value < 0n ? "-" : ""}${String((value < 0n ? -value : value) / 100n)}.${String((value < 0n ? -value : value) % 100n).padStart(2, "0")}`;
 
 /** The canonical accrual AP control is authoritative, not bill-open minus
  * funding-open (which double counts refunded funding). Retain all attributed
