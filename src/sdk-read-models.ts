@@ -376,6 +376,7 @@ export type CustomerStatementBalance = {
 };
 
 export type CustomerFundingDocument = {
+  readonly status: "posted" | "voided";
   readonly documentId: string;
   readonly sourceId: string;
   readonly transactionId: string;
@@ -3471,12 +3472,13 @@ async function getCustomerFundingDocuments(scope: Scope, request: CustomerStatem
     const book = await resolveBook(client, scope);
     const result = await client.query(`${receivableAgingDocumentsSql("$6", "$5", "'invoice'", "array['customer_payment','credit_memo','refund']", "$4")}
 select subledger_document_id, source_id, transaction_id, document_type, document_date::text,
- original_amount::text,historical_open_amount::text
+ original_amount::text,historical_open_amount::text, (terminal_date <= $6::date) as terminal
 from aging_balances where document_type <> 'invoice'
 order by document_date,source_id,subledger_document_id limit 10001`,
       [scope.tenantId,scope.companyId,scope.bookId,input.customerId,book.currencyCode,input.asOfDate]);
     if (result.rows.length > 10000) throw new ErpFinancialsError("unsupported_operation", "Customer funding history exceeds the complete-scan bound");
     const rows: CustomerFundingDocument[] = result.rows.map(row => ({
+      status: row.terminal === true ? "voided" : "posted",
       documentId: string(row.subledger_document_id,"subledger_document_id"), sourceId: string(row.source_id,"source_id"),
       transactionId: string(row.transaction_id,"transaction_id"),documentType: string(row.document_type,"document_type"),
       documentDate: date(row.document_date,"document_date"),originalAmount: money(row.original_amount,"original_amount"),
@@ -7675,7 +7677,7 @@ function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType 
       and customer_document.party_id=${party})`}
   group by link."source_id",link."original_transaction_id"
 ), aging_balances as (
-select document."subledger_document_id", document."source_id", document."transaction_id", document."document_date", document."original_amount",
+select document."subledger_document_id", document."source_id", document."transaction_id", document."document_date", document."original_amount", terminal."effective_date" as "terminal_date",
   document."party_id", party."display_name" as "party_name", document."document_type", document."due_date",
   case when document."document_type" = ${documentType} then coalesce(document."due_date", document."document_date") else document."document_date" end as "aging_date",
   case

@@ -192,7 +192,7 @@ function rows<Row extends Record<string, unknown>>(
 
 
 it("rejects malformed funding pagination before reading accounting", async () => {
-  const queries=statement({query:async()=>{throw Error("No reads expected");}});
+  const queries=statement({query:()=>Promise.reject(Error("No reads expected"))});
   for (const invalid of [{limit:0},{limit:201},{cursor:"not-json"},{customerId:" "},{asOfDate:"2026-02-30"}]) {
     await expect(queries.getCustomerFundingDocuments({customerId:"customer",asOfDate:"2026-08-31",...invalid})).rejects.toBeDefined();
   }
@@ -207,10 +207,11 @@ it("retains source-qualified funding rows and binds continuations to the entire 
   const input={customerId:"customer",asOfDate:"2026-08-31",limit:1};
   const first=await queries.getCustomerFundingDocuments(input);
   expect(first).toMatchObject({totalCount:2,items:[{sourceId:"historical",documentId:"same-id",availableAmount:"4.00"}]});
-  const second=await queries.getCustomerFundingDocuments({...input,cursor:first.nextCursor!});
+  if (!first.nextCursor) throw Error("Expected funding cursor");
+  const second=await queries.getCustomerFundingDocuments({...input,cursor:first.nextCursor});
   expect(second).toMatchObject({items:[{sourceId:"native",documentId:"same-id"}]});
   expect(second.nextCursor).toBeUndefined();
-  await expect(queries.getCustomerFundingDocuments({...input,customerId:"different",cursor:first.nextCursor!})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+  await expect(queries.getCustomerFundingDocuments({...input,customerId:"different",cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
   available="3.00";
-  await expect(queries.getCustomerFundingDocuments({...input,cursor:first.nextCursor!})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+  await expect(queries.getCustomerFundingDocuments({...input,cursor:first.nextCursor})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
 });

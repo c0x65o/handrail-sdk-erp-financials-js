@@ -7766,6 +7766,7 @@ insert into erp_financials.journal_entry_links values
     await sdk.refunds.voidIssued(voidCommand);
     expect(await sdk.refunds.voidIssued(voidCommand)).toMatchObject({status:"already_voided"});
     expect((await reporting.queries.getCustomerFundingDocuments({customerId:"customer_1",asOfDate:"2026-08-04"})).items.filter(row=>row.documentType==="credit_memo").reduce((sum,row)=>sum+Number(row.availableAmount),0)).toBe(200);
+    expect((await reporting.queries.getCustomerFundingDocuments({customerId:"customer_1",asOfDate:"2026-08-04"})).items.find(row=>row.documentId===refund.documentId)?.status).toBe("voided");
     const balances = (await pool.query<{subledger_document_id:string;open_amount:string;version:number}>("select subledger_document_id,open_amount::text,version from erp_financials.subledger_documents where document_type='credit_memo'")).rows;
     expect(balances.every(row=>Number(row.open_amount)===100)).toBe(true);
     const current = requiredComponentFixture(balances.find(row=>row.subledger_document_id===source.documentId));
