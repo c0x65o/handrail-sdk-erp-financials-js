@@ -354,6 +354,8 @@ export type {
   OperationalAccountListItem,
   CommercialDocumentLineReadModel,
   CustomerStatement,
+  CustomerFundingDocument,
+  CustomerFundingDocumentPage,
   CustomerStatementBalance,
   CustomerStatementApplicationEvidence,
   CustomerStatementRequest,

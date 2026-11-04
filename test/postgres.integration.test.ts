@@ -7746,6 +7746,13 @@ insert into erp_financials.journal_entry_links values
     expect(await depositDatabaseState(pool)).toEqual(before);
     const refund = await sdk.refunds.issue(command);
     expect(refund).toMatchObject({openAmount:"0.00",documentStatus:"settled",version:split?3:2});
+    const reporting = createErpFinancialsSdk({database:runner,tenantId:"tenant_1",companyId:"company_1",writeSourceId:"source_1",bookId:"funding-book",currencyCode:"USD"});
+    await reporting.books.define({operation,bookId:"funding-book",name:"Funding",baseCurrencyCode:"USD"});
+    await reporting.books.bindSource({operation,bookId:"funding-book",sourceId:"source_1",sourceRole:"active"});
+    const funding = await reporting.queries.getCustomerFundingDocuments({customerId:"customer_1",asOfDate:"2026-08-03"});
+    expect(funding.items.find(row=>row.documentId===refund.documentId)).toMatchObject({documentType:"refund",originalAmount:"30.00",availableAmount:"0.00"});
+    expect(funding.items.filter(row=>row.documentType==="credit_memo").reduce((sum,row)=>sum+Number(row.availableAmount),0)).toBe(170);
+    expect((await reporting.queries.getCustomerFundingDocuments({customerId:"customer_1",asOfDate:"2026-08-02"})).items.some(row=>row.documentId===refund.documentId)).toBe(false);
     const after = await depositDatabaseState(pool);
     expect(await sdk.refunds.issue(command)).toMatchObject({documentId:refund.documentId,status:"already_posted"});
     expect(await depositDatabaseState(pool)).toEqual(after);
@@ -7758,6 +7765,7 @@ insert into erp_financials.journal_entry_links values
     expect(await depositDatabaseState(pool)).toEqual(after);
     await sdk.refunds.voidIssued(voidCommand);
     expect(await sdk.refunds.voidIssued(voidCommand)).toMatchObject({status:"already_voided"});
+    expect((await reporting.queries.getCustomerFundingDocuments({customerId:"customer_1",asOfDate:"2026-08-04"})).items.filter(row=>row.documentType==="credit_memo").reduce((sum,row)=>sum+Number(row.availableAmount),0)).toBe(200);
     const balances = (await pool.query<{subledger_document_id:string;open_amount:string;version:number}>("select subledger_document_id,open_amount::text,version from erp_financials.subledger_documents where document_type='credit_memo'")).rows;
     expect(balances.every(row=>Number(row.open_amount)===100)).toBe(true);
     const current = requiredComponentFixture(balances.find(row=>row.subledger_document_id===source.documentId));

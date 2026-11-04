@@ -189,3 +189,28 @@ function rows<Row extends Record<string, unknown>>(
 ): Promise<PostgresQueryResult<Row>> {
   return Promise.resolve({ rows: values as Row[] });
 }
+
+
+it("rejects malformed funding pagination before reading accounting", async () => {
+  const queries=statement({query:async()=>{throw Error("No reads expected");}});
+  for (const invalid of [{limit:0},{limit:201},{cursor:"not-json"},{customerId:" "},{asOfDate:"2026-02-30"}]) {
+    await expect(queries.getCustomerFundingDocuments({customerId:"customer",asOfDate:"2026-08-31",...invalid})).rejects.toBeDefined();
+  }
+});
+
+it("retains source-qualified funding rows and binds continuations to the entire selection", async () => {
+  let available = "4.00";
+  const queries=statement({query: async <Row extends Record<string,unknown>>(sql:string):Promise<PostgresQueryResult<Row>> => {
+    if(sql.includes('from "erp_financials"."reporting_books"')) return rows<Row>([{base_currency_code:"USD",accounting_basis:"accrual",status:"active"}]);
+    return rows<Row>(["historical","native"].map(source_id=>({source_id,subledger_document_id:"same-id",transaction_id:"tx",document_type:"customer_payment",document_date:"2026-08-01",original_amount:"10.00",historical_open_amount:available})));
+  }});
+  const input={customerId:"customer",asOfDate:"2026-08-31",limit:1};
+  const first=await queries.getCustomerFundingDocuments(input);
+  expect(first).toMatchObject({totalCount:2,items:[{sourceId:"historical",documentId:"same-id",availableAmount:"4.00"}]});
+  const second=await queries.getCustomerFundingDocuments({...input,cursor:first.nextCursor!});
+  expect(second).toMatchObject({items:[{sourceId:"native",documentId:"same-id"}]});
+  expect(second.nextCursor).toBeUndefined();
+  await expect(queries.getCustomerFundingDocuments({...input,customerId:"different",cursor:first.nextCursor!})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+  available="3.00";
+  await expect(queries.getCustomerFundingDocuments({...input,cursor:first.nextCursor!})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+});

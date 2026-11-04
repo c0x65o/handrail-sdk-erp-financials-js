@@ -57,6 +57,20 @@ suite('importer-generated imported credit public package PostgreSQL',()=>{
     await sdk.books.define({operation,bookId:'dates-book',name:'Dates',baseCurrencyCode:'USD'});
     await sdk.books.bindSource({operation,bookId:'dates-book',sourceId:scope.sourceId,sourceRole:'historical'});
     const customerId=required(facts.parties[0]).partyId;
+    const funding = await sdk.queries.getCustomerFundingDocuments({customerId,asOfDate:'2025-07-03',limit:1});
+    expect(funding.totalCount).toBeGreaterThan(0);
+    expect(funding.items[0]?.sourceId).toBe(scope.sourceId);
+    expect(funding.items[0]?.documentType).toBe('customer_payment');
+    expect(required(funding.items[0]).documentDate <= '2025-07-03').toBe(true);
+    const same = await sdk.queries.getCustomerFundingDocuments({customerId,asOfDate:'2025-07-03',limit:200});
+    expect(same.revision).toBe(funding.revision);
+    expect(same.items.reduce((sum,row)=>sum+Number(row.availableAmount),0)).toBeGreaterThan(0);
+    if (funding.nextCursor) {
+      const next = await sdk.queries.getCustomerFundingDocuments({customerId,asOfDate:'2025-07-03',limit:1,cursor:funding.nextCursor});
+      expect(next.items[0]?.documentId).not.toBe(funding.items[0]?.documentId);
+      await expect(sdk.queries.getCustomerFundingDocuments({customerId,asOfDate:'2025-07-04',cursor:funding.nextCursor})).rejects.toMatchObject({code:'optimistic_concurrency_conflict'});
+    }
+
     expect((await sdk.queries.getCustomerStatement({customerId,asOfDate:'2025-07-03'})).balance)
       .toMatchObject({invoiceOutstandingAmount:'0.00',unappliedCashAmount:split?'330.72':'358.28',netReceivableAmount:split?'-330.72':'-358.28'});
     expect((await sdk.queries.getCustomerStatement({customerId,asOfDate:'2025-07-04'})).balance)

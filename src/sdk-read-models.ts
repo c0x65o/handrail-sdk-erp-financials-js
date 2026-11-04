@@ -375,6 +375,25 @@ export type CustomerStatementBalance = {
   readonly netReceivableAmount: DecimalString;
 };
 
+export type CustomerFundingDocument = {
+  readonly documentId: string;
+  readonly sourceId: string;
+  readonly transactionId: string;
+  readonly documentType: string;
+  readonly documentDate: IsoDate;
+  readonly originalAmount: DecimalString;
+  readonly availableAmount: DecimalString;
+};
+export type CustomerFundingDocumentPage = {
+  readonly customerId: string;
+  readonly asOfDate: IsoDate;
+  readonly currencyCode: string;
+  readonly revision: string;
+  readonly totalCount: number;
+  readonly items: readonly CustomerFundingDocument[];
+  readonly nextCursor?: string;
+};
+
 export type CustomerStatement = {
   /** Added in 0.3.178. Absence on older SDKs is not a zero balance. */
   readonly balance?: CustomerStatementBalance;
@@ -1758,6 +1777,7 @@ export type FinancialReadModels = {
   listInvoiceAudit(invoiceId: string, input?: PageRequest): Promise<Page<InvoiceAuditEvent>>;
   getInvoiceSummary(input?: { readonly asOfDate?: IsoDate }): Promise<InvoiceSummary>;
   getCustomerStatement(input: CustomerStatementRequest): Promise<CustomerStatement>;
+  getCustomerFundingDocuments(input: CustomerStatementRequest): Promise<CustomerFundingDocumentPage>;
   getCurrentInvoiceLinePage(input: CurrentInvoiceLineRequest): Promise<CurrentInvoiceLinePage>;
   getCurrentVendorBillPage(input: CurrentVendorBillRequest): Promise<CurrentVendorBillPage>;
   getVendorBillRegister(input?: VendorBillRegisterRequest): Promise<VendorBillRegisterPage>;
@@ -1917,6 +1937,7 @@ export function createFinancialReadModels(input: Scope): FinancialReadModels {
     listInvoiceAudit: (invoiceId, request = {}) => listInvoiceAudit(input, invoiceId, request),
     getInvoiceSummary: (request = {}) => getInvoiceSummary(input, request),
     getCustomerStatement: (request) => getCustomerStatement(input, request),
+    getCustomerFundingDocuments: request => getCustomerFundingDocuments(input, request),
     getCurrentInvoiceLinePage: request => getCurrentInvoiceLinePage(input, request),
     getCurrentVendorBillPage: request => getCurrentVendorBillPage(input, request),
     getVendorBillRegister: (request = {}) => getVendorBillRegister(input, request),
@@ -3426,6 +3447,48 @@ function retainedImportedApplicationInBookSql(): string {
       and retained.payload->>'bookId'=$3 and retained.approver_ref is not null and retained.approver_ref<>retained.actor_ref
       and (writer.effective_from is null or writer.effective_from<=application.application_date)
       and (writer.effective_through is null or writer.effective_through>=application.application_date))`;
+}
+
+/** Bounded source-qualified funding history. Refunds are disbursements, not
+ * available credit; their funding is already deducted by effective applications.
+ * A content revision binds every continuation to the entire dated selection. */
+async function getCustomerFundingDocuments(scope: Scope, request: CustomerStatementRequest): Promise<CustomerFundingDocumentPage> {
+  const input = structuredClone(request);
+  assertNonEmpty(input.customerId, "customerId"); assertDate(input.asOfDate, "asOfDate");
+  const limit = input.limit ?? 50;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new ErpFinancialsError("invalid_input", "Funding page limit must be between 1 and 200");
+  let offset = 0, expectedRevision: string | undefined;
+  if (input.cursor !== undefined) {
+    try {
+      if (input.cursor.length > 1024 || !/^[A-Za-z0-9_-]+$/u.test(input.cursor)) throw Error();
+      const cursor: unknown = JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8"));
+      if (!isRecord(cursor) || cursor.kind !== "customer-funding-v1" || typeof cursor.revision !== "string"
+        || !/^[a-f0-9]{64}$/u.test(cursor.revision) || typeof cursor.offset !== "number" || !Number.isInteger(cursor.offset) || cursor.offset < 1 || cursor.offset > 10000) throw Error();
+      offset = cursor.offset; expectedRevision = cursor.revision;
+    } catch { throw new ErpFinancialsError("invalid_input", "Invalid funding document cursor"); }
+  }
+  return scope.database.transaction(async client => {
+    const book = await resolveBook(client, scope);
+    const result = await client.query(`${receivableAgingDocumentsSql("$6", "$5", "'invoice'", "array['customer_payment','credit_memo','refund']", "$4")}
+select subledger_document_id, source_id, transaction_id, document_type, document_date::text,
+ original_amount::text,historical_open_amount::text
+from aging_balances where document_type <> 'invoice'
+order by document_date,source_id,subledger_document_id limit 10001`,
+      [scope.tenantId,scope.companyId,scope.bookId,input.customerId,book.currencyCode,input.asOfDate]);
+    if (result.rows.length > 10000) throw new ErpFinancialsError("unsupported_operation", "Customer funding history exceeds the complete-scan bound");
+    const rows: CustomerFundingDocument[] = result.rows.map(row => ({
+      documentId: string(row.subledger_document_id,"subledger_document_id"), sourceId: string(row.source_id,"source_id"),
+      transactionId: string(row.transaction_id,"transaction_id"),documentType: string(row.document_type,"document_type"),
+      documentDate: date(row.document_date,"document_date"),originalAmount: money(row.original_amount,"original_amount"),
+      availableAmount: money(row.historical_open_amount,"historical_open_amount")
+    }));
+    const revision = createHash("sha256").update(JSON.stringify([scope.tenantId,scope.companyId,scope.bookId,input.customerId,input.asOfDate,book.currencyCode,rows])).digest("hex");
+    if (expectedRevision !== undefined && revision !== expectedRevision) throw new ErpFinancialsError("optimistic_concurrency_conflict", "Funding history changed; restart pagination");
+    if (offset > rows.length) throw new ErpFinancialsError("invalid_input", "Funding cursor exceeds document count");
+    const items = rows.slice(offset,offset+limit), next = offset+items.length;
+    return {customerId: input.customerId,asOfDate: input.asOfDate,currencyCode: book.currencyCode,revision,totalCount: rows.length,items,
+      ...(next < rows.length ? {nextCursor: Buffer.from(JSON.stringify({kind:"customer-funding-v1",revision,offset:next})).toString("base64url")} : {})};
+  });
 }
 
 async function getCustomerStatement(
@@ -7612,9 +7675,11 @@ function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType 
       and customer_document.party_id=${party})`}
   group by link."source_id",link."original_transaction_id"
 ), aging_balances as (
-select document."party_id", party."display_name" as "party_name", document."document_type", document."due_date",
+select document."subledger_document_id", document."source_id", document."transaction_id", document."document_date", document."original_amount",
+  document."party_id", party."display_name" as "party_name", document."document_type", document."due_date",
   case when document."document_type" = ${documentType} then coalesce(document."due_date", document."document_date") else document."document_date" end as "aging_date",
   case
+    when document."document_type" = 'refund' then 0
     when terminal."effective_date" <= ${asOf}::date then 0
     -- Preserve provider-owned current snapshots where the provider does not
     -- supply a complete application history (same contract as the AP register).
