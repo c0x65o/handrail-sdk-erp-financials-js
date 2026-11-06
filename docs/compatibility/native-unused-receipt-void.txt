@@ -18,7 +18,7 @@ Validation: 3 focused real PostgreSQL lifecycle tests (including concurrent repl
 25 migration/manifest tests; SDK lint, typecheck and build passed. No CI check
 configuration changed. Focused commands/results are retained in this work's evidence.
 
-2026-11-06 — 0.3.212 follow-up for Spartan (schema unchanged)
+2026-11-06 — 0.3.213 follow-up for Spartan (schema unchanged)
 
 Explicit origin: native_released additionally accepts wholly restored native
 receipts with ended same-source customer_payment_to_invoice applications. Each

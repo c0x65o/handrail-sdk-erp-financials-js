@@ -365,10 +365,10 @@ function correctionService(context: Context, post: (client: PostgresQueryClient,
         where tenant_id=$1 and source_id=$2 and (posting_id=any($3::text[])
           or starts_with(source_posting_id,$4) or starts_with(source_posting_id,$5)) order by posting_id for share`,
         [context.tenantId, context.sourceId, postingIds, `cash-application:${id}:recognize:`, `cash-application:${id}:reverse:`])).rows;
-      if (postings.length !== postingIds.length || postings.some(p => !postingIds.includes(p.posting_id)
+      if (postings.length !== postingIds.length || postings.some(p => !postingIds.includes(String(p.posting_id))
         || p.transaction_id !== invoice.transaction_id || p.accounting_basis !== "cash" || p.currency_code !== context.currencyCode))
         fail("Released receipt cash postings do not match the exact invoice allocation");
-      const originals = postings.filter(p => originalIds.includes(p.posting_id)), reversals = postings.filter(p => reversalIds.includes(p.posting_id));
+      const originals = postings.filter(p => originalIds.includes(String(p.posting_id))), reversals = postings.filter(p => reversalIds.includes(String(p.posting_id)));
       for (const entry of originals) {
         const source = String(entry.source_posting_id), prefix = `cash-application:${id}:recognize:`;
         const matches = reversals.filter(p => p.source_posting_id === source.replace(prefix, `cash-application:${id}:reverse:`));
