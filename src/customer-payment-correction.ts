@@ -21,6 +21,8 @@ export type ImportedCustomerPaymentEvidence = {
 };
 export type CustomerPaymentCorrectionRequest = {
   readonly paymentId: string;
+  /** Explicit opt-in; native receipts must be wholly unused with no application history. */
+  readonly origin?: "native_unused";
   readonly date: string;
   readonly idempotencyKey: string;
   readonly operation: FinancialOperationContext;
@@ -203,8 +205,7 @@ function correctionService(context: Context, post: (client: PostgresQueryClient,
     if (bindings.rows.length !== 1 || bindings.rows[0]?.company_id !== context.companyId)
       fail("Correction source must belong exclusively to this company");
     const sources = await client.query("select source_system from erp_financials.accounting_sources where tenant_id=$1 and source_id=$2 for share", [context.tenantId, context.sourceId]);
-    if (sources.rows[0]?.source_system !== "quickbooks")
-      fail("Correction requires a QuickBooks import source");
+
     const books = (await client.query("select book_id from erp_financials.reporting_book_sources where tenant_id=$1 and company_id=$2 and source_id=$3 for share", scope)).rows;
     if (context.bookId ? !books.some(b => b.book_id === context.bookId) : books.length > 0)
       fail("Missing or mismatched reporting book provenance");
@@ -212,6 +213,11 @@ function correctionService(context: Context, post: (client: PostgresQueryClient,
     const payment = (await client.query(`select * from erp_financials.subledger_documents where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_document_id=$4 for update`, [...scope, request.paymentId])).rows[0];
     if (!payment || payment.document_type !== "customer_payment" || payment.status === "voided" || payment.currency_code !== context.currencyCode)
       fail("Payment is missing, terminal or outside correction scope");
+    if (request.origin === "native_unused") {
+      if (sources.rows[0]?.source_system !== "native_erp") fail("Native receipt void requires a native ERP source");
+      return prepareNative(client, request, payment, appEvidence);
+    }
+    if (sources.rows[0]?.source_system !== "quickbooks") fail("Correction requires a QuickBooks import source");
     const metadata = payment.metadata as Row | undefined;
     if (metadata?.provider !== "quickbooks" || metadata.sourceTransactionType !== "Payment" || metadata.customerPaymentProvenance)
       fail("Imported payment provenance is missing or has external associations");
@@ -308,8 +314,58 @@ function correctionService(context: Context, post: (client: PostgresQueryClient,
       postingIds: postings.map(p => String(p.posting_id)), reversals: postings.map(p => ({ basis: String(p.accounting_basis), accountId: String(p.account_id), debit: money(p.credit_amount), credit: money(p.debit_amount) })) };
     return { preview, payment, evidence, postings, applications };
   }
+  async function prepareNative(client: PostgresQueryClient, request: CustomerPaymentCorrectionRequest, payment: Row, appEvidence: Row) {
+    const metadata = payment.metadata as Row | undefined;
+    if (metadata?.provider || metadata?.customerPaymentProvenance || metadata?.collectionRef || payment.status !== "open"
+      || minor(payment.original_amount) <= 0n || minor(payment.open_amount) !== minor(payment.original_amount))
+      fail("Native void requires an unassociated, wholly unused receipt");
+    const applications = (await client.query(`select * from erp_financials.subledger_applications where tenant_id=$1 and company_id=$2
+      and (source_document_id=$3 or target_document_id=$3) for update`, [context.tenantId, context.companyId, request.paymentId])).rows;
+    if (applications.length) fail("Resolve native receipt application history through its owning lifecycle");
+    const outbox = (await client.query(`select * from erp_financials.financial_outbox where tenant_id=$1 and company_id=$2 and source_id=$3
+      and aggregate_id=$4 and event_type='subledger_document.customer_payment.posted' for share`, [...scope, request.paymentId])).rows;
+    if (outbox.length !== 1 || outbox[0]?.book_id !== (context.bookId ?? null)
+      || (outbox[0].payload as Row).transactionId !== payment.transaction_id)
+      fail("Native receipt requires exact posted document/book evidence");
+    const keys = [String(payment.idempotency_key), `${String(payment.idempotency_key)}:accounting-basis:cash`];
+    const transactions = (await client.query(`select * from erp_financials.transactions where tenant_id=$1 and source_id=$2
+      and source_transaction_type='Subledger:customer_payment' and source_transaction_id=any($3::text[]) order by transaction_id for update`,
+      [context.tenantId, context.sourceId, keys])).rows;
+    if (transactions.length !== 2 || !transactions.some(t => t.transaction_id === payment.transaction_id)
+      || transactions.some(t => t.status !== "posted" || t.currency_code !== context.currencyCode || t.party_id !== payment.party_id))
+      fail("Native receipt requires both original posted basis transactions");
+    const transactionIds = transactions.map(t => String(t.transaction_id));
+    const postings = (await loadPaymentAccountingEvidence(client, context.tenantId, context.sourceId, transactionIds)).postings;
+    for (const basis of ["accrual", "cash"]) {
+      const entries = postings.filter(p => p.accounting_basis === basis);
+      const transaction = transactions.find(t => t.source_transaction_id === (basis === "cash" ? keys[1] : keys[0]));
+      if (!transaction || entries.length !== 2 || entries.some(p => p.transaction_id !== transaction.transaction_id
+        || p.party_id !== payment.party_id || p.currency_code !== context.currencyCode || minor(p.debit_amount) < 0n || minor(p.credit_amount) < 0n
+        || (minor(p.debit_amount) > 0n) === (minor(p.credit_amount) > 0n))
+        || entries.reduce((sum,p) => sum + minor(p.debit_amount),0n) !== minor(payment.original_amount)
+        || entries.reduce((sum,p) => sum + minor(p.credit_amount),0n) !== minor(payment.original_amount))
+        fail("Native receipt basis postings are incomplete or inconsistent");
+    }
+    const blocked = (await client.query(`select 1 from erp_financials.journal_entry_links where tenant_id=$1 and company_id=$2 and source_id=$3
+      and (original_transaction_id=any($4::text[]) or related_transaction_id=any($4::text[]))
+      union all select 1 from erp_financials.bank_reconciliation_matches where tenant_id=$1 and company_id=$2 and source_id=$3
+      and transaction_id=any($4::text[]) and status='matched'`, [...scope, transactionIds])).rows;
+    if (blocked.length) fail("Native receipt has journal correction or bank reconciliation ownership");
+    const dates = (await client.query(`select document_date::text as date from erp_financials.subledger_documents where tenant_id=$1
+      and company_id=$2 and source_id=$3 and subledger_document_id=$4`, [...scope, request.paymentId])).rows;
+    if (!dates[0] || request.date < String(dates[0].date)) fail("Native void cannot predate the receipt");
+    for (const date of [request.date, String(dates[0].date)]) await assertPostingDateAllowed(client, context, date);
+    const evidence = {sourceVersion: `native:${String(payment.lifecycle_event_id)}:${String(payment.version)}`, transactionIds};
+    const preview: CustomerPaymentCorrectionPreview = {replayPolicy: "preserve_corrected_payment",
+      confirmation: hash({scope, bookId:context.bookId ?? null, request, payment, transactions, postings, outbox, appEvidence}),
+      paymentId:request.paymentId, paymentVersion:Number(payment.version), sourceVersion:evidence.sourceVersion, applications:[],
+      postingIds:postings.map(p => String(p.posting_id)), reversals:postings.map(p => ({basis:String(p.accounting_basis),
+        accountId:String(p.account_id), debit:money(p.credit_amount), credit:money(p.debit_amount)}))};
+    return {preview, payment, evidence, postings, applications};
+  }
   function requestCopy(input: CustomerPaymentCorrectionRequest): CustomerPaymentCorrectionRequest {
-    const request = structuredClone({ paymentId: input.paymentId, date: input.date, idempotencyKey: input.idempotencyKey, operation: input.operation });
+    const request = structuredClone({ paymentId: input.paymentId, date: input.date, idempotencyKey: input.idempotencyKey, operation: input.operation, ...(input.origin === undefined ? {} : {origin: input.origin}) });
+    if (!( [undefined, "native_unused"] as readonly unknown[]).includes(request.origin)) fail("Unsupported payment origin");
     request.operation = copyFinancialOperation(input.operation);
     assertFinancialApproval(context, request.operation);
     [request.paymentId, request.idempotencyKey, request.operation.reasonDetail].forEach(nonempty);

@@ -1439,6 +1439,52 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     await expect(sdk.queries.getJournalPostingPage({sourceId:"source_qbo",transactionId:"transaction_invoice_qbo",periodStart:"2026-08-01",periodEnd:"2026-08-01"})).rejects.toMatchObject({code:"invalid_input",message:"Canonical journal line linkage is incomplete"});
   });
 
+  async function nativeVoidFixture() {
+    const {options, operation} = await paymentHoldFixture();
+    const guard: CustomerPaymentCorrectionGuard = () => Promise.resolve({authorized:true,complete:true,deposited:false,reconciled:false,refunded:false,version:"host-locked-v1"});
+    const sdk = createErpFinancialsSdk({...options, customerPaymentCorrectionGuard:guard});
+    const receiptInput = {operation,idempotencyKey:"native-void:receipt",customerId:"customer_1",date:"2026-08-01",amount:"10.00",cashAccount:{accountId:"account_cash"},receivableAccount:{accountId:"account_ar"}};
+    const receipt = await sdk.commands.customerPayments.record(receiptInput);
+    const command = {paymentId:receipt.documentId,origin:"native_unused" as const,date:"2026-08-12",idempotencyKey:"native-void:correction",operation:{...operation,reasonDetail:"Receipt entered in error"}};
+    return {sdk,options,operation,command,receipt,receiptInput};
+  }
+  it("native unused receipt void reverses both bases once and protects the original history", async () => {
+    const {sdk,command,receipt,receiptInput} = await nativeVoidFixture();
+    const preview = await sdk.commands.customerPayments.previewVoidAndUnapply(command);
+    expect(preview.postingIds).toHaveLength(4);
+    const input={...command,confirmation:preview.confirmation,approvalRef:"host:approved"};
+    const results=await Promise.all([sdk.commands.customerPayments.voidAndUnapply(input),sdk.commands.customerPayments.voidAndUnapply(input)]);
+    expect(results.map(r=>r.status).sort()).toEqual(["already_voided","voided"]);
+    expect(results[0].basisReversals).toHaveLength(2);
+    expect(await sdk.queries.getCustomerPayment(receipt.documentId)).toMatchObject({status:"voided",unappliedAmount:"0.00"});
+    const ids=results[0].basisReversals.flatMap(r=>[...r.originalTransactionIds,r.reversalTransactionId]);
+    const sums=await pool.query<{accounting_basis:string;net:string}>(`select accounting_basis,sum(debit_amount-credit_amount)::text as net from erp_financials.ledger_postings
+      where transaction_id=any($1::text[]) and account_id='account_cash' group by accounting_basis`,[ids]);
+    expect(sums.rows).toHaveLength(2);expect(sums.rows.every(r=>Number(r.net)===0)).toBe(true);
+    await expect(pool.query(`update erp_financials.subledger_documents set status='open' where subledger_document_id=$1`,[receipt.documentId])).rejects.toThrow('corrected_record');
+    await expect(pool.query(`update erp_financials.ledger_postings set posting_date='2026-08-13' where posting_id=$1`,[preview.postingIds[0]])).rejects.toThrow('immutable');
+    await expect(sdk.commands.customerPayments.record(receiptInput)).rejects.toThrow();
+    await expect(sdk.commands.customerPayments.voidAndUnapply({...input,approvalRef:"different"})).rejects.toMatchObject({code:"idempotency_conflict"});
+    await expect(sdk.commands.customerPayments.record({...receiptInput,idempotencyKey:"native-void:replacement"})).resolves.toMatchObject({openAmount:"10.00"});
+  });
+  it("native unused receipt void rejects used receipts and stale host review", async () => {
+    const {sdk,options,command,operation,receipt} = await nativeVoidFixture();
+    const preview=await sdk.commands.customerPayments.previewVoidAndUnapply(command);
+    const changed=createErpFinancialsSdk({...options,customerPaymentCorrectionGuard:()=>Promise.resolve({authorized:true,complete:true,deposited:false,reconciled:false,refunded:false,version:"host-v2"})});
+    await expect(changed.commands.customerPayments.voidAndUnapply({...command,confirmation:preview.confirmation,approvalRef:"host:approved"})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    const invoice=await sdk.commands.invoices.create({operation,idempotencyKey:"native-void:invoice",customerId:"customer_1",date:"2026-08-01",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"10.00"}]});
+    await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"native-void:apply",applicationType:"customer_payment_to_invoice",sourceDocumentId:receipt.documentId,targetDocumentId:invoice.documentId,amount:"1.00",applicationDate:"2026-08-02",expectedSourceVersion:1,expectedTargetVersion:1});
+    await expect(sdk.commands.customerPayments.voidAndUnapply({...command,confirmation:preview.confirmation,approvalRef:"host:approved"})).rejects.toThrow('wholly unused');
+  });
+  it("native unused receipt void requires independent approval and complete unowned evidence", async () => {
+    const {sdk,options,command}=await nativeVoidFixture();
+    await expect(async()=>sdk.commands.customerPayments.previewVoidAndUnapply({...command,operation:{...command.operation,approverRef:command.operation.actorRef}})).rejects.toThrow();
+    await expect(createErpFinancialsSdk(options).commands.customerPayments.previewVoidAndUnapply(command)).rejects.toThrow('guard');
+    const blocked=createErpFinancialsSdk({...options,customerPaymentCorrectionGuard:()=>Promise.resolve({authorized:true,complete:true,deposited:true,reconciled:false,refunded:false,version:"owned"})});
+    await expect(blocked.commands.customerPayments.previewVoidAndUnapply(command)).rejects.toThrow('blocks correction');
+    await expect(sdk.commands.customerPayments.previewVoidAndUnapply({...command,date:"2026-07-31"})).rejects.toThrow('predate');
+  });
+
   async function applicationReplayFixture(){
     const {sdk,options,operation}=await paymentHoldFixture();
     const invoice=await sdk.commands.invoices.create({operation,idempotencyKey:"replay:invoice",customerId:"customer_1",date:"2026-08-01",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"10.00"}]});

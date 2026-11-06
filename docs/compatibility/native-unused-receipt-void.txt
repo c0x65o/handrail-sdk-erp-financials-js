@@ -1,0 +1,19 @@
+2026-11-06 — Hitcents gap 24 / Spartan shared capability notice
+
+customerPayments.previewVoidAndUnapply / voidAndUnapply now accept explicit
+origin: native_unused. The existing default remains imported QuickBooks behavior.
+Native ERP receipts must be wholly unused, unassociated and have no application
+history. Both original basis journals and exact book/outbox evidence are required.
+The existing transactional host guard and independent approval policy still apply.
+Voids preserve originals, append linked reversals, close the receipt, and retain a
+permanent correction tombstone. Schema v57 protects native originals/reversals,
+applications and bank matches without manufacturing imported evidence.
+
+Spartan should adopt 0.3.208 when implementing native receipt correction, binding
+its host guard to the exact locked request/approval evidence. No outside messages
+were sent. Used, deposited, returned and externally associated receipts still need
+their owning workflows; this extension does not claim those paths are supported.
+
+Validation: 3 focused real PostgreSQL lifecycle tests (including concurrent replay),
+25 migration/manifest tests; SDK lint, typecheck and build passed. No CI check
+configuration changed. Focused commands/results are retained in this work's evidence.
