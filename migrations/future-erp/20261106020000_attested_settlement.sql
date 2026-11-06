@@ -229,3 +229,52 @@ create trigger attested_settlement_retirement before update or delete on erp_fin
 for each row execute function erp_financials.guard_attested_settlement_retirement();
 create trigger attested_settlement_retirement before insert or update or delete on erp_financials.subledger_applications
 for each row execute function erp_financials.guard_attested_settlement_retirement();
+
+-- Spartan installs its book-scope validator separately. Retain the dedicated
+-- attestation validation as an additional trigger so it cannot be lost there.
+create function erp_financials.validate_attested_settlement_application() returns trigger language plpgsql as $$
+declare source_document erp_financials.subledger_documents%rowtype;
+begin
+ select * into source_document from erp_financials.subledger_documents
+ where tenant_id=new.tenant_id and company_id=new.company_id
+   and source_id=coalesce(new.source_document_source_id,new.source_id) and subledger_document_id=new.source_document_id;
+  -- Dedicated same-source settlement-only attestation. The independent imported
+  -- funding branch below remains unchanged for every ordinary funding command.
+  if exists (select 1 from erp_financials.financial_lifecycle_events e
+    where e.tenant_id=new.tenant_id and e.company_id=new.company_id and e.source_id=new.source_id
+      and e.event_id=new.applied_event_id and e.aggregate_id=new.subledger_application_id
+      and e.event_type='subledger_application.applied' and e.payload->>'settlementOnly'='true') then
+    if new.application_type<>'customer_payment_to_invoice' or new.source_document_source_id<>new.source_id
+      or new.target_document_source_id<>new.source_id or not exists (
+      select 1 from erp_financials.financial_lifecycle_events e
+      join erp_financials.subledger_applications a on a.tenant_id=e.tenant_id and a.company_id=e.company_id and a.source_id=e.source_id
+        and a.subledger_application_id=e.payload->>'endedApplicationId'
+      join erp_financials.subledger_documents d on d.tenant_id=a.tenant_id and d.company_id=a.company_id and d.source_id=a.source_id
+        and d.subledger_document_id=a.source_document_id
+      join erp_financials.financial_lifecycle_events ended on ended.event_id=a.ended_event_id and ended.tenant_id=a.tenant_id
+        and ended.company_id=a.company_id and ended.source_id=a.source_id
+      where e.tenant_id=new.tenant_id and e.company_id=new.company_id and e.source_id=new.source_id
+        and e.event_id=new.applied_event_id and e.aggregate_id=new.subledger_application_id
+        and e.event_type='subledger_application.applied' and e.payload->>'ledgerPolicy'='preserve_all_postings'
+        and length(e.payload->>'confirmation')=64 and length(e.payload->>'correctionId')>0
+        and e.payload->>'correctionId'=ended.payload->>'correctionId' and e.actor_ref=ended.actor_ref
+        and e.payload->>'sourceDocumentId'=new.source_document_id and e.payload->>'targetDocumentId'=new.target_document_id
+        and e.payload->>'effectiveDate'=new.application_date::text and (e.payload->>'amount')::numeric=new.applied_amount
+        and e.payload#>>'{attestation,erroneousReceiptNeverProcessed}'='true'
+        and e.payload#>>'{attestation,acceptUnchangedCashHistory}'='true'
+        and e.payload#>>'{attestation,providerDeletionVerified}'='false'
+        and length(e.payload#>>'{attestation,approvedBy}')>0
+        and jsonb_array_length(e.payload#>'{attestation,authorizationRefs}')>0
+        and e.payload#>>'{attestation,evidenceSha256}' ~ '^[a-f0-9]{64}$'
+        and a.status='voided' and a.applied_amount=new.applied_amount and a.target_document_id=new.target_document_id
+        and d.status='voided' and d.open_amount=0 and d.original_amount=new.applied_amount
+        and d.party_id=source_document.party_id and d.currency_code=new.currency_code
+        and d.subledger_document_id<>new.source_document_id
+        and exists(select 1 from erp_financials.transactions t where t.tenant_id=e.tenant_id
+          and t.source_id=e.payload->>'offsetSourceId' and t.transaction_id=e.payload->>'offsetTransactionId' and t.status='posted')
+    ) then raise exception 'attested settlement requires exact owner evidence and retired original settlement'; end if;
+  end if;
+ return new;
+end $$;
+create trigger attested_settlement_validation before insert on erp_financials.subledger_applications
+for each row execute function erp_financials.validate_attested_settlement_application();

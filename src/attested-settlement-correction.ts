@@ -171,7 +171,7 @@ export function createAttestedSettlementCorrection(context: AttestedSettlementCo
           documentEvidence: prepared.rows, originalApplication: prepared.application, authorization: prepared.authorization.evidence, ledgerBeforeChecksum: hash(prepared.beforeLedger), ledgerAfterChecksum: hash(prepared.beforeLedger) };
         const receipt = await appendFinancialLifecycleEvent(client, { tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId,
           aggregateType: "customer_payment", aggregateId: request.paymentId, eventType, idempotencyKey: `attested-settlement:${request.idempotencyKey}:receipt`, operation: request.operation, recordedAt: context.now(), payload: json(payload) });
-        await appendFinancialOutboxEvent(client, { tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId, bookId: context.bookId, eventType, aggregateType: "customer_payment", aggregateId: request.paymentId, idempotencyKey: correctionId, payload: json(payload), availableAt: context.now() });
+        await appendFinancialOutboxEvent(client, { tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId, bookId: context.bookId, eventType, aggregateType: "customer_payment", aggregateId: request.paymentId, idempotencyKey: correctionId, payload: { correctionId, receiptId: receipt.eventId, affectedDocumentIds: payload.affectedDocumentIds }, availableAt: context.now() });
         return { receiptId: receipt.eventId, replayed: false, ...payload };
       });
     },
