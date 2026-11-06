@@ -165,10 +165,27 @@ export function createAttestedSettlementCorrection(context: AttestedSettlementCo
           || minor(String(after.find(r => r.subledger_document_id === request.invoiceId)?.open_amount)) !== 0n
           || minor(String(after.find(r => r.subledger_document_id === request.replacementPaymentId)?.open_amount)) !== minor(prepared.plan.replacementOpenAfter)
           || hash(await ledger(client)) !== hash(prepared.beforeLedger)) fail("invariant_failed", "Settlement balances or unchanged ledger invariant failed; transaction rolled back");
+        // Keep full frozen source evidence in bounded immutable lifecycle chunks.
+        // Production documents can contain large provider metadata; never expand
+        // the shared audit size guard or discard evidence to fit the receipt.
+        const frozenEvidence = { documents: prepared.rows, originalApplication: prepared.application, applications: prepared.applications, authorization: prepared.authorization.evidence, offset: prepared.offset };
+        const evidenceText = JSON.stringify(frozenEvidence), evidenceChecksum = hash(frozenEvidence);
+        const chunks: string[] = []; let chunk = "", bytes = 0;
+        for (const character of evidenceText) {
+          const size = new TextEncoder().encode(character).byteLength;
+          if (bytes + size > 2000) { chunks.push(chunk); chunk = ""; bytes = 0; }
+          chunk += character; bytes += size;
+        }
+        if (chunk) chunks.push(chunk);
+        const evidenceEventIds: string[] = [];
+        for (const [index, data] of chunks.entries()) {
+          const saved = await event("customer_payment", request.paymentId, "customer_payment.attested_settlement_evidence", `evidence:${String(index)}`, { correctionId, evidenceChecksum, index, count: chunks.length, encoding: "json-utf8", data });
+          evidenceEventIds.push(saved.eventId);
+        }
         const payload = { correctionId, requestChecksum, confirmation, offsetTransactionId: request.offsetTransactionId, before: prepared.state, after,
           plan: prepared.plan, attestation: request.attestation, affectedDocumentIds: [request.paymentId, request.replacementPaymentId, request.invoiceId],
           applicationId: newId, endedApplicationId: request.applicationId, lifecycleEventIds: [ended.eventId, retired.eventId, applied.eventId],
-          documentEvidence: prepared.rows, originalApplication: prepared.application, authorization: prepared.authorization.evidence, ledgerBeforeChecksum: hash(prepared.beforeLedger), ledgerAfterChecksum: hash(prepared.beforeLedger) };
+          frozenEvidence: { checksum: evidenceChecksum, eventIds: evidenceEventIds }, ledgerBeforeChecksum: hash(prepared.beforeLedger), ledgerAfterChecksum: hash(prepared.beforeLedger) };
         const receipt = await appendFinancialLifecycleEvent(client, { tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId,
           aggregateType: "customer_payment", aggregateId: request.paymentId, eventType, idempotencyKey: `attested-settlement:${request.idempotencyKey}:receipt`, operation: request.operation, recordedAt: context.now(), payload: json(payload) });
         await appendFinancialOutboxEvent(client, { tenantId: context.tenantId, companyId: context.companyId, sourceId: context.sourceId, bookId: context.bookId, eventType, aggregateType: "customer_payment", aggregateId: request.paymentId, idempotencyKey: correctionId, payload: { correctionId, receiptId: receipt.eventId, affectedDocumentIds: payload.affectedDocumentIds }, availableAt: context.now() });

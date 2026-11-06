@@ -11,7 +11,7 @@ if(url&&!new URL(url).pathname.includes('test')) throw Error('Isolated database 
  const runner:ErpFinancialsTransactionRunner={async transaction(work){const c=await pool.connect();try{await c.query('begin');await c.query("set local statement_timeout='15s'");const value=await work({query:async(sql,params)=>c.query(sql,params?[...params]:[])});await c.query('commit');return value;}catch(e){await c.query('rollback');throw e;}finally{c.release();}}};
  beforeEach(async()=>{await pool.query<Record<string,unknown>>('drop schema if exists erp_financials cascade');});
  afterAll(async()=>{await pool.query<Record<string,unknown>>('drop schema if exists erp_financials cascade');await pool.end();});
- async function setup(){
+ async function setup(retainedEvidence=""){
   await migratePostgresSchema(runner,{appliedByRef:'test'});
   const original=importedCreditFixture();
   const f={...original,resources:{...original.resources,operationalDocuments:required(original.resources.operationalDocuments).map(r=>({...r,resource:{...r.resource,
@@ -31,7 +31,7 @@ if(url&&!new URL(url).pathname.includes('test')) throw Error('Isolated database 
   const app=required((await pool.query<Record<string,unknown>>('select * from erp_financials.subledger_applications where source_document_id=$1',[stale.subledger_document_id])).rows[0]);
   const request:AttestedSettlementRequest={paymentId:String(stale.subledger_document_id),replacementPaymentId:String(replacement.subledger_document_id),invoiceId:String(invoice.subledger_document_id),applicationId:String(app.subledger_application_id),offsetTransactionId:journal.transactionId,amount:'27.56',date:'2025-07-05',idempotencyKey:'correction',expectedVersions:{payment:Number(stale.version),replacement:Number(replacement.version),invoice:Number(invoice.version),application:Number(app.version)},attestation:{approvedBy:'owner',authorizationRefs:['p-t95u','p-t94u'],evidenceSha256:'a'.repeat(64),erroneousReceiptNeverProcessed:true,acceptUnchangedCashHistory:true,providerDeletionVerified:false},operation};
   let authorized=true;
-  const make=(database=runner,companyId=scope.companyId)=>createAttestedSettlementCorrection({...scope,companyId,nativeSourceId:scope.sourceId,bookId:'book',currencyCode:'USD',database,now:()=>now,authorize:()=>{if(!authorized)throw Error('Active admin required');return Promise.resolve({partyId:String(stale.party_id),evidence:{owner:'owner',journal:journal.transactionId}});}});
+  const make=(database=runner,companyId=scope.companyId)=>createAttestedSettlementCorrection({...scope,companyId,nativeSourceId:scope.sourceId,bookId:'book',currencyCode:'USD',database,now:()=>now,authorize:()=>{if(!authorized)throw Error('Active admin required');return Promise.resolve({partyId:String(stale.party_id),evidence:{owner:'owner',journal:journal.transactionId,retainedEvidence}});}});
   const service=make();
   const state=async()=>(await pool.query<Record<string,unknown>>(`select 'documents' as kind,to_jsonb(d) as data from erp_financials.subledger_documents d union all select 'apps',to_jsonb(a) from erp_financials.subledger_applications a union all select 'events',to_jsonb(e) from erp_financials.financial_lifecycle_events e order by 1,2`)).rows;
   const ledger=async()=>(await pool.query<Record<string,unknown>>('select * from erp_financials.ledger_postings order by posting_id')).rows;
@@ -48,6 +48,17 @@ if(url&&!new URL(url).pathname.includes('test')) throw Error('Isolated database 
   expect(await f.document('synthetic-credit')).toMatchObject({open_amount:'29.69'});expect(await f.document('synthetic-phantom')).toMatchObject({status:'voided'});expect(await f.document('synthetic-invoice')).toMatchObject({open_amount:'0.00'});expect(await f.ledger()).toEqual(before);
   await expect(pool.query<Record<string,unknown>>("update erp_financials.subledger_documents set status='settled' where subledger_document_id=$1",[f.request.paymentId])).rejects.toThrow('immutable');
   await expect(pool.query<Record<string,unknown>>("update erp_financials.subledger_applications set status='applied',version=version+1 where subledger_application_id=$1",[f.request.applicationId])).rejects.toThrow('immutable');
+ });
+ it('retains large provider evidence within the unchanged audit payload limit',async()=>{
+  const evidence='Provider note "quoted" \n🙂'.repeat(500);
+  const f=await setup(evidence);
+  const p=await f.service.preview(f.request),receipt=await f.service.execute({...f.request,confirmation:p.confirmation});
+  const rows=(await pool.query<Record<string,unknown>>("select payload,octet_length(payload::text) as bytes from erp_financials.financial_lifecycle_events where event_type='customer_payment.attested_settlement_evidence' order by (payload->>'index')::int")).rows;
+  expect(rows.length).toBeGreaterThan(5);expect(rows.every(r=>Number(r.bytes)<=8192)).toBe(true);
+  const frozen=JSON.parse(rows.map(r=>(r.payload as {data:string}).data).join('')) as {authorization:{retainedEvidence:string}};
+  expect(frozen.authorization.retainedEvidence).toBe(evidence);
+  expect(receipt.replayed).toBe(false);
+  const committed=await f.state();expect(await f.service.execute({...f.request,confirmation:p.confirmation})).toMatchObject({receiptId:receipt.receiptId,replayed:true});expect(await f.state()).toEqual(committed);
  });
  it('serializes concurrent duplicate execution to one receipt',async()=>{const f=await setup(),p=await f.service.preview(f.request);const settled=await Promise.allSettled([f.service.execute({...f.request,confirmation:p.confirmation}),f.service.execute({...f.request,confirmation:p.confirmation})]);const results=settled.map(r=>{if(r.status==="rejected")throw r.reason;return r.value;});expect(new Set(results.map(r=>r.receiptId)).size).toBe(1);expect(results.map(r=>r.replayed).sort()).toEqual([false,true]);});
  it('rolls back every settlement/event on a partial write failure',async()=>{const f=await setup(),p=await f.service.preview(f.request),before=await f.state();const broken=f.make({transaction:work=>runner.transaction(client=>work({query:async(sql,params)=>{if(sql.includes('insert into erp_financials.subledger_applications'))throw Error('injected application failure');return client.query(sql,params);}}))});await expect(broken.execute({...f.request,confirmation:p.confirmation})).rejects.toThrow('injected');expect(await f.state()).toEqual(before);});
