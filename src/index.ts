@@ -1291,3 +1291,5 @@ export type {AccountingAccessState,AccountingAccessCommand,AccountingHostRelatio
 export type { BankStatementCommandAttempt, RetireBankStatementCommandInput, RetireBankStatementCommandResult } from "./bank-statements.js";
 
 export type { VendorLiabilityStatementRequest, VendorLiabilityStatement, VendorLiabilityPosting } from "./vendor-liability-statement.js";
+
+export * from "./attested-settlement-correction.js";

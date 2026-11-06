@@ -53,6 +53,29 @@ export async function loadCustomerPaymentCorrectionReplayState(
             and sibling.target_document_id=d.subledger_document_id))
     where e.tenant_id=$1 and e.source_id=$2 and e.payload ? 'importedCorrection'
     order by e.event_id,d.subledger_document_id`,[tenantId,sourceId]);
+  const attested = await client.query<{
+    event_id: string; document_id: string; provider_type: string; provider_id: string;
+    version: string; transaction_ids: string[];
+  }>(`select e.event_id,d.subledger_document_id as document_id,
+      d.metadata->>'sourceTransactionType' as provider_type,d.metadata->>'sourceTransactionId' as provider_id,
+      d.version::text as version,
+      array(select t.transaction_id from erp_financials.transactions t where t.tenant_id=d.tenant_id and t.source_id=d.source_id
+        and (t.transaction_id=d.transaction_id
+          or (t.source_payload_ref->>'sourceObjectType'=d.metadata->>'sourceTransactionType' and t.source_payload_ref->>'sourceObjectId'=d.metadata->>'sourceTransactionId')
+          or (t.source_transaction_type='QuickBooksGeneralLedger:'||(d.metadata->>'sourceTransactionType')
+            and t.source_transaction_id in ('cash:'||(d.metadata->>'sourceTransactionType')||':'||(d.metadata->>'sourceTransactionId')||':'||t.transaction_date::text,
+              'accrual:'||(d.metadata->>'sourceTransactionType')||':'||(d.metadata->>'sourceTransactionId')||':'||t.transaction_date::text)))) as transaction_ids
+    from erp_financials.financial_lifecycle_events e
+    join erp_financials.subledger_documents d on d.tenant_id=e.tenant_id and d.company_id=e.company_id and d.source_id=e.source_id
+      and e.payload->'affectedDocumentIds' ? d.subledger_document_id
+    where e.tenant_id=$1 and e.source_id=$2 and e.event_type='customer_payment.attested_settlement_corrected'
+    order by e.event_id,d.subledger_document_id`, [tenantId,sourceId]);
+  const attestedState: CustomerPaymentCorrectionReplayState[] = attested.rows.map(row => ({
+    providerType: row.provider_type, dependency: { code: "provider_dependency", correctionId: row.event_id,
+      paymentId: row.document_id, sourceTransactionId: row.provider_id, correctedSourceVersion: row.version,
+      reason: "imported_application_correction_requires_provider_reconciliation" },
+    transactionIds: row.transaction_ids, reopenedInvoiceIds: [row.document_id]
+  }));
   const retained: CustomerPaymentCorrectionReplayState[] = imported.rows.map(row => ({
     providerType: row.provider_type,
     dependency: { code:"provider_dependency",correctionId:row.event_id,paymentId:row.document_id,
@@ -60,7 +83,7 @@ export async function loadCustomerPaymentCorrectionReplayState(
       reason:"imported_application_correction_requires_provider_reconciliation" },
     transactionIds:row.transaction_ids,reopenedInvoiceIds:[row.document_id]
   }));
-  return [...retained,...result.rows.map(row => ({
+  return [...attestedState,...retained,...result.rows.map(row => ({
     dependency: { code: "provider_dependency" as const, correctionId: row.correction_id, paymentId: row.payment_id,
       sourceTransactionId: row.evidence.sourceTransactionId, correctedSourceVersion: row.source_version,
       reason: "payment_correction_requires_provider_reconciliation" as const },
