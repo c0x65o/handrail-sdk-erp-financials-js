@@ -94,7 +94,7 @@ export function createAttestedSettlementCorrection(context: AttestedSettlementCo
     const doc = (id: string, type: string): SettlementDocument => {
       const row = rows.find(r => r.subledger_document_id === id);
       if (!row || row.document_type !== type || row.party_id !== authorization.partyId || row.currency_code !== context.currencyCode) return fail("ownership_mismatch", "Scoped document identity/type/currency changed");
-      return { id, partyId: String(row.party_id), currency: String(row.currency_code), version: Number(row.version), original: String(row.original_amount), open: String(row.open_amount), status: String(row.status) };
+      return { id, partyId: row.party_id, currency: row.currency_code, version: Number(row.version), original: String(row.original_amount), open: String(row.open_amount), status: String(row.status) };
     };
     const applications = (await client.query(`select * from erp_financials.subledger_applications where tenant_id=$1 and company_id=$2
       and ((coalesce(source_document_source_id,source_id)=$3 and source_document_id=any($4::text[])) or (coalesce(target_document_source_id,source_id)=$3 and target_document_id=$5))
