@@ -17,3 +17,25 @@ their owning workflows; this extension does not claim those paths are supported.
 Validation: 3 focused real PostgreSQL lifecycle tests (including concurrent replay),
 25 migration/manifest tests; SDK lint, typecheck and build passed. No CI check
 configuration changed. Focused commands/results are retained in this work's evidence.
+
+2026-11-06 — 0.3.212 follow-up for Spartan (schema unchanged)
+
+Explicit origin: native_released additionally accepts wholly restored native
+receipts with ended same-source customer_payment_to_invoice applications. Each
+allocation requires exact applied/ended lifecycle identities, full release, the
+original book's outbox posting receipts and one-to-one cash reversal postings
+with matching invoice/accounts/dimensions. The void date cannot precede release.
+The immutable original receipt and invoice allocation history remain intact; only
+the receipt's two original basis journals are reversed. Confirmations include
+all reviewed history and current invoice/payment evidence. Native source locking,
+host ownership guard, independent approval and replay tombstones remain required.
+
+Spartan adoption: opt into native_released only after its host reconciles all
+local applications, deposits, refunds and external ownership. native_unused
+retains its no-history contract. Active, cross-source/imported, cash-return and
+collection-owned receipt histories are outside this extension. This is a shared
+capability notice retained in the repo, not an outside message.
+
+Validation: 9 focused real PostgreSQL tests cover unchanged unused behavior,
+released unapply/void histories, concurrent replay, stale previews, missing cash
+postings, changed accounts and changed book evidence.

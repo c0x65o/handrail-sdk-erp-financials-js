@@ -1467,6 +1467,61 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     await expect(sdk.commands.customerPayments.voidAndUnapply({...input,approvalRef:"different"})).rejects.toMatchObject({code:"idempotency_conflict"});
     await expect(sdk.commands.customerPayments.record({...receiptInput,idempotencyKey:"native-void:replacement"})).resolves.toMatchObject({openAmount:"10.00"});
   });
+  it.each(["unapply", "void"] as const)("native released receipt void preserves %s history and reverses only receipt cash", async action => {
+    const {sdk,command,operation,receipt} = await nativeVoidFixture();
+    const invoice = await sdk.commands.invoices.create({operation,idempotencyKey:"released:invoice",customerId:"customer_1",date:"2026-08-01",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"10.00"}]});
+    const applied = await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"released:apply",applicationType:"customer_payment_to_invoice",sourceDocumentId:receipt.documentId,targetDocumentId:invoice.documentId,amount:"4.00",applicationDate:"2026-08-02",expectedSourceVersion:1,expectedTargetVersion:1});
+    const released = {...command,origin:"native_released" as const};
+    await expect(sdk.commands.customerPayments.previewVoidAndUnapply(released)).rejects.toThrow("wholly unused");
+    await sdk.commands.paymentApplications[action]({operation,applicationId:applied.applicationId,expectedVersion:1,effectiveDate:"2026-08-03"});
+    await expect(sdk.commands.customerPayments.previewVoidAndUnapply(command)).rejects.toThrow("application history");
+    await expect(sdk.commands.customerPayments.previewVoidAndUnapply({...released,date:"2026-08-02"})).rejects.toThrow("lifecycle evidence");
+    const history = (await pool.query(`select * from erp_financials.subledger_applications where subledger_application_id=$1`,[applied.applicationId])).rows;
+    const cash = (await pool.query(`select * from erp_financials.ledger_postings where transaction_id=$1 order by posting_id`,[invoice.journal.transactionId])).rows;
+    const preview = await sdk.commands.customerPayments.previewVoidAndUnapply(released);
+    expect(preview.postingIds).toHaveLength(4);
+    const input = {...released,confirmation:preview.confirmation,approvalRef:"released:approved"};
+    const results = await Promise.all([sdk.commands.customerPayments.voidAndUnapply(input),sdk.commands.customerPayments.voidAndUnapply(input)]);
+    expect(results.map(r=>r.status).sort()).toEqual(["already_voided","voided"]);
+    expect(results[0]).toMatchObject({endedApplicationIds:[],reopenedInvoiceIds:[]});
+    expect(await sdk.queries.getCustomerPayment(receipt.documentId)).toMatchObject({status:"voided",unappliedAmount:"0.00"});
+    expect((await pool.query(`select * from erp_financials.subledger_applications where subledger_application_id=$1`,[applied.applicationId])).rows).toEqual(history);
+    expect((await pool.query(`select * from erp_financials.ledger_postings where transaction_id=$1 order by posting_id`,[invoice.journal.transactionId])).rows).toEqual(cash);
+    const ids=results[0].basisReversals.flatMap(r=>[...r.originalTransactionIds,r.reversalTransactionId]);
+    const sums=await pool.query<{accounting_basis:string;net:string}>(`select accounting_basis,sum(debit_amount-credit_amount)::text as net from erp_financials.ledger_postings where transaction_id=any($1::text[]) and account_id='account_cash' group by accounting_basis`,[ids]);
+    expect(sums.rows).toHaveLength(2);expect(sums.rows.every(r=>Number(r.net)===0)).toBe(true);
+  });
+  it.each(["missing-posting", "wrong-account", "wrong-book"] as const)("native released receipt rejects %s evidence without financial writes", async fault => {
+    const {sdk,options,command,operation,receipt} = await nativeVoidFixture();
+    const invoice=await sdk.commands.invoices.create({operation,idempotencyKey:"fault:invoice",customerId:"customer_1",date:"2026-08-01",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"10.00"}]});
+    const applied=await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"fault:apply",applicationType:"customer_payment_to_invoice",sourceDocumentId:receipt.documentId,targetDocumentId:invoice.documentId,amount:"10.00",applicationDate:"2026-08-02",expectedSourceVersion:1,expectedTargetVersion:1});
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:applied.applicationId,expectedVersion:1,effectiveDate:"2026-08-03"});
+    let injected=false;
+    const database:ErpFinancialsTransactionRunner={transaction:work=>runner.transaction(client=>work({query:async <Row extends Record<string,unknown>>(sql:string,values?:readonly unknown[])=>{
+      const result=await client.query<Row>(sql,values);
+      if(sql.includes("starts_with(source_posting_id")){
+        if(fault==="missing-posting"){injected=true;return {...result,rows:result.rows.slice(1)};}
+        if(fault==="wrong-account"){injected=true;return {...result,rows:result.rows.map(row=>String(row.source_posting_id).includes(":reverse:")?{...row,account_id:"wrong-account"}:row)};}
+      }
+      if(fault==="wrong-book" && sql.includes("aggregate_type='subledger_application'")){injected=true;return {...result,rows:result.rows.map(row=>({...row,book_id:"wrong-book"}))};}
+      return result;
+    }}))};
+    const guarded=createErpFinancialsSdk({...options,database,customerPaymentCorrectionGuard:()=>Promise.resolve({authorized:true,complete:true,deposited:false,reconciled:false,refunded:false,version:"host-locked-v1"})});
+    const before=(await pool.query("select count(*) from erp_financials.ledger_postings")).rows;
+    await expect(guarded.commands.customerPayments.previewVoidAndUnapply({...command,origin:"native_released"})).rejects.toMatchObject({code:"invalid_input"});
+    expect(injected).toBe(true);
+    expect((await pool.query("select count(*) from erp_financials.ledger_postings")).rows).toEqual(before);
+  });
+  it("native released receipt rejects a stale preview after another complete allocation cycle", async () => {
+    const {sdk,command,operation,receipt} = await nativeVoidFixture();
+    const invoice=await sdk.commands.invoices.create({operation,idempotencyKey:"cycle:invoice",customerId:"customer_1",date:"2026-08-01",dueDate:"2026-08-31",receivableAccount:{accountId:"account_ar"},revenueLines:[{accountId:"account_income",amount:"10.00"}]});
+    const released={...command,origin:"native_released" as const};
+    const preview=await sdk.commands.customerPayments.previewVoidAndUnapply(released);
+    const applied=await sdk.commands.paymentApplications.apply({operation,idempotencyKey:"cycle:apply",applicationType:"customer_payment_to_invoice",sourceDocumentId:receipt.documentId,targetDocumentId:invoice.documentId,amount:"10.00",applicationDate:"2026-08-02",expectedSourceVersion:1,expectedTargetVersion:1});
+    await sdk.commands.paymentApplications.unapply({operation,applicationId:applied.applicationId,expectedVersion:1,effectiveDate:"2026-08-03"});
+    await expect(sdk.commands.customerPayments.voidAndUnapply({...released,confirmation:preview.confirmation,approvalRef:"stale"})).rejects.toMatchObject({code:"optimistic_concurrency_conflict"});
+    expect(await sdk.queries.getCustomerPayment(receipt.documentId)).toMatchObject({status:"unapplied",unappliedAmount:"10.00"});
+  });
   it("native unused receipt void rejects used receipts and stale host review", async () => {
     const {sdk,options,command,operation,receipt} = await nativeVoidFixture();
     const preview=await sdk.commands.customerPayments.previewVoidAndUnapply(command);

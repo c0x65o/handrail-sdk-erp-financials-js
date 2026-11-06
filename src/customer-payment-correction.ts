@@ -21,8 +21,8 @@ export type ImportedCustomerPaymentEvidence = {
 };
 export type CustomerPaymentCorrectionRequest = {
   readonly paymentId: string;
-  /** Explicit opt-in; native receipts must be wholly unused with no application history. */
-  readonly origin?: "native_unused";
+  /** Explicit opt-in: unused has no history; released verifies fully reversed native invoice applications. */
+  readonly origin?: "native_unused" | "native_released";
   readonly date: string;
   readonly idempotencyKey: string;
   readonly operation: FinancialOperationContext;
@@ -119,6 +119,9 @@ function stable(value: unknown): string {
 }
 function nonempty(value: unknown): asserts value is string { if (typeof value !== "string" || !value.trim())
   fail("Missing correction evidence or command field"); }
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item: unknown) => typeof item === "string");
+}
 function minor(value: unknown): bigint {
   const s = String(value);
   if (!/^-?\d+(\.\d{1,2})?$/.test(s))
@@ -213,7 +216,7 @@ function correctionService(context: Context, post: (client: PostgresQueryClient,
     const payment = (await client.query(`select * from erp_financials.subledger_documents where tenant_id=$1 and company_id=$2 and source_id=$3 and subledger_document_id=$4 for update`, [...scope, request.paymentId])).rows[0];
     if (!payment || payment.document_type !== "customer_payment" || payment.status === "voided" || payment.currency_code !== context.currencyCode)
       fail("Payment is missing, terminal or outside correction scope");
-    if (request.origin === "native_unused") {
+    if (request.origin === "native_unused" || request.origin === "native_released") {
       if (sources.rows[0]?.source_system !== "native_erp") fail("Native receipt void requires a native ERP source");
       return prepareNative(client, request, payment, appEvidence);
     }
@@ -314,14 +317,85 @@ function correctionService(context: Context, post: (client: PostgresQueryClient,
       postingIds: postings.map(p => String(p.posting_id)), reversals: postings.map(p => ({ basis: String(p.accounting_basis), accountId: String(p.account_id), debit: money(p.credit_amount), credit: money(p.debit_amount) })) };
     return { preview, payment, evidence, postings, applications };
   }
+  // A restored open balance alone is insufficient: retain the exact ended
+  // allocation and its cash recognition/reversal pair in the confirmation.
+  async function reviewReleasedNativeApplications(client: PostgresQueryClient, request: CustomerPaymentCorrectionRequest, payment: Row, applications: readonly Row[]) {
+    const history: Row[] = [];
+    for (const application of applications) {
+      const id = String(application.subledger_application_id), status = String(application.status);
+      if (application.source_id !== context.sourceId || application.source_document_id !== request.paymentId
+        || application.application_type !== "customer_payment_to_invoice" || !["unapplied", "voided"].includes(status)
+        || application.currency_code !== context.currencyCode || minor(application.applied_amount) <= 0n
+        || [application.source_document_source_id, application.target_document_source_id].some(source => source != null && source !== context.sourceId))
+        fail("Native released void requires fully ended, same-source invoice applications");
+      const invoice = (await client.query(`select * from erp_financials.subledger_documents where tenant_id=$1 and company_id=$2
+        and source_id=$3 and subledger_document_id=$4 for share`, [...scope, application.target_document_id])).rows[0];
+      if (!invoice || invoice.document_type !== "invoice" || invoice.party_id !== payment.party_id
+        || invoice.currency_code !== context.currencyCode || (invoice.metadata as Row | undefined)?.provider)
+        fail("Released receipt invoice identity is incomplete");
+      const events = (await client.query(`select * from erp_financials.financial_lifecycle_events where tenant_id=$1 and company_id=$2
+        and source_id=$3 and event_id=any($4::text[]) order by event_id for share`, [...scope, [application.applied_event_id, application.ended_event_id]])).rows;
+      const applied = events.find(e => e.event_id === application.applied_event_id), ended = events.find(e => e.event_id === application.ended_event_id);
+      const original = applied?.payload as Row | undefined, reversal = ended?.payload as Row | undefined;
+      if (events.length !== 2 || events.some(e => e.aggregate_type !== "subledger_application" || e.aggregate_id !== id)
+        || applied?.event_type !== "subledger_application.applied" || ended?.event_type !== `subledger_application.${status}`
+        || ended.prior_event_id !== applied.event_id || original?.sourceDocumentId !== request.paymentId
+        || original.targetDocumentId !== application.target_document_id || original.applicationType !== application.application_type
+        || original.appliedAmount !== money(application.applied_amount) || original.applicationDate !== application.application_date || original.crossSource || original.creditSettlement
+        || reversal?.status !== status || reversal.priorVersion !== Number(application.version) - 1
+        || reversal.releasedAmount !== money(application.applied_amount) || reversal.importedCorrection
+        || typeof reversal.effectiveDate !== "string" || typeof original.applicationDate !== "string"
+        || reversal.effectiveDate < original.applicationDate || request.date < reversal.effectiveDate)
+        fail("Released receipt requires exact native application lifecycle evidence");
+      const outbox = (await client.query(`select * from erp_financials.financial_outbox where tenant_id=$1 and company_id=$2
+        and source_id=$3 and aggregate_type='subledger_application' and aggregate_id=$4 order by event_type for share`, [...scope, id])).rows;
+      const recognized = outbox.find(e => e.event_type === "subledger_application.applied"), reversed = outbox.find(e => e.event_type === `subledger_application.${status}`);
+      const recognition = recognized?.payload as Row | undefined, undo = reversed?.payload as Row | undefined;
+      const originalIds = recognition?.cashBasisPostingIds, reversalIds = undo?.cashBasisPostingIds;
+      if (outbox.length !== 2 || outbox.some(e => e.book_id !== (context.bookId ?? null))
+        || recognition?.applicationId !== id || recognition.sourceDocumentId !== request.paymentId
+        || recognition.targetDocumentId !== application.target_document_id || recognition.applicationType !== application.application_type
+        || recognition.amount !== money(application.applied_amount) || undo?.applicationId !== id
+        || undo.effectiveDate !== reversal.effectiveDate || undo.priorVersion !== reversal.priorVersion || undo.status !== status
+        || !isStringArray(originalIds) || !isStringArray(reversalIds) || originalIds.length < 2 || originalIds.length !== reversalIds.length
+        || new Set([...originalIds, ...reversalIds]).size !== originalIds.length * 2)
+        fail("Released receipt requires complete cash posting receipts in the original book");
+      const postingIds = [...originalIds, ...reversalIds];
+      const postings = (await client.query(`select *, posting_date::text as posting_date from erp_financials.ledger_postings
+        where tenant_id=$1 and source_id=$2 and (posting_id=any($3::text[])
+          or starts_with(source_posting_id,$4) or starts_with(source_posting_id,$5)) order by posting_id for share`,
+        [context.tenantId, context.sourceId, postingIds, `cash-application:${id}:recognize:`, `cash-application:${id}:reverse:`])).rows;
+      if (postings.length !== postingIds.length || postings.some(p => !postingIds.includes(p.posting_id)
+        || p.transaction_id !== invoice.transaction_id || p.accounting_basis !== "cash" || p.currency_code !== context.currencyCode))
+        fail("Released receipt cash postings do not match the exact invoice allocation");
+      const originals = postings.filter(p => originalIds.includes(p.posting_id)), reversals = postings.filter(p => reversalIds.includes(p.posting_id));
+      for (const entry of originals) {
+        const source = String(entry.source_posting_id), prefix = `cash-application:${id}:recognize:`;
+        const matches = reversals.filter(p => p.source_posting_id === source.replace(prefix, `cash-application:${id}:reverse:`));
+        const reverse = matches[0];
+        if (!source.startsWith(prefix) || matches.length !== 1 || !reverse
+          || entry.posting_date !== original.applicationDate || reverse.posting_date !== reversal.effectiveDate
+          || minor(entry.debit_amount) < 0n || minor(entry.credit_amount) < 0n
+          || (minor(entry.debit_amount) > 0n) === (minor(entry.credit_amount) > 0n)
+          || minor(reverse.debit_amount) !== minor(entry.credit_amount) || minor(reverse.credit_amount) !== minor(entry.debit_amount)
+          || ["account_id", "party_id", "item_id", "transaction_line_id", "dimension_hash", "dimension_refs"].some(key => stable(entry[key]) !== stable(reverse[key])))
+          fail("Released receipt cash reversal must exactly cancel each original allocation posting");
+      }
+      if (originals.reduce((sum,p) => sum + minor(p.debit_amount) - minor(p.credit_amount), 0n) !== 0n)
+        fail("Released receipt cash recognition is unbalanced");
+      history.push({application, invoice, events, outbox, postings});
+    }
+    return history;
+  }
   async function prepareNative(client: PostgresQueryClient, request: CustomerPaymentCorrectionRequest, payment: Row, appEvidence: Row) {
     const metadata = payment.metadata as Row | undefined;
     if (metadata?.provider || metadata?.customerPaymentProvenance || metadata?.collectionRef || payment.status !== "open"
       || minor(payment.original_amount) <= 0n || minor(payment.open_amount) !== minor(payment.original_amount))
       fail("Native void requires an unassociated, wholly unused receipt");
-    const applications = (await client.query(`select * from erp_financials.subledger_applications where tenant_id=$1 and company_id=$2
-      and (source_document_id=$3 or target_document_id=$3) for update`, [context.tenantId, context.companyId, request.paymentId])).rows;
-    if (applications.length) fail("Resolve native receipt application history through its owning lifecycle");
+    const applications = (await client.query(`select *, application_date::text as application_date from erp_financials.subledger_applications where tenant_id=$1 and company_id=$2
+      and (source_document_id=$3 or target_document_id=$3) order by subledger_application_id for update`, [context.tenantId, context.companyId, request.paymentId])).rows;
+    if (applications.length && request.origin !== "native_released") fail("Resolve native receipt application history through its owning lifecycle");
+    const releasedHistory = await reviewReleasedNativeApplications(client, request, payment, applications);
     const outbox = (await client.query(`select * from erp_financials.financial_outbox where tenant_id=$1 and company_id=$2 and source_id=$3
       and aggregate_id=$4 and event_type='subledger_document.customer_payment.posted' for share`, [...scope, request.paymentId])).rows;
     if (outbox.length !== 1 || outbox[0]?.book_id !== (context.bookId ?? null)
@@ -357,7 +431,7 @@ function correctionService(context: Context, post: (client: PostgresQueryClient,
     for (const date of [request.date, String(dates[0].date)]) await assertPostingDateAllowed(client, context, date);
     const evidence = {sourceVersion: `native:${String(payment.lifecycle_event_id)}:${String(payment.version)}`, transactionIds};
     const preview: CustomerPaymentCorrectionPreview = {replayPolicy: "preserve_corrected_payment",
-      confirmation: hash({scope, bookId:context.bookId ?? null, request, payment, transactions, postings, outbox, appEvidence}),
+      confirmation: hash({scope, bookId:context.bookId ?? null, request, payment, transactions, postings, outbox, appEvidence, releasedHistory}),
       paymentId:request.paymentId, paymentVersion:Number(payment.version), sourceVersion:evidence.sourceVersion, applications:[],
       postingIds:postings.map(p => String(p.posting_id)), reversals:postings.map(p => ({basis:String(p.accounting_basis),
         accountId:String(p.account_id), debit:money(p.credit_amount), credit:money(p.debit_amount)}))};
@@ -365,7 +439,7 @@ function correctionService(context: Context, post: (client: PostgresQueryClient,
   }
   function requestCopy(input: CustomerPaymentCorrectionRequest): CustomerPaymentCorrectionRequest {
     const request = structuredClone({ paymentId: input.paymentId, date: input.date, idempotencyKey: input.idempotencyKey, operation: input.operation, ...(input.origin === undefined ? {} : {origin: input.origin}) });
-    if (!( [undefined, "native_unused"] as readonly unknown[]).includes(request.origin)) fail("Unsupported payment origin");
+    if (!( [undefined, "native_unused", "native_released"] as readonly unknown[]).includes(request.origin)) fail("Unsupported payment origin");
     request.operation = copyFinancialOperation(input.operation);
     assertFinancialApproval(context, request.operation);
     [request.paymentId, request.idempotencyKey, request.operation.reasonDetail].forEach(nonempty);
