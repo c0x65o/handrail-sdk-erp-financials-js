@@ -652,6 +652,11 @@ function normalizedQuickBooksLedgerTransactionToNativeTransaction(
   assertQuickBooksResourceId(resource, resource.resource.sourceTransactionId);
   const transaction = resource.resource;
   const sourceUpdatedAt = transaction.sourceUpdatedAt ?? resource.sourceUpdatedAt ?? context.latestSourceUpdatedAt;
+  // One provider line can expand into several posting-backed canonical lines.
+  // Their database ordinal must be unique even though provider line provenance
+  // remains shared; keep existing ordinals when no expansion is needed.
+  const hasExpandedLines = transaction.lines.some((line) => line.postings.length > 1);
+  let canonicalLineNumber = 0;
 
   return {
     sourceTransactionId: transaction.sourceTransactionId,
@@ -700,7 +705,7 @@ function normalizedQuickBooksLedgerTransactionToNativeTransaction(
         return {
           sourceLineId: line.sourceLineId ?? `${String(lineIndex + 1)}:${String(postingIndex + 1)}`,
           sourcePostingId,
-          lineNumber: line.lineNumber,
+          lineNumber: hasExpandedLines ? ++canonicalLineNumber : line.lineNumber,
           accountSourceId: posting.accountRef.sourceObjectId,
           postingDate: posting.postingDate,
           ...nativeAmountsFromNormalizedPosting(posting, line),

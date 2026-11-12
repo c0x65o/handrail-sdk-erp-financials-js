@@ -226,6 +226,44 @@ describe("source adapter contracts", () => {
     expect(JSON.stringify(facts)).not.toMatch(/access[_-]?token|refresh[_-]?token|client_secret|rawPayload/i);
   });
 
+  it("assigns unique canonical line ordinals when one provider line has multiple postings", () => {
+    const input = quickBooksNormalizedLedgerTransactionsFixtureInput();
+    const original = mapHandrailQuickBooksSdkResourcesToCanonicalFacts(input);
+    const ledgerTransactions = (input.resources.ledgerTransactions ?? []).map((resource) => {
+      if (resource.resource.sourceTransactionId !== "200") return resource;
+      const firstLine = resource.resource.lines[0];
+      if (firstLine === undefined) throw new Error("Missing invoice fixture line");
+      return {
+        ...resource,
+        resource: {
+          ...resource.resource,
+          lines: [{
+            ...firstLine,
+            sourceLineId: "provider-line-shared",
+            postings: resource.resource.lines.flatMap((line) => line.postings)
+          }]
+        }
+      };
+    });
+    const facts = mapHandrailQuickBooksSdkResourcesToCanonicalFacts({
+      ...input, resources: { ...input.resources, ledgerTransactions }
+    });
+    const invoice = facts.transactions.find((transaction) => transaction.sourceTransactionId === "200");
+    const lines = facts.transactionLines.filter((line) => line.transactionId === invoice?.transactionId);
+    expect(lines.map((line) => line.lineNumber)).toEqual([1, 2]);
+    expect(new Set(facts.transactionLines.map((line) => `${line.transactionId}:${String(line.lineNumber)}`)).size)
+      .toBe(facts.transactionLines.length);
+    expect(facts.transactionLines.map((line) => line.transactionLineId))
+      .toEqual(original.transactionLines.map((line) => line.transactionLineId));
+    expect(facts.postings.map((posting) => posting.sourcePayloadRef))
+      .toEqual(original.postings.map((posting) => posting.sourcePayloadRef));
+    expect(facts.postings.map((posting) => posting.sourcePostingId))
+      .toEqual(original.postings.map((posting) => posting.sourcePostingId));
+    expect(mapHandrailQuickBooksSdkResourcesToCanonicalFacts({
+      ...input, resources: { ...input.resources, ledgerTransactions }
+    })).toEqual(facts);
+  });
+
   it("preserves historical QuickBooks party references missing from customer and vendor masters", () => {
     const input = quickBooksNormalizedLedgerTransactionsFixtureInput();
     const invoice = input.resources.ledgerTransactions?.find((transaction) => transaction.resource.sourceTransactionId === "200");
