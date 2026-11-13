@@ -8270,8 +8270,8 @@ having sum(abs("signed_open_amount")) <> 0`;
       rows,
       totals: rows.reduce(
         (total, row) => ({
-          grossTotal: addMoney(total.grossTotal ?? "0.00", row.grossTotal ?? "0.00"),
-          unappliedTotal: addMoney(total.unappliedTotal ?? "0.00", row.unappliedTotal ?? "0.00"),
+          grossTotal: addMoney(total.grossTotal, row.grossTotal ?? "0.00"),
+          unappliedTotal: addMoney(total.unappliedTotal, row.unappliedTotal ?? "0.00"),
           current: addMoney(total.current, row.current),
           days1To30: addMoney(total.days1To30, row.days1To30),
           days31To60: addMoney(total.days31To60, row.days31To60),

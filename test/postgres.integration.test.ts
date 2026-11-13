@@ -4574,8 +4574,8 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:net-ap" });
     await seedQuickBooksAllDocumentScope(pool);
     const base = quickBooksAllDocumentResources();
-    const resources = { ...base, operationalDocuments: base.operationalDocuments!.map(envelope => envelope.resource.sourceTransactionType !== "VendorCredit" ? envelope : {
-      ...envelope, resource: {...envelope.resource, lines: envelope.resource.lines.flatMap(line => applied === "0.00" ? [{...line,linkedTransactions:[]}] : applied === "10.00" ? [line] : [{...line,sourceAmount:applied,sourceQuantity:"1.00",sourceUnitAmount:applied},{...line,sourceLineId:line.sourceLineId+"-remaining",lineNumber:2,sourceAmount:"6.00",sourceQuantity:"1.00",sourceUnitAmount:"6.00",linkedTransactions:[]}])}
+    const resources = { ...base, operationalDocuments: (base.operationalDocuments ?? []).map(envelope => envelope.resource.sourceTransactionType === "Invoice" ? {...envelope,resource:{...envelope.resource,openAmount:(80-Number(applied)).toFixed(2)}} : !["VendorCredit","CreditMemo"].includes(envelope.resource.sourceTransactionType) ? envelope : {
+      ...envelope, resource: {...envelope.resource, lines: envelope.resource.lines.flatMap(line => applied === "0.00" ? [{...line,linkedTransactions:[]}] : applied === "10.00" ? [line] : [{...line,sourceAmount:applied,sourceQuantity:"1.00",sourceUnitAmount:applied},{...line,sourceLineId:(line.sourceLineId ?? "credit")+"-remaining",lineNumber:2,sourceAmount:"6.00",sourceQuantity:"1.00",sourceUnitAmount:"6.00",linkedTransactions:[]}])}
     }) };
     await runner.transaction(client => persistQuickBooksSubledgerResources({ client, companyId: "company_qbo", importedAt: "2026-08-12T10:01:00Z", facts: quickBooksAllDocumentFacts(), resources }));
     const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "book_qbo", writeSourceId: "source_qbo", currencyCode: "USD" });
@@ -4587,10 +4587,10 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     expect((await sdk.queries.getDashboardSummary({periodStart:"2026-08-01",asOfDate:"2026-08-12"})).accountsPayable).toBe("50.00");
     expect((await sdk.queries.getAgingPage({kind:"payables",asOfDate:"2026-08-12",limit:1})).totals).toEqual(aging.totals);
     expect((await sdk.queries.getVendorBillRegister({asOfDate:"2026-08-12"})).summary.outstandingAmount).toBe(gross);
-    expect((await pool.query("select count(*)::int n from erp_financials.subledger_applications where application_type='vendor_credit_to_bill'")).rows[0]?.n).toBe(applied === "0.00" ? 0 : 1);
+    expect((await pool.query<{n:number}>("select count(*)::int n from erp_financials.subledger_applications where application_type='vendor_credit_to_bill'")).rows[0]?.n).toBe(applied === "0.00" ? 0 : 1);
     // Existing AR contract is net of the remaining credit/payment balance.
     const ar = await sdk.queries.getAging({kind:"receivables",asOfDate:"2026-08-12"});
-    expect(Number(ar.totals.total)).toBe(Number(ar.totals.grossTotal)-Number(ar.totals.unappliedTotal));
+    expect(ar.totals).toMatchObject({total:"70.00",grossTotal:(80-Number(applied)).toFixed(2),unappliedTotal:available});
   });
 
   it("vendor bill register includes imported vendor credits without counting them as cash payments", async () => {
