@@ -4570,6 +4570,29 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     expect(after.items).toEqual([expect.objectContaining({ openAmount: "80.00", appliedAmount: "20.00", version: 2 })]);
   });
 
+  it.each(["0.00", "4.00", "10.00"])("nets imported vendor credits with %s applied and preserves gross", async applied => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:net-ap" });
+    await seedQuickBooksAllDocumentScope(pool);
+    const base = quickBooksAllDocumentResources();
+    const resources = { ...base, operationalDocuments: base.operationalDocuments!.map(envelope => envelope.resource.sourceTransactionType !== "VendorCredit" ? envelope : {
+      ...envelope, resource: {...envelope.resource, lines: envelope.resource.lines.flatMap(line => applied === "0.00" ? [{...line,linkedTransactions:[]}] : applied === "10.00" ? [line] : [{...line,sourceAmount:applied,sourceQuantity:"1.00",sourceUnitAmount:applied},{...line,sourceLineId:line.sourceLineId+"-remaining",lineNumber:2,sourceAmount:"6.00",sourceQuantity:"1.00",sourceUnitAmount:"6.00",linkedTransactions:[]}])}
+    }) };
+    await runner.transaction(client => persistQuickBooksSubledgerResources({ client, companyId: "company_qbo", importedAt: "2026-08-12T10:01:00Z", facts: quickBooksAllDocumentFacts(), resources }));
+    const sdk = createErpFinancialsSdk({ database: runner, tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "book_qbo", writeSourceId: "source_qbo", currencyCode: "USD" });
+    await sdk.books.define({ operation: sdkOperation(), bookId: "book_qbo", name: "Net AP", baseCurrencyCode: "USD" });
+    await sdk.books.bindSource({ operation: sdkOperation(), bookId: "book_qbo", sourceId: "source_qbo", sourceRole: "historical", effectiveThrough: "2026-08-31" });
+    const gross = (60 - Number(applied)).toFixed(2), available = (10 - Number(applied)).toFixed(2);
+    const aging = await sdk.queries.getAging({kind:"payables",asOfDate:"2026-08-12"});
+    expect(aging.totals).toMatchObject({total:"50.00",grossTotal:gross,unappliedTotal:available});
+    expect((await sdk.queries.getDashboardSummary({periodStart:"2026-08-01",asOfDate:"2026-08-12"})).accountsPayable).toBe("50.00");
+    expect((await sdk.queries.getAgingPage({kind:"payables",asOfDate:"2026-08-12",limit:1})).totals).toEqual(aging.totals);
+    expect((await sdk.queries.getVendorBillRegister({asOfDate:"2026-08-12"})).summary.outstandingAmount).toBe(gross);
+    expect((await pool.query("select count(*)::int n from erp_financials.subledger_applications where application_type='vendor_credit_to_bill'")).rows[0]?.n).toBe(applied === "0.00" ? 0 : 1);
+    // Existing AR contract is net of the remaining credit/payment balance.
+    const ar = await sdk.queries.getAging({kind:"receivables",asOfDate:"2026-08-12"});
+    expect(Number(ar.totals.total)).toBe(Number(ar.totals.grossTotal)-Number(ar.totals.unappliedTotal));
+  });
+
   it("vendor bill register includes imported vendor credits without counting them as cash payments", async () => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:register-import" });
     await seedQuickBooksAllDocumentScope(pool);

@@ -1509,6 +1509,9 @@ export type FinancialStatement = {
 export type AgingBucket = "current" | "days_1_30" | "days_31_60" | "days_61_90" | "days_over_90";
 
 export type AgingRow = {
+  /** Open invoices/bills before remaining credits and prepayments. */
+  readonly grossTotal?: DecimalString;
+  readonly unappliedTotal?: DecimalString;
   readonly partyId: string;
   readonly partyName?: string;
   readonly current: DecimalString;
@@ -1527,7 +1530,7 @@ export type AgingReport = {
   readonly totals: Omit<AgingRow, "partyId" | "partyName">;
 };
 
-/** Historical net AR (including unapplied receipts/credits) or gross AP.
+/** Historical net AR (including unapplied receipts/credits) and net AP (including unapplied vendor credits/payments).
  * Totals cover all nonzero parties, never just the returned page. */
 export type AgingPageRequest = { readonly kind: "receivables" | "payables"; readonly asOfDate: IsoDate; readonly limit?: number; readonly cursor?: string };
 export type AgingPage = AgingReport & { readonly basis: "as_of"; readonly partyCount: string; readonly revision: string; readonly nextCursor?: string };
@@ -7843,8 +7846,7 @@ left join "erp_financials"."parties" party
   on party."tenant_id" = document."tenant_id" and party."source_id" = document."source_id" and party."party_id" = document."party_id"
 left join applied_documents applied on applied.source_id=document."source_id"
  and applied.document_id=document."subledger_document_id" and applied.document_type=document."document_type"
-left join terminal_documents terminal on document."document_type" <> 'vendor_bill'
- and terminal."source_id"=document."source_id" and terminal."original_transaction_id"=document."transaction_id"
+left join terminal_documents terminal on terminal."source_id"=document."source_id" and terminal."original_transaction_id"=document."transaction_id"
 where document."tenant_id" = $1 and document."company_id" = $2
   ${party === undefined ? "" : `and document.party_id=${party}`}
   and (document."document_type" = ${documentType} or document."document_type" = any(${offsetTypes}::text[]))
@@ -7928,16 +7930,16 @@ cross join lateral (
   from scoped_postings
 ) ledger
 cross join lateral (
-  ${receivableAgingDocumentsSql("$4", "book.base_currency_code", "'invoice'", "'{}'::text[]")}
+  ${receivableAgingDocumentsSql("$4", "book.base_currency_code", "'invoice'", "array['customer_payment','credit_memo']")}
   select coalesce(sum(signed_open_amount),0) as receivables,
-    coalesce(sum(signed_open_amount) filter(where due_date<$4::date),0) as overdue_receivables
+    coalesce(sum(signed_open_amount) filter(where aging_date<$4::date),0) as overdue_receivables
   from aging_documents where book.status='active'
 ) ar
 cross join lateral (
-  ${vendorBillRowsSql(7, "book.base_currency_code", "null::text", "null::text")}
-  select coalesce(sum(open_amount),0) as payables,
-    coalesce(sum(open_amount) filter(where due_date<$4::date),0) as overdue_payables
-  from bill_rows where book.status='active'
+  ${vendorFundingDocumentsSql("$4", "book.base_currency_code", "'vendor_bill'", "array['bill_payment','vendor_credit']")}
+  select coalesce(sum(signed_open_amount),0) as payables,
+    coalesce(sum(signed_open_amount) filter(where aging_date<$4::date),0) as overdue_payables
+  from aging_documents where book.status='active'
 ) ap`, [scope.tenantId, scope.companyId, scope.bookId, input.asOfDate, input.periodStart, input.accountingMethod ?? null]);
     const row = result.rows[0];
     if (!row) throw new ErpFinancialsError("missing_book", `Reporting book ${scope.bookId} does not exist`, { details: { bookId: scope.bookId } });
@@ -8210,39 +8212,31 @@ async function getAging(scope: Scope, input: AgingPageRequest, paginate = false)
   return scope.database.transaction(async (client) => {
     const book = await resolveBook(client, scope);
     const documentType = input.kind === "receivables" ? "invoice" : "vendor_bill";
-    const offsetDocumentTypes = input.kind === "receivables" ? ["customer_payment", "credit_memo"] : [];
-    // Reconstruct effective balances, not current open_amount, for as-of reports.
-    // AR preserves its net-of-unapplied-receipts/credits contract; AP is gross.
-    // Aggregate effective application sides once for the report. Per-document
-    // lateral event reconstruction repeats indexed work and can cause costly
-    // JIT compilation even for a 50-row page with whole-report controls.
-    const agingDocuments = input.kind === "payables"
-      ? `${vendorBillRowsSql(7)}, aging_documents as (
-select "party_id", "party_name", "due_date" as "aging_date", "open_amount" as "signed_open_amount"
-from bill_rows where "open_amount" > 0
-)`
-      : receivableAgingDocumentsSql();
-    const asOf = input.kind === "payables" ? "$4" : "$6";
-    const parameters = input.kind === "payables"
-      ? [scope.tenantId, scope.companyId, scope.bookId, input.asOfDate, book.currencyCode, null, null]
-      : [scope.tenantId, scope.companyId, scope.bookId, documentType, book.currencyCode, input.asOfDate, offsetDocumentTypes];
+    const offsetDocumentTypes = input.kind === "receivables" ? ["customer_payment", "credit_memo"] : ["bill_payment", "vendor_credit"];
+    // Both sides net only the remaining canonical funding balance, reconstructed
+    // from effective dated applications. Applied credits already reduce bills.
+    const agingDocuments = input.kind === "payables" ? vendorFundingDocumentsSql() : receivableAgingDocumentsSql();
+    const asOf = "$6";
+    const parameters = [scope.tenantId, scope.companyId, scope.bookId, documentType, book.currencyCode, input.asOfDate, offsetDocumentTypes];
     const groupedSql = `select "party_id", "party_name",
   coalesce(sum("signed_open_amount") filter (where "aging_date" >= ${asOf}::date), 0) as "current_amount",
   coalesce(sum("signed_open_amount") filter (where ${asOf}::date - "aging_date" between 1 and 30), 0) as "days_1_30",
   coalesce(sum("signed_open_amount") filter (where ${asOf}::date - "aging_date" between 31 and 60), 0) as "days_31_60",
   coalesce(sum("signed_open_amount") filter (where ${asOf}::date - "aging_date" between 61 and 90), 0) as "days_61_90",
   coalesce(sum("signed_open_amount") filter (where ${asOf}::date - "aging_date" > 90), 0) as "days_over_90",
+  coalesce(sum("signed_open_amount") filter(where "signed_open_amount">0),0) as gross_total,
+  -coalesce(sum("signed_open_amount") filter(where "signed_open_amount"<0),0) as unapplied_total,
   sum("signed_open_amount") as "total_amount"
 from aging_documents
 group by "party_id", "party_name"
-having sum("signed_open_amount") <> 0`;
+having sum(abs("signed_open_amount")) <> 0`;
     if (paginate) {
       const result = await client.query(`${agingDocuments}, aging_rows as materialized (${groupedSql}),
  aging_summary as (
   select count(*)::text party_count,coalesce(sum(current_amount),0)::text summary_current,
     coalesce(sum(days_1_30),0)::text summary_days_1_30,coalesce(sum(days_31_60),0)::text summary_days_31_60,
     coalesce(sum(days_61_90),0)::text summary_days_61_90,coalesce(sum(days_over_90),0)::text summary_days_over_90,
-    coalesce(sum(total_amount),0)::text summary_total from aging_rows
+    coalesce(sum(gross_total),0)::text summary_gross,coalesce(sum(unapplied_total),0)::text summary_unapplied,coalesce(sum(total_amount),0)::text summary_total from aging_rows
  ), scope_revision as (
   select encode(sha256(convert_to(jsonb_build_array(
     (select to_jsonb(b) from erp_financials.reporting_books b where b.tenant_id=$1 and b.company_id=$2 and b.book_id=$3),
@@ -8264,7 +8258,7 @@ having sum("signed_open_amount") <> 0`;
       if (!/^(0|[1-9]\d*)$/u.test(partyCount)) throw new ErpFinancialsError("invalid_input","Invalid aging party count");
       const candidates=result.rows.filter(row=>row.party_id!==null),rows=candidates.slice(0,limit).map(agingRowFromRow),last=rows.at(-1);
       return {kind:input.kind,asOfDate:input.asOfDate,currencyCode:book.currencyCode,basis:"as_of",partyCount,revision,rows,
-        totals:{current:money(head.summary_current,"summary_current"),days1To30:money(head.summary_days_1_30,"summary_days_1_30"),days31To60:money(head.summary_days_31_60,"summary_days_31_60"),days61To90:money(head.summary_days_61_90,"summary_days_61_90"),daysOver90:money(head.summary_days_over_90,"summary_days_over_90"),total:money(head.summary_total,"summary_total")},
+        totals:{grossTotal:money(head.summary_gross,"summary_gross"),unappliedTotal:money(head.summary_unapplied,"summary_unapplied"),current:money(head.summary_current,"summary_current"),days1To30:money(head.summary_days_1_30,"summary_days_1_30"),days31To60:money(head.summary_days_31_60,"summary_days_31_60"),days61To90:money(head.summary_days_61_90,"summary_days_61_90"),daysOver90:money(head.summary_days_over_90,"summary_days_over_90"),total:money(head.summary_total,"summary_total")},
         ...(candidates.length>limit&&last?{nextCursor:Buffer.from(JSON.stringify({v:1,scope:cursorScope,partyId:last.partyId,revision}),"utf8").toString("base64url")}:{})};
     }
     const result = await client.query(`${agingDocuments} ${groupedSql} order by "total_amount" desc, "party_id"`, parameters);
@@ -8276,6 +8270,8 @@ having sum("signed_open_amount") <> 0`;
       rows,
       totals: rows.reduce(
         (total, row) => ({
+          grossTotal: addMoney(total.grossTotal ?? "0.00", row.grossTotal ?? "0.00"),
+          unappliedTotal: addMoney(total.unappliedTotal ?? "0.00", row.unappliedTotal ?? "0.00"),
           current: addMoney(total.current, row.current),
           days1To30: addMoney(total.days1To30, row.days1To30),
           days31To60: addMoney(total.days31To60, row.days31To60),
@@ -8283,7 +8279,7 @@ having sum("signed_open_amount") <> 0`;
           daysOver90: addMoney(total.daysOver90, row.daysOver90),
           total: addMoney(total.total, row.total)
         }),
-        { current: "0.00", days1To30: "0.00", days31To60: "0.00", days61To90: "0.00", daysOver90: "0.00", total: "0.00" }
+        { grossTotal: "0.00", unappliedTotal: "0.00", current: "0.00", days1To30: "0.00", days31To60: "0.00", days61To90: "0.00", daysOver90: "0.00", total: "0.00" }
       )
     };
   });
@@ -9541,6 +9537,8 @@ function statementTotals(
 function agingRowFromRow(row: Readonly<Record<string, unknown>>): AgingRow {
   const partyName = optionalString(row.party_name);
   return {
+    grossTotal: money(row.gross_total ?? row.total_amount, "gross_total"),
+    unappliedTotal: money(row.unapplied_total ?? "0.00", "unapplied_total"),
     partyId: string(row.party_id, "party_id"),
     ...(partyName === undefined ? {} : { partyName }),
     current: money(row.current_amount, "current_amount"),
