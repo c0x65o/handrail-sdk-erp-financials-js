@@ -411,7 +411,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       normalized,
       originalAmount
     );
-    if (["invoice", "vendor_bill", "credit_memo", "vendor_credit"].includes(documentType)) {
+    if (["invoice", "vendor_bill", "credit_memo", "vendor_credit", "purchase", "sales_receipt", "refund"].includes(documentType)) {
       try {
         commercialPlans.set(`${normalized.sourceTransactionType}:${normalized.sourceTransactionId}`, planQuickBooksCommercialDetail(normalized, commercialReferences));
       } catch (error) {

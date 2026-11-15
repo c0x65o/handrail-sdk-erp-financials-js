@@ -12,6 +12,16 @@ const invoice: NormalizedQuickBooksLedgerTransaction = {
 const invoiceLine = invoice.lines[0];
 if (!invoiceLine) throw new Error("Missing invoice fixture line");
 describe("source-backed QuickBooks commercial detail", () => {
+  it.each(["Purchase", "SalesReceipt", "RefundReceipt"])("preserves fractional provider prices and quantities for %s", sourceTransactionType => {
+    const result = planQuickBooksCommercialDetail({ ...invoice, sourceTransactionType, totalAmount: "88.92", totalTax: "0", lines: [
+      { ...invoiceLine, sourceAmount: "86.42", sourceQuantity: "7", sourceUnitAmount: "12.34567", taxCode: "NON" },
+      { ...invoiceLine, lineNumber: 2, sourceLineId: "2", sourceAmount: "2.50", sourceQuantity: "0.375", sourceUnitAmount: "6.666666666667", taxCode: "NON" },
+    ] }, references);
+    expect(result.lines).toMatchObject([
+      { quantity: "7", unitAmount: "12.34567", amount: "86.42", discountAmount: "0.00", taxAmount: "0.00" },
+      { quantity: "0.375", unitAmount: "6.666666666667", amount: "2.50", discountAmount: "0.00", taxAmount: "0.00" },
+    ]);
+  });
   it("retains zero-charge system shipping without inventing an account, and rejects monetary or unresolved detail", () => {
     const shipping = { lineNumber: 2, sourceLineId: "shipping", detailType: "SalesItemLineDetail", sourceAmount: "0",
       itemRef: { sourceObjectId: "SHIPPING_ITEM_ID" }, postings: [] };
