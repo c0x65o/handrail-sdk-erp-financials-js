@@ -488,7 +488,8 @@ describe("QuickBooks SDK envelope adapter", () => {
             sourceTransactionId: "vendor_credit_1822",
             sourceTransactionType: "VendorCredit",
             partyId: vendorParty.partyId
-          }
+          },
+          { ...transactionTemplate, transactionId: "retained_zero_bill_payment", sourceTransactionId: "1822", sourceTransactionType: "BillPayment", partyId: vendorParty.partyId }
         ]
       },
       resources: {
@@ -1093,6 +1094,7 @@ describe("QuickBooks SDK envelope adapter", () => {
       importedAt: "2026-08-25T00:31:00.000Z",
       facts: {
         ...facts,
+        postings: [...facts.postings, { ...requiredFixtureValue(mapped.facts.postings[0]), transactionId: "transaction_balanced_payment" }],
         transactions: [
           ...facts.transactions,
           {
@@ -1115,6 +1117,44 @@ describe("QuickBooks SDK envelope adapter", () => {
         rejectionReasons: ["non_positive_total"]
       }
     });
+  });
+
+  it.each([["Invoice", "credit_memo"], ["Bill", "vendor_credit"], ["CreditMemo", "invoice"], ["VendorCredit", "vendor_bill"]])("maps negative %s to %s with explicit signed source evidence", async (sourceType, kind) => {
+    const adapted = adaptHandrailQuickBooksSdkFullSyncEnvelope(fullSyncEnvelope(), adapterOptions());
+    const mapped = mapNormalizedQuickBooksFullSyncResponseToCanonicalFacts(adapted, { companyId: "fixture-company" });
+    const resource = requiredFixtureValue(adapted.resources.operationalDocuments?.[0]);
+    const transaction = requiredFixtureValue(mapped.facts.transactions[0]);
+    const calls: Array<{ sql: string; params: readonly unknown[] }> = [];
+    await persistQuickBooksSubledgerResources({ client: { query: (sql, params = []) => { calls.push({sql, params}); return Promise.resolve({rows: [], rowCount: 1}); } },
+      companyId: "fixture-company", importedAt: "2026-11-15T00:00:00Z", facts: { ...mapped.facts,
+        transactions: [{ ...transaction, sourceTransactionId: "signed-doc", sourceTransactionType: sourceType }] },
+      resources: { ...adapted.resources, operationalDocuments: [{ ...resource, resourceId: "signed-doc", resource: { ...resource.resource,
+        sourceTransactionId: "signed-doc", sourceTransactionType: sourceType, totalAmount: "-125.00", totalTax: "0.00", openAmount: "-125.00", unappliedAmount: "-125.00", lines: commercialFixtureLines("-125.00") } }] }
+    });
+    const insert = requiredFixtureValue(calls.find(call => call.sql.includes('insert into "erp_financials"."subledger_documents"')));
+    expect(insert.params[4]).toBe(kind);
+    expect(insert.params[11]).toBe("125.00");
+    expect(JSON.parse(String(insert.params[16]))).toMatchObject({ sourceTransactionType: sourceType, providerSignedTotal: "-125.00", signedTotalMapping: kind });
+    const line = requiredFixtureValue(calls.find(call => call.sql.includes('insert into "erp_financials"."subledger_document_lines"')));
+    expect(line.params).toContain("-125.00");
+    expect(calls.some(call => call.sql.includes('insert into "erp_financials"."ledger_postings"'))).toBe(false);
+  });
+
+  it("retains a zero-total VendorCredit as a non-monetary canonical identity", async () => {
+    const adapted = adaptHandrailQuickBooksSdkFullSyncEnvelope(fullSyncEnvelope(), adapterOptions());
+    const mapped = mapNormalizedQuickBooksFullSyncResponseToCanonicalFacts(adapted, { companyId: "fixture-company" });
+    const resource = requiredFixtureValue(adapted.resources.operationalDocuments?.[0]);
+    const transaction = requiredFixtureValue(mapped.facts.transactions[0]);
+    const statements: string[] = [];
+    const result = await persistQuickBooksSubledgerResources({
+      client: { query: sql => { statements.push(sql); return Promise.resolve({ rows: [], rowCount: 0 }); } },
+      companyId: "fixture-company", importedAt: "2026-11-15T00:00:00Z",
+      facts: { ...mapped.facts, transactions: [{ ...transaction, sourceTransactionId: "zero-vendor-credit", sourceTransactionType: "VendorCredit" }], postings: [] },
+      resources: { ...adapted.resources, operationalDocuments: [{ ...resource, resourceId: "zero-vendor-credit", resource: { ...resource.resource,
+        sourceTransactionId: "zero-vendor-credit", sourceTransactionType: "VendorCredit", totalAmount: "0.00", openAmount: "0.00", lines: [] } }] }
+    });
+    expect(result).toMatchObject({ documents: 0, applications: 0, skippedTransactions: 1 });
+    expect(statements.some(sql => sql.includes('insert into "erp_financials"."ledger_postings"'))).toBe(false);
   });
 
   it("fails an ambiguous zero-total BillPayment with structured safe diagnostics", async () => {
@@ -1932,4 +1972,9 @@ function omitFixtureField<T extends object, K extends keyof T>(value: T, key: K)
   const remaining = { ...value };
   Reflect.deleteProperty(remaining, key);
   return remaining;
+}
+
+function requiredFixtureValue<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("Required fixture value is missing");
+  return value;
 }

@@ -1,3 +1,4 @@
+import { createQuickBooksNonCashLinkPlanner, QuickBooksNonCashLinkError } from "./quickbooks-non-cash-links.js";
 import { loadCustomerPaymentCorrectionReplayState, type CustomerPaymentCorrectionDependency } from "./customer-payment-correction-replay.js";
 import { persistImportedCustomerPaymentEvidence, type ImportedCustomerPaymentEvidence } from "./customer-payment-correction.js";
 import { createHash } from "node:crypto";
@@ -28,6 +29,8 @@ type ImportedApplicationType =
   | "vendor_credit_to_bill";
 
 export type QuickBooksSubledgerImportResult = {
+  readonly retainedNonCashDocuments?: number;
+  readonly retainedNonCashLinks?: number;
   readonly correctionDependencies?: readonly CustomerPaymentCorrectionDependency[];
   readonly documents: number;
   readonly documentLines: number;
@@ -59,7 +62,7 @@ export type QuickBooksSubledgerProjectionDiagnostic = {
   readonly sourceTransactionType: string;
   readonly sourceTransactionId: string;
   readonly missingBalancedJournal: boolean;
-  readonly totalAmountState: "missing" | "invalid" | "zero" | "positive";
+  readonly totalAmountState: "missing" | "invalid" | "zero" | "negative" | "positive";
   readonly totalAmount?: string;
   readonly openAmount?: string;
   readonly unappliedAmount?: string;
@@ -153,12 +156,32 @@ export async function persistQuickBooksSubledgerResources(
   const transactionBySourceId = new Map(
     input.facts.transactions.map((transaction) => [transaction.sourceTransactionId, transaction])
   );
+  // Retained zero-effect document headers are identities, not monetary journals.
+  const postingTransactionIds = new Set(input.facts.postings.map(posting => posting.transactionId));
+  const missingBalancedJournal = (sourceId: string): boolean => {
+    const transaction = transactionBySourceId.get(sourceId);
+    return transaction === undefined || !postingTransactionIds.has(transaction.transactionId);
+  };
   const documentIdBySourceId = new Map<string, string>();
   const documentDates = new Map<string, { date: string; recognitionDate: string | null; type: string }>();
   const accountIdBySourceId = new Map(input.facts.accounts.map((account) => [account.sourceAccountId, account.accountId]));
   const itemBySourceId = new Map(input.facts.items.map((item) => [item.sourceItemId, item]));
   const partyIdBySourceId = new Map(input.facts.parties.map((party) => [party.sourcePartyId, party.partyId]));
-  const operationalDocuments = input.resources.operationalDocuments;
+  const planNonCashLinks = createQuickBooksNonCashLinkPlanner(input.facts);
+  const nonCashLinks = input.resources.operationalDocuments
+    .filter(row => !["voided", "deleted", "skipped"].includes(row.syncAction ?? ""))
+    .map(row => {
+      try { return planNonCashLinks(row.resource); }
+      catch (error) {
+        if (!(error instanceof QuickBooksNonCashLinkError)) throw error;
+        throw new QuickBooksSubledgerProjectionError({
+          ...quickBooksSubledgerProjectionDiagnostic(row.resource, missingBalancedJournal(row.resource.sourceTransactionId)),
+          rejectionReasons: [error.reason]
+        });
+      }
+    }).filter(row => row !== undefined);
+  const nonCashIds = new Set(nonCashLinks.map(row => `${row.sourceTransactionType}:${row.sourceTransactionId}`));
+  const operationalDocuments = input.resources.operationalDocuments.filter(row => !nonCashIds.has(`${row.resource.sourceTransactionType}:${row.resource.sourceTransactionId}`));
   // Incremental envelopes need not repeat unchanged (including inactive) references.
   const retainedAccounts = await input.client.query<{ source_account_id: string; account_id: string }>(
     `select source_account_id, account_id from erp_financials.accounts where tenant_id=$1 and source_id=$2`,
@@ -175,7 +198,7 @@ export async function persistQuickBooksSubledgerResources(
   const commercialPlans = new Map<string, QuickBooksCommercialDetailPlan>();
   for (const resource of operationalDocuments) {
     const normalized = resource.resource;
-    if (importedDocumentType(normalized.sourceTransactionType) !== undefined) {
+    if (importedDocumentType(normalized.sourceTransactionType, normalized.totalAmount) !== undefined) {
       documentIdBySourceId.set(
         normalized.sourceTransactionId,
         stableId("qbo_document", input.facts.source.sourceId, normalized.sourceTransactionType, normalized.sourceTransactionId)
@@ -206,7 +229,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   }
   for (const row of operationalDocuments) {
     if (["voided", "deleted", "skipped"].includes(row.syncAction ?? "")) continue;
-    const type = importedDocumentType(row.resource.sourceTransactionType);
+    const type = importedDocumentType(row.resource.sourceTransactionType, row.resource.totalAmount);
     if (type !== undefined) documentDates.set(row.resource.sourceTransactionId, {
       date: row.resource.transactionDate,
       recognitionDate: documentDates.get(row.resource.sourceTransactionId)?.recognitionDate ?? null,
@@ -231,7 +254,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     if (resource.syncAction === "voided" || resource.syncAction === "deleted" || resource.syncAction === "skipped") continue;
     const normalized = resource.resource;
     if (
-      importedDocumentType(normalized.sourceTransactionType) !== undefined &&
+      importedDocumentType(normalized.sourceTransactionType, normalized.totalAmount) !== undefined &&
       positiveAmount(normalized.totalAmount) !== undefined &&
       transactionBySourceId.has(normalized.sourceTransactionId)
     ) {
@@ -255,7 +278,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     const normalized = resource.resource;
     const projection = quickBooksZeroTotalCustomerCreditProjection(
       normalized,
-      transactionBySourceId.get(normalized.sourceTransactionId) === undefined,
+      missingBalancedJournal(normalized.sourceTransactionId),
       projectableDocumentSourceIds
     );
     if (projection?.eligible === true && projection.projectionKind === "customer_deposit_application") {
@@ -327,32 +350,40 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   for (const resource of operationalDocuments) {
     if (resource.syncAction === "voided" || resource.syncAction === "deleted" || resource.syncAction === "skipped") continue;
     const normalized = resource.resource;
-    const documentType = importedDocumentType(normalized.sourceTransactionType);
+    const documentType = importedDocumentType(normalized.sourceTransactionType, normalized.totalAmount);
     if (documentType === undefined) continue;
     const transaction = transactionBySourceId.get(normalized.sourceTransactionId);
     const originalAmount = positiveAmount(normalized.totalAmount);
+    if (Number(normalized.totalAmount) < 0 &&
+      (!["Invoice", "Bill", "CreditMemo", "VendorCredit"].includes(normalized.sourceTransactionType)
+        || normalized.lines.some(line => (line.linkedTransactions?.length ?? 0) > 0))) {
+      recordProjectionDiagnostic({ ...quickBooksSubledgerProjectionDiagnostic(normalized, transaction === undefined),
+        rejectionReasons: ["negative_total_application_requires_explicit_mapping"] });
+      continue;
+    }
     if (
       transaction !== undefined &&
       zeroAmount(normalized.totalAmount) &&
-      importedApplicationType(normalized.sourceTransactionType) === undefined
+      !["Payment", "BillPayment"].includes(normalized.sourceTransactionType) &&
+      !normalized.lines.some(line => (line.linkedTransactions?.length ?? 0) > 0)
     ) {
       continue;
     }
     if (transaction === undefined || originalAmount === undefined) {
       if (quickBooksZeroTotalProviderOffsetBillPayment(
         normalized,
-        transaction === undefined,
+        missingBalancedJournal(normalized.sourceTransactionId),
         projectableDocumentSourceIds
       )) {
         continue;
       }
       const applicationOnly = quickBooksZeroTotalBillPaymentProjection(
         normalized,
-        transaction === undefined,
+        missingBalancedJournal(normalized.sourceTransactionId),
         projectableDocumentSourceIds
       ) ?? quickBooksZeroTotalCustomerCreditProjection(
         normalized,
-        transaction === undefined,
+        missingBalancedJournal(normalized.sourceTransactionId),
         projectableDocumentSourceIds
       );
       if (applicationOnly?.eligible === true) {
@@ -400,28 +431,52 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     );
   }
 
+  for (const evidence of nonCashLinks) {
+    const chunks = Math.max(1, Math.ceil(evidence.allocations.length / 10));
+    for (let index = 0; index < chunks; index++) {
+      const key = `quickbooks:non-cash-links:${input.facts.source.sourceId}:${evidence.sourceTransactionType}:${evidence.sourceTransactionId}:${String(index)}`;
+      await insertLifecycleEvent(input.client, {
+        eventId: stableId("qbo_event", key), tenantId: input.facts.company.tenantId, companyId: input.companyId,
+        sourceId: input.facts.source.sourceId, aggregateId: evidence.transactionId,
+        eventType: "quickbooks_non_cash_applications_imported", occurredAt: input.importedAt, recordedAt: input.importedAt,
+        idempotencyKey: key, payload: { ...evidence, chunkIndex: index, chunkCount: chunks,
+          allocationCount: evidence.allocations.length, allocations: evidence.allocations.slice(index * 10, (index + 1) * 10) }
+      });
+    }
+  }
+
   for (const resource of operationalDocuments) {
     if (resource.syncAction === "voided" || resource.syncAction === "deleted" || resource.syncAction === "skipped") continue;
     const normalized = resource.resource;
-    const documentType = importedDocumentType(normalized.sourceTransactionType);
+    const documentType = importedDocumentType(normalized.sourceTransactionType, normalized.totalAmount);
     if (documentType === undefined) continue;
     const transaction = transactionBySourceId.get(normalized.sourceTransactionId);
     const originalAmount = positiveAmount(normalized.totalAmount);
     if (
       transaction !== undefined &&
       zeroAmount(normalized.totalAmount) &&
-      importedApplicationType(normalized.sourceTransactionType) === undefined
+      !["Payment", "BillPayment"].includes(normalized.sourceTransactionType) &&
+      !normalized.lines.some(line => (line.linkedTransactions?.length ?? 0) > 0)
     ) {
       // A zero-net provider document can still own a balanced canonical journal
       // (for example revenue offset by a discount). Keep that accounting
       // activity while omitting a meaningless zero-value subledger header.
+      const key = `quickbooks:zero-document:${input.facts.source.sourceId}:${normalized.sourceTransactionType}:${normalized.sourceTransactionId}`;
+      await insertLifecycleEvent(input.client, {
+        eventId: stableId("qbo_event", key), tenantId: input.facts.company.tenantId, companyId: input.companyId,
+        sourceId: input.facts.source.sourceId, aggregateId: transaction.transactionId,
+        eventType: "quickbooks_zero_total_document_retained", occurredAt: input.importedAt, recordedAt: input.importedAt,
+        idempotencyKey: key, payload: { sourceTransactionId: normalized.sourceTransactionId,
+          sourceTransactionType: normalized.sourceTransactionType, providerSignedTotal: normalized.totalAmount ?? "0.00",
+          detailLineCount: normalized.lines.length, canonicalHeaderRetained: true, additionalPostings: 0 }
+      });
       skippedTransactions += 1;
       continue;
     }
     if (transaction === undefined || originalAmount === undefined) {
       if (quickBooksZeroTotalProviderOffsetBillPayment(
         normalized,
-        transaction === undefined,
+        missingBalancedJournal(normalized.sourceTransactionId),
         projectableDocumentSourceIds
       )) {
         // QuickBooks uses a zero-cash BillPayment as a relationship container
@@ -435,11 +490,11 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       }
       const applicationOnly = quickBooksZeroTotalBillPaymentProjection(
         normalized,
-        transaction === undefined,
+        missingBalancedJournal(normalized.sourceTransactionId),
         projectableDocumentSourceIds
       ) ?? quickBooksZeroTotalCustomerCreditProjection(
         normalized,
-        transaction === undefined,
+        missingBalancedJournal(normalized.sourceTransactionId),
         projectableDocumentSourceIds
       );
       if (applicationOnly?.eligible === true) {
@@ -540,6 +595,8 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
           provider: "quickbooks",
           sourceTransactionId: normalized.sourceTransactionId,
           sourceTransactionType: normalized.sourceTransactionType,
+          providerSignedTotal: normalized.totalAmount ?? null,
+          signedTotalMapping: Number(normalized.totalAmount) < 0 ? documentType : null,
           sourceUpdatedAt: normalized.sourceUpdatedAt ?? null,
           reportedOpenAmount: normalized.openAmount ?? normalized.unappliedAmount ?? null,
           emailStatus: normalized.emailStatus ?? null,
@@ -1019,7 +1076,7 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
   for (const resource of operationalDocuments) {
     if (resource.syncAction === "voided" || resource.syncAction === "deleted" || resource.syncAction === "skipped") continue;
     const normalized = resource.resource;
-    const documentType = importedDocumentType(normalized.sourceTransactionType);
+    const documentType = importedDocumentType(normalized.sourceTransactionType, normalized.totalAmount);
     const originalAmount = positiveAmount(normalized.totalAmount);
     if (documentType === undefined || originalAmount === undefined) continue;
     const openAmount = reportedQuickBooksOpenAmount(documentType, normalized, originalAmount);
@@ -1144,6 +1201,8 @@ where transaction."tenant_id" = $1 and transaction."source_id" = $2
     documentLines,
     applications,
     skippedTransactions,
+    ...(nonCashLinks.length ? { retainedNonCashDocuments: nonCashLinks.length,
+      retainedNonCashLinks: nonCashLinks.reduce((sum, row) => sum + row.allocations.length, 0) } : {}),
     skippedDocumentLines,
     skippedApplications,
     voidedDocuments,
@@ -1367,7 +1426,7 @@ function isQuickBooksProviderOnlyNonPostingLine(detailType: string | undefined):
     detailType === "GroupLineDetail";
 }
 
-function importedDocumentType(sourceType: string): ImportedDocumentType | undefined {
+function importedDocumentType(sourceType: string, totalAmount?: string): ImportedDocumentType | undefined {
   const types: Readonly<Record<string, ImportedDocumentType>> = {
     Invoice: "invoice",
     Payment: "customer_payment",
@@ -1381,6 +1440,12 @@ function importedDocumentType(sourceType: string): ImportedDocumentType | undefi
     Purchase: "purchase",
     VendorCredit: "vendor_credit"
   };
+  if (Number(totalAmount) < 0) {
+    const reversals: Readonly<Record<string, ImportedDocumentType>> = {
+      Invoice: "credit_memo", Bill: "vendor_credit", CreditMemo: "invoice", VendorCredit: "vendor_bill"
+    };
+    return reversals[sourceType] ?? types[sourceType];
+  }
   return types[sourceType];
 }
 
@@ -1847,7 +1912,7 @@ function quickBooksSubledgerProjectionDiagnostic(
       ? "invalid"
       : amount === 0
         ? "zero"
-        : "positive";
+        : (amount ?? 0) < 0 ? "negative" : "positive";
   return {
     sourceTransactionType: transaction.sourceTransactionType,
     sourceTransactionId: transaction.sourceTransactionId,
