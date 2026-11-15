@@ -434,12 +434,12 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   for (const evidence of nonCashLinks) {
     const chunks = Math.max(1, Math.ceil(evidence.allocations.length / 10));
     for (let index = 0; index < chunks; index++) {
-      const key = `quickbooks:non-cash-links:${input.facts.source.sourceId}:${evidence.sourceTransactionType}:${evidence.sourceTransactionId}:${String(index)}`;
+      const key = `quickbooks:non-cash-links:${input.facts.source.sourceId}:${input.facts.importBatch.importBatchId}:${evidence.sourceTransactionType}:${evidence.sourceTransactionId}:${String(index)}`;
       await insertLifecycleEvent(input.client, {
         eventId: stableId("qbo_event", key), tenantId: input.facts.company.tenantId, companyId: input.companyId,
         sourceId: input.facts.source.sourceId, aggregateId: evidence.transactionId,
         eventType: "quickbooks_non_cash_applications_imported", occurredAt: input.importedAt, recordedAt: input.importedAt,
-        idempotencyKey: key, payload: { ...evidence, chunkIndex: index, chunkCount: chunks,
+        idempotencyKey: key, immutablePayload: true, payload: { ...evidence, chunkIndex: index, chunkCount: chunks,
           allocationCount: evidence.allocations.length, allocations: evidence.allocations.slice(index * 10, (index + 1) * 10) }
       });
     }
@@ -2049,8 +2049,17 @@ async function insertLifecycleEvent(client: PostgresQueryClient, input: {
   readonly recordedAt: string;
   readonly idempotencyKey: string;
   readonly payload: JsonValue;
+  readonly immutablePayload?: boolean;
 }): Promise<void> {
   const payload = JSON.stringify(input.payload);
+  if (input.immutablePayload) {
+    const retained = await client.query<{ payload_checksum: string }>(
+      `select payload_checksum from erp_financials.financial_lifecycle_events where tenant_id=$1 and company_id=$2 and source_id=$3 and idempotency_key=$4`,
+      [input.tenantId, input.companyId, input.sourceId, input.idempotencyKey]);
+    if (retained.rows[0] && retained.rows[0].payload_checksum !== createHash("sha256").update(payload).digest("hex")) {
+      throw new Error("Changed provider non-cash application evidence requires explicit reconciliation");
+    }
+  }
   const datedPayload = input.payload !== null && typeof input.payload === "object" && !Array.isArray(input.payload)
     ? input.payload as Readonly<Record<string, JsonValue>> : undefined;
   if (typeof datedPayload?.applicationDate === "string") {
