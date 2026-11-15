@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
 import type { NormalizedQuickBooksLedgerLine, NormalizedQuickBooksLedgerTransaction } from "./normalized-accounting-contracts.js";
 
-export const QUICKBOOKS_COMMERCIAL_DETAIL_VERSION = 2;
+export const QUICKBOOKS_COMMERCIAL_DETAIL_VERSION = 3;
 export type QuickBooksCommercialReferences = {
   accounts: readonly { sourceAccountId: string; accountId: string }[];
   items: readonly { sourceItemId: string; itemId: string; incomeAccountId?: string; expenseAccountId?: string }[];
 };
 export type QuickBooksCommercialLine = {
   source: NormalizedQuickBooksLedgerLine;
+  representation: "provider" | "derived_unit_price" | "derived_quantity" | "amount_only";
   accountId: string;
   itemId?: string;
   quantity: string;
@@ -63,18 +64,31 @@ export function planQuickBooksCommercialDetail(
     if (source.itemRef && !item) fail("unresolved_line_item");
     let quantity = source.sourceQuantity;
     let unitAmount = source.sourceUnitAmount;
+    let representation: QuickBooksCommercialLine["representation"] = "provider";
     if (discount) { quantity = "1"; unitAmount = money(net); }
-    else if (quantity === undefined && unitAmount === undefined && !source.itemRef
-      && source.detailType !== "ItemBasedExpenseLineDetail") {
-      // Amount-only account and reimbursed-expense lines have no provider quantity semantics.
-      quantity = "1"; unitAmount = money(net);
+    else if (quantity === undefined && unitAmount === undefined) {
+      // QBO can report a valid amount-only item line (including shipping).
+      // This is an explicit representation, never a claim of provider quantity.
+      quantity = "1"; unitAmount = money(net); representation = "amount_only";
+    } else if (unitAmount === undefined && quantity !== undefined) {
+      const q = parse(quantity, "quantity");
+      if (q === 0n && net !== 0n) fail("zero_quantity_with_amount");
+      unitAmount = q === 0n ? "0" : rate(net, q);
+      representation = "derived_unit_price";
+    } else if (quantity === undefined && unitAmount !== undefined) {
+      const u = parse(unitAmount, "unit_price");
+      if (u === 0n && net !== 0n) fail("zero_unit_price_with_amount");
+      quantity = u === 0n ? "0" : rate(net, u);
+      representation = "derived_quantity";
     }
     if (quantity === undefined) return fail("missing_or_invalid_quantity");
     if (unitAmount === undefined) return fail("missing_or_invalid_unit_price");
     const q = parse(quantity, "quantity");
     const u = parse(unitAmount, "unit_price");
     if (q === 0n && net !== 0n) fail("zero_quantity_with_amount");
-    return { source, accountId, ...(item ? { itemId: item.itemId } : {}), quantity, unitAmount, net, gross: round(q * u, 10_000_000_000_000_000_000_000n) };
+    const gross = round(q * u, 10_000_000_000_000_000_000_000n);
+    if (representation !== "provider" && gross !== net) fail("derived_price_precision_insufficient");
+    return { source, accountId, ...(item ? { itemId: item.itemId } : {}), quantity, unitAmount, representation, net, gross };
   });
   const sum = candidates.reduce((value, line) => value + line.net, 0n);
   // Old envelopes may omit tax only when their commercial amounts already explain the total.
@@ -106,7 +120,7 @@ export function planQuickBooksCommercialDetail(
     const sign = line.gross < 0n ? -1n : 1n;
     const discount = (line.gross - net) * sign;
     if (discount < 0n || discount > abs(line.gross)) fail("line_price_arithmetic_mismatch");
-    return { source: line.source, accountId: line.accountId, ...(line.itemId ? { itemId: line.itemId } : {}),
+    return { source: line.source, representation: line.representation, accountId: line.accountId, ...(line.itemId ? { itemId: line.itemId } : {}),
       quantity: line.quantity, unitAmount: line.unitAmount, discountAmount: money(discount),
       taxAmount: money(lineTax), amount: money(net + lineTax) };
   });
@@ -124,3 +138,9 @@ function decimal(value: string): bigint {
 function abs(value: bigint): bigint { return value < 0n ? -value : value; }
 function round(value: bigint, divisor: bigint): bigint { return (value < 0n ? -1n : 1n) * ((abs(value) + divisor / 2n) / divisor); }
 function money(value: bigint): string { return `${value < 0n ? "-" : ""}${String(abs(value) / 100n)}.${String(abs(value) % 100n).padStart(2, "0")}`; }
+
+// Divide a cent amount by a 12-decimal quantity/price, retaining 12 decimals.
+function rate(cents: bigint, divisor: bigint): string {
+  const scaled = round(cents * 10_000_000_000_000_000_000_000n, abs(divisor)) * (divisor < 0n ? -1n : 1n);
+  return `${scaled < 0n ? "-" : ""}${String(abs(scaled) / 1_000_000_000_000n)}.${String(abs(scaled) % 1_000_000_000_000n).padStart(12, "0")}`;
+}

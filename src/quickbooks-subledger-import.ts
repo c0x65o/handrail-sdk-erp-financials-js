@@ -608,6 +608,19 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     documents += result.rowCount ?? 0;
 
     const commercialPlan = commercialPlans.get(`${normalized.sourceTransactionType}:${normalized.sourceTransactionId}`);
+    const representations = commercialPlan?.lines.filter(line => line.representation !== "provider") ?? [];
+    for (let offset = 0; offset < representations.length; offset += 20) {
+      const key = `quickbooks:commercial-representation:${input.facts.source.sourceId}:${input.facts.importBatch.importBatchId}:${normalized.sourceTransactionId}:${String(offset)}`;
+      await insertLifecycleEvent(input.client, {
+        eventId: stableId("qbo_event", key), tenantId: input.facts.company.tenantId, companyId: input.companyId,
+        sourceId: input.facts.source.sourceId, aggregateId: documentId, eventType: "quickbooks_commercial_representation_retained",
+        occurredAt: input.importedAt, recordedAt: input.importedAt, idempotencyKey: key, immutablePayload: true,
+        payload: { sourceTransactionId: normalized.sourceTransactionId, sourceTransactionType: normalized.sourceTransactionType,
+          lines: representations.slice(offset, offset + 20).map(line => ({ sourceLineId: line.source.sourceLineId ?? String(line.source.lineNumber),
+            representation: line.representation, providerQuantity: line.source.sourceQuantity ?? null, providerUnitAmount: line.source.sourceUnitAmount ?? null,
+            providerAmount: line.source.sourceAmount ?? null, projectedQuantity: line.quantity, projectedUnitAmount: line.unitAmount })) }
+      });
+    }
     const persistedLineNumbers: number[] = [];
     if (!importsCommercialDocumentLines(documentType)) {
       await input.client.query(

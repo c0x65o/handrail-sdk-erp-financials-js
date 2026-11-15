@@ -57,3 +57,21 @@ describe("source-backed QuickBooks commercial detail", () => {
     expect(() => planQuickBooksCommercialDetail({ ...invoice, lines: [{ ...invoiceLine, sourceUnitAmount: "400" }] }, references)).toThrow("line_price_arithmetic_mismatch");
   });
 });
+
+it("derives only missing provider price fields and retains their provenance", () => {
+  const base = { ...invoice, totalAmount: "100.00", totalTax: "0.00" };
+  const source = without({ ...invoiceLine, sourceAmount: "100.00", sourceQuantity: "3" }, "sourceUnitAmount");
+  const unit = planQuickBooksCommercialDetail({ ...base, lines: [source] }, references).lines[0];
+  expect(unit).toMatchObject({ quantity: "3", unitAmount: "33.333333333333", amount: "100.00", representation: "derived_unit_price" });
+  expect(unit?.source.sourceUnitAmount).toBeUndefined();
+  const quantity = planQuickBooksCommercialDetail({ ...base, lines: [{ ...without(source, "sourceQuantity"), sourceUnitAmount: "25" }] }, references).lines[0];
+  expect(quantity).toMatchObject({ quantity: "4.000000000000", unitAmount: "25", representation: "derived_quantity" });
+  const amountOnly = planQuickBooksCommercialDetail({ ...base, lines: [without(source, "sourceQuantity")] }, references).lines[0];
+  expect(amountOnly).toMatchObject({ quantity: "1", unitAmount: "100.00", representation: "amount_only" });
+  expect(() => planQuickBooksCommercialDetail({ ...base, lines: [{ ...source, sourceQuantity: "0" }] }, references)).toThrow("zero_quantity_with_amount");
+  expect(() => planQuickBooksCommercialDetail({ ...base, lines: [{ ...without(source, "sourceQuantity"), sourceUnitAmount: "0" }] }, references)).toThrow("zero_unit_price_with_amount");
+});
+
+function without<T extends object, K extends keyof T>(value: T, key: K): Omit<T, K> {
+  const result = { ...value }; Reflect.deleteProperty(result, key); return result;
+}
