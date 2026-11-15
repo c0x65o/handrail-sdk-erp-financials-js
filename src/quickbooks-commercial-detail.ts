@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { NormalizedQuickBooksLedgerLine, NormalizedQuickBooksLedgerTransaction } from "./normalized-accounting-contracts.js";
 
-export const QUICKBOOKS_COMMERCIAL_DETAIL_VERSION = 3;
+export const QUICKBOOKS_COMMERCIAL_DETAIL_VERSION = 4;
 export type QuickBooksCommercialReferences = {
   accounts: readonly { sourceAccountId: string; accountId: string }[];
   items: readonly { sourceItemId: string; itemId: string; incomeAccountId?: string; expenseAccountId?: string }[];
@@ -9,7 +9,8 @@ export type QuickBooksCommercialReferences = {
 export type QuickBooksCommercialLine = {
   source: NormalizedQuickBooksLedgerLine;
   representation: "provider" | "derived_unit_price" | "derived_quantity" | "amount_only";
-  accountId: string;
+  accountId?: string;
+  nonPostingDetail?: true;
   itemId?: string;
   quantity: string;
   unitAmount: string;
@@ -60,7 +61,13 @@ export function planQuickBooksCommercialDetail(
     const item = source.itemRef ? items.get(source.itemRef.sourceObjectId) : undefined;
     const accountId = source.accountRef ? accounts.get(source.accountRef.sourceObjectId)
       : sale ? item?.incomeAccountId : item?.expenseAccountId;
-    if (!accountId) return fail("unresolved_line_account");
+    // Intuit's built-in shipping placeholder can be an explicit zero-charge
+    // detail with no account. Retain it without inventing an income account.
+    const nonPostingDetail = !accountId && source.accountRef === undefined && item !== undefined
+      && source.itemRef?.sourceObjectId === "SHIPPING_ITEM_ID" && parse(source.sourceAmount, "source_line_amount") === 0n
+      && (source.amount === undefined || parse(source.amount, "line_amount") === 0n)
+      && source.postings.length === 0 && !source.linkedTransactions?.length;
+    if (!accountId && !nonPostingDetail) return fail("unresolved_line_account");
     if (source.itemRef && !item) fail("unresolved_line_item");
     let quantity = source.sourceQuantity;
     let unitAmount = source.sourceUnitAmount;
@@ -87,8 +94,10 @@ export function planQuickBooksCommercialDetail(
     const u = parse(unitAmount, "unit_price");
     if (q === 0n && net !== 0n) fail("zero_quantity_with_amount");
     const gross = round(q * u, 10_000_000_000_000_000_000_000n);
+    if (nonPostingDetail && gross !== 0n) fail("non_posting_detail_has_price_effect");
     if (representation !== "provider" && gross !== net) fail("derived_price_precision_insufficient");
-    return { source, accountId, ...(item ? { itemId: item.itemId } : {}), quantity, unitAmount, representation, net, gross };
+    return { source, ...(accountId ? { accountId } : {}), ...(nonPostingDetail ? { nonPostingDetail: true as const } : {}),
+      ...(item ? { itemId: item.itemId } : {}), quantity, unitAmount, representation, net, gross };
   });
   const sum = candidates.reduce((value, line) => value + line.net, 0n);
   // Old envelopes may omit tax only when their commercial amounts already explain the total.
@@ -120,7 +129,9 @@ export function planQuickBooksCommercialDetail(
     const sign = line.gross < 0n ? -1n : 1n;
     const discount = (line.gross - net) * sign;
     if (discount < 0n || discount > abs(line.gross)) fail("line_price_arithmetic_mismatch");
-    return { source: line.source, representation: line.representation, accountId: line.accountId, ...(line.itemId ? { itemId: line.itemId } : {}),
+    if (line.nonPostingDetail && lineTax !== 0n) fail("non_posting_detail_has_tax_effect");
+    return { source: line.source, representation: line.representation, ...(line.accountId ? { accountId: line.accountId } : {}),
+      ...(line.nonPostingDetail ? { nonPostingDetail: true } : {}), ...(line.itemId ? { itemId: line.itemId } : {}),
       quantity: line.quantity, unitAmount: line.unitAmount, discountAmount: money(discount),
       taxAmount: money(lineTax), amount: money(net + lineTax) };
   });

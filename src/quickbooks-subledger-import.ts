@@ -31,6 +31,7 @@ type ImportedApplicationType =
 export type QuickBooksSubledgerImportResult = {
   readonly retainedNonCashDocuments?: number;
   readonly retainedNonCashLinks?: number;
+  readonly retainedNonPostingDocumentLines?: number;
   readonly correctionDependencies?: readonly CustomerPaymentCorrectionDependency[];
   readonly documents: number;
   readonly documentLines: number;
@@ -267,6 +268,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   let voidedDocuments = 0;
   let removedLedgerPostings = 0;
   let skippedDocumentLines = 0;
+  let retainedNonPostingDocumentLines = 0;
   const applicationOnlyProjections = new Map<string, ApplicationOnlyProjection>();
   const providerOffsetBillPayments = new Set<string>();
   const customerDepositApplicationSourceIds = new Set<string>();
@@ -636,6 +638,23 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3 and "subledger
         continue;
       }
       const plannedLine = commercialPlan?.lines.find(candidate => candidate.source === line);
+      if (plannedLine?.nonPostingDetail) {
+        const key = `quickbooks:non-posting-detail:${input.facts.source.sourceId}:${input.facts.importBatch.importBatchId}:${normalized.sourceTransactionType}:${normalized.sourceTransactionId}:${line.sourceLineId ?? String(line.lineNumber)}`;
+        await insertLifecycleEvent(input.client, {
+          eventId: stableId("qbo_event", key), tenantId: input.facts.company.tenantId, companyId: input.companyId,
+          sourceId: input.facts.source.sourceId, aggregateId: documentId, eventType: "quickbooks_non_posting_commercial_detail_retained",
+          occurredAt: input.importedAt, recordedAt: input.importedAt, idempotencyKey: key, immutablePayload: true,
+          payload: { sourceTransactionId: normalized.sourceTransactionId, sourceTransactionType: normalized.sourceTransactionType,
+            sourceLineId: line.sourceLineId ?? String(line.lineNumber), sourceItemId: line.itemRef?.sourceObjectId ?? null,
+            itemId: plannedLine.itemId ?? null, sourceAccountId: null, providerAmount: line.sourceAmount ?? null,
+            providerQuantity: line.sourceQuantity ?? null, providerUnitAmount: line.sourceUnitAmount ?? null,
+            reason: "zero_charge_system_shipping_detail", postingEffect: "0.00",
+            detail: JSON.parse(JSON.stringify(line)) as JsonValue }
+        });
+        retainedNonPostingDocumentLines += 1;
+        skippedDocumentLines += 1;
+        continue;
+      }
       const amount = plannedLine?.amount ?? positiveAmount(line.sourceAmount);
       const item = line.itemRef === undefined ? undefined : itemBySourceId.get(line.itemRef.sourceObjectId);
       const accountId = plannedLine?.accountId ?? (line.accountRef === undefined
@@ -1217,6 +1236,7 @@ where transaction."tenant_id" = $1 and transaction."source_id" = $2
     ...(nonCashLinks.length ? { retainedNonCashDocuments: nonCashLinks.length,
       retainedNonCashLinks: nonCashLinks.reduce((sum, row) => sum + row.allocations.length, 0) } : {}),
     skippedDocumentLines,
+    ...(retainedNonPostingDocumentLines ? { retainedNonPostingDocumentLines } : {}),
     skippedApplications,
     voidedDocuments,
     removedLedgerPostings,

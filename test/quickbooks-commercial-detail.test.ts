@@ -12,6 +12,22 @@ const invoice: NormalizedQuickBooksLedgerTransaction = {
 const invoiceLine = invoice.lines[0];
 if (!invoiceLine) throw new Error("Missing invoice fixture line");
 describe("source-backed QuickBooks commercial detail", () => {
+  it("retains zero-charge system shipping without inventing an account, and rejects monetary or unresolved detail", () => {
+    const shipping = { lineNumber: 2, sourceLineId: "shipping", detailType: "SalesItemLineDetail", sourceAmount: "0",
+      itemRef: { sourceObjectId: "SHIPPING_ITEM_ID" }, postings: [] };
+    const refs = { ...references, items: [...references.items, { sourceItemId: "SHIPPING_ITEM_ID", itemId: "shipping" }] };
+    const withShipping = { ...invoice, lines: [...invoice.lines, shipping] };
+    const result = planQuickBooksCommercialDetail(withShipping, refs);
+    expect(result.lines[1]).toMatchObject({ nonPostingDetail: true, itemId: "shipping", amount: "0.00", taxAmount: "0.00" });
+    expect(result.lines[1]?.accountId).toBeUndefined();
+    expect(result.lines[1]?.source).toEqual(shipping);
+    for (const change of [
+      { sourceAmount: "1" }, { sourceAmount: "0.001" }, { amount: "1" },
+      { accountRef: { sourceObjectId: "missing" } }, { itemRef: { sourceObjectId: "missing" } },
+      { linkedTransactions: [{ sourceTransactionId: "another" }] },
+    ]) expect(() => planQuickBooksCommercialDetail({ ...invoice, lines: [...invoice.lines, { ...shipping, ...change }] }, refs)).toThrow("unresolved_line_account");
+    expect(() => planQuickBooksCommercialDetail({ ...invoice, lines: [...invoice.lines, { ...shipping, sourceQuantity: "1", sourceUnitAmount: "25" }] }, refs)).toThrow("non_posting_detail_has_price_effect");
+  });
   it("restores invoice 1492 economics and allocates its recorded tax", () => {
     const result = planQuickBooksCommercialDetail(invoice, references);
     expect(result.lines).toMatchObject([{ quantity: "1", unitAmount: "450", amount: "477.00", taxAmount: "27.00", discountAmount: "0.00" }]);
