@@ -1050,6 +1050,29 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     }
   }
 
+  // Read application-only ownership once for the whole snapshot. Repeating the
+  // payload lookup per payment scans the same history tens of thousands of times.
+  const projectionApplications = await input.client.query<{
+    subledger_application_id: string; source_transaction_id: string; source_transaction_type: string;
+  }>(`select application."subledger_application_id",
+  event."payload" ->> 'sourceTransactionId' as source_transaction_id,
+  event."payload" ->> 'sourceTransactionType' as source_transaction_type
+from "erp_financials"."subledger_applications" application
+join "erp_financials"."financial_lifecycle_events" event
+  on event."tenant_id" = application."tenant_id" and event."company_id" = application."company_id"
+  and event."source_id" = application."source_id" and event."event_id" = application."applied_event_id"
+where application."tenant_id" = $1 and application."company_id" = $2 and application."source_id" = $3
+  and application."status" = 'applied'
+  and event."payload" ->> 'projectionKind' in ('customer_credit_application', 'customer_deposit_application', 'vendor_credit_application')`,
+    [input.facts.company.tenantId, input.companyId, input.facts.source.sourceId]);
+  const projectionApplicationsBySource = new Map<string, { subledger_application_id: string }[]>();
+  for (const application of projectionApplications.rows) {
+    const key = JSON.stringify([application.source_transaction_type, application.source_transaction_id]);
+    const group = projectionApplicationsBySource.get(key) ?? [];
+    group.push({ subledger_application_id: application.subledger_application_id });
+    projectionApplicationsBySource.set(key, group);
+  }
+
   // Application-only provider wrappers are provenance, not cash documents.
   // Retire their canonical application directly when an incremental change no
   // longer carries the supported shape, or when QuickBooks voids/deletes it.
@@ -1067,7 +1090,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       ...(resource.syncAction === "voided" || resource.syncAction === "deleted"
         ? {}
         : { reason: "projection_changed" as const })
-    });
+    }, projectionApplicationsBySource.get(JSON.stringify([source.sourceTransactionType, source.sourceTransactionId])) ?? []);
   }
   if (input.replaceMissingDocuments === true) {
     const incomingSourceIds = operationalDocuments.map((resource) => resource.resource.sourceTransactionId);
@@ -1252,9 +1275,10 @@ async function retireQuickBooksApplicationOnlyProjection(
     readonly action: "deleted" | "removed" | "voided";
     readonly occurredAt: string;
     readonly reason?: "missing_from_full_snapshot" | "projection_changed";
-  }
+  },
+  prefetchedApplications?: readonly { subledger_application_id: string }[]
 ): Promise<number> {
-  const activeApplications = await input.client.query<{ subledger_application_id: string }>(
+  const activeApplications = prefetchedApplications ?? (await input.client.query<{ subledger_application_id: string }>(
     `select application."subledger_application_id"
 from "erp_financials"."subledger_applications" application
 join "erp_financials"."financial_lifecycle_events" event
@@ -1272,9 +1296,9 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
       target.sourceTransactionId,
       target.sourceTransactionType
     ]
-  );
+  )).rows;
   let retired = 0;
-  for (const application of activeApplications.rows) {
+  for (const application of activeApplications) {
     const terminalRef = target.reason ?? target.action;
     const endedEventId = stableId(
       "qbo_event",

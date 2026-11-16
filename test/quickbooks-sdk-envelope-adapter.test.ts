@@ -18,6 +18,28 @@ import type {
 } from "../src/index.js";
 
 describe("QuickBooks SDK envelope adapter", () => {
+  it("looks up application-only ownership once for 28,000 payment dispositions and retires only the matching identity", async () => {
+    const adapted=adaptHandrailQuickBooksSdkFullSyncEnvelope(fullSyncEnvelope(),adapterOptions());
+    const mapped=mapNormalizedQuickBooksFullSyncResponseToCanonicalFacts(adapted,{companyId:"batch-fixture"});
+    const template=requiredFixtureValue(adapted.resources.operationalDocuments?.[0]);
+    const documents=Array.from({length:28000},(_,index)=>({...template,syncAction:"voided" as const,resourceId:`payment-${String(index)}`,
+      resource:{...template.resource,sourceTransactionType:index%2===0?"Payment":"BillPayment",sourceTransactionId:`payment-${String(index)}`,lines:[]}}));
+    const calls:Array<{sql:string;params:readonly unknown[]}>=[];
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- Match the caller-generic PostgreSQL query contract.
+    await persistQuickBooksSubledgerResources({client:{query<Row extends Record<string,unknown>>(sql:string,params:readonly unknown[]=[]):Promise<{rows:readonly Row[];rowCount:number}>{
+      calls.push({sql,params});
+      const rows=sql.includes("as source_transaction_type") && sql.includes("as source_transaction_id")
+        ? [{subledger_application_id:"retire-this-only",source_transaction_type:"Payment",source_transaction_id:"payment-42"}] : [];
+      return Promise.resolve({rows:rows as unknown as Row[],rowCount:1});
+    }},companyId:"batch-fixture",importedAt:"2026-08-13T12:46:00Z",facts:{...mapped.facts,transactions:[]},resources:{...adapted.resources,operationalDocuments:documents}});
+    const lookups=calls.filter(c=>c.sql.includes("select application.") && c.sql.includes("projectionKind"));
+    expect(lookups).toHaveLength(1);
+    expect(lookups[0]?.params).toEqual([mapped.facts.company.tenantId,"batch-fixture",mapped.facts.source.sourceId]);
+    const retired=calls.filter(c=>c.sql.includes('update "erp_financials"."subledger_applications"'));
+    expect(retired).toHaveLength(1);
+    expect(retired[0]?.params[3]).toBe("retire-this-only");
+  });
+
   it("carries document tax and provider precision into the normalized commercial contract", () => {
     const envelope = fullSyncEnvelope();
     const adapted = adaptHandrailQuickBooksSdkFullSyncEnvelope({ ...envelope, normalizedResources: {
