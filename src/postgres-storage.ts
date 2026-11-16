@@ -1,3 +1,4 @@
+import { createImportStatisticsRefresh } from "./import-statistics.js";
 import { ErpFinancialsError } from "./sdk-errors.js";
 import type { CanonicalAccountingFactSet } from "./source-adapters.js";
 import { prepareCustomerPaymentCorrectionImport, loadCustomerPaymentCorrectionReplayState, correctedTransactionIds, type CustomerPaymentCorrectionDependency, type CustomerPaymentCorrectionImportPlan } from "./customer-payment-correction-replay.js";
@@ -2715,6 +2716,10 @@ async function upsertRows(
   const rowsPerBatch = Math.max(1, Math.floor(MAX_UPSERT_PARAMETERS / columns.length));
   let affectedRows = 0;
 
+  const refreshStatistics = createImportStatisticsRefresh(client,
+    [qualifiedTable(manifest, tableName)],
+    ["transactions", "transaction_lines", "ledger_postings"].includes(tableName) ? rows.length : 0);
+
   for (let start = 0; start < rows.length; start += rowsPerBatch) {
     affectedRows += await upsertRowBatch(
       client,
@@ -2727,6 +2732,8 @@ async function upsertRows(
       conflictAction,
       immutableScopeColumns
     );
+    const processed = Math.min(start + rowsPerBatch, rows.length);
+    await refreshStatistics(processed, processed === rows.length);
   }
 
   return affectedRows;

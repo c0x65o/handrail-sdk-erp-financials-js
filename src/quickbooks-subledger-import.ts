@@ -1,3 +1,4 @@
+import { createImportStatisticsRefresh } from "./import-statistics.js";
 import { createQuickBooksNonCashLinkPlanner, QuickBooksNonCashLinkError } from "./quickbooks-non-cash-links.js";
 import { loadCustomerPaymentCorrectionReplayState, type CustomerPaymentCorrectionDependency } from "./customer-payment-correction-replay.js";
 import { persistImportedCustomerPaymentEvidence, type ImportedCustomerPaymentEvidence } from "./customer-payment-correction.js";
@@ -447,7 +448,11 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     }
   }
 
+  const refreshDocuments = createImportStatisticsRefresh(input.client,
+    ['"erp_financials"."subledger_documents"', '"erp_financials"."subledger_document_lines"', '"erp_financials"."financial_lifecycle_events"'], operationalDocuments.length);
+  let processedDocuments = 0;
   for (const resource of operationalDocuments) {
+    await refreshDocuments(processedDocuments++);
     if (resource.syncAction === "voided" || resource.syncAction === "deleted" || resource.syncAction === "skipped") continue;
     const normalized = resource.resource;
     const documentType = importedDocumentType(normalized.sourceTransactionType, normalized.totalAmount);
@@ -722,6 +727,9 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     );
   }
 
+  await refreshDocuments(processedDocuments, true);
+  const refreshApplications = createImportStatisticsRefresh(input.client,
+    ['"erp_financials"."subledger_applications"', '"erp_financials"."financial_lifecycle_events"'], operationalDocuments.length);
   let applications = 0;
   let skippedApplications = 0;
   const unresolvedApplications: QuickBooksSubledgerImportResult["unresolvedApplications"][number][] = [];
@@ -888,6 +896,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
           ]
         );
         applications += result.rowCount ?? 0;
+        await refreshApplications(applications);
       }
     }
   }
@@ -1047,11 +1056,13 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
         ]
       );
       applications += result.rowCount ?? 0;
+      await refreshApplications(applications);
     }
   }
 
   // Read application-only ownership once for the whole snapshot. Repeating the
   // payload lookup per payment scans the same history tens of thousands of times.
+  await refreshApplications(applications, true);
   const projectionApplications = await input.client.query<{
     subledger_application_id: string; source_transaction_id: string; source_transaction_type: string;
   }>(`select application."subledger_application_id",

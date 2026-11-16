@@ -65,6 +65,38 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     await pool.end();
   });
 
+  it("imports a growing linked snapshot with refreshed plans and retains atomic rollback", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "test:import-statistics" });
+    const count = 1_000;
+    const base = quickBooksSubledgerFacts();
+    const resources = quickBooksSubledgerResources("100.00", true, "2026-08-10T10:00:00Z");
+    const facts = { ...base, transactions: Array.from({ length: count }, (_, n) => base.transactions.map(t => ({
+      ...t, transactionId: `${t.transactionId}_${String(n)}`, sourceTransactionId: `${t.sourceTransactionId}_${String(n)}`
+    }))).flat() };
+    const expanded = { ...resources, operationalDocuments: Array.from({ length: count }, (_, n) => (resources.operationalDocuments ?? []).map(e => ({
+      ...e, resourceId: `${e.resourceId}_${String(n)}`, resource: { ...e.resource,
+        sourceTransactionId: `${e.resource.sourceTransactionId}_${String(n)}`,
+        lines: e.resource.lines.map(line => ({ ...line, linkedTransactions: (line.linkedTransactions ?? []).map(link => ({
+          ...link, sourceTransactionId: `${link.sourceTransactionId}_${String(n)}`
+        })) }))
+      }
+    }))).flat() };
+    const start = performance.now();
+    await expect(runner.transaction(async client => {
+      await persistCanonicalFacts(createPostgresStorageAdapter(client), facts);
+      const result = await persistQuickBooksSubledgerResources({ client, facts, resources: expanded,
+        companyId: "company_qbo", importedAt: "2026-08-12T10:00:00Z" });
+      expect(result).toMatchObject({ documents: count * 2, applications: count, skippedApplications: 0 });
+      expect((await client.query("select count(*)::int n from erp_financials.subledger_documents where open_amount<>0")).rows[0]?.n).toBe(0);
+      expect((await pool.query<{ n: number }>("select count(*)::int n from erp_financials.transactions")).rows[0]?.n).toBe(0);
+      console.log("ATOMIC_LINKED_IMPORT_FIXTURE", JSON.stringify({ documents: count * 2, applications: count, durationMs: performance.now() - start }));
+      throw Error("fixture rollback");
+    })).rejects.toThrow("fixture rollback");
+    for (const table of ["transactions", "subledger_documents", "subledger_document_lines", "subledger_applications", "financial_lifecycle_events"]) {
+      expect((await pool.query<{ n: number }>(`select count(*)::int n from erp_financials.${table}`)).rows[0]?.n).toBe(0);
+    }
+  }, 120_000);
+
   it("host accounting guards persist across transactions and reject drift, busy writes and stale snapshots",async()=>{
     await migratePostgresSchema(runner,{appliedByRef:'host-guards'});
     await pool.query('create schema host_access_fixture');

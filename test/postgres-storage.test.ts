@@ -268,10 +268,12 @@ describe("Postgres storage adapter", () => {
     }));
 
     await expect(adapter.upsertTransactionLines(lines)).resolves.toBe(lines.length);
-    expect(client.calls).toHaveLength(2);
+    const inserts = client.calls.filter(call => call.sql.startsWith("insert into"));
+    expect(inserts).toHaveLength(2);
+    expect(client.calls.filter(call => call.sql.startsWith("analyze"))).toHaveLength(2);
     expect(client.calls.every((call) => call.params.length <= 30_000)).toBe(true);
     expect(client.calls.reduce((count, call) => count + call.params.length, 0)).toBe(39_000);
-    expect(client.calls[1]?.sql).toContain("($1, $2, $3");
+    expect(inserts[1]?.sql).toContain("($1, $2, $3");
   });
 
   it("persists posting rules, match audit records, and payment applications with stable conflicts", async () => {
@@ -2232,7 +2234,7 @@ function rowCell(
 }
 
 function parseIsoDate(value: IsoDate): Date {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  const match = /^([0-9]{4})-([0-9]{2})-([0-9]{2})$/.exec(value);
   if (match === null || match[1] === undefined || match[2] === undefined || match[3] === undefined) {
     throw new Error(`Invalid ISO date: ${value}`);
   }
