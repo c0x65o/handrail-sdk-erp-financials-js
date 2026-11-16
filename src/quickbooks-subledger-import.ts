@@ -2,6 +2,7 @@ import { planQuickBooksPooledSettlement } from "./quickbooks-pooled-settlement.j
 import { createQuickBooksJournalProjections, journalProjectionKinds, type JournalSettlementEvidence } from "./quickbooks-journal-projection.js";
 import { planQuickBooksMixedCredit, QuickBooksMixedCreditError } from "./quickbooks-mixed-credit.js";
 import { createImportStatisticsRefresh } from "./import-statistics.js";
+import { restoreQuickBooksOpenBalances } from "./quickbooks-open-balances.js";
 import { createQuickBooksNonCashLinkPlanner, QuickBooksNonCashLinkError } from "./quickbooks-non-cash-links.js";
 import { loadCustomerPaymentCorrectionReplayState, type CustomerPaymentCorrectionDependency } from "./customer-payment-correction-replay.js";
 import { persistImportedCustomerPaymentEvidence, type ImportedCustomerPaymentEvidence } from "./customer-payment-correction.js";
@@ -1298,6 +1299,7 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
   // instead retain the canonical application balance; a late Balance snapshot
   // cannot reinstate the voided application. Native applications are a local
   // overlay on the provider snapshot; replay must not make that credit spendable again.
+  const providerOpenBalances: { documentId: string; openAmount: string }[] = [];
   for (const resource of operationalDocuments) {
     if (resource.syncAction === "voided" || resource.syncAction === "deleted" || resource.syncAction === "skipped") continue;
     const normalized = resource.resource;
@@ -1307,31 +1309,11 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
     const openAmount = reportedQuickBooksOpenAmount(documentType, normalized, originalAmount);
     const documentId = documentIdBySourceId.get(normalized.sourceTransactionId);
     if (openAmount === undefined || documentId === undefined || preservedInvoiceIds.includes(documentId)) continue;
-    await input.client.query(
-      `update "erp_financials"."subledger_documents"
-set "open_amount" = $5::numeric - native_overlay.applied_amount,
-  "status" = case when $5::numeric - native_overlay.applied_amount = 0 then 'settled'
-    when $5::numeric - native_overlay.applied_amount = "original_amount" then 'open' else 'partially_applied' end,
-  "version" = "version" + 1, "updated_at" = $6
-from (select coalesce(sum(a.applied_amount),0) as applied_amount
-  from erp_financials.subledger_applications a
-  join erp_financials.financial_lifecycle_events e on e.tenant_id=a.tenant_id and e.company_id=a.company_id
-    and e.source_id=a.source_id and e.event_id=a.applied_event_id
-  where a.tenant_id=$1 and a.company_id=$2
-    and ((coalesce(to_jsonb(a)->>'source_document_source_id',a.source_id)=$3 and a.source_document_id=$4) or (coalesce(a.target_document_source_id,a.source_id)=$3 and a.target_document_id=$4)) and a.status='applied'
-    and e.event_type='subledger_application.applied') native_overlay
-where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
-  and "subledger_document_id" = $4 and "open_amount" is distinct from ($5::numeric - native_overlay.applied_amount)`,
-      [
-        input.facts.company.tenantId,
-        input.companyId,
-        input.facts.source.sourceId,
-        documentId,
-        openAmount,
-        input.importedAt
-      ]
-    );
+    providerOpenBalances.push({ documentId, openAmount });
   }
+  await restoreQuickBooksOpenBalances({ client: input.client, tenantId: input.facts.company.tenantId,
+    companyId: input.companyId, sourceId: input.facts.source.sourceId, importedAt: input.importedAt,
+    balances: providerOpenBalances });
 
   for (const resource of operationalDocuments) {
     if (resource.syncAction !== "voided" && resource.syncAction !== "deleted") continue;

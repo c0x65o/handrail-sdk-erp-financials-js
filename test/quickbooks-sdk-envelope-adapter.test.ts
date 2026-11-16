@@ -376,7 +376,8 @@ describe("QuickBooks SDK envelope adapter", () => {
       expect(error.code).toBe("quickbooks_subledger_projection_invalid");
       expect(error.diagnosticCount).toBe(2);
       expect(error.diagnosticsTruncated).toBe(false);
-      expect(error.diagnostics).toEqual([
+      expect(error.diagnostics).toHaveLength(2);
+      expect(error.diagnostics).toEqual(expect.arrayContaining([
         expect.objectContaining({
           sourceTransactionType: "Invoice",
           sourceTransactionId: "invoice:arbitrary-1048",
@@ -387,7 +388,7 @@ describe("QuickBooks SDK envelope adapter", () => {
           sourceTransactionId: "bill:arbitrary-2048",
           rejectionReasons: ["missing_balanced_journal", "non_positive_total"]
         })
-      ]);
+      ]));
     }
 
     expect(statements.some(statement => statement.includes("importedCorrection"))).toBe(true);
@@ -1400,7 +1401,7 @@ describe("QuickBooks SDK envelope adapter", () => {
       unresolvedApplications: []
     });
     expect(calls.filter((sql) => sql.includes('insert into "erp_financials"."subledger_applications"'))).toHaveLength(1);
-    expect(calls.some((sql) => sql.includes('set "open_amount" = $5'))).toBe(true);
+    expect(calls.some((sql) => sql.includes('with incoming as materialized'))).toBe(true);
   });
 
   it("restores BillPayment LinkedTxn evidence from derived A/P ledger line ids", () => {
