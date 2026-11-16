@@ -6366,6 +6366,52 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
     expect(state.applications.filter(row => row.status === "voided")).toHaveLength(1);
   });
 
+  it.each([false, true])("splits mixed cash and credit, replays and retires owned links (customer=%s)", async customer => {
+    await migratePostgresSchema(runner, { appliedByRef: "integration:mixed-credit" });
+    await seedQuickBooksAllDocumentScope(pool);
+    const facts = quickBooksAllDocumentFacts();
+    const base = quickBooksAllDocumentResources();
+    const ids: [string, string, string] = customer ? ["invoice_all", "credit_all", "payment_all"] : ["bill_all", "vendor_credit_all", "bill_payment_all"];
+    const resources: HandrailQuickBooksSdkResourceSet = { ...base, operationalDocuments: (base.operationalDocuments ?? [])
+      .filter(row => ids.includes(row.resourceId)).map(row => {
+        const payment = row.resourceId === ids[2];
+        const amount = row.resourceId === ids[0] ? "140.00" : row.resourceId === ids[1] ? "110.00" : "30.00";
+        const template = row.resource.lines[0];
+        if (!template) throw Error("Missing fixture line");
+        return { ...row, resource: { ...row.resource, totalAmount: amount, openAmount: "0.00", unappliedAmount: "0.00",
+          lines: payment ? [
+            { ...template, sourceAmount: "140.00", sourceLineId: "target", linkedTransactions: [{ sourceTransactionId: ids[0], sourceTransactionType: customer ? "Invoice" : "Bill" }] },
+            { ...template, sourceAmount: "110.00", sourceLineId: "credit", lineNumber: 2, linkedTransactions: [{ sourceTransactionId: ids[1], sourceTransactionType: customer ? "CreditMemo" : "VendorCredit" }] }
+          ] : [{ ...template, sourceAmount: amount, sourceQuantity: "1.00", sourceUnitAmount: amount, linkedTransactions: [] }]
+        } };
+      }) };
+    const persist = (next = resources) => runner.transaction(client => persistQuickBooksSubledgerResources({ client,
+      companyId: "company_qbo", facts, resources: next, importedAt: "2026-08-12T12:00:00.000Z" }));
+    const invalidParty: HandrailQuickBooksSdkResourceSet = { ...resources, operationalDocuments: (resources.operationalDocuments ?? []).map(row =>
+      row.resourceId === ids[2] ? { ...row, resource: { ...row.resource, partyRef: { sourceObjectId: "unknown-party", partyType: customer ? "customer" : "vendor" } } } : row) };
+    await expect(persist(invalidParty)).rejects.toThrow();
+    expect((await pool.query("select count(*)::int as count from erp_financials.subledger_documents")).rows[0]).toEqual({ count: 0 });
+    await expect(persist()).resolves.toMatchObject({ documents: 3, applications: 2, skippedApplications: 0 });
+    const state = async () => (await pool.query<{ applied_amount: string; source_type: string; target_type: string }>(`select a.applied_amount::text, s.document_type as source_type, t.document_type as target_type
+      from erp_financials.subledger_applications a join erp_financials.subledger_documents s on s.subledger_document_id=a.source_document_id
+      join erp_financials.subledger_documents t on t.subledger_document_id=a.target_document_id where a.status='applied' order by a.applied_amount`)).rows;
+    expect(await state()).toEqual([
+      { applied_amount: "30.00", source_type: customer ? "customer_payment" : "bill_payment", target_type: customer ? "invoice" : "vendor_bill" },
+      { applied_amount: "110.00", source_type: customer ? "credit_memo" : "vendor_credit", target_type: customer ? "invoice" : "vendor_bill" }
+    ]);
+    expect((await pool.query("select original_amount::text, open_amount::text from erp_financials.subledger_documents order by original_amount::numeric")).rows)
+      .toEqual([{ original_amount: "30.00", open_amount: "0.00" }, { original_amount: "110.00", open_amount: "0.00" }, { original_amount: "140.00", open_amount: "0.00" }]);
+    expect((await pool.query("select payload->'cashCreditSplit' as split from erp_financials.financial_lifecycle_events where payload ? 'cashCreditSplit'")).rows)
+      .toEqual([{ split: { providerLinkedAmount: "140.00", cashAmount: "30.00", creditAmount: "110.00" } }]);
+    await expect(persist()).resolves.toMatchObject({ documents: 0, applications: 0, skippedApplications: 0 });
+    expect(await state()).toHaveLength(2);
+    expect((await pool.query("select count(*)::int as count from erp_financials.ledger_postings")).rows[0]).toEqual({ count: 0 });
+    const payment = resources.operationalDocuments?.find(row => row.resourceId === ids[2]);
+    if (!payment) throw Error("Missing fixture payment");
+    await persist({ ...resources, operationalDocuments: [{ ...payment, syncAction: "voided" }] });
+    expect(await state()).toHaveLength(0);
+  });
+
   it("persists and idempotently replays a zero-cash BillPayment as a vendor-credit application", async () => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:quickbooks-credit-only-bill-payment" });
     await seedQuickBooksAllDocumentScope(pool);

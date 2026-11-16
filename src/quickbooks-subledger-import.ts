@@ -1,3 +1,4 @@
+import { planQuickBooksMixedCredit, QuickBooksMixedCreditError } from "./quickbooks-mixed-credit.js";
 import { createImportStatisticsRefresh } from "./import-statistics.js";
 import { createQuickBooksNonCashLinkPlanner, QuickBooksNonCashLinkError } from "./quickbooks-non-cash-links.js";
 import { loadCustomerPaymentCorrectionReplayState, type CustomerPaymentCorrectionDependency } from "./customer-payment-correction-replay.js";
@@ -271,6 +272,9 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   let skippedDocumentLines = 0;
   let retainedNonPostingDocumentLines = 0;
   const applicationOnlyProjections = new Map<string, ApplicationOnlyProjection>();
+  const mixedCreditProjections = new Map<string, ApplicationOnlyProjection>();
+  const mixedCreditPlans = new Map<string, NonNullable<ReturnType<typeof planQuickBooksMixedCredit>>>();
+  const applicationLines = (source: NormalizedQuickBooksLedgerTransaction) => mixedCreditPlans.get(source.sourceTransactionId)?.cashLines ?? source.lines;
   const providerOffsetBillPayments = new Set<string>();
   const customerDepositApplicationSourceIds = new Set<string>();
   const customerDepositPartyIdBySourceId = new Map<string, string>();
@@ -425,6 +429,34 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
         ...quickBooksSubledgerProjectionDiagnostic(normalized, false),
         rejectionReasons
       });
+    }
+  }
+  for (const resource of operationalDocuments) {
+    if (["voided", "deleted", "skipped"].includes(resource.syncAction ?? "")) continue;
+    const normalized = resource.resource;
+    try {
+      const plan = planQuickBooksMixedCredit(normalized);
+      if (!plan) continue;
+      const customer = normalized.sourceTransactionType === "Payment";
+      const projection: ApplicationOnlyProjection = {
+        eligible: true, sourceTransactionType: customer ? "Payment" : "BillPayment",
+        applicationType: customer ? "credit_to_invoice" : "vendor_credit_to_bill",
+        projectionKind: customer ? "customer_credit_application" : "vendor_credit_application",
+        allocations: plan.allocations, transactionDate: normalized.transactionDate,
+        ...(normalized.currencyCode ? { currencyCode: normalized.currencyCode } : {}),
+        ...(normalized.sourceUpdatedAt ? { sourceUpdatedAt: normalized.sourceUpdatedAt } : {}),
+        diagnostic: quickBooksSubledgerProjectionDiagnostic(normalized, missingBalancedJournal(normalized.sourceTransactionId))
+      };
+      const reasons = applicationOnlyPartyRejectionReasons(normalized, projection);
+      if (plan.allocations.some(allocation => !projectableDocumentSourceIds.has(allocation.sourceDocumentSourceTransactionId) || !projectableDocumentSourceIds.has(allocation.targetDocumentSourceTransactionId))) reasons.push("mixed_credit_missing_document");
+      if (reasons.length) recordProjectionDiagnostic({ ...projection.diagnostic, rejectionReasons: reasons });
+      else {
+        mixedCreditPlans.set(normalized.sourceTransactionId, plan);
+        mixedCreditProjections.set(normalized.sourceTransactionId, projection);
+      }
+    } catch (error) {
+      if (!(error instanceof QuickBooksMixedCreditError)) throw error;
+      recordProjectionDiagnostic({ ...quickBooksSubledgerProjectionDiagnostic(normalized, false), rejectionReasons: [error.reason] });
     }
   }
   if (projectionDiagnosticCount > 0) {
@@ -744,7 +776,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     const sourceDocumentId = documentIdBySourceId.get(source.sourceTransactionId);
     if (sourceDocumentId === undefined) continue;
     const incomingApplicationIds = new Set(
-      source.lines.flatMap((line) => (line.linkedTransactions ?? []).map((linked) => {
+      applicationLines(source).flatMap((line) => (line.linkedTransactions ?? []).map((linked) => {
         const targetDocumentId = documentIdBySourceId.get(linked.sourceTransactionId);
         return targetDocumentId === undefined
           ? undefined
@@ -822,7 +854,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     if (applicationType === undefined) continue;
     const sourceDocumentId = documentIdBySourceId.get(source.sourceTransactionId);
     if (sourceDocumentId === undefined) continue;
-    for (const line of source.lines) {
+    for (const line of applicationLines(source)) {
       if ((line.linkedTransactions?.length ?? 0) > 1) {
         throw new Error(
           `QuickBooks ${source.sourceTransactionType} ${source.sourceTransactionId} line ${line.sourceLineId ?? String(line.lineNumber)} links multiple documents without per-link amounts`
@@ -845,8 +877,10 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
         const eventId = stableId("qbo_event", applicationId, "applied");
         const idempotencyKey = `quickbooks:application:${input.facts.source.sourceId}:${source.sourceTransactionId}:${linked.sourceTransactionId}:${line.sourceLineId ?? String(line.lineNumber)}`;
         const effectiveDate = applicationDate(source.transactionDate, source.sourceTransactionId, linked.sourceTransactionId);
+        const cashCreditSplit = mixedCreditPlans.get(source.sourceTransactionId)?.evidence;
         const payload: JsonValue = {
           applicationDate: effectiveDate,
+          ...(cashCreditSplit ? { cashCreditSplit } : {}),
           provider: "quickbooks",
           sourceTransactionId: source.sourceTransactionId,
           targetSourceTransactionId: linked.sourceTransactionId,
@@ -901,7 +935,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     }
   }
 
-  for (const [sourceTransactionId, projection] of applicationOnlyProjections) {
+  for (const [sourceTransactionId, projection] of [...applicationOnlyProjections, ...mixedCreditProjections]) {
     const incomingApplicationIds = new Set(projection.allocations.map((allocation, index) =>
       stableId(
         "qbo_application",
@@ -1090,7 +1124,7 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
   for (const resource of operationalDocuments) {
     const source = resource.resource;
     if (source.sourceTransactionType !== "Payment" && source.sourceTransactionType !== "BillPayment") continue;
-    if (applicationOnlyProjections.has(source.sourceTransactionId)) continue;
+    if (applicationOnlyProjections.has(source.sourceTransactionId) || mixedCreditProjections.has(source.sourceTransactionId)) continue;
     await retireQuickBooksApplicationOnlyProjection(input, {
       sourceTransactionId: source.sourceTransactionId,
       sourceTransactionType: source.sourceTransactionType,
