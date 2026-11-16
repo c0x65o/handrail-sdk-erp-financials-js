@@ -34,6 +34,8 @@ type ImportedApplicationType =
   | "vendor_credit_to_bill";
 
 export type QuickBooksSubledgerImportResult = {
+  readonly pooledSettlements?: readonly { sourceTransactionType:string; sourceTransactionId:string; cashAmount:string;
+    settledAmount:string; fundingLegCount:number; targetLegCount:number; fundingAllocation:"unknown" }[];
   readonly journalSettlements?: readonly JournalSettlementEvidence[];
   readonly retainedNonCashDocuments?: number;
   readonly retainedNonCashLinks?: number;
@@ -244,14 +246,31 @@ export async function persistQuickBooksSubledgerResources(
     document_date: string;
     recognition_date: string | null;
     document_type: string;
+    pool_owner: string | null;
   }>(
     `select "metadata" ->> 'sourceTransactionId' as "source_transaction_id", "subledger_document_id", "status", "party_id",
-  "document_date"::text, (to_jsonb("subledger_documents")->>'recognition_date') as "recognition_date", "document_type"
+  "document_date"::text, (to_jsonb("subledger_documents")->>'recognition_date') as "recognition_date", "document_type", metadata#>>'{settlementPool,sourceTransactionId}' as pool_owner
 from "erp_financials"."subledger_documents"
 where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   and "metadata" ->> 'provider' = 'quickbooks'`,
     [input.facts.company.tenantId, input.companyId, input.facts.source.sourceId]
   );
+  const incomingOriginal = new Map(suppliedInput.resources.operationalDocuments?.map(row => [row.resource.sourceTransactionId,row]) ?? []);
+  for (const row of existingDocuments.rows) {
+    if (row.document_type === "settlement_pool" && row.status !== "voided" && row.pool_owner && incomingOriginal.has(row.pool_owner)
+      && !["voided","deleted"].includes(incomingOriginal.get(row.pool_owner)?.syncAction ?? "") && !poolBySource.has(row.pool_owner)) {
+      throw Error("Changed pooled provider settlement requires explicit reconciliation");
+    }
+  }
+  if (journalPlan.evidence.length && existingDocuments.rows.some(row => row.document_type.startsWith("journal_"))) {
+    const retainedOwners=await input.client.query<{owner:string}>(`select distinct e.payload->>'sourceTransactionId' owner
+      from erp_financials.subledger_applications a join erp_financials.financial_lifecycle_events e
+        on e.tenant_id=a.tenant_id and e.company_id=a.company_id and e.source_id=a.source_id and e.event_id=a.applied_event_id
+      where a.tenant_id=$1 and a.company_id=$2 and a.source_id=$3 and a.status='applied'
+        and (e.payload ? 'journalSettlement' or e.payload ? 'journalSettlementRoles')`,
+      [input.facts.company.tenantId,input.companyId,input.facts.source.sourceId]);
+    if (retainedOwners.rows.some(row=>!incomingOriginal.has(row.owner))) throw Error("Journal settlement refresh requires complete retained application history");
+  }
   for (const row of existingDocuments.rows) {
     if (row.source_transaction_id && row.subledger_document_id) {
       documentIdBySourceId.set(row.source_transaction_id, row.subledger_document_id);
@@ -1406,6 +1425,9 @@ where transaction."tenant_id" = $1 and transaction."source_id" = $2
   }
 
   return {
+    ...(pools.length ? { pooledSettlements: pools.map(pool=>({sourceTransactionType:pool.source.sourceTransactionType,
+      sourceTransactionId:pool.source.sourceTransactionId,cashAmount:pool.cashAmount,settledAmount:pool.amount,
+      fundingLegCount:pool.funding.length,targetLegCount:pool.targets.length,fundingAllocation:"unknown" as const})) } : {}),
     ...(journalPlan.evidence.length ? { journalSettlements: journalPlan.evidence } : {}),
     ...(corrections.length ? { correctionDependencies: corrections.map(row => row.dependency) } : {}),
     documents,

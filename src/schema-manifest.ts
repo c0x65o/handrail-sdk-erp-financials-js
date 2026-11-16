@@ -62,7 +62,7 @@ export type PostgresTableManifest = {
 
 export type PostgresSchemaManifest = {
   readonly manifestVersion: "2026-10-31.provider-application-refresh";
-  readonly schemaVersion: 61;
+  readonly schemaVersion: 62;
   readonly dialect: "postgres";
   readonly namespace: "erp_financials";
   readonly requiredTriggers: readonly PostgresTriggerManifest[];
@@ -153,7 +153,7 @@ const table = (
 
 export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
   manifestVersion: "2026-10-31.provider-application-refresh",
-  schemaVersion: 61,
+  schemaVersion: 62,
   dialect: "postgres",
   namespace: "erp_financials",
   requiredTriggers: [
@@ -1259,7 +1259,7 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
         },
         {
           name: "subledger_documents_type_check",
-          sql: "document_type in ('invoice', 'customer_payment', 'credit_memo', 'refund', 'vendor_bill', 'bill_payment', 'write_off', 'deposit', 'transfer', 'sales_receipt', 'purchase', 'vendor_credit', 'journal_receivable', 'journal_payable', 'journal_customer_credit', 'journal_vendor_credit')"
+          sql: "document_type in ('invoice', 'customer_payment', 'credit_memo', 'refund', 'vendor_bill', 'bill_payment', 'write_off', 'deposit', 'transfer', 'sales_receipt', 'purchase', 'vendor_credit', 'journal_receivable', 'journal_payable', 'journal_customer_credit', 'journal_vendor_credit', 'settlement_pool')"
         },
         {
           name: "subledger_documents_amount_check",
@@ -1372,7 +1372,7 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
       [
         {
           name: "subledger_applications_type_check",
-          sql: "application_type in ('customer_payment_to_invoice', 'bill_payment_to_bill', 'credit_to_invoice', 'vendor_credit_to_bill', 'write_off_to_invoice', 'customer_payment_to_refund', 'credit_to_refund')"
+          sql: "application_type in ('customer_payment_to_invoice', 'bill_payment_to_bill', 'credit_to_invoice', 'vendor_credit_to_bill', 'write_off_to_invoice', 'customer_payment_to_refund', 'credit_to_refund', 'settlement_funding', 'settlement_application')"
         },
         {
           name: "subledger_applications_amount_check",

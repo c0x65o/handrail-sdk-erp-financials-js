@@ -7721,7 +7721,7 @@ function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType 
         and ((customer_document.source_id=coalesce(application.source_document_source_id,application.source_id) and customer_document.subledger_document_id=application.source_document_id)
           or (customer_document.source_id=coalesce(application.target_document_source_id,application.source_id) and customer_document.subledger_document_id=application.target_document_id))
         and customer_document.party_id=${party})`}
-    and application."application_type" in ('customer_payment_to_invoice','credit_to_invoice','write_off_to_invoice','customer_payment_to_refund','credit_to_refund')
+    and application."application_type" in ('settlement_funding','settlement_application','customer_payment_to_invoice','credit_to_invoice','write_off_to_invoice','customer_payment_to_refund','credit_to_refund')
     and application."application_date" <= ${asOf}::date
     and coalesce((applied_event."payload"->>'applicationDate')::date, (applied_event."occurred_at" at time zone 'UTC')::date) <= ${asOf}::date
     and (ended_event."event_id" is null or coalesce((ended_event."payload"->>'effectiveDate')::date, (ended_event."occurred_at" at time zone 'UTC')::date) > ${asOf}::date)
@@ -7733,6 +7733,15 @@ function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType 
     select funding_source_id as source_id,source_document_id,
       case when application_type in ('credit_to_invoice','credit_to_refund') then 'credit_memo' else 'customer_payment' end,applied_amount
     from effective_applications where application_type in ('customer_payment_to_invoice','credit_to_invoice','customer_payment_to_refund','credit_to_refund')
+    union all
+    select d.source_id,d.subledger_document_id,
+      case d.document_type when 'journal_receivable' then 'invoice' when 'journal_payable' then 'vendor_bill'
+        when 'journal_customer_credit' then 'credit_memo' when 'journal_vendor_credit' then 'vendor_credit' else d.document_type end,
+      a.applied_amount
+    from effective_applications a join erp_financials.subledger_documents d on d.tenant_id=$1 and d.company_id=$2
+      and ((a.application_type='settlement_funding' and d.source_id=a.funding_source_id and d.subledger_document_id=a.source_document_id)
+        or (a.application_type='settlement_application' and d.source_id=a.target_source_id and d.subledger_document_id=a.target_document_id))
+    where a.application_type in ('settlement_funding','settlement_application')
   ) sides group by source_id,document_id,document_type
 ), terminal_documents as (
   select link."source_id",link."original_transaction_id",min(related."transaction_date") "effective_date"
@@ -7802,7 +7811,7 @@ function vendorFundingDocumentsSql(asOf = "$6", currency = "$5", documentType = 
         and ((customer_document.source_id=coalesce(application.source_document_source_id,application.source_id) and customer_document.subledger_document_id=application.source_document_id)
           or (customer_document.source_id=coalesce(application.target_document_source_id,application.source_id) and customer_document.subledger_document_id=application.target_document_id))
         and customer_document.party_id=${party})`}
-    and application."application_type" in ('bill_payment_to_bill','vendor_credit_to_bill')
+    and application."application_type" in ('settlement_funding','settlement_application','bill_payment_to_bill','vendor_credit_to_bill')
     and application."application_date" <= ${asOf}::date
     and coalesce((applied_event."payload"->>'applicationDate')::date, (applied_event."occurred_at" at time zone 'UTC')::date) <= ${asOf}::date
     and (ended_event."event_id" is null or coalesce((ended_event."payload"->>'effectiveDate')::date, (ended_event."occurred_at" at time zone 'UTC')::date) > ${asOf}::date)
@@ -7814,6 +7823,15 @@ function vendorFundingDocumentsSql(asOf = "$6", currency = "$5", documentType = 
     select funding_source_id as source_id,source_document_id,
       case when application_type in ('vendor_credit_to_bill') then 'vendor_credit' else 'bill_payment' end,applied_amount
     from effective_applications where application_type in ('bill_payment_to_bill','vendor_credit_to_bill')
+    union all
+    select d.source_id,d.subledger_document_id,
+      case d.document_type when 'journal_receivable' then 'invoice' when 'journal_payable' then 'vendor_bill'
+        when 'journal_customer_credit' then 'credit_memo' when 'journal_vendor_credit' then 'vendor_credit' else d.document_type end,
+      a.applied_amount
+    from effective_applications a join erp_financials.subledger_documents d on d.tenant_id=$1 and d.company_id=$2
+      and ((a.application_type='settlement_funding' and d.source_id=a.funding_source_id and d.subledger_document_id=a.source_document_id)
+        or (a.application_type='settlement_application' and d.source_id=a.target_source_id and d.subledger_document_id=a.target_document_id))
+    where a.application_type in ('settlement_funding','settlement_application')
   ) sides group by source_id,document_id,document_type
 ), terminal_documents as (
   select link."source_id",link."original_transaction_id",min(related."transaction_date") "effective_date"
