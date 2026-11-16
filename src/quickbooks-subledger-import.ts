@@ -1,3 +1,5 @@
+import { planQuickBooksPooledSettlement } from "./quickbooks-pooled-settlement.js";
+import { createQuickBooksJournalProjections, journalProjectionKinds, type JournalSettlementEvidence } from "./quickbooks-journal-projection.js";
 import { planQuickBooksMixedCredit, QuickBooksMixedCreditError } from "./quickbooks-mixed-credit.js";
 import { createImportStatisticsRefresh } from "./import-statistics.js";
 import { createQuickBooksNonCashLinkPlanner, QuickBooksNonCashLinkError } from "./quickbooks-non-cash-links.js";
@@ -12,6 +14,7 @@ import type { PostgresQueryClient } from "./postgres-storage.js";
 import type { HandrailQuickBooksSdkResourceSet, CanonicalAccountingFactSet } from "./source-adapters.js";
 
 type ImportedDocumentType =
+  | "journal_receivable" | "journal_payable" | "journal_customer_credit" | "journal_vendor_credit" | "settlement_pool"
   | "invoice"
   | "customer_payment"
   | "credit_memo"
@@ -31,6 +34,7 @@ type ImportedApplicationType =
   | "vendor_credit_to_bill";
 
 export type QuickBooksSubledgerImportResult = {
+  readonly journalSettlements?: readonly JournalSettlementEvidence[];
   readonly retainedNonCashDocuments?: number;
   readonly retainedNonCashLinks?: number;
   readonly retainedNonPostingDocumentLines?: number;
@@ -143,6 +147,24 @@ export async function persistQuickBooksSubledgerResources(
     operationalDocuments: (suppliedInput.resources.operationalDocuments ?? suppliedInput.resources.ledgerTransactions ?? []).filter(row =>
       !corrections.some(c => row.resource.sourceTransactionType === (c.providerType ?? "Payment") && row.resource.sourceTransactionId === c.dependency.sourceTransactionId)) } };
 
+  const journalPlan = createQuickBooksJournalProjections(input.facts);
+  const ordered = [...input.resources.operationalDocuments].sort((a,b) => a.resource.transactionDate.localeCompare(b.resource.transactionDate) || a.resource.sourceTransactionId.localeCompare(b.resource.sourceTransactionId));
+  input.resources.operationalDocuments = ordered.map(row => ({ ...row, resource: (() => {
+    try { return ["voided", "deleted", "skipped"].includes(row.syncAction ?? "") ? row.resource : journalPlan.rewrite(row.resource); }
+    catch (error) { throw new QuickBooksSubledgerProjectionError({ ...quickBooksSubledgerProjectionDiagnostic(row.resource, false),
+      rejectionReasons: [error instanceof Error ? error.message : "journal_settlement_invalid"] }); }
+  })() }));
+  const pools = input.resources.operationalDocuments.filter(row => !["voided","deleted","skipped"].includes(row.syncAction ?? ""))
+    .map(row => planQuickBooksPooledSettlement(row.resource)).filter(pool => pool !== undefined);
+  const poolBySource = new Map(pools.map(pool => [pool.source.sourceTransactionId, pool]));
+  const poolById = new Map(pools.map(pool => [pool.id, pool]));
+  const envelope = input.resources.operationalDocuments[0];
+  if (envelope) input.resources.operationalDocuments.push(...journalPlan.projections.map(projection => ({ ...envelope,
+    resourceId: projection.id, syncAction: "changed" as const, resource: projection.resource })));
+
+  if (envelope) input.resources.operationalDocuments.push(...pools.map(pool => ({ ...envelope,
+    resourceId: pool.id, syncAction: "changed" as const, resource: pool.resource })));
+
   const retainedImportedTargets = new Set(corrections.filter(c => c.providerType === "Bill" || c.providerType === "Invoice").map(c => `${c.providerType ?? ""}:${c.dependency.sourceTransactionId}`));
   const retainedTargetIds = new Set(corrections.filter(c => c.providerType === "Bill" || c.providerType === "Invoice")
     .map(c => c.dependency.sourceTransactionId));
@@ -159,6 +181,12 @@ export async function persistQuickBooksSubledgerResources(
   const transactionBySourceId = new Map(
     input.facts.transactions.map((transaction) => [transaction.sourceTransactionId, transaction])
   );
+  for (const projection of journalPlan.projections) transactionBySourceId.set(projection.id, projection.transaction);
+  for (const pool of pools) {
+    const transaction = transactionBySourceId.get(pool.source.sourceTransactionId);
+    if (!transaction) throw Error("journal_pool_missing_cash_transaction");
+    transactionBySourceId.set(pool.id, transaction);
+  }
   // Retained zero-effect document headers are identities, not monetary journals.
   const postingTransactionIds = new Set(input.facts.postings.map(posting => posting.transactionId));
   const missingBalancedJournal = (sourceId: string): boolean => {
@@ -174,7 +202,7 @@ export async function persistQuickBooksSubledgerResources(
   const nonCashLinks = input.resources.operationalDocuments
     .filter(row => !["voided", "deleted", "skipped"].includes(row.syncAction ?? ""))
     .map(row => {
-      try { return planNonCashLinks(row.resource); }
+      try { return row.resource.lines.some(line => line.linkedTransactions?.some(link => link.sourceTransactionType && link.sourceTransactionType in journalProjectionKinds)) ? undefined : planNonCashLinks(row.resource); }
       catch (error) {
         if (!(error instanceof QuickBooksNonCashLinkError)) throw error;
         throw new QuickBooksSubledgerProjectionError({
@@ -243,7 +271,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
   // Each allocation waits for its own invoice, never the latest invoice in a receipt.
   const applicationDate = (date: string, sourceId: string, targetId: string): string => {
     const source = documentDates.get(sourceId), target = documentDates.get(targetId);
-    if (target?.type !== "invoice") return date;
+    if (target?.type !== "invoice" && target?.type !== "journal_receivable") return date;
     if (!source?.date || !target.date) throw new Error("Imported application requires retained document dates");
     return [source.date, target.recognitionDate ?? target.date].reduce((latest, value) => value > latest ? value : latest, date);
   };
@@ -435,7 +463,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     if (["voided", "deleted", "skipped"].includes(resource.syncAction ?? "")) continue;
     const normalized = resource.resource;
     try {
-      const plan = planQuickBooksMixedCredit(normalized);
+      const plan = poolBySource.has(normalized.sourceTransactionId) ? undefined : planQuickBooksMixedCredit(normalized);
       if (!plan) continue;
       const customer = normalized.sourceTransactionType === "Payment";
       const projection: ApplicationOnlyProjection = {
@@ -466,6 +494,17 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     );
   }
 
+  for (const evidence of journalPlan.evidence) {
+    const count = Math.max(1, Math.ceil(evidence.lineIds.length / 20));
+    for (let chunk = 0; chunk < count; chunk++) {
+      const key = `quickbooks:journal-settlement:${input.facts.source.sourceId}:${input.facts.importBatch.importBatchId}:${evidence.sourceTransactionType}:${evidence.sourceTransactionId}:${evidence.sourceLineId}:${String(chunk)}`;
+      await insertLifecycleEvent(input.client, { eventId: stableId("qbo_event", key), tenantId: input.facts.company.tenantId,
+        companyId: input.companyId, sourceId: input.facts.source.sourceId, aggregateId: evidence.sourceTransactionId,
+        eventType: "quickbooks_journal_settlement_recorded", occurredAt: input.importedAt, recordedAt: input.importedAt,
+        idempotencyKey: key, immutablePayload: true, payload: { ...evidence, chunk, chunks: count,
+          importBatchId: input.facts.importBatch.importBatchId, lineIds: evidence.lineIds.slice(chunk * 20, (chunk + 1) * 20) } });
+    }
+  }
   for (const evidence of nonCashLinks) {
     const chunks = Math.max(1, Math.ceil(evidence.allocations.length / 10));
     for (let index = 0; index < chunks; index++) {
@@ -563,7 +602,8 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       provider: "quickbooks",
       sourceTransactionId: normalized.sourceTransactionId,
       sourceTransactionType: normalized.sourceTransactionType,
-      importBatchId: input.facts.importBatch.importBatchId
+      importBatchId: input.facts.importBatch.importBatchId,
+      ...(journalPlan.byId.get(normalized.sourceTransactionId)?.metadata ?? {})
     };
     await insertLifecycleEvent(input.client, {
       eventId,
@@ -639,7 +679,12 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
           sourceUpdatedAt: normalized.sourceUpdatedAt ?? null,
           reportedOpenAmount: normalized.openAmount ?? normalized.unappliedAmount ?? null,
           emailStatus: normalized.emailStatus ?? null,
-          printStatus: normalized.printStatus ?? null
+          printStatus: normalized.printStatus ?? null,
+          ...(poolById.has(normalized.sourceTransactionId) ? { settlementPool: {
+            sourceTransactionId: poolById.get(normalized.sourceTransactionId)?.source.sourceTransactionId,
+            side: poolById.get(normalized.sourceTransactionId)?.side, cashAmount: poolById.get(normalized.sourceTransactionId)?.cashAmount,
+            fundingAllocation: "unknown", reason: "provider supplied settlement legs without cash-to-target pairing" } } : {}),
+          ...(journalPlan.byId.has(normalized.sourceTransactionId) ? { journalSettlementScope: journalPlan.byId.get(normalized.sourceTransactionId)?.metadata } : {})
         }),
         input.importedAt
       ]
@@ -772,7 +817,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       applicationOnlyProjections.has(source.sourceTransactionId) ||
       providerOffsetBillPayments.has(source.sourceTransactionId)
     ) continue;
-    if (importedApplicationType(source.sourceTransactionType) === undefined) continue;
+    if (importedApplicationType(source.sourceTransactionType) === undefined || poolBySource.has(source.sourceTransactionId)) continue;
     const sourceDocumentId = documentIdBySourceId.get(source.sourceTransactionId);
     if (sourceDocumentId === undefined) continue;
     const incomingApplicationIds = new Set(
@@ -850,6 +895,7 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       applicationOnlyProjections.has(source.sourceTransactionId) ||
       providerOffsetBillPayments.has(source.sourceTransactionId)
     ) continue;
+    if (poolBySource.has(source.sourceTransactionId)) continue;
     const applicationType = importedApplicationType(source.sourceTransactionType);
     if (applicationType === undefined) continue;
     const sourceDocumentId = documentIdBySourceId.get(source.sourceTransactionId);
@@ -878,9 +924,21 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
         const idempotencyKey = `quickbooks:application:${input.facts.source.sourceId}:${source.sourceTransactionId}:${linked.sourceTransactionId}:${line.sourceLineId ?? String(line.lineNumber)}`;
         const effectiveDate = applicationDate(source.transactionDate, source.sourceTransactionId, linked.sourceTransactionId);
         const cashCreditSplit = mixedCreditPlans.get(source.sourceTransactionId)?.evidence;
+        const journalSettlement = journalPlan.evidenceByLine.get(journalPlan.lineKey(source.sourceTransactionId, line.sourceLineId ?? String(line.lineNumber)));
+        const allocationChunks = journalSettlement && journalSettlement.lineIds.length > 20 ? Math.ceil(journalSettlement.lineIds.length / 20) : 0;
+        for (let chunk = 0; chunk < allocationChunks; chunk++) {
+          const key = `${idempotencyKey}:journal-lines:${input.facts.importBatch.importBatchId}:${String(chunk)}`;
+          await insertLifecycleEvent(input.client, { eventId: stableId("qbo_event", key), tenantId: input.facts.company.tenantId,
+            companyId: input.companyId, sourceId: input.facts.source.sourceId, aggregateId: applicationId,
+            eventType: "quickbooks_journal_allocation_lines", occurredAt: input.importedAt, recordedAt: input.importedAt,
+            idempotencyKey: key, immutablePayload: true, payload: { importBatchId: input.facts.importBatch.importBatchId,
+              chunk, chunks: allocationChunks, lineIds: journalSettlement?.lineIds.slice(chunk * 20, (chunk + 1) * 20) ?? [] } });
+        }
         const payload: JsonValue = {
           applicationDate: effectiveDate,
           ...(cashCreditSplit ? { cashCreditSplit } : {}),
+          ...(journalSettlement ? { journalSettlement: { ...journalSettlement, lineIds: allocationChunks ? [] : journalSettlement.lineIds,
+            lineCount: journalSettlement.lineIds.length, allocationChunks } } : {}),
           provider: "quickbooks",
           sourceTransactionId: source.sourceTransactionId,
           targetSourceTransactionId: linked.sourceTransactionId,
@@ -1020,7 +1078,15 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
       const eventId = stableId("qbo_event", applicationId, "applied");
       const idempotencyKey = `quickbooks:${projection.projectionKind.replaceAll("_", "-")}:${input.facts.source.sourceId}:${sourceTransactionId}:${allocation.sourceDocumentSourceTransactionId}:${allocation.targetDocumentSourceTransactionId}:${String(index + 1)}`;
       const effectiveDate = applicationDate(projection.transactionDate, allocation.sourceDocumentSourceTransactionId, allocation.targetDocumentSourceTransactionId);
+      const journalSettlementRoles = [
+        { role: "funding", id: allocation.sourceDocumentSourceTransactionId },
+        { role: "target", id: allocation.targetDocumentSourceTransactionId }
+      ].flatMap(({role,id}) => {
+        const journal = journalPlan.byId.get(id);
+        return journal ? [{ role, ...journal.metadata, amount: allocation.amount }] : [];
+      });
       const payload: JsonValue = {
+        ...(journalSettlementRoles.length ? { journalSettlementRoles } : {}),
         applicationDate: effectiveDate,
         provider: "quickbooks",
         sourceTransactionId,
@@ -1167,6 +1233,43 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
   }
 
   // QuickBooks Balance/UnappliedAmt is the authoritative current snapshot.
+  for (const pool of pools) {
+    const poolDocumentId = documentIdBySourceId.get(pool.id);
+    if (!poolDocumentId) throw Error("journal_pool_missing_document");
+    for (const [direction, legs] of [["funding",pool.funding],["application",pool.targets]] as const) {
+      for (const leg of legs) {
+        const documentId = documentIdBySourceId.get(leg.id);
+        if (!documentId) throw Error(`journal_pool_missing_leg:${pool.source.sourceTransactionId}:${leg.id}`);
+        const sourceDocumentId = direction === "funding" ? documentId : poolDocumentId;
+        const targetDocumentId = direction === "funding" ? poolDocumentId : documentId;
+        const key = `quickbooks:journal-pool:${input.facts.source.sourceId}:${pool.source.sourceTransactionId}:${direction}:${leg.lineId}`;
+        const applicationId = stableId("qbo_application",key), eventId = stableId("qbo_event",key);
+        const journal = journalPlan.byId.get(leg.id);
+        const effectiveDate = applicationDate(pool.source.transactionDate, pool.source.sourceTransactionId, leg.id);
+        await insertLifecycleEvent(input.client, { eventId, tenantId: input.facts.company.tenantId, companyId: input.companyId,
+          sourceId: input.facts.source.sourceId, aggregateId: applicationId, eventType: "quickbooks_pooled_settlement_imported",
+          occurredAt: pool.source.sourceUpdatedAt ?? input.importedAt, recordedAt: input.importedAt, idempotencyKey: `${key}:event`, immutablePayload: true,
+          payload: { provider:"quickbooks", sourceTransactionId:pool.source.sourceTransactionId, projectionKind:"journal_settlement_pool",
+            direction, sourceDocumentId,targetDocumentId,amount:leg.amount,applicationDate:effectiveDate,
+            fundingAllocation:"unknown",reason:"provider supplied settlement legs without cash-to-target pairing",
+            journalSettlementRoles: journal ? [{ role: direction === "funding" ? "funding" : "target", ...journal.metadata, amount:leg.amount }] : [] } });
+        const result=await input.client.query(`insert into erp_financials.subledger_applications
+          (subledger_application_id,tenant_id,company_id,source_id,application_type,source_document_id,target_document_id,applied_amount,currency_code,application_date,status,version,idempotency_key,applied_event_id,created_at,updated_at)
+          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'applied',1,$11,$12,$13,$13)
+          on conflict (tenant_id,company_id,source_id,idempotency_key) do nothing`,
+          [applicationId,input.facts.company.tenantId,input.companyId,input.facts.source.sourceId,`settlement_${direction}`,
+            sourceDocumentId,targetDocumentId,leg.amount,pool.source.currencyCode ?? input.facts.company.baseCurrencyCode,effectiveDate,key,eventId,input.importedAt]);
+        applications+=result.rowCount ?? 0;
+        await refreshApplications(applications);
+      }
+    }
+    const balances=await input.client.query<{valid:boolean}>(`select d.open_amount=0
+      and (select coalesce(sum(a.applied_amount),0) from erp_financials.subledger_applications a where a.tenant_id=d.tenant_id and a.company_id=d.company_id and a.source_id=d.source_id and a.target_document_id=d.subledger_document_id and a.application_type='settlement_funding' and a.status='applied')=d.original_amount as valid
+      from erp_financials.subledger_documents d where d.tenant_id=$1 and d.company_id=$2 and d.source_id=$3 and d.subledger_document_id=$4`,
+      [input.facts.company.tenantId,input.companyId,input.facts.source.sourceId,poolDocumentId]);
+    if (balances.rows[0]?.valid !== true) throw Error("journal_pool_incomplete_funding_or_applications");
+  }
+
   // Applications preserve the dated history, but a provider may omit or
   // normalize LinkedTxn evidence differently; never let that make the current
   // operational balance disagree with QuickBooks. Locally corrected invoices
@@ -1221,6 +1324,13 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     });
     voidedDocuments += outcome.documents;
     removedLedgerPostings += outcome.postings;
+    const relatedPools = await input.client.query<{subledger_document_id:string;source_transaction_id:string}>(
+      `select subledger_document_id,metadata->>'sourceTransactionId' source_transaction_id from erp_financials.subledger_documents
+        where tenant_id=$1 and company_id=$2 and source_id=$3 and document_type='settlement_pool'
+          and metadata#>>'{settlementPool,sourceTransactionId}'=$4 and status<>'voided'`,
+      [input.facts.company.tenantId,input.companyId,input.facts.source.sourceId,source.sourceTransactionId]);
+    for (const pool of relatedPools.rows) await voidQuickBooksDocument(input,{documentId:pool.subledger_document_id,
+      sourceTransactionId:pool.source_transaction_id,action:resource.syncAction,occurredAt:source.sourceUpdatedAt ?? input.importedAt});
   }
 
   if (input.replaceMissingDocuments === true) {
@@ -1296,6 +1406,7 @@ where transaction."tenant_id" = $1 and transaction."source_id" = $2
   }
 
   return {
+    ...(journalPlan.evidence.length ? { journalSettlements: journalPlan.evidence } : {}),
     ...(corrections.length ? { correctionDependencies: corrections.map(row => row.dependency) } : {}),
     documents,
     documentLines,
@@ -1516,7 +1627,7 @@ function importsCommercialDocumentLines(documentType: ImportedDocumentType): boo
   // because the balanced provider GL carries the authoritative Undeposited
   // Funds and bank accounts. Retain the settled deposit header and its canonical
   // ledger postings without inventing an account for an allocation line.
-  return documentType !== "customer_payment" &&
+  return documentType !== "settlement_pool" && !documentType.startsWith("journal_") && documentType !== "customer_payment" &&
     documentType !== "bill_payment" &&
     documentType !== "deposit";
 }
@@ -1530,6 +1641,8 @@ function isQuickBooksProviderOnlyNonPostingLine(detailType: string | undefined):
 
 function importedDocumentType(sourceType: string, totalAmount?: string): ImportedDocumentType | undefined {
   const types: Readonly<Record<string, ImportedDocumentType>> = {
+    ...journalProjectionKinds,
+    JournalSettlementPool: "settlement_pool",
     Invoice: "invoice",
     Payment: "customer_payment",
     CreditMemo: "credit_memo",
@@ -1720,7 +1833,7 @@ function quickBooksZeroTotalBillPaymentProjection(
 
     for (const reference of linked) {
       linkedTransactionCount += 1;
-      const type = reference.sourceTransactionType ?? "Unknown";
+      const type = journalLinkedRole(reference.sourceTransactionType ?? "Unknown");
       typeCounts.set(type, (typeCounts.get(type) ?? 0) + 1);
       if (!hasPositiveAmount || linked.length !== 1) {
         missingLinkedAmountCount += 1;
@@ -1867,7 +1980,7 @@ function quickBooksZeroTotalCustomerCreditProjection(
 
     for (const reference of linked) {
       linkedTransactionCount += 1;
-      const type = reference.sourceTransactionType ?? "Unknown";
+      const type = journalLinkedRole(reference.sourceTransactionType ?? "Unknown");
       typeCounts.set(type, (typeCounts.get(type) ?? 0) + 1);
       if (!hasPositiveAmount || linked.length !== 1) {
         missingLinkedAmountCount += 1;
@@ -2196,4 +2309,8 @@ async function insertLifecycleEvent(client: PostgresQueryClient, input: {
       payload
     ]
   );
+}
+
+function journalLinkedRole(type: string): string {
+  return ({ JournalReceivable: "Invoice", JournalPayable: "Bill", JournalCustomerCredit: "CreditMemo", JournalVendorCredit: "VendorCredit" } as Record<string,string>)[type] ?? type;
 }

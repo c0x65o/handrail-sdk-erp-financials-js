@@ -6366,6 +6366,66 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
     expect(state.applications.filter(row => row.status === "voided")).toHaveLength(1);
   });
 
+  it.each([
+    { zero: false, journalCredit: false, customer: false, amounts: [30, 70], applied: 30, mixed: false, allocation: "single_line" },
+    { zero: false, journalCredit: false, customer: false, amounts: [60, 50, -10], applied: 100, mixed: false, allocation: "all_lines" },
+    { zero: false, journalCredit: false, customer: false, amounts: [60, 40], applied: 25, mixed: false, allocation: "unallocated" },
+    { zero: false, journalCredit: false, customer: false, amounts: [60, 40], applied: 25, mixed: true, allocation: "unallocated" },
+    { zero: false, journalCredit: false, customer: true, amounts: [60, 40], applied: 25, mixed: true, allocation: "unallocated" },
+    { zero: true, journalCredit: true, customer: false, amounts: [-60, -40], applied: 25, mixed: true, allocation: "unallocated" },
+    { zero: true, journalCredit: false, customer: true, amounts: [60, 40], applied: 25, mixed: true, allocation: "unallocated" }
+  ])("imports journal settlement with aging and replay: %j", async scenario => {
+    await migratePostgresSchema(runner, { appliedByRef: "fixture:journal-settlement" });
+    await seedQuickBooksAllDocumentScope(pool);
+    const baseFacts = quickBooksAllDocumentFacts(), base = quickBooksAllDocumentResources();
+    const partyId = scenario.customer ? "customer_qbo" : "vendor_qbo";
+    const paymentId = scenario.customer ? "payment_all" : "bill_payment_all", billId = scenario.zero && !scenario.journalCredit ? "credit_all" : scenario.customer ? "invoice_all" : "bill_all";
+    const journal = { ...baseFacts.transactions[0]!, transactionId: "journal_fixture", sourceTransactionId: "journal-fixture", sourceTransactionType: "JournalEntry", transactionNumber: "JE-FIXTURE", transactionDate: "2026-08-01", partyId: undefined };
+    const { partyId: ignoredParty, ...journalWithoutParty } = journal; void ignoredParty;
+    const account = { ...baseFacts.accounts[0]!, accountId: "control_fixture", sourceAccountId: "control", type: scenario.customer ? "Accounts Receivable" : "Accounts Payable", classification: scenario.customer ? "asset" as const : "liability" as const, name: "Control fixture" };
+    await pool.query(`insert into erp_financials.accounts(account_id,tenant_id,source_id,source_account_id,name,type,classification,active)
+      values ('control_fixture','tenant_qbo','source_qbo','control','Control fixture',$1,$2,true)`,[account.type,account.classification]);
+    await pool.query(`insert into erp_financials.transactions(transaction_id,tenant_id,source_id,source_transaction_id,source_transaction_type,transaction_number,transaction_date,currency_code,status,source_payload_ref)
+      values ('journal_fixture','tenant_qbo','source_qbo','journal-fixture','JournalEntry','JE-FIXTURE','2026-08-01','USD','posted','{}')`);
+    const postings = scenario.amounts.map((amount,index) => {
+      const signed = scenario.customer ? amount : -amount;
+      return { tenantId:"tenant_qbo",sourceId:"source_qbo",postingId:`journal_line_${String(index)}`,sourcePostingId:`provider_line_${String(index)}`,transactionId:"journal_fixture",
+        accountId:"control_fixture",partyId,postingDate:"2026-08-01",accountingBasis:"accrual" as const,debitAmount:Math.max(signed,0).toFixed(2),creditAmount:Math.max(-signed,0).toFixed(2),netAmount:signed.toFixed(2),
+        currencyCode:"USD",dimensionHash:"a".repeat(64),dimensionRefs:[],importBatchId:"batch_qbo" };
+    });
+    for (const [index,p] of postings.entries()) await pool.query(`insert into erp_financials.transaction_lines(transaction_line_id,tenant_id,source_id,transaction_id,line_number,account_id,party_id,amount,dimension_refs)
+      values ($1,'tenant_qbo','source_qbo','journal_fixture',$2,'control_fixture',$3,$4,'[]')`,[p.postingId,index+1,partyId,p.netAmount]);
+    if (!scenario.customer) for (const p of postings) await pool.query(`insert into erp_financials.ledger_postings(posting_id,tenant_id,source_id,source_posting_id,transaction_id,account_id,party_id,posting_date,accounting_basis,debit_amount,credit_amount,net_amount,currency_code,dimension_hash,dimension_refs,source_payload_ref,import_batch_id)
+      values ($1,'tenant_qbo','source_qbo',$2,'journal_fixture','control_fixture',$3,'2026-08-01','accrual',$4,$5,$6,'USD',repeat('a',64),'[]','{}','batch_qbo')`,[p.postingId,p.sourcePostingId,partyId,p.debitAmount,p.creditAmount,p.netAmount]);
+    const facts: CanonicalAccountingFactSet = { ...baseFacts, accounts:[...baseFacts.accounts,account],transactions:[...baseFacts.transactions,journalWithoutParty],postings };
+    const resources: HandrailQuickBooksSdkResourceSet = { ...base, operationalDocuments:(base.operationalDocuments ?? []).filter(row => row.resourceId === paymentId || (scenario.mixed && row.resourceId === billId)).map(row => {
+      const line = row.resource.lines[0]!;
+      if (row.resourceId === billId) return {...row,resource:{...row.resource,totalAmount:scenario.zero?"25.00":"20.00",openAmount:"0.00",lines:[{...line,sourceAmount:scenario.zero?"25.00":"20.00",sourceQuantity:"1.00",sourceUnitAmount:scenario.zero?"25.00":"20.00",linkedTransactions:[]}]}};
+      return {...row,resource:{...row.resource,totalAmount:scenario.zero?"0.00":(scenario.applied+(scenario.mixed?20:0)).toFixed(2),unappliedAmount:"0.00",lines:[
+        {...line,sourceLineId:"journal-link",sourceAmount:scenario.applied.toFixed(2),linkedTransactions:[{sourceTransactionId:"journal-fixture",sourceTransactionType:"JournalEntry"}]},
+        ...(scenario.mixed?[{...line,sourceLineId:"bill-link",lineNumber:2,sourceAmount:scenario.zero?"25.00":"20.00",linkedTransactions:[{sourceTransactionId:billId,sourceTransactionType:scenario.zero&&!scenario.journalCredit?"CreditMemo":scenario.customer?"Invoice":"Bill"}]}]:[])
+      ]}};
+    }) };
+    const persist=()=>runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:"company_qbo",facts,resources,replaceMissingDocuments:true,importedAt:"2026-08-12T12:00:00Z"}));
+    const before=(await pool.query("select count(*)::int n from erp_financials.transactions")).rows;
+    const result=await persist();
+    expect(result.unresolvedApplications).toEqual([]);
+    expect(result.journalSettlements).toEqual([expect.objectContaining({sourceTransactionId:paymentId,journalSourceId:"journal-fixture",amount:scenario.applied.toFixed(2),allocation:scenario.allocation,
+      reason:scenario.allocation === "unallocated" ? "provider gave no line id; partial amount" : null})]);
+    const balance=async()=> (await pool.query("select document_type,original_amount::text,open_amount::text,metadata#>>'{journalSettlementScope,journalSourceId}' journal from erp_financials.subledger_documents where document_type like 'journal_%'")).rows;
+    expect(await balance()).toEqual([{document_type:scenario.journalCredit?"journal_vendor_credit":scenario.customer?"journal_receivable":"journal_payable",original_amount:"100.00",open_amount:(100-scenario.applied).toFixed(2),journal:"journal-fixture"}]);
+    await expect(persist()).resolves.toMatchObject({documents:0,applications:0});
+    expect((await pool.query("select count(*)::int n from erp_financials.transactions")).rows).toEqual(before);
+    expect((await pool.query("select count(*)::int n from erp_financials.ledger_postings")).rows[0]).toEqual({n:scenario.customer ? 0 : scenario.amounts.length});
+    const sdk=createErpFinancialsSdk({database:runner,tenantId:"tenant_qbo",companyId:"company_qbo",bookId:"book_qbo",writeSourceId:"source_qbo",currencyCode:"USD"});
+    await sdk.books.define({operation:sdkOperation(),bookId:"book_qbo",name:"Journal fixture",baseCurrencyCode:"USD"});
+    await sdk.books.bindSource({operation:sdkOperation(),bookId:"book_qbo",sourceId:"source_qbo",sourceRole:"historical",effectiveThrough:"2026-08-31"});
+    const aging=await sdk.queries.getAging({kind:scenario.customer?"receivables":"payables",asOfDate:"2026-08-12"});
+    expect(aging.totals.total).toBe(((scenario.journalCredit?-1:1)*(100-scenario.applied)).toFixed(2));
+    const early=await sdk.queries.getAging({kind:scenario.customer?"receivables":"payables",asOfDate:"2026-08-01"});
+    expect(early.totals.total).toBe(scenario.journalCredit?"-100.00":!scenario.zero && scenario.customer && scenario.mixed ? "120.00":"100.00");
+  });
+
   it.each([false, true])("splits mixed cash and credit, replays and retires owned links (customer=%s)", async customer => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:mixed-credit" });
     await seedQuickBooksAllDocumentScope(pool);

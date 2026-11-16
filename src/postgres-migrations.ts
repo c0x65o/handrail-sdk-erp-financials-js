@@ -95,6 +95,7 @@ export class PostgresMigrationError extends Error {
 const namespace = POSTGRES_CANONICAL_SCHEMA_MANIFEST.namespace;
 const migrationLockKey = `${namespace}:schema-migrations`;
 const migrationFiles = {
+  journalSettlementV61: new URL("../migrations/future-erp/20261116020000_journal_subledger_settlement.sql", import.meta.url),
   lifecycleTypeV60: new URL("../migrations/future-erp/20261116010000_lifecycle_event_type_index.sql", import.meta.url),
   signedQuickBooksV59: new URL("../migrations/future-erp/20261115010000_signed_quickbooks_document_kinds.sql", import.meta.url),
   attestedSettlementV58: new URL("../migrations/future-erp/20261106020000_attested_settlement.sql", import.meta.url),
@@ -384,7 +385,8 @@ export const POSTGRES_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
   migration("20261106010000_native_receipt_void", "Protect native receipt void evidence", 56, 57, migrationFiles.nativeReceiptVoidV57),
   migration("20261106020000_attested_settlement", "Attested settlement-only replacement and retirement protection", 57, 58, migrationFiles.attestedSettlementV58),
   migration("20261115010000_signed_quickbooks_document_kinds", "Signed QuickBooks document kind provenance", 58, 59, migrationFiles.signedQuickBooksV59),
-  migration("20261116010000_lifecycle_event_type_index", "Bound lifecycle guard lookups by event type", 59, 60, migrationFiles.lifecycleTypeV60)
+  migration("20261116010000_lifecycle_event_type_index", "Bound lifecycle guard lookups by event type", 59, 60, migrationFiles.lifecycleTypeV60),
+  migration("20261116020000_journal_subledger_settlement", "Journal party and control-account subledger settlements", 60, 61, migrationFiles.journalSettlementV61)
 ] as const;
 
 export async function planPostgresMigrations(

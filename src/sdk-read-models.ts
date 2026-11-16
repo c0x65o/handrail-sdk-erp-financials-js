@@ -314,7 +314,7 @@ export type CustomerStatementApplicationEvidence = {
   readonly amount: DecimalString;
   readonly currencyCode: IsoCurrencyCode;
   readonly sourceDocumentId: string;
-  readonly sourceDocumentType: "customer_payment" | "credit_memo" | "write_off";
+  readonly sourceDocumentType: "customer_payment" | "credit_memo" | "journal_customer_credit" | "write_off";
   readonly sourceDocumentNumber?: string;
   readonly sourceDocumentDate: IsoDate;
   readonly sourceIdentity: CustomerStatementSourceIdentity;
@@ -7747,17 +7747,19 @@ function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType 
   group by link."source_id",link."original_transaction_id"
 ), aging_balances as (
 select document."subledger_document_id", document."source_id", document."transaction_id", document."document_date", document."original_amount", terminal."effective_date" as "terminal_date",
-  document."party_id", party."display_name" as "party_name", document."document_type", document."due_date",
-  case when document."document_type" = ${documentType} then coalesce(document."due_date", document."document_date") else document."document_date" end as "aging_date",
+  document."party_id", party."display_name" as "party_name", document."aging_role" as "document_type", document."due_date",
+  case when document."aging_role" = ${documentType} then coalesce(document."due_date", document."document_date") else document."document_date" end as "aging_date",
   case
-    when document."document_type" = 'refund' then 0
+    when document."aging_role" = 'refund' then 0
     when terminal."effective_date" <= ${asOf}::date then 0
     -- Preserve provider-owned current snapshots where the provider does not
     -- supply a complete application history (same contract as the AP register).
     when document."metadata"->>'provider' = 'quickbooks' and document."updated_at" < (${asOf}::date + interval '1 day') then document."open_amount"
     else greatest(document."original_amount" - coalesce(applied."amount", 0), 0)
   end as "historical_open_amount"
-from "erp_financials"."subledger_documents" document
+from (select d.*, case d.document_type when 'journal_receivable' then 'invoice' when 'journal_payable' then 'vendor_bill'
+  when 'journal_customer_credit' then 'credit_memo' when 'journal_vendor_credit' then 'vendor_credit' else d.document_type end as aging_role
+  from erp_financials.subledger_documents d) document
 join "erp_financials"."reporting_book_sources" source
   on source."tenant_id" = document."tenant_id" and source."company_id" = document."company_id"
  and source."book_id" = $3 and source."source_id" = document."source_id"
@@ -7766,12 +7768,12 @@ join "erp_financials"."reporting_book_sources" source
 left join "erp_financials"."parties" party
   on party."tenant_id" = document."tenant_id" and party."source_id" = document."source_id" and party."party_id" = document."party_id"
 left join applied_documents applied on applied.source_id=document."source_id"
- and applied.document_id=document."subledger_document_id" and applied.document_type=document."document_type"
-left join terminal_documents terminal on document."document_type" <> 'invoice'
+ and applied.document_id=document."subledger_document_id" and applied.document_type=document."aging_role"
+left join terminal_documents terminal on document."aging_role" <> 'invoice'
  and terminal."source_id"=document."source_id" and terminal."original_transaction_id"=document."transaction_id"
 where document."tenant_id" = $1 and document."company_id" = $2
   ${party === undefined ? "" : `and document.party_id=${party}`}
-  and (document."document_type" = ${documentType} or document."document_type" = any(${offsetTypes}::text[]))
+  and (document."aging_role" = ${documentType} or document."aging_role" = any(${offsetTypes}::text[]))
   and document."currency_code" = ${currency} and coalesce(document."recognition_date",document."document_date") <= ${asOf}::date
 ), aging_documents as (
   select "party_id", "party_name", "document_type", "aging_date", "due_date",
@@ -7826,17 +7828,19 @@ function vendorFundingDocumentsSql(asOf = "$6", currency = "$5", documentType = 
   group by link."source_id",link."original_transaction_id"
 ), aging_balances as (
 select document."subledger_document_id", document."source_id", document."transaction_id", document."document_date", document."original_amount", terminal."effective_date" as "terminal_date",
-  document."party_id", party."display_name" as "party_name", document."document_type", document."due_date",
-  case when document."document_type" = ${documentType} then coalesce(document."due_date", document."document_date") else document."document_date" end as "aging_date",
+  document."party_id", party."display_name" as "party_name", document."aging_role" as "document_type", document."due_date",
+  case when document."aging_role" = ${documentType} then coalesce(document."due_date", document."document_date") else document."document_date" end as "aging_date",
   case
-    when document."document_type" = 'refund' then 0
+    when document."aging_role" = 'refund' then 0
     when terminal."effective_date" <= ${asOf}::date then 0
     -- Preserve provider-owned current snapshots where the provider does not
     -- supply a complete application history (same contract as the AP register).
     when document."metadata"->>'provider' = 'quickbooks' and document."updated_at" < (${asOf}::date + interval '1 day') then document."open_amount"
     else greatest(document."original_amount" - coalesce(applied."amount", 0), 0)
   end as "historical_open_amount"
-from "erp_financials"."subledger_documents" document
+from (select d.*, case d.document_type when 'journal_receivable' then 'invoice' when 'journal_payable' then 'vendor_bill'
+  when 'journal_customer_credit' then 'credit_memo' when 'journal_vendor_credit' then 'vendor_credit' else d.document_type end as aging_role
+  from erp_financials.subledger_documents d) document
 join "erp_financials"."reporting_book_sources" source
   on source."tenant_id" = document."tenant_id" and source."company_id" = document."company_id"
  and source."book_id" = $3 and source."source_id" = document."source_id"
@@ -7845,11 +7849,11 @@ join "erp_financials"."reporting_book_sources" source
 left join "erp_financials"."parties" party
   on party."tenant_id" = document."tenant_id" and party."source_id" = document."source_id" and party."party_id" = document."party_id"
 left join applied_documents applied on applied.source_id=document."source_id"
- and applied.document_id=document."subledger_document_id" and applied.document_type=document."document_type"
+ and applied.document_id=document."subledger_document_id" and applied.document_type=document."aging_role"
 left join terminal_documents terminal on terminal."source_id"=document."source_id" and terminal."original_transaction_id"=document."transaction_id"
 where document."tenant_id" = $1 and document."company_id" = $2
   ${party === undefined ? "" : `and document.party_id=${party}`}
-  and (document."document_type" = ${documentType} or document."document_type" = any(${offsetTypes}::text[]))
+  and (document."aging_role" = ${documentType} or document."aging_role" = any(${offsetTypes}::text[]))
   and document."currency_code" = ${currency} and coalesce(document."recognition_date",document."document_date") <= ${asOf}::date
 ), aging_documents as (
   select "party_id", "party_name", "document_type", "aging_date", "due_date",
@@ -8684,7 +8688,7 @@ function customerStatementApplications(value: unknown): readonly CustomerStateme
       throw new Error("Stored customer statement application type is invalid");
     }
     const sourceDocumentType = string(candidate.sourceDocumentType, "sourceDocumentType");
-    if (!new Set<string>(["customer_payment", "credit_memo", "write_off"]).has(sourceDocumentType)) {
+    if (!new Set<string>(["customer_payment", "credit_memo", "journal_customer_credit", "write_off"]).has(sourceDocumentType)) {
       throw new Error("Stored customer statement source document type is invalid");
     }
     const sourceDocumentNumber = optionalString(candidate.sourceDocumentNumber);
