@@ -95,6 +95,7 @@ export class PostgresMigrationError extends Error {
 const namespace = POSTGRES_CANONICAL_SCHEMA_MANIFEST.namespace;
 const migrationLockKey = `${namespace}:schema-migrations`;
 const migrationFiles = {
+  purchaseSettlementV63: new URL("../migrations/future-erp/20261116040000_purchase_control_settlement.sql", import.meta.url),
   pooledSettlementV62: new URL("../migrations/future-erp/20261116030000_pooled_journal_settlement.sql", import.meta.url),
   journalSettlementV61: new URL("../migrations/future-erp/20261116020000_journal_subledger_settlement.sql", import.meta.url),
   lifecycleTypeV60: new URL("../migrations/future-erp/20261116010000_lifecycle_event_type_index.sql", import.meta.url),
@@ -388,7 +389,8 @@ export const POSTGRES_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
   migration("20261115010000_signed_quickbooks_document_kinds", "Signed QuickBooks document kind provenance", 58, 59, migrationFiles.signedQuickBooksV59),
   migration("20261116010000_lifecycle_event_type_index", "Bound lifecycle guard lookups by event type", 59, 60, migrationFiles.lifecycleTypeV60),
   migration("20261116020000_journal_subledger_settlement", "Journal party and control-account subledger settlements", 60, 61, migrationFiles.journalSettlementV61),
-  migration("20261116030000_pooled_journal_settlement", "Retain independent credit and cash settlement legs", 61, 62, migrationFiles.pooledSettlementV62)
+  migration("20261116030000_pooled_journal_settlement", "Retain independent credit and cash settlement legs", 61, 62, migrationFiles.pooledSettlementV62),
+  migration("20261116040000_purchase_control_settlement", "Settle customer control balances on purchase checks", 62, 63, migrationFiles.purchaseSettlementV63)
 ] as const;
 
 export async function planPostgresMigrations(

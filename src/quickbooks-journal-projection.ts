@@ -27,11 +27,11 @@ export type JournalSettlementEvidence = {
 /** Subledger projections reference the existing journal. They never enter the
  * canonical fact writer, manufacture an invoice/bill, or create a posting.
  */
-export function createQuickBooksJournalProjections(facts: CanonicalAccountingFactSet) {
+export function createQuickBooksJournalProjections(facts: CanonicalAccountingFactSet, purchaseIds: ReadonlySet<string> = new Set()) {
   const accounts = new Map(facts.accounts.map(row => [row.accountId, row]));
   const parties = new Map(facts.parties.map(row => [row.partyId, row]));
   const transactions = new Map(facts.transactions.map(row => [row.transactionId, row]));
-  const journalBySourceId = new Map(facts.transactions.filter(row => row.sourceTransactionType === "JournalEntry").map(row => [row.sourceTransactionId, row]));
+  const journalBySourceId = new Map(facts.transactions.filter(row => (row.sourceTransactionType === "JournalEntry" || (row.sourceTransactionType === "Purchase" && purchaseIds.has(row.sourceTransactionId)))).map(row => [row.sourceTransactionId, row]));
   const partyBySourceId = new Map(facts.parties.map(row => [row.sourcePartyId, row]));
   const controls = new Map<string, "ar" | "ap">(facts.accounts.flatMap<readonly [string, "ar" | "ap"]>(account => {
     const type = account.type.toLowerCase().replace(/[^a-z]/g, "");
@@ -46,7 +46,7 @@ export function createQuickBooksJournalProjections(facts: CanonicalAccountingFac
     if (!side) continue;
     const transaction = transactions.get(posting.transactionId);
     if (!transaction || transaction.status !== "posted") continue;
-    if (transaction.sourceTransactionType !== "JournalEntry") {
+    if (transaction.sourceTransactionType !== "JournalEntry" && !(transaction.sourceTransactionType === "Purchase" && purchaseIds.has(transaction.sourceTransactionId) && side === "ar")) {
       const set = paymentAccounts.get(transaction.sourceTransactionId) ?? new Set<string>();
       set.add(posting.accountId); paymentAccounts.set(transaction.sourceTransactionId, set); continue;
     }
@@ -83,7 +83,7 @@ export function createQuickBooksJournalProjections(facts: CanonicalAccountingFac
     return [{ id, group, transaction: { ...transaction, partyId: group.partyId }, resource,
       metadata: { journalSourceId: group.journalId, journalTransactionId: transaction.transactionId,
         partyId: group.partyId, accountId: group.accountId, partySourceId: party.sourcePartyId, accountSourceId: account.sourceAccountId,
-        sourceTransactionType: "JournalEntry", projectionRole: sourceTransactionType } }];
+        sourceTransactionType: transaction.sourceTransactionType, projectionRole: sourceTransactionType } }];
   });
   const byId = new Map(projections.map(row => [row.id, row]));
   const candidatesByIdentity = new Map<string, typeof projections>();
@@ -107,7 +107,7 @@ export function createQuickBooksJournalProjections(facts: CanonicalAccountingFac
     }
     return { ...document, lines: document.lines.map(line => {
       const links = line.linkedTransactions ?? [];
-      if (!links.some(link => link.sourceTransactionType === "JournalEntry")) return line;
+      if (!links.some(link => link.sourceTransactionType === "JournalEntry" || (["Purchase", "Check", "Expense"].includes(link.sourceTransactionType ?? "") && purchaseIds.has(link.sourceTransactionId)))) return line;
       const link = links[0];
       if (links.length !== 1 || !link || !line.sourceAmount) throw Error(`journal_settlement_ambiguous_link:${document.sourceTransactionId}`);
       const party = partyBySourceId.get(document.partyRef?.sourceObjectId ?? "");

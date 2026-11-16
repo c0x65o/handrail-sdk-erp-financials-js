@@ -149,7 +149,10 @@ export async function persistQuickBooksSubledgerResources(
     operationalDocuments: (suppliedInput.resources.operationalDocuments ?? suppliedInput.resources.ledgerTransactions ?? []).filter(row =>
       !corrections.some(c => row.resource.sourceTransactionType === (c.providerType ?? "Payment") && row.resource.sourceTransactionId === c.dependency.sourceTransactionId)) } };
 
-  const journalPlan = createQuickBooksJournalProjections(input.facts);
+  const purchaseIds = new Set(input.resources.operationalDocuments.filter(row => row.resource.sourceTransactionType === "Payment")
+    .flatMap(row => row.resource.lines.flatMap(line => line.linkedTransactions ?? []))
+    .filter(link => ["Purchase", "Check", "Expense"].includes(link.sourceTransactionType ?? "")).map(link => link.sourceTransactionId));
+  const journalPlan = createQuickBooksJournalProjections(input.facts, purchaseIds);
   const ordered = [...input.resources.operationalDocuments].sort((a,b) => a.resource.transactionDate.localeCompare(b.resource.transactionDate) || a.resource.sourceTransactionId.localeCompare(b.resource.sourceTransactionId));
   input.resources.operationalDocuments = ordered.map(row => ({ ...row, resource: (() => {
     try { return ["voided", "deleted", "skipped"].includes(row.syncAction ?? "") ? row.resource : journalPlan.rewrite(row.resource); }
