@@ -62,7 +62,7 @@ export type PostgresTableManifest = {
 
 export type PostgresSchemaManifest = {
   readonly manifestVersion: "2026-10-31.provider-application-refresh";
-  readonly schemaVersion: 59;
+  readonly schemaVersion: 60;
   readonly dialect: "postgres";
   readonly namespace: "erp_financials";
   readonly requiredTriggers: readonly PostgresTriggerManifest[];
@@ -153,7 +153,7 @@ const table = (
 
 export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
   manifestVersion: "2026-10-31.provider-application-refresh",
-  schemaVersion: 59,
+  schemaVersion: 60,
   dialect: "postgres",
   namespace: "erp_financials",
   requiredTriggers: [
@@ -616,6 +616,10 @@ export const POSTGRES_CANONICAL_SCHEMA_MANIFEST: PostgresSchemaManifest = {
         {
           name: "financial_lifecycle_events_recorded_page_idx",
           columns: ["tenant_id", "company_id", "source_id", "aggregate_type", "aggregate_id", "recorded_at", "event_id"]
+        },
+        {
+          name: "financial_lifecycle_events_type_scope_idx",
+          columns: ["tenant_id", "company_id", "source_id", "event_type"]
         },
         {
           name: "financial_lifecycle_events_correlation_idx",

@@ -95,6 +95,7 @@ export class PostgresMigrationError extends Error {
 const namespace = POSTGRES_CANONICAL_SCHEMA_MANIFEST.namespace;
 const migrationLockKey = `${namespace}:schema-migrations`;
 const migrationFiles = {
+  lifecycleTypeV60: new URL("../migrations/future-erp/20261116010000_lifecycle_event_type_index.sql", import.meta.url),
   signedQuickBooksV59: new URL("../migrations/future-erp/20261115010000_signed_quickbooks_document_kinds.sql", import.meta.url),
   attestedSettlementV58: new URL("../migrations/future-erp/20261106020000_attested_settlement.sql", import.meta.url),
   nativeReceiptVoidV57: new URL("../migrations/future-erp/20261106010000_native_receipt_void.sql", import.meta.url),
@@ -382,7 +383,8 @@ export const POSTGRES_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
   migration("20261104010000_signed_vendor_components", "Preserve signed explicit vendor tax components", 55, 56, migrationFiles.vendorComponentsV56),
   migration("20261106010000_native_receipt_void", "Protect native receipt void evidence", 56, 57, migrationFiles.nativeReceiptVoidV57),
   migration("20261106020000_attested_settlement", "Attested settlement-only replacement and retirement protection", 57, 58, migrationFiles.attestedSettlementV58),
-  migration("20261115010000_signed_quickbooks_document_kinds", "Signed QuickBooks document kind provenance", 58, 59, migrationFiles.signedQuickBooksV59)
+  migration("20261115010000_signed_quickbooks_document_kinds", "Signed QuickBooks document kind provenance", 58, 59, migrationFiles.signedQuickBooksV59),
+  migration("20261116010000_lifecycle_event_type_index", "Bound lifecycle guard lookups by event type", 59, 60, migrationFiles.lifecycleTypeV60)
 ] as const;
 
 export async function planPostgresMigrations(
