@@ -6434,6 +6434,14 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
         {...bill,resourceId:"extra-bill",resource:{...bill.resource,sourceTransactionId:"extra-bill",totalAmount:"25.00",lines:bill.resource.lines.map(line=>({...line,sourceAmount:"25.00",sourceUnitAmount:"25.00"}))}}]};
     }
     const persist=()=>runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:"company_qbo",facts,resources,replaceMissingDocuments:true,importedAt:"2026-08-12T12:00:00Z"}));
+    if (scenario.deposit) {
+      // Re-import after an import that disposed the $0 payment (Hitcents VendorCredit 51969): the credit
+      // was left at QuickBooks' Balance (0.00) with no application, and the settlement must still apply.
+      const withoutPayment = {...resources,operationalDocuments:(resources.operationalDocuments ?? []).filter(row=>row.resourceId!==paymentId)};
+      await runner.transaction(client=>persistQuickBooksSubledgerResources({client,companyId:"company_qbo",facts,resources:withoutPayment,replaceMissingDocuments:true,importedAt:"2026-08-12T11:00:00Z"}));
+      expect((await pool.query("select open_amount::text,status from erp_financials.subledger_documents where document_type='vendor_credit'")).rows).toEqual([{open_amount:"0.00",status:"settled"}]);
+      expect((await pool.query("select count(*)::int n from erp_financials.subledger_applications")).rows[0]).toEqual({n:0});
+    }
     const before=(await pool.query("select count(*)::int n from erp_financials.transactions")).rows;
     const result=await persist();
     expect(result.unresolvedApplications).toEqual([]);

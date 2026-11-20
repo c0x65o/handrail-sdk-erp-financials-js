@@ -831,7 +831,68 @@ where "tenant_id" = $1 and "company_id" = $2 and "source_id" = $3
     );
   }
 
+  // Documents in this batch whose open amount is restored from QuickBooks'
+  // Balance/UnappliedAmt after the applications below.
+  const providerOpenBalances = (): { documentId: string; openAmount: string }[] => {
+    const balances: { documentId: string; openAmount: string }[] = [];
+    for (const resource of operationalDocuments) {
+      if (resource.syncAction === "voided" || resource.syncAction === "deleted" || resource.syncAction === "skipped") continue;
+      const normalized = resource.resource;
+      const documentType = importedDocumentType(normalized.sourceTransactionType, normalized.totalAmount);
+      const originalAmount = positiveAmount(normalized.totalAmount);
+      if (documentType === undefined || originalAmount === undefined) continue;
+      const openAmount = reportedQuickBooksOpenAmount(documentType, normalized, originalAmount);
+      const documentId = documentIdBySourceId.get(normalized.sourceTransactionId);
+      if (openAmount === undefined || documentId === undefined || preservedInvoiceIds.includes(documentId)) continue;
+      balances.push({ documentId, openAmount });
+    }
+    return balances;
+  };
   await refreshDocuments(processedDocuments, true);
+  // A refreshed document keeps its prior consumption (original - open), but on a
+  // re-import that consumption can come from the previous import's QuickBooks
+  // Balance snapshot rather than from an application (Hitcents VendorCredit 51969:
+  // open 0.00 with no application, because the earlier import disposed its $0
+  // settlement payment). Rebuild the open amount of each document whose QuickBooks
+  // Balance is restored after the applications below from its applied
+  // applications, so a re-import applies exactly as a first import does. Only those
+  // documents: anything else (a document outside an incremental delta, a locally
+  // corrected invoice) keeps its balance. Document types that start settled, and
+  // settlement pools, are left as refreshed.
+  await input.client.query(
+    `with consumed as (
+       select document_id, sum(applied_amount) as amount from (
+         select "source_document_id" as document_id, "applied_amount" from "erp_financials"."subledger_applications"
+          where "tenant_id" = $1 and "company_id" = $2 and "status" = 'applied'
+         union all
+         select "target_document_id" as document_id, "applied_amount" from "erp_financials"."subledger_applications"
+          where "tenant_id" = $1 and "company_id" = $2 and "status" = 'applied'
+       ) legs group by document_id
+     ), rebuilt as (
+       select document."subledger_document_id", document."original_amount" - coalesce(consumed.amount, 0) as open_amount,
+              coalesce(consumed.amount, 0) as consumed
+         from "erp_financials"."subledger_documents" document
+         left join consumed on consumed.document_id = document."subledger_document_id"
+        where document."tenant_id" = $1 and document."company_id" = $2 and document."source_id" = $3
+          and document."subledger_document_id" = any($5::text[])
+          and document."status" <> 'voided'
+          -- Documents whose first-import state is not "original amount open"
+          -- (see initialDocumentState) and settlement pools (funded and drawn)
+          -- keep their refreshed state.
+          and document."document_type" not in ('refund', 'deposit', 'transfer', 'sales_receipt', 'purchase', 'settlement_pool')
+          and document."open_amount" <> document."original_amount" - coalesce(consumed.amount, 0)
+     )
+     update "erp_financials"."subledger_documents" document
+        set "open_amount" = rebuilt.open_amount,
+            "status" = case when rebuilt.open_amount = 0 then 'settled' when rebuilt.consumed = 0 then 'open' else 'partially_applied' end,
+            "version" = document."version" + 1,
+            "updated_at" = $4
+       from rebuilt
+      where document."tenant_id" = $1 and document."company_id" = $2 and document."source_id" = $3
+        and document."subledger_document_id" = rebuilt."subledger_document_id"`,
+    [input.facts.company.tenantId, input.companyId, input.facts.source.sourceId, input.importedAt,
+      [...new Set(providerOpenBalances().map(row => row.documentId))]]
+  );
   const refreshApplications = createImportStatisticsRefresh(input.client,
     ['"erp_financials"."subledger_applications"', '"erp_financials"."financial_lifecycle_events"'], operationalDocuments.length);
   let applications = 0;
@@ -1303,21 +1364,9 @@ where application."tenant_id" = $1 and application."company_id" = $2 and applica
   // instead retain the canonical application balance; a late Balance snapshot
   // cannot reinstate the voided application. Native applications are a local
   // overlay on the provider snapshot; replay must not make that credit spendable again.
-  const providerOpenBalances: { documentId: string; openAmount: string }[] = [];
-  for (const resource of operationalDocuments) {
-    if (resource.syncAction === "voided" || resource.syncAction === "deleted" || resource.syncAction === "skipped") continue;
-    const normalized = resource.resource;
-    const documentType = importedDocumentType(normalized.sourceTransactionType, normalized.totalAmount);
-    const originalAmount = positiveAmount(normalized.totalAmount);
-    if (documentType === undefined || originalAmount === undefined) continue;
-    const openAmount = reportedQuickBooksOpenAmount(documentType, normalized, originalAmount);
-    const documentId = documentIdBySourceId.get(normalized.sourceTransactionId);
-    if (openAmount === undefined || documentId === undefined || preservedInvoiceIds.includes(documentId)) continue;
-    providerOpenBalances.push({ documentId, openAmount });
-  }
   await restoreQuickBooksOpenBalances({ client: input.client, tenantId: input.facts.company.tenantId,
     companyId: input.companyId, sourceId: input.facts.source.sourceId, importedAt: input.importedAt,
-    balances: providerOpenBalances });
+    balances: providerOpenBalances() });
 
   for (const resource of operationalDocuments) {
     if (resource.syncAction !== "voided" && resource.syncAction !== "deleted") continue;
