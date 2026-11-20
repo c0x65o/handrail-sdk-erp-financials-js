@@ -12910,6 +12910,13 @@ where subledger_document_id = $1`, [original.documentId]);
     expect(await sdk.queries.listChartOfAccounts({ asOfDate: "2026-08-31" })).toEqual(expect.arrayContaining([
       expect.objectContaining({ bookAccountKey: "revenue", active: false, directBalance: "-25.00" })
     ]));
+    // Without balances: the same identities and hierarchy, every balance zero.
+    const withBalances = await sdk.queries.listChartOfAccounts({ asOfDate: "2026-08-31", includeInactive: true });
+    const withoutBalances = await sdk.queries.listChartOfAccounts({ asOfDate: "2026-08-31", includeInactive: true, includeBalances: false });
+    const identity = (rows: typeof withBalances) => rows.map(({ bookAccountKey, sourceAccountIds, classification, active, accountRole, parentBookAccountKey, version }) =>
+      ({ bookAccountKey, sourceAccountIds, classification, active, accountRole, parentBookAccountKey, version }));
+    expect(identity(withoutBalances)).toEqual(identity(withBalances));
+    expect(withoutBalances.find(row => row.bookAccountKey === "revenue")).toMatchObject({ directBalance: "0.00", balance: "0.00" });
     const writeState = async () => Promise.all(["financial_lifecycle_events", "financial_outbox", "import_batches", "transaction_lines"]
       .map(async table => (await pool.query<Record<string, unknown>>(`select * from erp_financials.${table} order by 1`)).rows));
     const beforeDenied = await writeState();

@@ -1873,7 +1873,11 @@ export type FinancialReadModels = {
   getOperationalAccounts(input: OperationalAccountsRequest): Promise<readonly OperationalAccountDefinition[]>;
   getOperationalAccount(input: OperationalAccountRequest): Promise<OperationalAccountDefinition>;
   getOperationalAccountByKey(input: OperationalAccountKeyRequest): Promise<OperationalAccountDefinition>;
-  listChartOfAccounts(input?: { readonly asOfDate?: IsoDate; readonly includeInactive?: boolean }): Promise<readonly ChartOfAccountsItem[]>;
+  /**
+   * `includeBalances: false` skips the ledger aggregation for callers that only
+   * need account identity and hierarchy; every balance is then "0.00".
+   */
+  listChartOfAccounts(input?: { readonly asOfDate?: IsoDate; readonly includeInactive?: boolean; readonly includeBalances?: boolean }): Promise<readonly ChartOfAccountsItem[]>;
   getCashFlowPurpose(input: { sourceId: string; documentId: string }): Promise<CashFlowPurposeCorrection | null>;
   getCashFlowSummary(input: CashFlowSummaryRequest): Promise<CashFlowSummary>;
   getOutstandingDocumentSummary(input: { readonly asOfDate: IsoDate }): Promise<OutstandingDocumentSummary>;
@@ -7633,8 +7637,11 @@ limit 1`, [scope.tenantId, scope.companyId, scope.bookId, sourceId, accountId, a
 
 async function listChartOfAccounts(
   scope: Scope,
-  input: { readonly asOfDate?: IsoDate; readonly includeInactive?: boolean }
+  input: { readonly asOfDate?: IsoDate; readonly includeInactive?: boolean; readonly includeBalances?: boolean }
 ): Promise<readonly ChartOfAccountsItem[]> {
+  // Balances aggregate every ledger posting (seconds at ~900k postings). Account
+  // preparation and mapping only read identity and hierarchy.
+  const balances = input.includeBalances !== false;
   const asOfDate = input.asOfDate ?? today();
   assertDate(asOfDate, "asOfDate");
   return scope.database.transaction(async (client) => {
@@ -7655,8 +7662,9 @@ async function listChartOfAccounts(
         else parent_account."source_id" || ':' || parent_account."account_id" end))
   end as "parent_book_account_key",
   coalesce(bool_or(book_account."active"), bool_or(account."active")) as "active",
-  coalesce(sum(posting."debit_amount"), 0) as "debit_amount",
-  coalesce(sum(posting."credit_amount"), 0) as "credit_amount", coalesce(sum(posting."net_amount"), 0) as "balance"
+  ${balances ? `coalesce(sum(posting."debit_amount"), 0) as "debit_amount",
+  coalesce(sum(posting."credit_amount"), 0) as "credit_amount", coalesce(sum(posting."net_amount"), 0) as "balance"`
+    : `0::numeric as "debit_amount", 0::numeric as "credit_amount", 0::numeric as "balance"`}
 from "erp_financials"."accounts" account
 join "erp_financials"."reporting_book_sources" source
   on source."tenant_id" = $1 and source."company_id" = $2 and source."book_id" = $3 and source."source_id" = account."source_id"
@@ -7673,15 +7681,17 @@ left join "erp_financials"."accounts" parent_account
 left join "erp_financials"."reporting_book_account_mappings" parent_mapping
   on parent_mapping."tenant_id" = $1 and parent_mapping."company_id" = $2 and parent_mapping."book_id" = $3
  and parent_mapping."source_id" = parent_account."source_id" and parent_mapping."account_id" = parent_account."account_id"
-left join "erp_financials"."ledger_postings" posting
+${balances ? `left join "erp_financials"."ledger_postings" posting
   on posting."tenant_id" = account."tenant_id" and posting."source_id" = account."source_id" and posting."account_id" = account."account_id"
  and posting."accounting_basis" = $5 and posting."currency_code" = $6 and posting."posting_date" <= $4::date
  and (source."effective_from" is null or source."effective_from" <= posting."posting_date")
- and (source."effective_through" is null or source."effective_through" >= posting."posting_date")
+ and (source."effective_through" is null or source."effective_through" >= posting."posting_date")` : ""}
 where account."tenant_id" = $1
 group by coalesce(mapping."book_account_key", account."source_id" || ':' || account."account_id")
 order by min(account."account_number") nulls last, min(account."name"), "book_account_key"`,
-      [scope.tenantId, scope.companyId, scope.bookId, asOfDate, book.accountingBasis, book.currencyCode]
+      balances
+        ? [scope.tenantId, scope.companyId, scope.bookId, asOfDate, book.accountingBasis, book.currencyCode]
+        : [scope.tenantId, scope.companyId, scope.bookId, asOfDate]
     );
     const defined = await client.query(
       `select "book_account_key", "account_number", "name" as "account_name", "classification",
