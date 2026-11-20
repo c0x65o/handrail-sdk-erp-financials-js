@@ -27,12 +27,13 @@ export type JournalSettlementEvidence = {
 const PAYABLE_CONTROL_LINK_TYPES: ReadonlySet<string> = new Set(["Purchase", "Check", "Expense", "Deposit"]);
 
 /**
- * Purchase checks and deposits that QuickBooks links from a bill payment and that
- * post to Accounts Payable for a vendor (a vendor refund deposited, or a check
- * that credits or charges the vendor's payable). QuickBooks settles these
- * through the bill payment, so their payable scope becomes a subledger item.
- * Only transactions whose every accrual payable posting names a vendor qualify;
- * anything else keeps the previous behavior.
+ * Purchase checks and deposits that post to Accounts Payable for a vendor (a
+ * vendor refund deposited, or a check that credits or charges the vendor's
+ * payable). QuickBooks ages them as open AP items and settles them through bill
+ * payments that link them, so their payable scope becomes a subledger item.
+ * Only transactions whose every accrual payable posting names a vendor (or
+ * whose linking bill payments name one vendor) qualify; anything else keeps the
+ * previous behavior.
  */
 /**
  * The vendor of the bill payments that link a purchase/deposit, when every such
@@ -66,15 +67,15 @@ export function quickBooksPayableControlSourceIds(
   documents: readonly NormalizedQuickBooksLedgerTransaction[],
   vendorFallbacks: ReadonlyMap<string, string> = quickBooksPayableVendorFallbacks(facts, documents),
 ): Set<string> {
-  const linked = new Set(documents.filter(document => document.sourceTransactionType === "BillPayment")
-    .flatMap(document => document.lines.flatMap(line => line.linkedTransactions ?? []))
-    .filter(link => PAYABLE_CONTROL_LINK_TYPES.has(link.sourceTransactionType ?? ""))
-    .map(link => link.sourceTransactionId));
-  if (linked.size === 0) return linked;
+  // QuickBooks ages every Accounts Payable line that names a vendor as an open
+  // item until something is applied to it, whether or not a bill payment links
+  // it (Ben Lomand Telco Deposit 94010 refunds VendorCredit 93706; QuickBooks
+  // shows both open and the vendor at $0.00). Bill payment links settle them below.
   const payables = new Set(facts.accounts.filter(account => account.type.toLowerCase().replace(/[^a-z]/g, "") === "accountspayable").map(account => account.accountId));
+  if (payables.size === 0) return new Set();
   const vendors = new Set(facts.parties.filter(party => party.partyType === "vendor").map(party => party.partyId));
   const candidates = new Map(facts.transactions
-    .filter(row => (row.sourceTransactionType === "Purchase" || row.sourceTransactionType === "Deposit") && row.status === "posted" && linked.has(row.sourceTransactionId))
+    .filter(row => (row.sourceTransactionType === "Purchase" || row.sourceTransactionType === "Deposit") && row.status === "posted")
     .map(row => [row.transactionId, row.sourceTransactionId]));
   const qualified = new Map<string, boolean>();
   for (const posting of facts.postings) {

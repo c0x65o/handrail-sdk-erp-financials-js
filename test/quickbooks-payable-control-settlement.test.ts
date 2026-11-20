@@ -60,10 +60,29 @@ describe("QuickBooks payable purchase/deposit settlement", () => {
     // Payable postings on a customer are not a vendor scope.
     const customer = facts({ transactions: [{ id: "101068", type: "Deposit" }], postings: [{ id: "dep_ap", transaction: "101068", account: "ap", party: "houchens", credit: "10.58" }] });
     expect([...quickBooksPayableControlSourceIds(customer, [payment])]).toEqual([]);
-    // Not linked from a bill payment, or no payable posting: not selected.
-    expect([...quickBooksPayableControlSourceIds(base, [{ ...payment, sourceTransactionType: "Payment" }])]).toEqual([]);
+    // QuickBooks ages a vendor-named payable posting as open even when no bill
+    // payment links it (Ben Lomand Telco Deposit 94010): selected without a link.
+    expect([...quickBooksPayableControlSourceIds(base, [{ ...payment, sourceTransactionType: "Payment" }])]).toEqual(["101068"]);
+    expect([...quickBooksPayableControlSourceIds(base, [])]).toEqual(["101068"]);
+    // Without a vendor on the posting and no linking bill payment, nothing names the vendor: not selected.
+    expect([...quickBooksPayableControlSourceIds(noParty, [])]).toEqual([]);
     const noPayable = facts({ transactions: [{ id: "101068", type: "Deposit" }], postings: [{ id: "dep_bank", transaction: "101068", account: "bank", debit: "10.58" }] });
     expect([...quickBooksPayableControlSourceIds(noPayable, [payment])]).toEqual([]);
+  });
+
+  it("projects an unlinked vendor refund deposit as an open payable that nets the vendor's open credit, as QuickBooks ages it", () => {
+    // Ben Lomand Telco: VendorCredit 93706 $38.14 (2024-10-11) refunded by Deposit 94010 $38.14 (2024-10-29)
+    // credited to Accounts Payable; no bill payment links them. QuickBooks' AP aging shows both open, vendor total $0.00.
+    const base = facts({
+      transactions: [{ id: "94010", type: "Deposit" }],
+      postings: [
+        { id: "dep_bank", transaction: "94010", account: "bank", debit: "38.14" },
+        { id: "dep_ap", transaction: "94010", account: "ap", party: "frontier", credit: "38.14" },
+      ],
+    });
+    const plan = createQuickBooksJournalProjections(base, new Set(), quickBooksPayableControlSourceIds(base, []));
+    expect(plan.projections.map(row => [row.resource.sourceTransactionType, row.resource.totalAmount, row.metadata.journalSourceId, row.metadata.sourceTransactionType]))
+      .toEqual([["JournalPayable", "38.14", "94010", "Deposit"]]);
   });
 
   it("projects a refund deposit's vendor payable and settles the bill payment link against it", () => {
