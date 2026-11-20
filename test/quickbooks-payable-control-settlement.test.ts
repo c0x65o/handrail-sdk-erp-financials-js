@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createQuickBooksJournalProjections, quickBooksPayableControlSourceIds } from "../src/quickbooks-journal-projection.js";
+import { createQuickBooksJournalProjections, quickBooksPayableControlSourceIds, quickBooksPayableVendorFallbacks } from "../src/quickbooks-journal-projection.js";
 import type { CanonicalAccountingFactSet } from "../src/source-adapters.js";
 import type { NormalizedQuickBooksLedgerTransaction } from "../src/normalized-accounting-contracts.js";
 
@@ -48,9 +48,15 @@ describe("QuickBooks payable purchase/deposit settlement", () => {
     const { facts: base, payment } = frontier();
     expect([...quickBooksPayableControlSourceIds(base, [payment])]).toEqual(["101068"]);
 
-    // A refund deposit whose payable posting has no party keeps the previous behavior.
+    // QuickBooks' GL can omit the party on a refund deposit's payable posting; the
+    // linking bill payment's vendor then identifies it (Truist 68565/68566 shape).
     const noParty = facts({ transactions: [{ id: "101068", type: "Deposit" }], postings: [{ id: "dep_ap", transaction: "101068", account: "ap", credit: "10.58" }] });
-    expect([...quickBooksPayableControlSourceIds(noParty, [payment])]).toEqual([]);
+    expect([...quickBooksPayableControlSourceIds(noParty, [payment])]).toEqual(["101068"]);
+    expect([...quickBooksPayableVendorFallbacks(noParty, [payment])]).toEqual([["101068", "frontier"]]);
+    // Bill payments from different vendors linking the same deposit: no fallback, not selected.
+    const otherVendorPayment = billPayment("101099", "14261", [["Deposit", "101068", "10.58"], ["VendorCredit", "99470", "10.58"]]);
+    expect([...quickBooksPayableVendorFallbacks(noParty, [payment, otherVendorPayment])]).toEqual([]);
+    expect([...quickBooksPayableControlSourceIds(noParty, [payment, otherVendorPayment])]).toEqual([]);
     // Payable postings on a customer are not a vendor scope.
     const customer = facts({ transactions: [{ id: "101068", type: "Deposit" }], postings: [{ id: "dep_ap", transaction: "101068", account: "ap", party: "houchens", credit: "10.58" }] });
     expect([...quickBooksPayableControlSourceIds(customer, [payment])]).toEqual([]);
@@ -68,6 +74,24 @@ describe("QuickBooks payable purchase/deposit settlement", () => {
     const rewritten = plan.rewrite(payment);
     expect(rewritten.lines.map(line => line.linkedTransactions?.[0]?.sourceTransactionType)).toEqual(["JournalPayable", "Bill", "VendorCredit"]);
     expect(plan.evidence).toEqual([expect.objectContaining({ sourceTransactionId: "101069", journalSourceId: "101068", amount: "10.58", allocation: "single_line" })]);
+  });
+
+  it("settles a $0 bill payment's vendor credit against a refund deposit whose payable posting names no party", () => {
+    // Truist 2021: VendorCredit 68564 $44,785.37 applied by $0 BillPayment 68566 to refund Deposit 68565,
+    // whose Accounts Payable posting QuickBooks reports without a party.
+    const base = facts({ transactions: [{ id: "68565", type: "Deposit" }], postings: [
+      { id: "dep_bank", transaction: "68565", account: "bank", debit: "44785.37" },
+      { id: "dep_ap", transaction: "68565", account: "ap", credit: "44785.37" },
+    ] });
+    const payment = billPayment("68566", "14005", [["Deposit", "68565", "44785.37"], ["VendorCredit", "68564", "44785.37"]]);
+    const fallbacks = quickBooksPayableVendorFallbacks(base, [payment]);
+    const plan = createQuickBooksJournalProjections(base, new Set(), quickBooksPayableControlSourceIds(base, [payment], fallbacks), fallbacks);
+    expect(plan.projections.map(row => [row.resource.sourceTransactionType, row.resource.totalAmount, row.metadata.partyId, row.metadata.journalSourceId]))
+      .toEqual([["JournalPayable", "44785.37", "frontier", "68565"]]);
+    expect(plan.rewrite(payment).lines.map(line => line.linkedTransactions?.[0]?.sourceTransactionType)).toEqual(["JournalPayable", "VendorCredit"]);
+    expect(plan.evidence).toEqual([expect.objectContaining({ sourceTransactionId: "68566", journalSourceId: "68565", amount: "44785.37" })]);
+    // Without the fallback map (other SDK users), party-less payables stay unsettled as before.
+    expect(createQuickBooksJournalProjections(base, new Set(), new Set()).projections).toEqual([]);
   });
 
   it("projects a purchase check's vendor payable debit as a vendor credit (Harlan 99576 shape)", () => {

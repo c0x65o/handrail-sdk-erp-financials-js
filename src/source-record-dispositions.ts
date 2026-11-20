@@ -151,9 +151,49 @@ export function consumeSourceRecordDispositions(
     assertDispositionProvenance(disposition, input.importBatchId);
   }
 
-  const normalizedResources = excludeDisposedZeroEffectRecords(input.normalizedResources, dispositions);
-  assertNoCredentialKeys(dispositions);
-  return { dispositions, normalizedResources };
+  // A $0 QuickBooks bill payment that applies vendor credits to a refund deposit
+  // has no ledger effect, but it is how QuickBooks closes those open items. It
+  // stays in the import as an ordinary $0 bill payment (not a disposal) so the
+  // subledger settles the credit against the deposit exactly as QuickBooks does.
+  const settlementBearing = dispositions.filter(isSettlementBearingDisposition);
+  assertSettlementBearingRecords(input.normalizedResources, settlementBearing);
+  const disposed = settlementBearing.length === 0 ? dispositions
+    : dispositions.filter((disposition) => !isSettlementBearingDisposition(disposition));
+  const normalizedResources = excludeDisposedZeroEffectRecords(input.normalizedResources, disposed);
+  assertNoCredentialKeys(disposed);
+  return { dispositions: disposed, normalizedResources };
+}
+
+/**
+ * Provider zero-effect reasons for records that carry no ledger posting but do
+ * settle subledger items (QuickBooks links on a $0 bill payment).
+ */
+export const SETTLEMENT_BEARING_DISPOSITION_REASONS: ReadonlySet<string> = new Set([
+  "zero_cash_deposit_vendor_credit_offset"
+]);
+
+export function isSettlementBearingDisposition(
+  disposition: Pick<SourceRecordDisposition, "reason" | "sourceRecordType">
+): boolean {
+  return disposition.sourceRecordType === "BillPayment" && SETTLEMENT_BEARING_DISPOSITION_REASONS.has(disposition.reason);
+}
+
+/** Fail closed: exactly one $0 header, no ledger rows. */
+function assertSettlementBearingRecords(
+  resources: SourceDispositionResourceMap,
+  dispositions: readonly SourceRecordDisposition[]
+): void {
+  for (const disposition of dispositions) {
+    const key = dispositionIdentity(disposition);
+    const matches = (resources.transactions ?? []).filter((value) => sourceRecordIdentity(value) === key);
+    if (matches.length !== 1) {
+      throw new Error(`Settlement-bearing source record ${key} must match exactly one normalized transaction header.`);
+    }
+    assertExplicitZeroEffect(matches[0], key);
+    if ((resources.ledger_entries ?? []).some((posting) => childSourceRecordIdentity(posting) === key)) {
+      throw new Error(`Settlement-bearing source record ${key} has normalized posting data.`);
+    }
+  }
 }
 
 export function assertSourceRecordDispositionsExcluded(

@@ -166,7 +166,9 @@ export {
 } from "./quickbooks-sdk-envelope-adapter.js";
 export {
   compactSourceRecordDispositionWarningSummary,
-  consumeSourceRecordDispositions
+  consumeSourceRecordDispositions,
+  isSettlementBearingDisposition,
+  SETTLEMENT_BEARING_DISPOSITION_REASONS
 } from "./source-record-dispositions.js";
 export { createFutureErpQuickBooksIncrementalSyncWorker } from "./future-erp-quickbooks-incremental-sync.js";
 export {

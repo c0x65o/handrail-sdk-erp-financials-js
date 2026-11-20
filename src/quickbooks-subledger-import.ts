@@ -1,5 +1,5 @@
 import { planQuickBooksPooledSettlement } from "./quickbooks-pooled-settlement.js";
-import { createQuickBooksJournalProjections, journalProjectionKinds, quickBooksPayableControlSourceIds, type JournalSettlementEvidence } from "./quickbooks-journal-projection.js";
+import { createQuickBooksJournalProjections, journalProjectionKinds, quickBooksPayableControlSourceIds, quickBooksPayableVendorFallbacks, type JournalSettlementEvidence } from "./quickbooks-journal-projection.js";
 import { planQuickBooksMixedCredit, QuickBooksMixedCreditError } from "./quickbooks-mixed-credit.js";
 import { createImportStatisticsRefresh } from "./import-statistics.js";
 import { restoreQuickBooksOpenBalances } from "./quickbooks-open-balances.js";
@@ -153,9 +153,11 @@ export async function persistQuickBooksSubledgerResources(
   const purchaseIds = new Set(input.resources.operationalDocuments.filter(row => row.resource.sourceTransactionType === "Payment")
     .flatMap(row => row.resource.lines.flatMap(line => line.linkedTransactions ?? []))
     .filter(link => ["Purchase", "Check", "Expense"].includes(link.sourceTransactionType ?? "")).map(link => link.sourceTransactionId));
-  const payableIds = quickBooksPayableControlSourceIds(input.facts, input.resources.operationalDocuments
-    .filter(row => !["voided", "deleted", "skipped"].includes(row.syncAction ?? "")).map(row => row.resource));
-  const journalPlan = createQuickBooksJournalProjections(input.facts, purchaseIds, payableIds);
+  const activeDocuments = input.resources.operationalDocuments
+    .filter(row => !["voided", "deleted", "skipped"].includes(row.syncAction ?? "")).map(row => row.resource);
+  const payableVendorFallbacks = quickBooksPayableVendorFallbacks(input.facts, activeDocuments);
+  const payableIds = quickBooksPayableControlSourceIds(input.facts, activeDocuments, payableVendorFallbacks);
+  const journalPlan = createQuickBooksJournalProjections(input.facts, purchaseIds, payableIds, payableVendorFallbacks);
   const ordered = [...input.resources.operationalDocuments].sort((a,b) => a.resource.transactionDate.localeCompare(b.resource.transactionDate) || a.resource.sourceTransactionId.localeCompare(b.resource.sourceTransactionId));
   input.resources.operationalDocuments = ordered.map(row => ({ ...row, resource: (() => {
     try { return ["voided", "deleted", "skipped"].includes(row.syncAction ?? "") ? row.resource : journalPlan.rewrite(row.resource); }

@@ -34,9 +34,37 @@ const PAYABLE_CONTROL_LINK_TYPES: ReadonlySet<string> = new Set(["Purchase", "Ch
  * Only transactions whose every accrual payable posting names a vendor qualify;
  * anything else keeps the previous behavior.
  */
+/**
+ * The vendor of the bill payments that link a purchase/deposit, when every such
+ * bill payment names the same vendor. QuickBooks' general ledger can omit the
+ * party on a refund deposit's Accounts Payable posting; the $0 bill payment
+ * that applies the vendor credit to that deposit identifies the vendor.
+ */
+export function quickBooksPayableVendorFallbacks(
+  facts: CanonicalAccountingFactSet,
+  documents: readonly NormalizedQuickBooksLedgerTransaction[],
+): Map<string, string> {
+  const vendorsBySource = new Map(facts.parties.filter(party => party.partyType === "vendor").map(party => [party.sourcePartyId, party.partyId]));
+  const vendorsByLinked = new Map<string, Set<string | undefined>>();
+  for (const document of documents) {
+    if (document.sourceTransactionType !== "BillPayment") continue;
+    const vendor = vendorsBySource.get(document.partyRef?.sourceObjectId ?? "");
+    for (const link of document.lines.flatMap(line => line.linkedTransactions ?? [])) {
+      if (!PAYABLE_CONTROL_LINK_TYPES.has(link.sourceTransactionType ?? "")) continue;
+      const set = vendorsByLinked.get(link.sourceTransactionId) ?? new Set<string | undefined>();
+      set.add(vendor); vendorsByLinked.set(link.sourceTransactionId, set);
+    }
+  }
+  return new Map([...vendorsByLinked].flatMap(([sourceId, vendors]) => {
+    const [vendor] = [...vendors];
+    return vendors.size === 1 && vendor !== undefined ? [[sourceId, vendor] as const] : [];
+  }));
+}
+
 export function quickBooksPayableControlSourceIds(
   facts: CanonicalAccountingFactSet,
   documents: readonly NormalizedQuickBooksLedgerTransaction[],
+  vendorFallbacks: ReadonlyMap<string, string> = quickBooksPayableVendorFallbacks(facts, documents),
 ): Set<string> {
   const linked = new Set(documents.filter(document => document.sourceTransactionType === "BillPayment")
     .flatMap(document => document.lines.flatMap(line => line.linkedTransactions ?? []))
@@ -53,7 +81,8 @@ export function quickBooksPayableControlSourceIds(
     const sourceId = candidates.get(posting.transactionId);
     if (sourceId === undefined || posting.accountingBasis !== "accrual" || !payables.has(posting.accountId)) continue;
     if (settlementMinor(posting.debitAmount) - settlementMinor(posting.creditAmount) === 0n) continue;
-    qualified.set(sourceId, (qualified.get(sourceId) ?? true) && posting.partyId !== undefined && vendors.has(posting.partyId));
+    const partyId = posting.partyId ?? vendorFallbacks.get(sourceId);
+    qualified.set(sourceId, (qualified.get(sourceId) ?? true) && partyId !== undefined && vendors.has(partyId));
   }
   return new Set([...qualified].filter(([, ok]) => ok).map(([sourceId]) => sourceId));
 }
@@ -65,6 +94,7 @@ export function createQuickBooksJournalProjections(
   facts: CanonicalAccountingFactSet,
   purchaseIds: ReadonlySet<string> = new Set(),
   payableIds: ReadonlySet<string> = new Set(),
+  payableVendorFallbacks: ReadonlyMap<string, string> = new Map(),
 ) {
   const accounts = new Map(facts.accounts.map(row => [row.accountId, row]));
   const parties = new Map(facts.parties.map(row => [row.partyId, row]));
@@ -94,16 +124,20 @@ export function createQuickBooksJournalProjections(
       set.add(posting.accountId); paymentAccounts.set(transaction.sourceTransactionId, set); continue;
     }
     const net = settlementMinor(posting.debitAmount) - settlementMinor(posting.creditAmount);
-    if (!posting.partyId) { if (net !== 0n) throw Error(`journal_settlement_missing_party:${transaction.sourceTransactionId}:${posting.accountId}`); continue; }
-    const party = parties.get(posting.partyId);
+    // A payable purchase/deposit posting without a party belongs to the vendor of
+    // the bill payments that link it (only when they all name the same vendor).
+    const partyId = posting.partyId ?? (transaction.sourceTransactionType !== "JournalEntry" && side === "ap"
+      && payableIds.has(transaction.sourceTransactionId) ? payableVendorFallbacks.get(transaction.sourceTransactionId) : undefined);
+    if (!partyId) { if (net !== 0n) throw Error(`journal_settlement_missing_party:${transaction.sourceTransactionId}:${posting.accountId}`); continue; }
+    const party = parties.get(partyId);
     if (!party || party.partyType !== (side === "ar" ? "customer" : "vendor")) throw Error(`journal_settlement_invalid_party:${transaction.sourceTransactionId}`);
-    const key = JSON.stringify([transaction.transactionId, posting.partyId, posting.accountId]);
+    const key = JSON.stringify([transaction.transactionId, partyId, posting.accountId]);
     const prior = groups.get(key);
     const amount = side === "ar" ? net : -net;
     const lineId = posting.transactionLineId ?? posting.postingId;
     const lines = new Map((prior?.lines ?? []).map(line => [line.lineId, line.openMinor]));
     lines.set(lineId, (lines.get(lineId) ?? 0n) + amount);
-    groups.set(key, { journalId: transaction.sourceTransactionId, partyId: posting.partyId, accountId: posting.accountId,
+    groups.set(key, { journalId: transaction.sourceTransactionId, partyId, accountId: posting.accountId,
       openMinor: (prior?.openMinor ?? 0n) + amount, lines: [...lines].map(([lineId, openMinor]) => ({lineId, openMinor})), lineBalancesKnown: true });
   }
   const zeroScopesByParty = new Map<string, Set<string>>();

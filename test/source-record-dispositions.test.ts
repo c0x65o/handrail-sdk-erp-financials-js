@@ -293,6 +293,30 @@ describe("provider-neutral source record dispositions", () => {
     expect(consumed.normalizedResources.transactions).toHaveLength(1);
   });
 
+  it("keeps a $0 bill payment that offsets a vendor credit against a refund deposit as a settlement, not a disposal", () => {
+    const ref = (id: string) => `raw://${importBatchId}/objects/BillPayment/records/${id}`;
+    const disposition = (id: string, reason: string) => ({ disposition: "skipped", reason, providerObjectType: "BillPayment",
+      providerObjectId: id, rawPayloadProvenance: { sourcePayloadRef: ref(id) } });
+    const header = (id: string) => ({ ...transactionHeader(), id: `bp_${id}`, sourceObject: "BillPayment", sourceObjectId: id, amount: 0 });
+    const lines = [{ sourceObject: "BillPayment", transactionId: "68566", sourceObjectId: "68566:synthetic-line-1",
+      linkedTransactions: [{ transactionId: "68565", transactionType: "Deposit" }] }];
+    const dispositions = [disposition("68566", "zero_cash_deposit_vendor_credit_offset"), disposition("70001", "zero_effect_empty_payment")];
+    const consumed = consumeSourceRecordDispositions({ importBatchId, rootDispositions: dispositions, nestedDispositions: dispositions,
+      normalizedResources: { transactions: [header("68566"), header("70001")], transaction_lines: lines }, skippedCount: 2 });
+    // The settlement stays (with its links); the genuinely empty payment is still disposed.
+    expect(consumed.dispositions.map((row) => [row.sourceRecordId, row.reason])).toEqual([["70001", "zero_effect_empty_payment"]]);
+    expect(consumed.normalizedResources.transactions?.map((row) => (row as { sourceObjectId: string }).sourceObjectId)).toEqual(["68566"]);
+    expect(consumed.normalizedResources.transaction_lines).toEqual(lines);
+
+    // Fail closed: only a $0 header without ledger rows qualifies.
+    const once = [disposition("68566", "zero_cash_deposit_vendor_credit_offset")];
+    expect(() => consumeSourceRecordDispositions({ importBatchId, rootDispositions: once, nestedDispositions: once, skippedCount: 1,
+      normalizedResources: { transactions: [{ ...header("68566"), amount: 5 }] } })).toThrow("must have an explicit zero normalized amount");
+    expect(() => consumeSourceRecordDispositions({ importBatchId, rootDispositions: once, nestedDispositions: once, skippedCount: 1,
+      normalizedResources: { transactions: [header("68566")], ledger_entries: [{ sourceObject: "BillPayment", transactionId: "68566" }] } }))
+      .toThrow("Settlement-bearing source record BillPayment\u000068566 has normalized posting data.");
+  });
+
   it("preserves a producer-owned zero skipped count without reclassifying batch accounting", () => {
     const consumed = consumeSourceRecordDispositions({ ...strictInput(), skippedCount: 0 });
     expect(consumed.dispositions).toHaveLength(1);
