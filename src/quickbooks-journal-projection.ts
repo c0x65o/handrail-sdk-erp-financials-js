@@ -24,14 +24,54 @@ export type JournalSettlementEvidence = {
   amount: string; allocation: string; lineIds: string[]; reason: string | null;
 };
 
+const PAYABLE_CONTROL_LINK_TYPES: ReadonlySet<string> = new Set(["Purchase", "Check", "Expense", "Deposit"]);
+
+/**
+ * Purchase checks and deposits that QuickBooks links from a bill payment and that
+ * post to Accounts Payable for a vendor (a vendor refund deposited, or a check
+ * that credits or charges the vendor's payable). QuickBooks settles these
+ * through the bill payment, so their payable scope becomes a subledger item.
+ * Only transactions whose every accrual payable posting names a vendor qualify;
+ * anything else keeps the previous behavior.
+ */
+export function quickBooksPayableControlSourceIds(
+  facts: CanonicalAccountingFactSet,
+  documents: readonly NormalizedQuickBooksLedgerTransaction[],
+): Set<string> {
+  const linked = new Set(documents.filter(document => document.sourceTransactionType === "BillPayment")
+    .flatMap(document => document.lines.flatMap(line => line.linkedTransactions ?? []))
+    .filter(link => PAYABLE_CONTROL_LINK_TYPES.has(link.sourceTransactionType ?? ""))
+    .map(link => link.sourceTransactionId));
+  if (linked.size === 0) return linked;
+  const payables = new Set(facts.accounts.filter(account => account.type.toLowerCase().replace(/[^a-z]/g, "") === "accountspayable").map(account => account.accountId));
+  const vendors = new Set(facts.parties.filter(party => party.partyType === "vendor").map(party => party.partyId));
+  const candidates = new Map(facts.transactions
+    .filter(row => (row.sourceTransactionType === "Purchase" || row.sourceTransactionType === "Deposit") && row.status === "posted" && linked.has(row.sourceTransactionId))
+    .map(row => [row.transactionId, row.sourceTransactionId]));
+  const qualified = new Map<string, boolean>();
+  for (const posting of facts.postings) {
+    const sourceId = candidates.get(posting.transactionId);
+    if (sourceId === undefined || posting.accountingBasis !== "accrual" || !payables.has(posting.accountId)) continue;
+    if (settlementMinor(posting.debitAmount) - settlementMinor(posting.creditAmount) === 0n) continue;
+    qualified.set(sourceId, (qualified.get(sourceId) ?? true) && posting.partyId !== undefined && vendors.has(posting.partyId));
+  }
+  return new Set([...qualified].filter(([, ok]) => ok).map(([sourceId]) => sourceId));
+}
+
 /** Subledger projections reference the existing journal. They never enter the
  * canonical fact writer, manufacture an invoice/bill, or create a posting.
  */
-export function createQuickBooksJournalProjections(facts: CanonicalAccountingFactSet, purchaseIds: ReadonlySet<string> = new Set()) {
+export function createQuickBooksJournalProjections(
+  facts: CanonicalAccountingFactSet,
+  purchaseIds: ReadonlySet<string> = new Set(),
+  payableIds: ReadonlySet<string> = new Set(),
+) {
   const accounts = new Map(facts.accounts.map(row => [row.accountId, row]));
   const parties = new Map(facts.parties.map(row => [row.partyId, row]));
   const transactions = new Map(facts.transactions.map(row => [row.transactionId, row]));
-  const journalBySourceId = new Map(facts.transactions.filter(row => (row.sourceTransactionType === "JournalEntry" || (row.sourceTransactionType === "Purchase" && purchaseIds.has(row.sourceTransactionId)))).map(row => [row.sourceTransactionId, row]));
+  const journalBySourceId = new Map(facts.transactions.filter(row => (row.sourceTransactionType === "JournalEntry"
+    || (row.sourceTransactionType === "Purchase" && purchaseIds.has(row.sourceTransactionId))
+    || ((row.sourceTransactionType === "Purchase" || row.sourceTransactionType === "Deposit") && payableIds.has(row.sourceTransactionId)))).map(row => [row.sourceTransactionId, row]));
   const partyBySourceId = new Map(facts.parties.map(row => [row.sourcePartyId, row]));
   const controls = new Map<string, "ar" | "ap">(facts.accounts.flatMap<readonly [string, "ar" | "ap"]>(account => {
     const type = account.type.toLowerCase().replace(/[^a-z]/g, "");
@@ -46,7 +86,10 @@ export function createQuickBooksJournalProjections(facts: CanonicalAccountingFac
     if (!side) continue;
     const transaction = transactions.get(posting.transactionId);
     if (!transaction || transaction.status !== "posted") continue;
-    if (transaction.sourceTransactionType !== "JournalEntry" && !(transaction.sourceTransactionType === "Purchase" && purchaseIds.has(transaction.sourceTransactionId) && side === "ar")) {
+    const scoped = transaction.sourceTransactionType === "JournalEntry"
+      || (transaction.sourceTransactionType === "Purchase" && purchaseIds.has(transaction.sourceTransactionId) && side === "ar")
+      || ((transaction.sourceTransactionType === "Purchase" || transaction.sourceTransactionType === "Deposit") && payableIds.has(transaction.sourceTransactionId) && side === "ap");
+    if (!scoped) {
       const set = paymentAccounts.get(transaction.sourceTransactionId) ?? new Set<string>();
       set.add(posting.accountId); paymentAccounts.set(transaction.sourceTransactionId, set); continue;
     }
@@ -95,7 +138,22 @@ export function createQuickBooksJournalProjections(facts: CanonicalAccountingFac
   const evidence: JournalSettlementEvidence[] = [];
   const evidenceByLine = new Map<string, JournalSettlementEvidence>();
   const lineKey = (sourceId: string, lineId: string) => JSON.stringify([sourceId, lineId]);
+  const payableLink = (document: NormalizedQuickBooksLedgerTransaction, link: { sourceTransactionType?: string; sourceTransactionId: string }) =>
+    document.sourceTransactionType === "BillPayment" && PAYABLE_CONTROL_LINK_TYPES.has(link.sourceTransactionType ?? "") && payableIds.has(link.sourceTransactionId);
+  /** Payable purchase/deposit links settle all-or-nothing per document; otherwise
+   * the document keeps its previous (unsettled) representation. */
   function rewrite(document: NormalizedQuickBooksLedgerTransaction): NormalizedQuickBooksLedgerTransaction {
+    if (!document.lines.some(line => (line.linkedTransactions ?? []).some(link => payableLink(document, link)))) return rewriteLinks(document, false);
+    const balanceSnapshot = new Map(balances), evidenceLength = evidence.length;
+    try {
+      return rewriteLinks(document, true);
+    } catch {
+      balances.clear(); for (const [id, scope] of balanceSnapshot) balances.set(id, scope);
+      for (const record of evidence.splice(evidenceLength)) evidenceByLine.delete(lineKey(record.sourceTransactionId, record.sourceLineId));
+      return rewriteLinks(document, false);
+    }
+  }
+  function rewriteLinks(document: NormalizedQuickBooksLedgerTransaction, settlePayables: boolean): NormalizedQuickBooksLedgerTransaction {
     if (!["Payment", "BillPayment"].includes(document.sourceTransactionType) || settlementMinor(document.totalAmount ?? "0") < 0n) return document;
     if (settlementMinor(document.totalAmount ?? "0") === 0n) {
       const party = partyBySourceId.get(document.partyRef?.sourceObjectId ?? "");
@@ -107,7 +165,9 @@ export function createQuickBooksJournalProjections(facts: CanonicalAccountingFac
     }
     return { ...document, lines: document.lines.map(line => {
       const links = line.linkedTransactions ?? [];
-      if (!links.some(link => link.sourceTransactionType === "JournalEntry" || (["Purchase", "Check", "Expense"].includes(link.sourceTransactionType ?? "") && purchaseIds.has(link.sourceTransactionId)))) return line;
+      if (!links.some(link => link.sourceTransactionType === "JournalEntry"
+        || (["Purchase", "Check", "Expense"].includes(link.sourceTransactionType ?? "") && purchaseIds.has(link.sourceTransactionId))
+        || (settlePayables && payableLink(document, link)))) return line;
       const link = links[0];
       if (links.length !== 1 || !link || !line.sourceAmount) throw Error(`journal_settlement_ambiguous_link:${document.sourceTransactionId}`);
       const party = partyBySourceId.get(document.partyRef?.sourceObjectId ?? "");

@@ -6377,6 +6377,10 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
     { zero: false, journalCredit: true, customer: false, amounts: [-60,-40], applied: 25, mixed: true, allocation: "unallocated" }
     ,{ purchase: true, zero: false, journalCredit: false, customer: true, amounts: [60,40], applied: 25, mixed: true, allocation: "unallocated" }
     ,{ purchase: true, zero: false, journalCredit: false, customer: true, amounts: [100], applied: 100, mixed: false, allocation: "single_line" }
+    // A $0 bill payment applying a purchase check's vendor payable debit to a bill.
+    ,{ purchase: true, zero: true, journalCredit: true, customer: false, amounts: [-60,-40], applied: 25, mixed: true, allocation: "unallocated" }
+    // A $0 bill payment applying a vendor credit to a vendor refund deposit's payable.
+    ,{ deposit: true, zero: true, journalCredit: false, customer: false, amounts: [60,40], applied: 25, mixed: true, allocation: "unallocated" }
   ])("imports journal settlement with aging and replay: %j", async scenario => {
     await migratePostgresSchema(runner, { appliedByRef: "fixture:journal-settlement" });
     await seedQuickBooksAllDocumentScope(pool);
@@ -6384,17 +6388,18 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
     const linkedBillAmount = scenario.zero ? "25.00" : "20.00";
     const baseFacts = quickBooksAllDocumentFacts(), base = quickBooksAllDocumentResources();
     const partyId = scenario.customer ? "customer_qbo" : "vendor_qbo";
-    const paymentId = scenario.customer ? "payment_all" : "bill_payment_all", billId = scenario.zero && !scenario.journalCredit ? "credit_all" : scenario.customer ? "invoice_all" : "bill_all";
+    const paymentId = scenario.customer ? "payment_all" : "bill_payment_all", billId = scenario.zero && !scenario.journalCredit ? (scenario.customer ? "credit_all" : "vendor_credit_all") : scenario.customer ? "invoice_all" : "bill_all";
+    const journalType = scenario.deposit ? "Deposit" : scenario.purchase ? "Purchase" : "JournalEntry";
     const transactionTemplate = baseFacts.transactions[0], accountTemplate = baseFacts.accounts[0];
     if (!transactionTemplate || !accountTemplate) throw Error("Missing fixture templates");
-    const journal = { ...transactionTemplate, transactionId: "journal_fixture", sourceTransactionId: "journal-fixture", sourceTransactionType: scenario.purchase ? "Purchase" : "JournalEntry", transactionNumber: "JE-FIXTURE", transactionDate: "2026-08-01", partyId: undefined };
+    const journal = { ...transactionTemplate, transactionId: "journal_fixture", sourceTransactionId: "journal-fixture", sourceTransactionType: journalType, transactionNumber: "JE-FIXTURE", transactionDate: "2026-08-01", partyId: undefined };
     const { partyId: ignoredParty, ...journalWithoutParty } = journal;
     expect(ignoredParty).toBeUndefined();
     const account = { ...accountTemplate, accountId: "control_fixture", sourceAccountId: "control", type: scenario.customer ? "Accounts Receivable" : "Accounts Payable", classification: scenario.customer ? "asset" as const : "liability" as const, name: "Control fixture" };
     await pool.query(`insert into erp_financials.accounts(account_id,tenant_id,source_id,source_account_id,name,type,classification,active)
       values ('control_fixture','tenant_qbo','source_qbo','control','Control fixture',$1,$2,true)`,[account.type,account.classification]);
     await pool.query(`insert into erp_financials.transactions(transaction_id,tenant_id,source_id,source_transaction_id,source_transaction_type,transaction_number,transaction_date,currency_code,status,source_payload_ref)
-      values ('journal_fixture','tenant_qbo','source_qbo','journal-fixture',$1,'JE-FIXTURE','2026-08-01','USD','posted','{}')`, [scenario.purchase ? 'Purchase' : 'JournalEntry']);
+      values ('journal_fixture','tenant_qbo','source_qbo','journal-fixture',$1,'JE-FIXTURE','2026-08-01','USD','posted','{}')`, [journalType]);
     const postings = scenario.amounts.map((amount,index) => {
       const signed = scenario.customer ? amount : -amount;
       return { tenantId:"tenant_qbo",sourceId:"source_qbo",postingId:`journal_line_${String(index)}`,sourcePostingId:`provider_line_${String(index)}`,transactionId:"journal_fixture",
@@ -6416,8 +6421,8 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
       if (!line) throw Error("Missing fixture line");
       if (row.resourceId === billId) return {...row,resource:{...row.resource,totalAmount:linkedBillAmount,openAmount:"0.00",lines:[{...line,sourceAmount:linkedBillAmount,sourceQuantity:"1.00",sourceUnitAmount:linkedBillAmount,linkedTransactions:[]}]}};
       return {...row,resource:{...row.resource,totalAmount:scenario.zero?"0.00":pooled?"20.00":(scenario.applied+(scenario.mixed?20:0)).toFixed(2),unappliedAmount:"0.00",lines:[
-        {...line,sourceLineId:"journal-link",sourceAmount:scenario.applied.toFixed(2),linkedTransactions:[{sourceTransactionId:"journal-fixture",sourceTransactionType:scenario.purchase ? "Check" : "JournalEntry"}]},
-        ...(scenario.mixed?[{...line,sourceLineId:"bill-link",lineNumber:2,sourceAmount:linkedBillAmount,linkedTransactions:[{sourceTransactionId:billId,sourceTransactionType:scenario.zero&&!scenario.journalCredit?"CreditMemo":scenario.customer?"Invoice":"Bill"}]}]:[])
+        {...line,sourceLineId:"journal-link",sourceAmount:scenario.applied.toFixed(2),linkedTransactions:[{sourceTransactionId:"journal-fixture",sourceTransactionType:scenario.deposit ? "Deposit" : scenario.purchase ? "Check" : "JournalEntry"}]},
+        ...(scenario.mixed?[{...line,sourceLineId:"bill-link",lineNumber:2,sourceAmount:linkedBillAmount,linkedTransactions:[{sourceTransactionId:billId,sourceTransactionType:scenario.zero&&!scenario.journalCredit?(scenario.customer?"CreditMemo":"VendorCredit"):scenario.customer?"Invoice":"Bill"}]}]:[])
       ]}};
     }) };
     if (pooled) {
