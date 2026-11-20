@@ -6466,6 +6466,37 @@ where document.tenant_id = 'tenant_qbo' and document.source_id = 'source_qbo'
     }
   });
 
+  it("full-sync cleanup stays index-bound for a large uncommitted import", async () => {
+    await migratePostgresSchema(runner, { appliedByRef: "fixture:full-sync-cleanup-scale" });
+    await seedQuickBooksImportScope(pool);
+    const result = await runner.transaction(async client => {
+      // Rows written in the same transaction, as a full import does: 20,000 kept
+      // transactions with postings and lines, and 2,000 orphans with only lines.
+      await client.query(`insert into erp_financials.transactions (transaction_id, tenant_id, source_id, source_transaction_id, source_transaction_type,
+          transaction_number, transaction_date, currency_code, status, source_payload_ref)
+        select 'scale_' || n, 'tenant_qbo', 'source_qbo', 'scale-' || n, 'Purchase', 'CHK-' || n, '2026-08-01', 'USD', 'posted', '{}'::jsonb
+        from generate_series(1, 22000) n`);
+      await client.query(`insert into erp_financials.transaction_lines (transaction_line_id, tenant_id, source_id, transaction_id, line_number, account_id, amount, dimension_refs)
+        select 'scale_line_' || n, 'tenant_qbo', 'source_qbo', 'scale_' || n, 1, 'account_cash_qbo', 10, '[]'::jsonb from generate_series(1, 22000) n`);
+      await client.query(`insert into erp_financials.ledger_postings (posting_id, tenant_id, source_id, source_posting_id, transaction_id, account_id, posting_date,
+          accounting_basis, debit_amount, credit_amount, net_amount, currency_code, dimension_hash, dimension_refs, source_payload_ref, import_batch_id)
+        select 'scale_' || n || '_' || side, 'tenant_qbo', 'source_qbo', 'scale_' || n || '_' || side, 'scale_' || n,
+          case side when 'd' then 'account_cash_qbo' else 'account_revenue_qbo' end, '2026-08-01', 'accrual',
+          case side when 'd' then 10 else 0 end, case side when 'c' then 10 else 0 end, case side when 'd' then 10 else -10 end,
+          'USD', repeat('a', 64), '[]'::jsonb, '{}'::jsonb, 'batch_qbo'
+        from generate_series(1, 20000) n cross join (values ('d'), ('c')) sides(side)`);
+      const started = Date.now();
+      const deleted = await createPostgresStorageAdapter(client).deleteLedgerFactsOutsideImportBatch({ tenantId: "tenant_qbo", sourceId: "source_qbo", importBatchId: "batch_qbo" });
+      return { deleted, elapsedMs: Date.now() - started };
+    });
+    // The 2,000 orphans plus the seeded scope's two posting-free fixture transactions.
+    expect(result.deleted).toMatchObject({ postings: 0, transactionLines: 2000, transactions: 2002 });
+    expect((await pool.query("select count(*)::int n from erp_financials.transaction_lines where transaction_id like 'scale_%'")).rows[0]).toEqual({ n: 20000 });
+    // Previously each lookup re-scanned the tenant's postings/lines (quadratic: minutes at this size).
+    expect(result.elapsedMs).toBeLessThan(60_000);
+    expect((await pool.query("select count(*)::int n from erp_financials.transactions where transaction_id like 'scale_%'")).rows[0]).toEqual({ n: 20000 });
+  }, 240_000);
+
   it.each([false, true])("splits mixed cash and credit, replays and retires owned links (customer=%s)", async customer => {
     await migratePostgresSchema(runner, { appliedByRef: "integration:mixed-credit" });
     await seedQuickBooksAllDocumentScope(pool);

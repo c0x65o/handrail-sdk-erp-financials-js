@@ -1179,6 +1179,12 @@ async function deleteLedgerFactsOutsideImportBatch(
     where d.tenant_id=$1 and d.source_id=$2 and d.subledger_document_id=any($3::text[])`,
     [input.tenantId, input.sourceId, corrections.flatMap(row => row.reopenedInvoiceIds)]);
   const retainedIds = [...corrections.flatMap(row => row.transactionIds), ...preserved.rows.map(row => row.transaction_id)];
+  // A full sync runs this cleanup in the import transaction, after writing its
+  // facts and documents. Autovacuum cannot see those uncommitted rows, so refresh
+  // statistics (after the correction lock) first or the anti-joins below are planned as per-row scans of
+  // tables the planner still believes are empty.
+  await client.query(`analyze ${["transactions", "transaction_lines", "ledger_postings", "subledger_documents"]
+    .map(table => qualifiedTable(manifest, table)).join(", ")}`);
   await client.query(`select set_config('erp_financials.quickbooks_projection_refresh', 'on', true)`);
   const postingsResult = await client.query(
     `delete from ${qualifiedTable(manifest, "ledger_postings")} posting
@@ -1194,11 +1200,13 @@ where "tenant_id" = $1 and "source_id" = $2 and "import_batch_id" <> $3
 using ${qualifiedTable(manifest, "transactions")} transactions
 where transactions."transaction_id" = lines."transaction_id"
   and transactions."tenant_id" = lines."tenant_id"
+  and transactions."source_id" = lines."source_id"
   and transactions."tenant_id" = $1
   and transactions."source_id" = $2
   and not exists (
     select 1 from ${qualifiedTable(manifest, "ledger_postings")} postings
     where postings."tenant_id" = transactions."tenant_id"
+      and postings."source_id" = transactions."source_id"
       and postings."transaction_id" = transactions."transaction_id"
   )
   and not exists (
@@ -1216,6 +1224,7 @@ where transactions."tenant_id" = $1
   and not exists (
     select 1 from ${qualifiedTable(manifest, "ledger_postings")} postings
     where postings."tenant_id" = transactions."tenant_id"
+      and postings."source_id" = transactions."source_id"
       and postings."transaction_id" = transactions."transaction_id"
   )
   and not exists (

@@ -95,6 +95,7 @@ export class PostgresMigrationError extends Error {
 const namespace = POSTGRES_CANONICAL_SCHEMA_MANIFEST.namespace;
 const migrationLockKey = `${namespace}:schema-migrations`;
 const migrationFiles = {
+  subledgerDocumentSourceTransactionV65: new URL("../migrations/future-erp/20261120020000_subledger_document_source_transaction_index.sql", import.meta.url),
   payablePurchaseDepositSettlementV64: new URL("../migrations/future-erp/20261120010000_payable_purchase_deposit_settlement.sql", import.meta.url),
   purchaseSettlementV63: new URL("../migrations/future-erp/20261116040000_purchase_control_settlement.sql", import.meta.url),
   pooledSettlementV62: new URL("../migrations/future-erp/20261116030000_pooled_journal_settlement.sql", import.meta.url),
@@ -392,7 +393,8 @@ export const POSTGRES_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
   migration("20261116020000_journal_subledger_settlement", "Journal party and control-account subledger settlements", 60, 61, migrationFiles.journalSettlementV61),
   migration("20261116030000_pooled_journal_settlement", "Retain independent credit and cash settlement legs", 61, 62, migrationFiles.pooledSettlementV62),
   migration("20261116040000_purchase_control_settlement", "Settle customer control balances on purchase checks", 62, 63, migrationFiles.purchaseSettlementV63),
-  migration("20261120010000_payable_purchase_deposit_settlement", "Settle vendor control balances on purchase checks and deposits", 63, 64, migrationFiles.payablePurchaseDepositSettlementV64)
+  migration("20261120010000_payable_purchase_deposit_settlement", "Settle vendor control balances on purchase checks and deposits", 63, 64, migrationFiles.payablePurchaseDepositSettlementV64),
+  migration("20261120020000_subledger_document_source_transaction_index", "Bound full-sync cleanup lookups by source transaction", 64, 65, migrationFiles.subledgerDocumentSourceTransactionV65)
 ] as const;
 
 export async function planPostgresMigrations(
