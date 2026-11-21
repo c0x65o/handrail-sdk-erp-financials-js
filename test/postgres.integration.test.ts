@@ -4623,6 +4623,26 @@ describeIntegration("ERP Financials real PostgreSQL", () => {
     // Existing AR contract is net of the remaining credit/payment balance.
     const ar = await sdk.queries.getAging({kind:"receivables",asOfDate:"2026-08-12"});
     expect(ar.totals).toMatchObject({total:"70.00",grossTotal:(80-Number(applied)).toFixed(2),unappliedTotal:available});
+
+    // Aging reconstructions run with hash joins only (Hitcents: 9-13 minutes
+    // nested-loop/merge joined, ~3 s hashed), and every other statement in the
+    // same transaction plans with the defaults.
+    const planned: { sql: string; nestloop: string; mergejoin: string }[] = [];
+    const recording = { transaction: <Result>(operation: (client: PostgresQueryClient) => Promise<Result>) => runner.transaction(client => operation({
+      query: async <Row extends Record<string, unknown>>(sql: string, params?: readonly unknown[]) => {
+        const settings = (await client.query<{ nestloop: string; mergejoin: string }>("select current_setting('enable_nestloop') nestloop, current_setting('enable_mergejoin') mergejoin")).rows[0];
+        planned.push({ sql, nestloop: settings?.nestloop ?? "", mergejoin: settings?.mergejoin ?? "" });
+        return client.query<Row>(sql, params);
+      },
+    })) };
+    const recorded = createErpFinancialsSdk({ database: recording, tenantId: "tenant_qbo", companyId: "company_qbo", bookId: "book_qbo", writeSourceId: "source_qbo", currencyCode: "USD" });
+    expect((await recorded.queries.getAging({kind:"payables",asOfDate:"2026-08-12"})).totals).toEqual(aging.totals);
+    expect((await recorded.queries.getDashboardSummary({periodStart:"2026-08-01",asOfDate:"2026-08-12"})).accountsPayable).toBe("50.00");
+    const agingStatements = planned.filter(({ sql }) => sql.includes("effective_applications as materialized"));
+    expect(agingStatements).toHaveLength(2);
+    expect(agingStatements.every(({ nestloop, mergejoin }) => nestloop === "off" && mergejoin === "off")).toBe(true);
+    expect(planned.filter(({ sql }) => !sql.includes("effective_applications as materialized") && !sql.includes("set_config("))
+      .every(({ nestloop, mergejoin }) => nestloop === "on" && mergejoin === "on")).toBe(true);
   });
 
   it("vendor bill register includes imported vendor credits without counting them as cash payments", async () => {

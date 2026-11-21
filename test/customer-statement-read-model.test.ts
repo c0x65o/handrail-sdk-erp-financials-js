@@ -136,6 +136,9 @@ class CustomerStatementClient implements PostgresQueryClient {
     if (sql.includes('from "erp_financials"."reporting_books"')) {
       return rows<Row>([{ base_currency_code: "USD", accounting_basis: "accrual", status: "active" }]);
     }
+    // The statement runs with hash joins only (queryWithHashJoins).
+    if (sql.includes("current_setting('enable_nestloop')")) return rows<Row>([{ nestloop: "on", mergejoin: "on", jit: "on" }]);
+    if (sql.includes("set_config('enable_nestloop'")) return rows<Row>([]);
     if (sql.includes("with scoped_invoices as")) {
       this.statementSql = sql;
       this.statementParameters.push(parameters);

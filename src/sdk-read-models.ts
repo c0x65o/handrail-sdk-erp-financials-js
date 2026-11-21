@@ -20,7 +20,7 @@ import type {
   JsonValue
 } from "./canonical-model.js";
 import type { ErpFinancialsTransactionRunner, JournalEntryOrigin } from "./erp-financials-service.js";
-import type { PostgresQueryClient } from "./postgres-storage.js";
+import type { PostgresQueryClient, PostgresQueryResult } from "./postgres-storage.js";
 import type { ReportingBookAccountRole } from "./reporting-books.js";
 
 export type PageRequest = {
@@ -3485,7 +3485,7 @@ async function getCustomerFundingDocuments(scope: Scope, request: CustomerStatem
   }
   return scope.database.transaction(async client => {
     const book = await resolveBook(client, scope);
-    const result = await client.query(`${receivableAgingDocumentsSql("$6", "$5", "'invoice'", "array['customer_payment','credit_memo','refund']", "$4")}
+    const result = await queryWithHashJoins(client, `${receivableAgingDocumentsSql("$6", "$5", "'invoice'", "array['customer_payment','credit_memo','refund']", "$4")}
 select documents.*, b.status as book_status,b.base_currency_code as book_currency,b.accounting_basis as book_basis
 from erp_financials.reporting_books b
 left join lateral (
@@ -3534,7 +3534,7 @@ async function getVendorFundingDocuments(scope: Scope, request: VendorFundingDoc
   }
   return scope.database.transaction(async client => {
     const book = await resolveBook(client, scope);
-    const result = await client.query(`${vendorFundingDocumentsSql("$6", "$5", "'vendor_bill'", "array['bill_payment','vendor_credit']", "$4")}
+    const result = await queryWithHashJoins(client, `${vendorFundingDocumentsSql("$6", "$5", "'vendor_bill'", "array['bill_payment','vendor_credit']", "$4")}
 select documents.*, b.status as book_status,b.base_currency_code as book_currency,b.accounting_basis as book_basis
 from erp_financials.reporting_books b
 left join lateral (
@@ -3589,7 +3589,7 @@ async function getCustomerStatement(
   }
   return scope.database.transaction(async (client) => {
     const book = await resolveBook(client, scope);
-    const result = await client.query(
+    const result = await queryWithHashJoins(client, 
       `with scoped_invoices as (
   select document."subledger_document_id" as "invoice_id", document."source_id", document."transaction_id",
     document."party_id" as "customer_id", party."display_name" as "customer_name", document."document_number",
@@ -7709,6 +7709,40 @@ order by "account_number" nulls last, "name", "book_account_key"`,
   });
 }
 
+/**
+ * Runs a statement built on the effective-date aging reconstructions with hash
+ * joins only. Their per-document applied totals join every document on (source,
+ * document, role), but PostgreSQL cannot estimate the CASE-mapped roles or the
+ * effective-date filters (Hitcents, Nov 2026: about 190 documents and 17
+ * applications estimated for 40,000 and 30,000), so it nested-loop or merge
+ * joined on source alone: one source, so every document against every applied
+ * total, 9-13 minutes per Sep 30 aging read. Hash joins on all the keys answer
+ * the same rows in about 3 s. The settings are transaction-local and reset after
+ * the statement, so the caller's other statements plan as before.
+ */
+async function queryWithHashJoins<Row extends Record<string, unknown> = Record<string, unknown>>(
+  client: PostgresQueryClient, sql: string, params?: readonly unknown[]
+): Promise<PostgresQueryResult<Row>> {
+  // Disabled join methods carry a large cost penalty that would push the plan
+  // over jit_above_cost and spend seconds compiling it, so JIT is off too.
+  const prior = (await client.query<{ nestloop: string; mergejoin: string; jit: string }>(`select
+    current_setting('enable_nestloop') nestloop, current_setting('enable_mergejoin') mergejoin, current_setting('jit') jit`)).rows[0];
+  await client.query("select set_config('enable_nestloop','off',true), set_config('enable_mergejoin','off',true), set_config('jit','off',true)");
+  let failed = false;
+  try {
+    return await client.query<Row>(sql, params);
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    // A failed statement aborts the transaction, which ends these settings with it.
+    if (!failed && prior) {
+      await client.query("select set_config('enable_nestloop',$1,true), set_config('enable_mergejoin',$2,true), set_config('jit',$3,true)",
+        [prior.nestloop, prior.mergejoin, prior.jit]);
+    }
+  }
+}
+
 // Shared effective-date AR reconstruction. SQL expressions are internal constants,
 // never caller-provided values; reporting inputs remain bound parameters.
 function receivableAgingDocumentsSql(asOf = "$6", currency = "$5", documentType = "$4", offsetTypes = "$7", party?: string): string {
@@ -7895,7 +7929,7 @@ where document."tenant_id" = $1 and document."company_id" = $2
 async function getOutstandingDocumentSummary(scope: Scope, request: { readonly asOfDate: IsoDate }): Promise<OutstandingDocumentSummary> {
   const asOfDate = request.asOfDate; assertDate(asOfDate, "asOfDate");
   return scope.database.transaction(async client => {
-    const result = await client.query(`/* outstanding_document_summary */
+    const result = await queryWithHashJoins(client, `/* outstanding_document_summary */
 with book as (select base_currency_code,status from erp_financials.reporting_books where tenant_id=$1 and company_id=$2 and book_id=$3)
 select book.*,statement_timestamp() observed_at,ar.*,ap.* from book
 cross join lateral (
@@ -7926,7 +7960,7 @@ async function getDashboardSummary(
   assertWindow(input.periodStart, input.asOfDate);
   assertReportAccountingMethod(input.accountingMethod);
   return scope.database.transaction(async (client) => {
-    const result = await client.query(`/* financial_dashboard_snapshot */
+    const result = await queryWithHashJoins(client, `/* financial_dashboard_snapshot */
 with book as (
   select "base_currency_code", "accounting_basis", "status" from "erp_financials"."reporting_books"
   where "tenant_id"=$1 and "company_id"=$2 and "book_id"=$3
@@ -8263,7 +8297,7 @@ from aging_documents
 group by "party_id", "party_name"
 having sum(abs("signed_open_amount")) <> 0`;
     if (paginate) {
-      const result = await client.query(`${agingDocuments}, aging_rows as materialized (${groupedSql}),
+      const result = await queryWithHashJoins(client, `${agingDocuments}, aging_rows as materialized (${groupedSql}),
  aging_summary as (
   select count(*)::text party_count,coalesce(sum(current_amount),0)::text summary_current,
     coalesce(sum(days_1_30),0)::text summary_days_1_30,coalesce(sum(days_31_60),0)::text summary_days_31_60,
@@ -8293,7 +8327,7 @@ having sum(abs("signed_open_amount")) <> 0`;
         totals:{grossTotal:money(head.summary_gross,"summary_gross"),unappliedTotal:money(head.summary_unapplied,"summary_unapplied"),current:money(head.summary_current,"summary_current"),days1To30:money(head.summary_days_1_30,"summary_days_1_30"),days31To60:money(head.summary_days_31_60,"summary_days_31_60"),days61To90:money(head.summary_days_61_90,"summary_days_61_90"),daysOver90:money(head.summary_days_over_90,"summary_days_over_90"),total:money(head.summary_total,"summary_total")},
         ...(candidates.length>limit&&last?{nextCursor:Buffer.from(JSON.stringify({v:1,scope:cursorScope,partyId:last.partyId,revision}),"utf8").toString("base64url")}:{})};
     }
-    const result = await client.query(`${agingDocuments} ${groupedSql} order by "total_amount" desc, "party_id"`, parameters);
+    const result = await queryWithHashJoins(client, `${agingDocuments} ${groupedSql} order by "total_amount" desc, "party_id"`, parameters);
     const rows = result.rows.map(agingRowFromRow);
     return {
       kind: input.kind,

@@ -45,7 +45,10 @@ it("dashboard freezes its window and basis before database acquisition", async (
   const input={periodStart:"2026-01-01",asOfDate:"2026-08-12",accountingMethod:"cash" as const};
   const queries=createFinancialReadModels({...scope,database:{transaction:async work=>{
     await gate;
-    return work({query:<Row extends Record<string,unknown>>(_sql:string,parameters?:readonly unknown[]):Promise<PostgresQueryResult<Row>>=>{
+    return work({query:<Row extends Record<string,unknown>>(sql:string,parameters?:readonly unknown[]):Promise<PostgresQueryResult<Row>>=>{
+      // The dashboard statement runs with hash joins only (queryWithHashJoins).
+      if (sql.includes("current_setting('enable_nestloop')")) return Promise.resolve({rows:[{nestloop:"on",mergejoin:"on",jit:"on"}] as unknown as Row[]});
+      if (sql.includes("set_config('enable_nestloop'")) return Promise.resolve({rows:[] as Row[]});
       expect(parameters).toEqual(["t","c","b","2026-08-12","2026-01-01","cash"]);
       return Promise.resolve({rows:[{status:"active",base_currency_code:"USD",accounting_basis:"accrual",assets:"0",liabilities:"0",equity:"0",revenue:"0",expenses:"0",receivables:"0",payables:"0",overdue_receivables:"0",overdue_payables:"0"}] as unknown as Row[]});
     }});

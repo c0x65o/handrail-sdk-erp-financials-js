@@ -113,6 +113,9 @@ class ReceivablesLookupClient implements PostgresQueryClient {
     sql: string,
     parameters: readonly unknown[] = []
   ): Promise<PostgresQueryResult<Row>> {
+    // Aging statements run with hash joins only (queryWithHashJoins).
+    if (sql.includes("current_setting('enable_nestloop')")) return rows<Row>([{ nestloop: "on", mergejoin: "on", jit: "on" }]);
+    if (sql.includes("set_config('enable_nestloop'")) return rows<Row>([]);
     this.sql.push(sql);
     if (sql.includes('from "erp_financials"."reporting_books"')) return rows<Row>([book()]);
     if (sql.includes('max("digits" collate "C")')) return rows<Row>([{ latest_sequence: "42" }]);
@@ -178,6 +181,9 @@ class AgingClient implements PostgresQueryClient {
     parameters: readonly unknown[] = []
   ): Promise<PostgresQueryResult<Row>> {
     if (sql.includes('from "erp_financials"."reporting_books"')) return rows<Row>([book()]);
+    // The aging statement runs with hash joins only (queryWithHashJoins).
+    if (sql.includes("current_setting('enable_nestloop')")) return rows<Row>([{ nestloop: "on", mergejoin: "on", jit: "on" }]);
+    if (sql.includes("set_config('enable_nestloop'")) return rows<Row>([]);
     if (sql.includes("aging_documents as")) {
       this.agingSql = sql;
       this.parameters = parameters;

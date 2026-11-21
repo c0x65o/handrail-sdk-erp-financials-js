@@ -671,6 +671,9 @@ class DashboardClient implements PostgresQueryClient {
     sql: string,
     params: readonly unknown[] = []
   ): Promise<PostgresQueryResult<Row>> {
+    // The dashboard statement runs with hash joins only (queryWithHashJoins).
+    if (sql.includes("current_setting('enable_nestloop')")) return Promise.resolve({ rows: [{ nestloop: "on", mergejoin: "on", jit: "on" } as unknown as Row] });
+    if (sql.includes("set_config('enable_nestloop'")) return Promise.resolve({ rows: [] });
     if (sql.includes("financial_dashboard_snapshot")) {
       this.requestedAccountingBases.push(params[5] ?? "accrual");
       return Promise.resolve({ rows: [{
